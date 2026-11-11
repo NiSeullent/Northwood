@@ -5,15 +5,19 @@
 //! ([`stela_formats::payload::gpt::read`]): the primary, or the backup when
 //! an interrupted write left the primary damaged, as boot selection reads
 //! it. So a disk the mount selected is a disk it can open.
-use alloc::{format, vec};
+use alloc::format;
 use core::fmt;
-use stela_drivers::block::{BlockDevice, BlockError, Command, Finished, Identity};
+use stela_drivers::block::{BlockDevice, BlockError, Command, Finished, Identity, Request};
 use stela_formats::payload::{
     PayloadError,
     gpt::{self as shared, Disk, Found},
 };
 
 pub use shared::{Guid, Partition, Table};
+
+/// The Northwood Swap partition type, E9AFCDBE-E70E-40C5-8A5F-AF97B70BD75D.
+pub const NORTHWOOD_SWAP_TYPE: Guid = shared::Role::NORTHWOOD_SWAP_TYPE;
+pub const NORTHWOOD_SWAP_NAME: &str = shared::Role::NORTHWOOD_SWAP_NAME;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GptError {
@@ -52,6 +56,15 @@ pub fn geometry(identity: &Identity) -> Disk {
 /// damaged or missing. Both copies damaged is an error; a disk with neither
 /// has no table.
 pub fn read(disk: &mut dyn BlockDevice) -> Result<Table, GptError> {
+    read_table(disk, false)
+}
+
+/// Require agreeing primary and backup GPTs and a pure protective MBR.
+pub(super) fn read_for_write(disk: &mut dyn BlockDevice) -> Result<Table, GptError> {
+    read_table(disk, true)
+}
+
+fn read_table(disk: &mut dyn BlockDevice, writable: bool) -> Result<Table, GptError> {
     let geometry = geometry(disk.identity());
     if !matches!(geometry.block_bytes, 512 | 1024 | 2048 | 4096)
         || geometry.blocks <= 2 * geometry.first_usable()
@@ -59,25 +72,41 @@ pub fn read(disk: &mut dyn BlockDevice) -> Result<Table, GptError> {
         return Err(GptError::NoTable);
     }
     let mut failed = None;
-    let found = shared::read(geometry, |lba, blocks| {
+    let read = |lba, blocks| {
         let bytes = usize::try_from(blocks * geometry.block_bytes)
             .map_err(|_| PayloadError::Disk("GPT read too large"))?;
-        let mut buffer = vec![0; bytes];
-        disk.read(lba, &mut buffer).map_err(|error| {
+        read_blocks(disk, lba, bytes).map_err(|error| {
             failed = Some(error.clone());
             PayloadError::io(error)
-        })?;
-        Ok(buffer)
-    });
+        })
+    };
+    let found = if writable {
+        shared::read_for_write(geometry, read).map(Some)
+    } else {
+        shared::read(geometry, read).map(|found| match found {
+            Found::Table { table, .. } => Some(table),
+            Found::Blank | Found::Interrupted => None,
+        })
+    };
     if let Some(error) = failed {
         return Err(GptError::Device(error));
     }
     match found {
-        Ok(Found::Table { table, .. }) => Ok(table),
-        Ok(Found::Blank | Found::Interrupted) => Err(GptError::NoTable),
+        Ok(Some(table)) => Ok(table),
+        Ok(None) => Err(GptError::NoTable),
         Err(PayloadError::Disk(why)) => Err(GptError::Invalid(why)),
         Err(_) => Err(GptError::Invalid("unreadable")),
     }
+}
+
+fn read_blocks(
+    disk: &mut dyn BlockDevice,
+    lba: u64,
+    bytes: usize,
+) -> Result<alloc::vec::Vec<u8>, BlockError> {
+    Request::Read { lba, bytes }
+        .run(disk)?
+        .ok_or(BlockError::Protocol("GPT read returned no bytes"))
 }
 
 /// A block device that reaches only the blocks of one partition.

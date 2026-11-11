@@ -5,6 +5,7 @@ use crate::machine::{
     Regime,
     mmu::tlbi::{Everywhere, Reach},
 };
+use crate::memory::{RegisteredSystemRam, system_ram::ClosedDescriptorFrame};
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -20,6 +21,35 @@ pub enum HostEffect {
     ArmTimer(Option<u64>),
     DiscardCode,
     MemoryBarrier,
+    RevokeRamCpuMappings(RamCpuMappingRevocation),
+}
+
+/// Issued only while the exact frame and its registered owner are held.
+/// A worker may retire a wider set of local CPU translations to cover it.
+#[derive(Debug)]
+pub struct RamCpuMappingRevocation {
+    ram: usize,
+    generation: u64,
+    physical: u64,
+}
+
+impl RamCpuMappingRevocation {
+    pub(in crate::machine::engine) fn new(frame: &ClosedDescriptorFrame<'_>) -> Self {
+        let service = frame.service();
+        Self {
+            ram: core::ptr::from_ref(service.registration()).addr(),
+            generation: service.generation(),
+            physical: frame.physical(),
+        }
+    }
+
+    pub fn physical(&self) -> u64 {
+        self.physical
+    }
+
+    pub fn belongs_to(&self, ram: &RegisteredSystemRam) -> bool {
+        core::ptr::from_ref(ram).addr() == self.ram && ram.generation() == Ok(self.generation)
+    }
 }
 
 #[derive(Debug)]
@@ -291,6 +321,7 @@ impl HostEffectCommand {
             HostEffect::ArmTimer(_) => "timer",
             HostEffect::DiscardCode => "discard",
             HostEffect::MemoryBarrier => "cpu-memory-fence",
+            HostEffect::RevokeRamCpuMappings(_) => "revoke-ram-cpu-mappings",
         }
     }
 }
@@ -330,6 +361,14 @@ impl WorkerOwner {
             HostEffect::ArmTimer(deadline) => host.arm_timer(*deadline),
             HostEffect::DiscardCode => host.discard_code(),
             HostEffect::MemoryBarrier => host.memory_barrier(),
+            HostEffect::RevokeRamCpuMappings(request) => {
+                if !host.revoke_ram_cpu_mappings(request) {
+                    return Err(WithPayload {
+                        error: PublicationError::UnqualifiedHost,
+                        payload: command,
+                    });
+                }
+            }
         }
         command
             .session

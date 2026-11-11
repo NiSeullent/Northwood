@@ -35,7 +35,7 @@ use stela_drivers::{
     },
     bus::dma::RegionAllocator,
     input::InputDevice,
-    probe::{NativeServices, native::usb4, probe_with_provider},
+    probe::{NativeServices, native::usb4, probe_with_policy, registry::DriverPolicy},
 };
 use stela_runtime::pc::{
     gpt::{Guid, PartitionDevice},
@@ -907,12 +907,17 @@ pub struct Selection<'a> {
     pub store: Option<Guid>,
     /// The USB's boot log, by its GUID; left out when it cannot open.
     pub log: Option<Guid>,
+    /// The data partition holding the current readable boot log.
+    pub volume_log: Option<Guid>,
+    /// Read the swap metadata while the disk probe still owns its resources.
+    pub swap: Option<&'a super::swap::Probe>,
     /// Required host-owned durable FDR file volume, when explicitly staged.
     pub fdr: Option<Guid>,
     /// Whole USB disks for the guest, by serial number.
     pub usb_disks: &'a [String],
     /// The Wi-Fi network to join; without one a Wi-Fi adapter stays down.
     pub wifi: Option<&'a stela_drivers::net::wifi::network::Network>,
+    pub policy: DriverPolicy<'a>,
     /// With `--external-disks`, the guest hub's free ports, which every disk
     /// left over fills in probe order.
     pub external: Option<usize>,
@@ -943,9 +948,12 @@ pub unsafe fn open(
         preboot,
         store,
         log,
+        volume_log,
+        swap,
         fdr,
         usb_disks,
         wifi,
+        policy,
         external,
     } = *selection;
     if let Some(serial) = usb_disks
@@ -962,8 +970,11 @@ pub unsafe fn open(
     let firmware =
         super::firmware_requests::Requests::new(stela_drivers::probe::handoff_provider(handoff));
     // SAFETY: the loader mapped these ranges uncached and identity-mapped.
-    let mut devices =
-        unsafe { probe_with_provider(handoff, captures, &mut dma, firmware, services, wifi) };
+    let mut devices = unsafe {
+        probe_with_policy(
+            handoff, captures, &mut dma, firmware, services, wifi, &policy,
+        )
+    };
     firmware.report();
     // The owners native attachments keep, and those of failed ones, stay
     // for the boot: their mappings and DMA domains outlive the devices.
@@ -1049,6 +1060,24 @@ pub unsafe fn open(
             class[0], class[1], class[2]
         ));
     }
+    for adapter in &devices.gpus {
+        match adapter.glk_memory {
+            Some(Ok(memory)) => {
+                let (base, bytes) = memory
+                    .stolen
+                    .map_or((0, 0), |stolen| (stolen.base, stolen.bytes));
+                output::arguments(format_args!(
+                    "HOST GPU GLK pci={} device={:04x} ggtt_bytes={} stolen_base={base:#x} stolen_bytes={bytes}\n",
+                    adapter.address, adapter.device, memory.ggtt_bytes
+                ));
+            }
+            Some(Err(error)) => output::arguments(format_args!(
+                "HOST GPU GLK pci={} device={:04x} memory unavailable: {error:?}\n",
+                adapter.address, adapter.device
+            )),
+            None => {}
+        }
+    }
     for (location, error) in &devices.device_failures {
         output::arguments(format_args!("HOST DEVICE FAILED {location}: {error}\n"));
     }
@@ -1095,7 +1124,13 @@ pub unsafe fn open(
         .map(|guid| (Named::Unique(guid), Optional::Store))
         .into_iter()
         .chain(log.map(|guid| (Named::Host(guid), Optional::Log)))
+        .chain(volume_log.map(|guid| (Named::Unique(guid), Optional::VolumeLog)))
         .collect();
+    if let Some(probe) = swap
+        && !probe.inspect_partition(&mut devices.disks)
+    {
+        probe.inspect_volume(&mut devices.disks, handoff.clock.ticks_per_microsecond);
+    }
     // The controllers that could hold a missing disk and were not driven.
     let not_driven = devices
         .unsupported
@@ -1171,13 +1206,14 @@ pub unsafe fn open(
             failures: 0,
         })
     };
-    let (mut store_partition, mut log_partition) = (None, None);
+    let (mut store_partition, mut log_partition, mut volume_log_partition) = (None, None, None);
     for (_, which) in optional.iter().rev() {
         let role = format!(" ({})", which.role());
         let partition = Some(service(opened.pop().expect("an optional partition"), &role));
         match which {
             Optional::Store => store_partition = partition,
             Optional::Log => log_partition = partition,
+            Optional::VolumeLog => volume_log_partition = partition,
         }
     }
     let fdr = fdr.map(|_| service(opened.pop().expect("FDR storage"), " (FDR storage)"));
@@ -1244,6 +1280,7 @@ pub unsafe fn open(
         preboot,
         store: store_partition,
         log: log_partition,
+        volume_log: volume_log_partition,
         fdr,
         inputs,
         links,
@@ -1265,6 +1302,7 @@ pub unsafe fn open(
 enum Optional {
     Store,
     Log,
+    VolumeLog,
 }
 
 impl Optional {
@@ -1272,6 +1310,7 @@ impl Optional {
         match self {
             Optional::Store => "translation store",
             Optional::Log => "boot log",
+            Optional::VolumeLog => "data-volume boot log",
         }
     }
 }
@@ -1289,6 +1328,7 @@ pub struct Opened {
     pub store: Option<Box<dyn BlockDevice>>,
     /// The partition holding the USB's boot log, found by its GUID.
     pub log: Option<Box<dyn BlockDevice>>,
+    pub volume_log: Option<Box<dyn BlockDevice>>,
     pub fdr: Option<Box<dyn BlockDevice>>,
     pub inputs: Inputs,
     pub links: super::network::Links,

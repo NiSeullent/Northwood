@@ -336,6 +336,25 @@ nir_shader *stela_metal_compile_reflected(const void *air, size_t size, const ch
                                          const struct stela_metal_reflection *reflection,
                                          struct stela_air_error *error);
 
+/* Software binary16 for kernels and ordinary vertex/fragment stages. Render
+ * stages require explicit FP32 flush-to-zero, 32-bit inputs, and 32-bit
+ * outputs or a primary half color target. The caller supplies a backend with
+ * 16-bit integer SSA and a separate shader cache key. */
+nir_shader *stela_metal_compile_software_reflected(const void *air, size_t size, const char *entry,
+                                                  const struct stela_metal_target *target,
+                                                  const struct stela_metal_specialization *specialization,
+                                                  const struct stela_metal_reflection *reflection,
+                                                  struct stela_air_error *error);
+
+/* The software profile with FP32 denorm preservation for bounded shader
+ * arithmetic. The caller must select the patched lavapipe that implements
+ * the private NIR contract and use a separate shader cache key. */
+nir_shader *stela_metal_compile_lavapipe_reflected(const void *air, size_t size, const char *entry,
+                                                 const struct stela_metal_target *target,
+                                                 const struct stela_metal_specialization *specialization,
+                                                 const struct stela_metal_reflection *reflection,
+                                                 struct stela_air_error *error);
+
 /* The vertex and control stages a tessellated pipeline runs ahead of its
  * post-tessellation vertex function (metal_abi.h), each with entry point
  * main, which stela_metal_release frees. */

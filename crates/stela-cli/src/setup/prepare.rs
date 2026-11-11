@@ -163,8 +163,9 @@ pub(super) fn copy_bundles(record: &mut Record, prepared: &[Prepared]) -> Result
             "a {} bundle cannot be one of this setup's {generation} bundles",
             bundle.generation
         );
-        let destination = bundle::directory_of(
+        let destination = bundle::directory_of_in(
             &record.volume,
+            record.layout,
             bundle::Identity {
                 kind: bundle.kind,
                 build: &bundle.build,

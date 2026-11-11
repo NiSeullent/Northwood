@@ -2,14 +2,16 @@
 //! engine heap, native code arena and shadow page-table pool), the share
 //! left for the guest, and what is left of it for the translation pack.
 //!
-//! Two profiles split the RAM. The standard one gives the heap its measured
+//! The standard profile gives the heap its measured
 //! desktop floor ([`HEAP_FLOOR`]) and the guest at least [`GUEST_FLOOR`]; a
 //! PC of about 7 GiB free and up boots with it. The compact one is for
 //! smaller PCs, a 4 GB one above all: the guest gets at least
 //! [`GUEST_COMPACT_FLOOR`], the heap at least [`HEAP_COMPACT_FLOOR`] beside
 //! its block records, and what is left is split evenly between them. A
 //! compact boot runs slower: its code window and shadow pools are small, it
-//! reads no translation pack, and macOS pages more with less DRAM.
+//! reads no translation pack, and macOS pages more with less DRAM. The paged
+//! profile also reduces the heap and limits native workers on tighter hosts.
+//! For now its guest DRAM is entirely resident, like the other profiles.
 use crate::Result;
 use crate::native_resources::{
     COMPACT_WINDOW_PER_RUNNER, CodeReservation, SMALL_WINDOW_PER_RUNNER, WINDOW_PER_RUNNER,
@@ -102,8 +104,17 @@ pub const HEAP_COMPACT_FLOOR: u64 = 1024 * MIB;
 /// halves, which a 26A434 restore's userland filled 20 to 80 times a beat
 /// and ran with.
 const POOL_COMPACT_RUNNER_FLOOR: u64 = 16 * MIB;
-/// The step [`Shortfall::needed`] is found in.
-const NEEDED_STEP: u64 = 256 * MIB;
+/// The least usable host RAM at which a low-memory reservation is attempted.
+pub const MIN_PHYSICAL: u64 = 2 * GIB;
+/// The paged profile's provisional engine heap floor beside the code-window
+/// records and each PE's own allocations.
+const HEAP_PAGED_FLOOR: u64 = 512 * MIB;
+/// The paged profile reserves up to four native workers; the other processors
+/// stay parked and need no engine arenas.
+const PAGED_MAX_CORES: usize = 4;
+/// Allow for the loader's remaining stack, table and handoff allocations when
+/// estimating resident guest DRAM. The final firmware map decides its size.
+const PAGED_HANDOFF_RESERVE: u64 = 16 * MIB;
 /// Free host RAM bytes per byte of the persistent translation pack the
 /// loader may hold: a cache, it takes no more than this share and only what
 /// the parts and the guest's floor leave.
@@ -125,6 +136,9 @@ pub enum Profile {
     /// A small host: the guest at [`GUEST_COMPACT_FLOOR`] or more, the heap
     /// at [`HEAP_COMPACT_FLOOR`] or more, the rest split between them.
     Compact,
+    /// The small heap and limited worker set intended for future host paging.
+    /// The guest uses only its physical backing until a pager is available.
+    Paged,
 }
 
 impl Profile {
@@ -133,6 +147,7 @@ impl Profile {
         match self {
             Self::Standard => "standard",
             Self::Compact => "compact",
+            Self::Paged => "paged",
         }
     }
 }
@@ -140,11 +155,13 @@ impl Profile {
 /// The parts' sizes and the guest DRAM left after them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizes {
+    /// Native executors to reserve, which can be fewer than requested.
+    pub cores: usize,
     pub heap: u64,
     pub code: CodeReservation,
     pub pool: u64,
-    /// Free RAM after the three parts; Stela's stacks, tables and image
-    /// take a few more MiB of it.
+    /// Estimated resident guest DRAM. The final map also accounts for the
+    /// loader's stacks, tables and other handoff allocations.
     pub guest: u64,
     pub profile: Profile,
 }
@@ -183,7 +200,7 @@ pub fn gigabytes(bytes: u64) -> String {
     alloc::format!("{}.{}", bytes / GIB, bytes % GIB * 10 / GIB)
 }
 
-/// Too little RAM for the guest's floor: `free` bytes, of `needed`.
+/// Too little usable RAM for the smallest profile: `free` bytes, of `needed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shortfall {
     pub free: u64,
@@ -196,13 +213,10 @@ impl Shortfall {
     pub fn refusal(self) -> crate::Refusal {
         let needed = self.needed.div_ceil(GIB);
         let free = gigabytes(self.free);
-        let floor = GUEST_COMPACT_FLOOR / GIB;
         refuse!(
-            "this PC has {free} GB of RAM free; Stela needs at least {needed} GB free: \
-             {floor} GB for macOS and the rest for its own memory",
+            "this PC has {free} GB of RAM free; Stela needs at least {needed} GB free to start the guest",
             free = %free,
-            needed = %needed,
-            floor = %floor
+            needed = %needed
         )
     }
 }
@@ -226,8 +240,8 @@ impl Shortfall {
 ///   [`POOL_RUNNER_FLOOR`] per runner, at most [`POOL_PER_RUNNER`] per sharer.
 ///
 /// A guest share under [`GUEST_FLOOR`] falls back to the [compact
-/// profile](Profile::Compact), and a host too small for that is a
-/// [`Shortfall`].
+/// profile](Profile::Compact). Smaller hosts use the [paged profile](Profile::Paged)
+/// from [`MIN_PHYSICAL`] up, with fewer workers and a smaller heap as needed.
 pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
     let estimate = estimate(free, cores, runners)?;
     if estimate.guest >= GUEST_FLOOR {
@@ -236,11 +250,30 @@ pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
     if let Some(compact) = compact(free, cores, runners)? {
         return Ok(compact);
     }
-    let mut needed = free.next_multiple_of(NEEDED_STEP);
-    while compact(needed, cores, runners)?.is_none() {
-        needed += NEEDED_STEP;
+    if free >= MIN_PHYSICAL {
+        return paged(free, cores, runners, true);
     }
-    Err(Shortfall { free, needed }.refusal())
+    Err(Shortfall {
+        free,
+        needed: MIN_PHYSICAL,
+    }
+    .refusal())
+}
+
+/// The least contiguous heap a paged boot can use. The loader retries with
+/// this split when UEFI cannot allocate the preferred heap in one extent.
+pub fn fragmented_sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
+    if free < MIN_PHYSICAL {
+        return Err(Shortfall {
+            free,
+            needed: MIN_PHYSICAL,
+        }
+        .refusal());
+    }
+    if runners > cores {
+        return Err(refuse!("invalid native runner count"));
+    }
+    paged(free, cores, runners, false)
 }
 
 /// The bytes of persistent translation pack the loader may read for
@@ -250,7 +283,7 @@ pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
 /// standard profile the guest's floor, after the pack and a margin for the
 /// loader's other allocations. Zero, below [`PACK_FLOOR`]: the parts and
 /// the guest come first, and the pack never makes a boot fail. A compact
-/// host, where the standard profile never fits, reads no pack: its RAM is
+/// or paged host, where the standard profile never fits, reads no pack: its RAM is
 /// the guest's and the heap's.
 pub fn pack_budget(free: u64, cores: usize, runners: usize) -> u64 {
     let mut budget = free / PACK_SHARE / ALIGNMENT * ALIGNMENT;
@@ -297,6 +330,7 @@ fn estimate_with(free: u64, cores: usize, runners: usize, per_runner: u64) -> Re
     let (_, parked) = parked_reserve(cores, runners);
     let pool = pool + parked;
     Ok(Sizes {
+        cores,
         heap,
         code,
         pool,
@@ -333,12 +367,42 @@ fn compact(free: u64, cores: usize, runners: usize) -> Result<Option<Sizes>> {
         .max(pool_floor);
     let pool = (pool_share(rest, running) / ALIGNMENT * ALIGNMENT).clamp(pool_floor, cap) + parked;
     Ok(Some(Sizes {
+        cores,
         heap,
         code,
         pool,
         guest: rest - pool,
         profile: Profile::Compact,
     }))
+}
+
+fn paged(free: u64, cores: usize, runners: usize, grow_heap: bool) -> Result<Sizes> {
+    let cores = cores.min(PAGED_MAX_CORES);
+    let runners = runners.min(cores);
+    let code = code_reservation_per_runner(free, cores, runners, COMPACT_WINDOW_PER_RUNNER)?;
+    let running = runners as u64;
+    let (_, parked) = parked_reserve(cores, runners);
+    let pool = POOL_FLOOR.max(running * POOL_COMPACT_RUNNER_FLOOR) + parked;
+    let heap_overhead = HEAP_PER_WINDOW * code.window + running * PE_HEAP;
+    let available = free - code.bytes - pool - PAGED_HANDOFF_RESERVE;
+    // Grow the heap once the guest has 2 GiB, up to the compact floor for
+    // this worker count. Hosts that entered this profile because they
+    // requested many workers can give the guest more of their surplus.
+    let floor = HEAP_PAGED_FLOOR + heap_overhead;
+    let heap = if grow_heap {
+        (available.saturating_sub(GUEST_COMPACT_FLOOR) / ALIGNMENT * ALIGNMENT)
+            .clamp(floor, HEAP_COMPACT_FLOOR + heap_overhead)
+    } else {
+        floor
+    };
+    Ok(Sizes {
+        cores,
+        heap,
+        code,
+        pool,
+        guest: available - heap,
+        profile: Profile::Paged,
+    })
 }
 
 /// The running executors' pool for `rest` bytes of guest and pool together:

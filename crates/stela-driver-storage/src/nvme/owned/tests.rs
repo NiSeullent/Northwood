@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2011-2014, Intel Corporation.
+mod exclusive;
 mod limits;
 pub(crate) mod protocol;
 use super::*;
@@ -144,6 +145,7 @@ struct Model {
     /// Configurations set and log pages read.
     async_events: u32,
     event_request: Option<u32>,
+    notice_on_io: Option<u32>,
     event_configs: Vec<u32>,
     logs: Vec<u32>,
     /// The namespace's command set and NSTAT.NRDY.
@@ -174,6 +176,7 @@ struct Model {
     lifecycle_owner_drops: usize,
     fail_disable: bool,
     stuck_ready: bool,
+    stuck_enable: bool,
     coherent: bool,
     events: Vec<&'static str>,
     commands: usize,
@@ -228,6 +231,7 @@ impl Model {
             apst_sets: Vec::new(),
             async_events: 0,
             event_request: None,
+            notice_on_io: None,
             event_configs: Vec::new(),
             logs: Vec::new(),
             csi: 0,
@@ -257,6 +261,7 @@ impl Model {
             lifecycle_owner_drops: 0,
             fail_disable: false,
             stuck_ready: false,
+            stuck_enable: false,
             coherent: true,
             events: Vec::new(),
             commands: 0,
@@ -375,6 +380,11 @@ impl Model {
         self.outstanding = true;
         self.drained = false;
         self.record("command");
+        if queue == 1
+            && let Some(notice) = self.notice_on_io.take()
+        {
+            self.post_event(notice);
+        }
         if holding {
             self.held_io.push(command);
             return;
@@ -759,6 +769,9 @@ unsafe impl Registers for Regs {
             return Ok(u32::from(m.enabled || m.stuck_ready)
                 | u32::from(m.fatal) << 1
                 | if m.stopped { 8 } else { 0 });
+        }
+        if offset == CONFIGURATION && m.stuck_enable {
+            return Ok(m.registers.get(&offset).copied().unwrap_or(0) | ENABLE);
         }
         Ok(*m.registers.get(&offset).unwrap_or(&0))
     }
@@ -1452,6 +1465,68 @@ fn owned_stop_bme_drain_and_unmap_failures_keep_original_owners() {
         assert!(f.model.lock().unwrap().released);
     }
 }
+
+#[test]
+fn owned_stop_requires_disabled_configuration_even_when_ready_is_clear() {
+    let f = Fixture::new();
+    let mut a = f.attach().unwrap();
+    let before = {
+        let mut model = f.model.lock().unwrap();
+        model.stuck_enable = true;
+        model.events.len()
+    };
+    assert_eq!(
+        a.namespaces[0].retire_owned(),
+        Err(BlockError::Protocol("NVMe disable did not clear CC.EN"))
+    );
+    {
+        let mut model = f.model.lock().unwrap();
+        assert!(model.stopped && !model.enabled && model.bme);
+        assert_eq!(model.maps.len(), BUFFERS);
+        assert!(model.events[before..].contains(&"stop"));
+        assert!(!model.events[before..].contains(&"drain"));
+        assert!(!model.events[before..].contains(&"bme_off"));
+        assert_eq!(model.unmap_attempts, 0);
+        assert_eq!(f.source.released.load(Ordering::SeqCst), 0);
+        model.stuck_enable = false;
+    }
+    a.namespaces[0].retire_owned().unwrap();
+    assert!(f.model.lock().unwrap().released);
+}
+
+#[test]
+fn owned_reset_refuses_queue_reuse_when_disable_readback_fails() {
+    let _clock = crate::test_clock::virtualize();
+    let f = Fixture::new();
+    let mut a = f.attach().unwrap();
+    let before = {
+        let mut model = f.model.lock().unwrap();
+        model.delay_io = 1;
+        model.stuck_enable = true;
+        model.events.len()
+    };
+    let mut output = [0x57; 512];
+    assert_eq!(
+        a.namespaces[0].read(0, &mut output),
+        Err(BlockError::Protocol("NVMe disable did not clear CC.EN"))
+    );
+    assert_eq!(output, [0x57; 512]);
+    {
+        let controller = a.namespaces[0].controller.borrow();
+        assert_eq!(controller.held.iter().map(Vec::len).sum::<usize>(), 1);
+    }
+    {
+        let mut model = f.model.lock().unwrap();
+        assert!(model.stopped && !model.enabled && model.bme);
+        assert!(!model.events[before..].contains(&"drain"));
+        assert!(!model.events[before..].contains(&"enable"));
+        assert_eq!(model.maps.len(), BUFFERS);
+        model.stuck_enable = false;
+    }
+    a.namespaces[0].retire_owned().unwrap();
+    assert!(f.model.lock().unwrap().released);
+}
+
 #[test]
 fn owned_visibility_failures_poison_without_exposing_unacquired_data() {
     for device in [true, false] {

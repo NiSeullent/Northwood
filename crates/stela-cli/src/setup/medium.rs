@@ -29,16 +29,16 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use stela_boot_core::options::System;
+use stela_loader::mount_interface::layout::{DATA_INSTALL, Layout as VolumeLayout};
 use {
     stela_formats::payload::BLOCK_HASHES_FILE, stela_formats::payload::BlockHashes,
     stela_formats::payload::HASH_BLOCK_BYTES, stela_formats::payload::Layout,
     stela_formats::payload::MANIFEST_FILE, stela_formats::payload::MAX_PIECES,
     stela_formats::payload::PIECE_HASHES_FILE, stela_formats::payload::Piece,
-    stela_formats::payload::install_directory, stela_formats::payload::piece_name,
-    stela_formats::payload::piece_sizes,
+    stela_formats::payload::piece_name, stela_formats::payload::piece_sizes,
 };
 
 pub(super) mod download;
@@ -49,6 +49,9 @@ const BUFFER: usize = 64 * HASH_BLOCK_BYTES as usize;
 /// The install medium a setup wrote.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct Medium {
+    /// Inherited from the enclosing setup record after reading it.
+    #[serde(skip, default = "legacy_layout")]
+    pub(super) layout: VolumeLayout,
     pub(super) build: String,
     /// The mounted FAT32 data partition of the USB that holds it.
     pub(super) volume: PathBuf,
@@ -61,20 +64,27 @@ pub(super) struct Medium {
     pub(super) remote: bool,
 }
 
+fn legacy_layout() -> VolumeLayout {
+    VolumeLayout::Legacy
+}
+
 impl Medium {
     pub(super) fn directory(&self) -> PathBuf {
-        directory(&self.volume, &self.build)
+        directory_in(&self.volume, self.layout, &self.build)
     }
 
     /// Its directory, checked to be an install medium's on its volume
     /// before setup removes it.
     pub(super) fn removable_directory(&self) -> Result<PathBuf> {
         let directory = self.directory();
+        let mut build = Path::new(&self.build).components();
         ensure!(
-            directory.starts_with(&self.volume)
+            matches!(build.next(), Some(Component::Normal(_)))
+                && build.next().is_none()
+                && directory.starts_with(&self.volume)
                 && directory
                     .parent()
-                    .is_some_and(|p| p.ends_with("stela/install")),
+                    .is_some_and(|p| p == self.volume.join(self.layout.data_path(DATA_INSTALL))),
             "the setup record names an unexpected install medium {}",
             directory.display()
         );
@@ -85,7 +95,7 @@ impl Medium {
     pub(super) fn firmware_manifest(&self) -> String {
         format!(
             "\\{}\\{MANIFEST_FILE}",
-            install_directory(&self.build).replace('/', "\\")
+            install_path(self.layout, &self.build).replace('/', "\\")
         )
     }
 
@@ -158,9 +168,17 @@ impl Medium {
     }
 }
 
-/// `stela/install/<build>` on `volume`.
+/// The legacy install directory on `volume`.
 pub(super) fn directory(volume: &Path, build: &str) -> PathBuf {
-    volume.join(install_directory(build))
+    directory_in(volume, VolumeLayout::Legacy, build)
+}
+
+fn install_path(layout: VolumeLayout, build: &str) -> String {
+    layout.data_path(&format!("{DATA_INSTALL}/{build}"))
+}
+
+pub(super) fn directory_in(volume: &Path, layout: VolumeLayout, build: &str) -> PathBuf {
+    volume.join(install_path(layout, build))
 }
 
 /// The USB's FAT32 data partition, which holds the boot bundles, the install
@@ -230,8 +248,19 @@ pub(super) fn locate(
 
 /// What writing the medium needs: the IPSW's pieces not already on
 /// `volume` with their sizes, the hash files and a margin.
-pub(super) fn needed_bytes(volume: &Path, build: &str, ipsw_bytes: u64, piece_bytes: u64) -> u64 {
-    let directory = directory(volume, build);
+#[cfg(test)]
+fn needed_bytes(volume: &Path, build: &str, ipsw_bytes: u64, piece_bytes: u64) -> u64 {
+    needed_bytes_in(volume, VolumeLayout::Legacy, build, ipsw_bytes, piece_bytes)
+}
+
+pub(super) fn needed_bytes_in(
+    volume: &Path,
+    layout: VolumeLayout,
+    build: &str,
+    ipsw_bytes: u64,
+    piece_bytes: u64,
+) -> u64 {
+    let directory = directory_in(volume, layout, build);
     let mut need = MARGIN;
     for (index, size) in piece_sizes(ipsw_bytes, piece_bytes).into_iter().enumerate() {
         let present = fs::metadata(directory.join(piece_name(index))).map(|m| m.len());
@@ -247,6 +276,7 @@ pub(super) fn needed_bytes(volume: &Path, build: &str, ipsw_bytes: u64, piece_by
 /// Volume and piece layout whose required capacity is checked.
 pub(super) struct SpaceOptions<'a> {
     pub(super) volume: &'a Path,
+    pub(super) layout: VolumeLayout,
     pub(super) build: &'a str,
     pub(super) ipsw_bytes: u64,
     pub(super) piece_bytes: u64,
@@ -256,11 +286,12 @@ pub(super) struct SpaceOptions<'a> {
 pub(super) fn check_space(host: &dyn Host, options: SpaceOptions<'_>) -> Result<u64> {
     let SpaceOptions {
         volume,
+        layout,
         build,
         ipsw_bytes,
         piece_bytes,
     } = options;
-    let need = needed_bytes(volume, build, ipsw_bytes, piece_bytes);
+    let need = needed_bytes_in(volume, layout, build, ipsw_bytes, piece_bytes);
     let free = host.volume(volume)?.free_bytes;
     ensure!(
         free >= need,
@@ -400,6 +431,7 @@ pub(super) struct Written {
 /// Source inventory and destination layout for one install medium.
 pub(super) struct WriteOptions<'a> {
     pub(super) volume: &'a Path,
+    pub(super) layout: VolumeLayout,
     pub(super) ipsw: &'a Path,
     pub(super) inventory: restore::payload::Inventory,
     pub(super) expected: &'a Expected,
@@ -411,6 +443,7 @@ pub(super) struct WriteOptions<'a> {
 pub(super) fn write(options: WriteOptions<'_>) -> Result<Written> {
     let WriteOptions {
         volume,
+        layout,
         ipsw,
         inventory,
         expected,
@@ -418,7 +451,7 @@ pub(super) fn write(options: WriteOptions<'_>) -> Result<Written> {
     } = options;
     let mut manifest = inventory.manifest;
     let build = manifest.product_build.clone();
-    let directory = directory(volume, &build);
+    let directory = directory_in(volume, layout, &build);
     fs::create_dir_all(&directory)?;
     // The old manifest goes first, so a medium being rewritten is never
     // taken for a complete one.
@@ -562,15 +595,21 @@ pub(super) fn write(options: WriteOptions<'_>) -> Result<Written> {
 /// Write a remote medium to `volume`: `inventory`, which names the IPSW on
 /// Apple's servers ([`restore::remote_inventory`]), and its block hashes;
 /// the SHA-256 of its `payload.json`.
-pub(super) fn write_remote(
+#[cfg(test)]
+fn write_remote(volume: &Path, inventory: restore::payload::Inventory) -> Result<String> {
+    write_remote_in(volume, VolumeLayout::Legacy, inventory)
+}
+
+pub(super) fn write_remote_in(
     volume: &Path,
+    layout: VolumeLayout,
     inventory: restore::payload::Inventory,
 ) -> Result<String> {
     ensure!(
         matches!(inventory.manifest.layout, Layout::Remote { .. }),
         "a remote medium's inventory names a remote image"
     );
-    let directory = directory(volume, &inventory.manifest.product_build);
+    let directory = directory_in(volume, layout, &inventory.manifest.product_build);
     fs::create_dir_all(&directory)?;
     efi::write_atomic(&directory.join(BLOCK_HASHES_FILE), &inventory.blocks, false)?;
     let json = inventory.manifest.to_json();
@@ -660,6 +699,7 @@ pub(super) mod tests {
         fs::create_dir_all(&volume).unwrap();
         let bytes = fs::read(&ipsw).unwrap();
         let first = write(WriteOptions {
+            layout: VolumeLayout::Legacy,
             volume: &volume,
             ipsw: &ipsw,
             inventory: inventory(&ipsw),
@@ -698,6 +738,7 @@ pub(super) mod tests {
         assert_eq!(read, bytes);
         assert!(
             Medium {
+                layout: VolumeLayout::Legacy,
                 build: manifest.product_build.clone(),
                 volume: volume.clone(),
                 partition_guid: "G".into(),
@@ -717,6 +758,7 @@ pub(super) mod tests {
         fs::write(&partial, b"interrupted").unwrap();
         fs::write(directory.join(piece_name(count + 3)), b"stale").unwrap();
         let again = write(WriteOptions {
+            layout: VolumeLayout::Legacy,
             volume: &volume,
             ipsw: &ipsw,
             inventory: inventory(&ipsw),
@@ -735,6 +777,7 @@ pub(super) mod tests {
         assert_eq!(joined, bytes);
 
         let manual = write(WriteOptions {
+            layout: VolumeLayout::Legacy,
             volume: &volume,
             ipsw: &ipsw,
             inventory: inventory(&ipsw),
@@ -757,6 +800,7 @@ pub(super) mod tests {
         let mut wrong = expected(&ipsw);
         wrong.sha1 = Some("0".repeat(40));
         let error = write(WriteOptions {
+            layout: VolumeLayout::Legacy,
             volume: &volume,
             ipsw: &ipsw,
             inventory: inventory(&ipsw),
@@ -774,6 +818,7 @@ pub(super) mod tests {
         let mut wrong = expected(&ipsw);
         wrong.sha256 = Some("0".repeat(64));
         let error = write(WriteOptions {
+            layout: VolumeLayout::Legacy,
             volume: &volume,
             ipsw: &ipsw,
             inventory: inventory(&ipsw),
@@ -788,6 +833,7 @@ pub(super) mod tests {
         );
         assert!(!directory.join(MANIFEST_FILE).exists());
         let medium = Medium {
+            layout: VolumeLayout::Legacy,
             build: restore::payload::SYNTHETIC_BUILD.into(),
             volume,
             partition_guid: "G".into(),
@@ -820,12 +866,24 @@ pub(super) mod tests {
         .unwrap();
         assert!(write_remote(&volume, inventory(&ipsw)).is_err());
         let medium = Medium {
+            layout: VolumeLayout::Northwood,
             build: restore::payload::SYNTHETIC_BUILD.into(),
             volume: volume.clone(),
             partition_guid: String::new(),
-            manifest_sha256: write_remote(&volume, remote).unwrap(),
+            manifest_sha256: write_remote_in(&volume, VolumeLayout::Northwood, remote).unwrap(),
             remote: true,
         };
+        assert!(
+            medium
+                .directory()
+                .starts_with(volume.join("northwood/install"))
+        );
+        assert!(!volume.join("stela/install").exists());
+        assert!(
+            medium
+                .firmware_manifest()
+                .starts_with("\\northwood\\install\\")
+        );
         assert!(medium.problems().is_empty(), "{:?}", medium.problems());
         let mut names: Vec<_> = fs::read_dir(medium.directory())
             .unwrap()
@@ -844,6 +902,7 @@ pub(super) mod tests {
     #[test]
     fn only_an_install_directory_on_its_volume_is_removable() {
         let medium = |build: &str| Medium {
+            layout: VolumeLayout::Legacy,
             build: build.into(),
             volume: PathBuf::from("/Volumes/STELA"),
             partition_guid: String::new(),
@@ -855,6 +914,7 @@ pub(super) mod tests {
             Path::new("/Volumes/STELA/stela/install/26A434")
         );
         assert!(medium("../../../Users").removable_directory().is_err());
+        assert!(medium("..").removable_directory().is_err());
     }
 
     #[test]

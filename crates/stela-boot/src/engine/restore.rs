@@ -23,7 +23,7 @@ use crate::{
     system::{RESTORE_BLOCKS_FILE, RESTORE_INVENTORY_FILE},
 };
 use alloc::{boxed::Box, collections::VecDeque, format, rc::Rc, string::String, vec::Vec};
-use core::{cell::RefCell, task::Poll};
+use core::{cell::RefCell, fmt::Write, task::Poll};
 use stela_contracts::Refusal;
 use stela_contracts::refuse;
 use stela_drivers::block::{Ahead, BlockDevice, ReadAhead};
@@ -38,7 +38,7 @@ use {
     stela_runtime::restore::store::Store, stela_runtime::restore::store::Verify,
     stela_runtime::restore::stream::ByteStream, stela_soc::machine::AppleDevices,
     stela_soc::machine::MuxBackpressure, stela_soc::machine::MuxStream,
-    stela_soc::machine::UsbClient, stela_soc::machine::UsbId,
+    stela_soc::machine::MuxStreamStats, stela_soc::machine::UsbClient, stela_soc::machine::UsbId,
 };
 
 /// The bundle's boot manifest (`stela_loader::boot_bundle`).
@@ -172,11 +172,19 @@ pub fn inventory(handoff: &Handoff) -> Result<PayloadManifest> {
         .map_err(|error| refuse!("restore inventory: {error}", %error))
 }
 
-/// A file the loader read beside the inventory.
-pub fn inventory_file(handoff: &Handoff, name: &str) -> Option<&'static [u8]> {
+/// A retained file the loader read, excluding bytes now owned by the guest.
+pub fn inventory_file<'a>(handoff: &'a Handoff, name: &str) -> Option<&'a [u8]> {
     handoff.files[..handoff.file_count]
         .iter()
         .find(|f| f.name() == name)
+        .filter(|file| {
+            let start = file.contents.physical;
+            let end = start.saturating_add(file.contents.bytes);
+            !handoff.bundle_layout.backing().iter().any(|part| {
+                let physical = part.region.physical;
+                start < physical.saturating_add(part.region.bytes) && physical < end
+            })
+        })
         .map(bundle::contents)
 }
 
@@ -204,6 +212,7 @@ pub struct Experiment {
     mode: Mode,
     /// The mux's backpressure as the last poll found it.
     backpressure: MuxBackpressure,
+    asr_stream: Option<MuxStreamStats>,
 }
 
 /// How long the guest runs on after its restore fails. A failure is often
@@ -606,7 +615,7 @@ impl Experiment {
     pub fn new(
         source: Source,
         usb: UsbId,
-        handoff: &Handoff,
+        handoff: &'static Handoff,
         mode: Mode,
         identity: Option<usize>,
         verify: Verify,
@@ -739,6 +748,7 @@ impl Experiment {
             ledger: 0,
             mode,
             backpressure: MuxBackpressure::default(),
+            asr_stream: None,
         })
     }
     /// Read ahead from the host's storage, without the guest's devices.
@@ -781,7 +791,7 @@ impl Experiment {
         let asr = self.driver.asr()?;
         let (sent, size) = asr.progress();
         let backpressure = self.backpressure;
-        Some(format!(
+        let mut report = format!(
             "ASR HOST sent={}MiB/{}MiB polls_host_behind={} polls_guest_full={} \
              refused_window={} refused_queue={} largest_window={}KiB",
             sent >> 20,
@@ -791,7 +801,31 @@ impl Experiment {
             backpressure.window,
             backpressure.queue,
             backpressure.largest_window >> 10
-        ))
+        );
+        if let Some(payload) = asr.payload_progress() {
+            let _ = write!(
+                report,
+                " payload_verified_bytes={} payload_staged_bytes={} payload_accepted_bytes={}",
+                payload.verified_ahead_bytes, payload.staged_bytes, payload.accepted_bytes,
+            );
+        }
+        if let Some(stream) = self.asr_stream {
+            let _ = write!(
+                report,
+                " mux_accepted_bytes={} mux_acked_bytes={} mux_window_bytes={} \
+                 mux_outstanding_bytes={} mux_zero_window_writes={} mux_full_window_writes={} \
+                 mux_credit_wait_ticks={} mux_credit_waiting={}",
+                stream.accepted_bytes,
+                stream.acknowledged_bytes,
+                stream.window_bytes,
+                stream.outstanding_bytes,
+                stream.zero_window_writes,
+                stream.full_window_writes,
+                stream.credit_wait_ticks,
+                stream.credit_waiting,
+            );
+        }
+        Some(report)
     }
 
     /// Serve the guest's restore client; [`Self::pump`] read ahead and
@@ -814,6 +848,10 @@ impl Experiment {
         }
         let result = self.driver.poll_prefetched(&mut client);
         self.backpressure = client.backpressure();
+        self.asr_stream = self
+            .driver
+            .asr_transfer()
+            .and_then(|(_, handle)| client.stream_stats(handle?));
         for message in &self.driver.session.ledger()[self.ledger..] {
             output::arguments(format_args!("{label} ledger={message:?}\n"));
         }

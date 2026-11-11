@@ -19,7 +19,8 @@ use super::{
     resource::{TextureDescriptor, vulkan_format},
     vulkan::{
         AttachmentLoadOp, AttachmentStoreOp, ImageAspects, ImageViewType, ResolveModes,
-        object::{Image, SubresourceRange},
+        command::BufferImageCopy,
+        object::{Buffer, Image, SubresourceRange},
     },
 };
 use alloc::vec::Vec;
@@ -121,7 +122,7 @@ pub struct RenderingAttachment<T> {
     pub follows_depth: bool,
 }
 
-/// What a fragment function's `[[color(n)]]` inputs read.
+/// Resources a pass reads or copies in addition to its attachment views.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AttachmentInputs {
     /// Each color attachment's raw texel storage view
@@ -155,6 +156,16 @@ pub struct AttachmentInputs {
     /// (`RGB10A8_2P_XR10`), which renders as half floats that the texel
     /// kernels convert where the pass begins and ends.
     pub extended_planes: [Option<ExtendedPlanes>; MAX_COLOR_ATTACHMENTS],
+    /// Host buffer attachments with separate renderable images.
+    pub(crate) staged_colors: [Option<StagedColor>; MAX_COLOR_ATTACHMENTS],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StagedColor {
+    pub buffer: Buffer,
+    pub image: Image,
+    pub region: BufferImageCopy,
+    pub guest_rows: Option<super::vulkan::backend::GuestRows>,
 }
 
 /// A two-plane extended-range color attachment's conversions: a pass
@@ -384,6 +395,11 @@ impl<T: Copy> RenderPassPlan<T> {
             action != StoreAction::Unknown,
             "the deferred store action must be known",
         )?;
+        require(
+            !matches!(slot, AttachmentSlot::Color(index) if self.inputs.staged_colors.get(index).is_some_and(Option::is_some))
+                || matches!(action, StoreAction::Store | StoreAction::DontCare),
+            "store action of a host buffer render target",
+        )?;
         let attachment = self
             .attachment(slot)
             .ok_or(Error::Invalid("no attachment at that slot"))?;
@@ -418,6 +434,11 @@ impl<T: Copy> RenderPassPlan<T> {
         ensure(
             self.attachment(slot).is_some(),
             "no attachment at that slot",
+        )?;
+        require(
+            !matches!(slot, AttachmentSlot::Color(index) if self.inputs.staged_colors.get(index).is_some_and(Option::is_some))
+                || options.is_empty(),
+            "store options of a host buffer render target",
         )?;
         ensure(
             !options.contains(StoreActionOptions::CUSTOM_SAMPLE_POSITIONS)

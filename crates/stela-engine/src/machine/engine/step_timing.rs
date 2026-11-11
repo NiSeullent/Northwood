@@ -370,7 +370,9 @@ pub fn fault_slot(cause: &super::FaultCause) -> usize {
             FaultCause::Device { .. } => DEVICE_FAULT_SLOT - FAULT_SLOTS,
             FaultCause::NonCanonical | FaultCause::InvalidOpcode => CHECK_FAULT_SLOT - FAULT_SLOTS,
             FaultCause::Watched | FaultCause::TagChecked => 3,
-            FaultCause::Translation(_) => 4,
+            FaultCause::Translation(_)
+            | FaultCause::NonresidentRam { .. }
+            | FaultCause::RamBinding => 4,
         }
 }
 

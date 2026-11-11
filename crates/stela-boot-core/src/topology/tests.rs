@@ -548,6 +548,7 @@ fn native_snapshot() -> Snapshot {
 
 fn target_snapshot(vendor: [u32; 3]) -> Snapshot {
     let mut snapshot = native_snapshot();
+    snapshot.records[0].eax = 6 << 8;
     snapshot.records[3] = Cpuid {
         leaf: 0,
         eax: 7,
@@ -663,6 +664,7 @@ fn common_target_keeps_only_features_present_on_every_assigned_worker() {
     assert!(solo.supports(TargetCpu::Sha));
     assert!(solo.supports(TargetCpu::Pclmulqdq));
     assert!(solo.supports(TargetCpu::AtomicLoad16));
+    assert!(solo.supports(TargetCpu::LineAtomic));
     for excluded in [
         TargetCpu::Bmi1,
         TargetCpu::Fma,
@@ -670,9 +672,30 @@ fn common_target_keeps_only_features_present_on_every_assigned_worker() {
         TargetCpu::Avx2,
         TargetCpu::Avx512f,
         TargetCpu::Doit,
-        TargetCpu::LineAtomic,
     ] {
         assert!(!solo.supports(excluded));
+    }
+}
+
+#[test]
+fn common_line_atomicity_needs_every_worker_to_be_p6_or_later_intel() {
+    use stela_compiler::TargetCpu;
+    let mut intel = target_snapshot(TargetCpu::INTEL_VENDOR);
+    intel.records[0].ecx &= !(1 << 28);
+    let common = common_native_target(&[&intel, &intel]).unwrap();
+    assert!(common.supports(TargetCpu::LineAtomic));
+    assert!(!common.supports(TargetCpu::AtomicLoad16));
+
+    let mut older = intel;
+    older.records[0].eax = 5 << 8;
+    for other in [
+        older,
+        target_snapshot(TargetCpu::AMD_VENDOR),
+        target_snapshot(TargetCpu::HYGON_VENDOR),
+        target_snapshot([0; 3]),
+    ] {
+        let common = common_native_target(&[&intel, &other]).unwrap();
+        assert!(!common.supports(TargetCpu::LineAtomic));
     }
 }
 

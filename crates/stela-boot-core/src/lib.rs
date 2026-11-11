@@ -19,6 +19,8 @@ pub mod bluetooth_dsbr;
 pub mod boot_progress;
 pub mod bundle;
 pub mod chain_check;
+#[cfg(all(feature = "config-validation", not(target_os = "uefi")))]
+pub mod config_validation;
 pub mod console_lines;
 #[cfg(feature = "native-acpi")]
 pub mod crs;
@@ -29,6 +31,8 @@ pub mod entropy;
 pub mod exit_port;
 pub mod firmware_state;
 pub mod firmware_time;
+#[cfg(feature = "metal-vulkan")]
+pub mod gpu_memory;
 pub mod gpu_status;
 pub mod guarded_stacks;
 pub mod guest_timeouts;
@@ -53,6 +57,7 @@ pub mod native_resources;
 pub mod nofault_read;
 pub mod options;
 pub mod page_window;
+pub mod pager;
 pub mod paging_controls;
 pub mod passthrough;
 pub mod pe;

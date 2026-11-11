@@ -1,15 +1,22 @@
 //! BSP control-plane Host routing during a true all-worker stop. Only the
 //! closed native effects cross cores; the Machine and Cpu never do.
 mod completion;
-pub use completion::HeldRamService;
+pub use completion::{CpuMappingsRevokedFrame, HeldRamService};
 
 use super::super::publication;
 use super::*;
-use crate::machine::{InstallError, NativeCode, NativeExit, Regime, mmu};
+use crate::machine::{
+    InstallError, NativeCode, NativeExit, Regime,
+    engine::{DeviceSiteRam, NativeEntryError},
+    mmu,
+};
 use publication::{
     HostEffect, HostEffectCommand, HostEffectReceipt, WithPayload, WorkerId, WorkerServices,
 };
-use stela_compiler::{GuestState, context::ExecutionContext};
+use stela_compiler::{
+    GuestState,
+    context::{ExecutionContext, memory::MemoryStatus},
+};
 
 /// Synchronous transport to the already-held native owner. Failure must
 /// stop before any later source/controller effect or ACK can occur.
@@ -228,6 +235,22 @@ impl<H: Host, T: ServiceTransport> Host for ServiceHost<H, T> {
         // exclusion. No identity/raw-RAM fallback is admitted by this adapter.
         unsafe { self.ram.read_physical(physical, buffer).is_ok() }
     }
+    fn device_site_ram(&self) -> Result<Option<DeviceSiteRam>, MemoryStatus> {
+        let local = self.local.device_site_ram()?;
+        if local
+            .as_ref()
+            .is_some_and(|site| !Arc::ptr_eq(&site.ram, &self.ram))
+        {
+            return Err(MemoryStatus::Domain);
+        }
+        Ok(Some(DeviceSiteRam {
+            ram: Arc::clone(&self.ram),
+            expected_generation: local.and_then(|site| site.expected_generation),
+        }))
+    }
+    fn device_site_has_retained_ram(&self, page: u64) -> bool {
+        self.local.device_site_has_retained_ram(page)
+    }
     fn write_ram(&mut self, physical: u64, data: &[u8]) -> bool {
         // SAFETY: every source/host/alias writer uses this same physical domain.
         unsafe { self.ram.publish_physical(physical, data).is_ok() }
@@ -334,6 +357,15 @@ impl<H: Host, T: ServiceTransport> Host for ServiceHost<H, T> {
         // SAFETY: caller keeps the existing installed system block contract;
         // stopped source services are excluded above.
         unsafe { self.local.execute(code, state) }
+    }
+    unsafe fn try_execute(
+        &mut self,
+        code: NativeCode,
+        state: &mut GuestState,
+    ) -> Result<NativeExit, NativeEntryError> {
+        self.native_entry();
+        // SAFETY: caller keeps the installed block and stopped services.
+        unsafe { self.local.try_execute(code, state) }
     }
     unsafe fn execute_context(
         &mut self,
@@ -456,6 +488,42 @@ pub(in crate::machine::engine::shared_memory) mod tests {
     };
     use anyhow::Result;
     use stela_contracts::refuse;
+
+    #[cfg(feature = "std")]
+    struct RamRevocationModel {
+        ram: Arc<RegisteredSystemRam>,
+        aliases: Vec<(u64, u64)>,
+        requests: Vec<u64>,
+        acknowledge: bool,
+    }
+
+    #[cfg(feature = "std")]
+    std::thread_local! {
+        static RAM_REVOCATION: core::cell::RefCell<Option<RamRevocationModel>> = const {
+            core::cell::RefCell::new(None)
+        };
+    }
+
+    #[cfg(feature = "std")]
+    fn model_ram_revocation(
+        ram: &Arc<RegisteredSystemRam>,
+        aliases: &[(u64, u64)],
+        acknowledge: bool,
+    ) {
+        RAM_REVOCATION.with(|model| {
+            assert!(
+                model
+                    .replace(Some(RamRevocationModel {
+                        ram: Arc::clone(ram),
+                        aliases: aliases.to_vec(),
+                        requests: Vec::new(),
+                        acknowledge,
+                    }))
+                    .is_none()
+            );
+        });
+    }
+
     pub(in crate::machine::engine::shared_memory) struct Local;
     impl Host for Local {
         fn read_native(&mut self, code: NativeCode, output: &mut [u8]) -> bool {
@@ -495,6 +563,42 @@ pub(in crate::machine::engine::shared_memory) mod tests {
         }
         fn set_regime(&mut self, _: &Regime) {}
         fn invalidate_translations(&mut self) {}
+        #[cfg(feature = "std")]
+        fn revoke_ram_cpu_mappings(
+            &mut self,
+            request: &publication::RamCpuMappingRevocation,
+        ) -> bool {
+            use stela_compiler::context::memory::MemoryStatus;
+
+            RAM_REVOCATION.with(|model| {
+                let mut model = model.borrow_mut();
+                let Some(model) = model.as_mut() else {
+                    return false;
+                };
+                assert!(request.belongs_to(&model.ram));
+                let physical = request.physical();
+                model.requests.push(physical);
+                let mut output = [0xa5; 8];
+                // SAFETY: the sentinel output is private and the model retains the RAM owner.
+                let read = unsafe { model.ram.read_physical(physical, &mut output) };
+                assert_eq!(read, Err(MemoryStatus::Domain));
+                assert_eq!(output, [0xa5; 8]);
+                let range = stela_contracts::gate::MemoryRange {
+                    address: physical + 4096,
+                    bytes: 4096,
+                };
+                assert!(matches!(
+                    model.ram.prepare_external_dma(&[range]),
+                    Err(MemoryStatus::Domain)
+                ));
+                if model.acknowledge {
+                    model
+                        .aliases
+                        .retain(|&(_, mapped)| !(physical..physical + 16 * 1024).contains(&mapped));
+                }
+                model.acknowledge
+            })
+        }
         fn counter(&mut self) -> u64 {
             1
         }
@@ -648,17 +752,24 @@ pub(in crate::machine::engine::shared_memory) mod tests {
         Machine<ServiceHost<Local, OneWorker>, Copyout>,
         Arc<RegisteredSystemRam>,
     ) {
-        memory_service_machine_slots(fail, 1)
+        memory_service_machine_slots(fail, 1, false)
     }
 
     fn memory_service_machine_slots(
         fail: bool,
         count: usize,
+        track_frames: bool,
     ) -> (
         Machine<ServiceHost<Local, OneWorker>, Copyout>,
         Arc<RegisteredSystemRam>,
     ) {
-        let (cpu, mut profile, missing, ram) = super::super::policy::tests::fixture();
+        let (cpu, mut profile, missing, mut ram) = super::super::policy::tests::fixture();
+        if track_frames {
+            Arc::get_mut(&mut ram)
+                .unwrap()
+                .enable_descriptor_frame_leases()
+                .unwrap();
+        }
         if count > 1 {
             // Synthetic modeled slots, not a claim about a physical Apple SKU.
             profile.processors = (0..count)
@@ -1023,7 +1134,7 @@ pub(in crate::machine::engine::shared_memory) mod tests {
     }
     #[test]
     fn active_bootstrap_keeps_off_slots_unbound_and_refuses_start_or_reset() {
-        let (mut machine, ram) = memory_service_machine_slots(false, 10);
+        let (mut machine, ram) = memory_service_machine_slots(false, 10, false);
         assert_eq!(machine.peers.len(), 10);
         assert!(
             machine.peers[1..]
@@ -1132,6 +1243,292 @@ pub(in crate::machine::engine::shared_memory) mod tests {
         );
         drop(ram.domain().execution_loan().unwrap());
     }
+
+    #[test]
+    fn held_ram_service_closes_and_snapshots_a_frame_without_reacquiring_writers() {
+        const FRAME: u64 = 0x10000;
+        const BYTES: usize = 16 * 1024;
+        let (mut machine, ram) = memory_service_machine_slots(false, 1, true);
+        let mut expected = [0; BYTES];
+        let tail = [1, 2, 3, 4, 5, 6, 7, 8];
+        // SAFETY: private staging and the fixture keeps the registered mapping.
+        unsafe {
+            ram.publish_physical(FRAME + BYTES as u64 - 8, &tail)
+                .unwrap();
+            ram.read_physical(FRAME, &mut expected).unwrap();
+        }
+        assert_eq!(expected[BYTES - 8..], tail);
+
+        // SAFETY: one actual modeled held worker, with no external DMA or writer.
+        let service = unsafe { machine.prepare_native_ram_service() }.unwrap();
+        assert!(ram.try_service().unwrap().is_none());
+        let closed = service.memory().try_close_frame(FRAME).unwrap().unwrap();
+        let mut snapshot = [0xa5; BYTES];
+        // SAFETY: the output is private and the same held service owns the frame.
+        unsafe {
+            assert!(ram.read_physical(FRAME, &mut snapshot).is_err());
+            assert_eq!(snapshot, [0xa5; BYTES]);
+            closed.copy_into(&mut snapshot).unwrap();
+        }
+        assert_eq!(snapshot, expected);
+
+        drop(closed);
+        snapshot.fill(0xa5);
+        // SAFETY: private staging and all modeled writers remain held.
+        unsafe { ram.read_physical(FRAME, &mut snapshot) }.unwrap();
+        assert_eq!(snapshot, expected);
+        assert!(ram.try_service().unwrap().is_none());
+        service.finish();
+        assert!(machine.host.services.is_empty());
+        assert_eq!(machine.devices.calls, 1);
+        assert!(
+            machine
+                .native_publication
+                .as_ref()
+                .unwrap()
+                .require_stopped(1, &[0])
+                .is_err()
+        );
+        drop(ram.domain().execution_loan().unwrap());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn held_worker_revokes_a_closed_frame_only_after_its_io_loan_returns() {
+        const FRAME: u64 = 0x10000;
+        const BYTES: usize = 16 * 1024;
+        let (mut machine, ram) = memory_service_machine_slots(false, 1, true);
+        let aliases = [
+            (0x4000, FRAME),
+            (0x8000, FRAME + 3 * 4096),
+            (0xc000, FRAME + BYTES as u64),
+        ];
+        model_ram_revocation(&ram, &aliases, true);
+        let mut expected = [0; BYTES];
+        // SAFETY: the fixture retains the registration and owns these private buffers.
+        unsafe {
+            ram.publish_physical(FRAME + BYTES as u64 - 8, b"revoked!")
+                .unwrap();
+            ram.read_physical(FRAME, &mut expected).unwrap();
+        }
+        let ranges = [stela_contracts::gate::MemoryRange {
+            address: FRAME + 4096,
+            bytes: 4096,
+        }];
+        let loan = ram.prepare_external_dma(&ranges).unwrap();
+
+        // SAFETY: the modeled worker is the only CPU owner and the I/O loan
+        // only reserves admission. It has published no CPU mapping or DMA.
+        let mut service = unsafe { machine.prepare_native_ram_service() }.unwrap();
+        assert!(
+            service
+                .try_revoke_frame_cpu_mappings(FRAME)
+                .unwrap()
+                .is_none()
+        );
+        RAM_REVOCATION.with(|model| {
+            let model = model.borrow();
+            let model = model.as_ref().unwrap();
+            assert!(model.requests.is_empty());
+            assert_eq!(model.aliases, aliases);
+        });
+
+        drop(loan);
+        let revoked = service
+            .try_revoke_frame_cpu_mappings(FRAME)
+            .unwrap()
+            .unwrap();
+        assert_eq!(revoked.physical(), FRAME);
+        let model = RAM_REVOCATION.with(|model| model.take().unwrap());
+        assert_eq!(model.requests, [FRAME]);
+        assert_eq!(model.aliases, [aliases[2]]);
+        let mut output = [0xa5; BYTES];
+        // SAFETY: this private output is disjoint from every modeled mapping.
+        unsafe { revoked.copy_into(&mut output) }.unwrap();
+        assert_eq!(output, expected);
+        assert_eq!(&output[BYTES - 8..], b"revoked!");
+        drop(revoked);
+        drop(ram.prepare_external_dma(&ranges).unwrap());
+
+        service.finish();
+        assert_eq!(machine.devices.calls, 1);
+        assert!(machine.host.services.is_empty());
+        assert!(
+            machine
+                .native_publication
+                .as_ref()
+                .unwrap()
+                .require_stopped(1, &[0])
+                .is_err()
+        );
+        drop(ram.domain().execution_loan().unwrap());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn missing_worker_revocation_ack_keeps_the_original_cohort_failed_and_held() {
+        const FRAME: u64 = 0x10000;
+        let (mut machine, ram) = memory_service_machine_slots(false, 1, true);
+        model_ram_revocation(&ram, &[(0x4000, FRAME)], false);
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: one actual modeled worker and no external device writers.
+            let mut service = unsafe { machine.prepare_native_ram_service() }.unwrap();
+            let _ = service.try_revoke_frame_cpu_mappings(FRAME);
+        }));
+        let model = RAM_REVOCATION.with(|model| model.take().unwrap());
+        assert_eq!(model.requests, [FRAME]);
+        assert_eq!(model.aliases, [(0x4000, FRAME)]);
+        let reason = stopped.expect_err("a refused revocation must fail stopped");
+        assert_eq!(
+            reason
+                .downcast_ref::<alloc::string::String>()
+                .map(alloc::string::String::as_str)
+                .or_else(|| reason.downcast_ref::<&str>().copied()),
+            Some("held worker RAM CPU mapping revocation did not complete")
+        );
+        assert!(ram.domain().check_execution().is_err());
+        let inventory = machine.native_publication.as_mut().unwrap();
+        assert!(inventory.require_stopped(1, &[0]).is_ok());
+        assert!(inventory.request_stop(&[0]).is_err());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn revoked_frame_remains_nonresident_until_the_original_snapshot_is_verified() {
+        use stela_compiler::context::memory::MemoryStatus;
+        use stela_contracts::gate::MemoryRange;
+
+        const FRAME: u64 = 0x10000;
+        const BYTES: usize = 16 * 1024;
+        const NEXT: u64 = FRAME + BYTES as u64;
+        let (mut machine, ram) = memory_service_machine_slots(false, 1, true);
+        model_ram_revocation(&ram, &[(0x4000, FRAME)], true);
+        let mut descriptors = ram.descriptor_reader();
+        let descriptor = descriptors.read_descriptor(FRAME).unwrap();
+        // SAFETY: the private source and the exact registered backing stay live.
+        unsafe { ram.publish_physical(NEXT - 8, b"retained") }.unwrap();
+
+        // SAFETY: this modeled worker and its synchronous Copyout own the fixture.
+        let mut service = unsafe { machine.prepare_native_ram_service() }.unwrap();
+        let revoked = service
+            .try_revoke_frame_cpu_mappings(FRAME)
+            .unwrap()
+            .unwrap();
+        let mut original = [0; BYTES];
+        // SAFETY: this snapshot buffer is private and disjoint from live RAM.
+        unsafe { revoked.copy_into(&mut original) }.unwrap();
+        assert_eq!(&original[BYTES - 8..], b"retained");
+        let mut missing = revoked.mark_nonresident().unwrap();
+        assert_eq!(missing.physical(), FRAME);
+        let model = RAM_REVOCATION.with(|model| model.take().unwrap());
+        assert_eq!(model.requests, [FRAME]);
+        assert!(model.aliases.is_empty());
+
+        assert_eq!(ram.nonresident_frame(FRAME, 8), Some(FRAME));
+        assert_eq!(ram.nonresident_frame(NEXT - 8, 16), Some(FRAME));
+        assert_eq!(ram.nonresident_frame(NEXT, 8), None);
+        assert_eq!(
+            descriptors.read_descriptor(FRAME),
+            Err(MemoryStatus::Nonresident)
+        );
+        assert_eq!(
+            ram.update_descriptor(FRAME, descriptor, !descriptor),
+            Err(MemoryStatus::Nonresident)
+        );
+        let mut output = [0xa5; 16];
+        // SAFETY: the output is private, and the fixture retains the RAM registration.
+        let read = unsafe { ram.read_physical_progress(NEXT - 8, &mut output) }.unwrap_err();
+        assert_eq!(
+            (read.status, read.completed),
+            (MemoryStatus::Nonresident, 0)
+        );
+        assert_eq!(output, [0xa5; 16]);
+        // SAFETY: the source is private and disjoint from the same registered RAM.
+        let write = unsafe { ram.publish_physical(NEXT - 8, &[0xee; 16]) }.unwrap_err();
+        assert_eq!(
+            (write.status, write.completed),
+            (MemoryStatus::Nonresident, 0)
+        );
+        let ranges = [MemoryRange {
+            address: FRAME + 4096,
+            bytes: 4096,
+        }];
+        assert!(matches!(
+            ram.prepare_external_dma(&ranges),
+            Err(MemoryStatus::Nonresident)
+        ));
+        let mut neighbor = [0; 8];
+        // SAFETY: the output is private. The Copyout wrote the adjacent resident frame.
+        unsafe { ram.read_physical(NEXT + 0x80, &mut neighbor) }.unwrap();
+        assert_eq!(neighbor, 0x12345678u64.to_le_bytes());
+
+        let mut wrong = original;
+        wrong[BYTES - 1] ^= 0x80;
+        assert_eq!(
+            missing.try_restore(&wrong),
+            Err(MemoryStatus::InvalidRequest)
+        );
+        assert_eq!(ram.nonresident_frame(FRAME, BYTES), Some(FRAME));
+        assert_eq!(
+            descriptors.read_descriptor(FRAME),
+            Err(MemoryStatus::Nonresident)
+        );
+
+        assert_eq!(missing.try_restore(&original), Ok(true));
+        drop(missing);
+        assert_eq!(ram.nonresident_frame(FRAME, BYTES), None);
+        assert_eq!(descriptors.read_descriptor(FRAME), Ok(descriptor));
+        drop(ram.prepare_external_dma(&ranges).unwrap());
+        service.finish();
+
+        let mut actual = [0; BYTES];
+        // SAFETY: the output is private and the fixture keeps the same backing.
+        unsafe { ram.read_physical(FRAME, &mut actual) }.unwrap();
+        assert_eq!(actual, original);
+        assert_eq!(machine.devices.calls, 1);
+        assert!(machine.host.services.is_empty());
+        drop(ram.domain().execution_loan().unwrap());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn dropped_or_forgotten_nonresident_frame_prevents_worker_release() {
+        use stela_compiler::context::memory::MemoryStatus;
+
+        const FRAME: u64 = 0x10000;
+        for forget in [false, true] {
+            let (mut machine, ram) = memory_service_machine_slots(false, 1, true);
+            model_ram_revocation(&ram, &[(0x4000, FRAME)], true);
+            // SAFETY: the modeled worker and its synchronous Copyout own the fixture.
+            let mut service = unsafe { machine.prepare_native_ram_service() }.unwrap();
+            let missing = service
+                .try_revoke_frame_cpu_mappings(FRAME)
+                .unwrap()
+                .unwrap()
+                .mark_nonresident()
+                .unwrap();
+            assert_eq!(ram.nonresident_frame(FRAME, 8), Some(FRAME));
+            let model = RAM_REVOCATION.with(|model| model.take().unwrap());
+            assert_eq!(model.requests, [FRAME]);
+            if forget {
+                core::mem::forget(missing);
+                assert_eq!(ram.domain().check_execution(), Ok(()));
+            } else {
+                drop(missing);
+                assert_eq!(ram.domain().check_execution(), Err(MemoryStatus::Domain));
+            }
+
+            let stopped =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| service.finish()));
+            assert!(stopped.is_err());
+            assert_eq!(ram.domain().check_execution(), Err(MemoryStatus::Domain));
+            let inventory = machine.native_publication.as_mut().unwrap();
+            assert!(inventory.require_stopped(1, &[0]).is_ok());
+            assert!(inventory.request_stop(&[0]).is_err());
+            assert_eq!(machine.host.services.len(), 1);
+        }
+    }
+
     #[test]
     fn abandoned_ram_service_fails_owner_and_never_releases_workers() {
         let (mut machine, ram) = memory_service_machine(false);

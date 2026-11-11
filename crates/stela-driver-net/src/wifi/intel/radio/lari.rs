@@ -4,7 +4,10 @@
 // Copyright (C) 2016-2017 Intel Deutschland GmbH
 //! Pure source BIOS LARI/extension wire preparation, not a BIOS observation,
 //! trusted source selector, command completion or regulatory permission.
-use super::super::{command::Id, firmware::Firmware};
+use super::super::{
+    command::Id,
+    firmware::{Firmware, legacy},
+};
 use alloc::vec::Vec;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -39,9 +42,22 @@ pub enum Input {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     MissingApi,
+    DuplicateVersion(u8),
     Version(u8),
     ExtensionVersion(u8),
     NotObserved(Input),
+}
+fn command_version(firmware: &Firmware<'_>, opcode: u8) -> Result<Option<u8>, Error> {
+    let mut rows = firmware
+        .command_versions()
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| row.group == 12 && row.command == opcode);
+    let version = rows.next().map(|row| row.command_version);
+    if rows.next().is_some() {
+        return Err(Error::DuplicateVersion(opcode));
+    }
+    Ok(version)
 }
 fn observed(input: Input, observation: Observation) -> Result<Option<Value>, Error> {
     match observation {
@@ -76,10 +92,14 @@ fn bios_header(inputs: &Inputs) -> [u8; 4] {
 }
 impl Plan {
     pub fn prepare(firmware: &Firmware<'_>, radio_id: u32, inputs: Inputs) -> Result<Self, Error> {
-        let schema = firmware
-            .command_version(12, 1)
-            .ok_or(Error::MissingApi)?
-            .command_version;
+        let change_version = command_version(firmware, 1)?;
+        let extension_version = command_version(firmware, 8)?.unwrap_or(0);
+        let schema = match change_version {
+            Some(version) => version,
+            // Linux defaults LARI_CONFIG_CHANGE to v1 when the row is absent.
+            None if legacy::has_pinned_lari_v1(firmware) => 1,
+            None => return Err(Error::MissingApi),
+        };
         let bytes = match schema {
             1 => 4,
             6 => 24,
@@ -88,9 +108,6 @@ impl Plan {
             13 => 44,
             other => return Err(Error::Version(other)),
         };
-        let extension_version = firmware
-            .command_version(12, 8)
-            .map_or(0, |v| v.command_version);
         if extension_version > 1 {
             return Err(Error::ExtensionVersion(extension_version));
         }
@@ -440,6 +457,65 @@ mod tests {
         let plan = Plan::prepare(&fw, 0, inputs).unwrap();
         assert_eq!(plan.words()[7], 3);
         assert_eq!(plan.commands().next().unwrap().1, [0; 4]);
+    }
+    #[test]
+    fn duplicate_lari_rows_are_not_treated_as_a_missing_or_supported_version() {
+        for opcode in [1, 8] {
+            let mut bytes = firmware(None, 0, 0);
+            bytes.extend(48u32.to_le_bytes()); // CMD_VERSIONS
+            bytes.extend(8u32.to_le_bytes());
+            bytes.extend([opcode, 12, 1, 0, opcode, 12, 1, 0]);
+            let fw = Firmware::parse(&bytes).unwrap();
+            assert_eq!(
+                Plan::prepare(&fw, 0, unavailable()),
+                Err(Error::DuplicateVersion(opcode))
+            );
+        }
+    }
+    #[test]
+    #[ignore = "oracle: STELA_IWLWIFI_IMAGES"]
+    fn pinned_api46_images_use_lari_v1_only_when_the_version_row_is_absent() {
+        let root = std::env::var("STELA_IWLWIFI_IMAGES").unwrap();
+        for sku in [legacy::Sku::Cnvi9000, legacy::Sku::WirelessAc9260] {
+            let bytes =
+                std::fs::read(std::path::Path::new(&root).join(sku.firmware_name())).unwrap();
+            let fw = Firmware::parse(&bytes).unwrap();
+            assert_eq!(fw.api_version(), 46);
+            assert!(fw.command_version(12, 1).is_none());
+            assert!(fw.command_version(12, 8).is_none());
+
+            let plan = Plan::prepare(&fw, 0, unavailable()).unwrap();
+            assert_eq!(plan.schema(), 1);
+            let mut commands = plan.commands();
+            let (id, payload) = commands.next().unwrap();
+            assert_eq!((id.group, id.opcode, id.version), (12, 1, 0));
+            assert_eq!(payload, [0x80, 0, 0, 0]); // Synthetic exhausted BIOS lookup.
+            assert!(commands.next().is_none());
+
+            let mut inputs = unavailable();
+            inputs.dsm[4] = Observation::NotObserved;
+            assert_eq!(
+                Plan::prepare(&fw, 0, inputs),
+                Err(Error::NotObserved(Input::Dsm(4)))
+            );
+
+            let mut different = bytes.clone();
+            different[80] ^= 1; // Ignored header byte; API and TLVs are unchanged.
+            let changed = Firmware::parse(&different).unwrap();
+            assert_eq!(
+                Plan::prepare(&changed, 0, unavailable()),
+                Err(Error::MissingApi)
+            );
+
+            let versions = fw.tlvs().iter().find(|tlv| tlv.kind == 48).unwrap();
+            let row = versions.range.start + 8;
+            different[row..row + 4].copy_from_slice(&[1, 12, 0xff, 0]);
+            let changed = Firmware::parse(&different).unwrap();
+            assert_eq!(
+                Plan::prepare(&changed, 0, unavailable()),
+                Err(Error::Version(0xff))
+            );
+        }
     }
     #[test]
     #[ignore = "oracle: STELA_IWLWIFI_IMAGES"]

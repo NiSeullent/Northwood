@@ -31,10 +31,15 @@ test = false
 default = []
 diagnostics = ["stela-drivers/irq-diagnostics"]
 native-profile = ["stela-soc/native-profile", "stela-engine/native-profile"]
+# StelaGPU kext objects and plugin CDHashes, from `cargo xtask guest`.
+guest-stelagpu = []
 # NVK, NIR and NAK in the image, from `cargo xtask gpu nvk`.
-nvk = ["dep:stela-mesa", "stela-drivers/metal-linked"]
+nvk = ["guest-stelagpu", "dep:stela-mesa", "stela-drivers/metal-linked"]
+# Native Linux continuations and Stela libc pthread diagnostics without Mesa.
+pthread-runtime-probe = ["dep:stela-c-build"]
 
 [dependencies]
+northwood-config = { path = "../northwood-config" }
 stela-linux = { path = "../stela-linux", features = ["kernel"] }
 stela-soc-data = { path = "../stela-soc-data", default-features = false }
 stela-engine = { path = "../stela-engine", default-features = false }
@@ -51,6 +56,9 @@ stela-runtime = { path = "../stela-runtime", default-features = false }
 stela-loader = { path = "../stela-loader", default-features = false }
 stela-compiler = { path = "../stela-compiler", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[build-dependencies]
+stela-c-build = { path = "../stela-c-build", features = ["native"], optional = true }
 
 [profile.dev]
 panic = "abort"

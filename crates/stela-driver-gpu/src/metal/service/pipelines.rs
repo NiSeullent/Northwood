@@ -46,6 +46,29 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         self.device.timing().begin(Timed::NewRenderPipeline);
         let request: NewRenderPipelineRequest = call.request()?;
         let flags = flags(request.flags)?;
+        if self.device.is_hosted_lavapipe()
+            && (!flags.is_empty()
+                || request.targets.raster_sample_count != 1
+                || request.targets.alpha_to_coverage_enabled != 0
+                || request.targets.alpha_to_one_enabled != 0
+                || request.targets.depth_attachment_pixel_format != 0
+                || request.targets.stencil_attachment_pixel_format != 0
+                || !request.targets.color_attachments[1..]
+                    .iter()
+                    .all(|color| color.pixel_format == 0)
+                || !hosted_pipeline_inputs(
+                    &request.archives,
+                    &[
+                        request.vertex_linked_functions,
+                        request.fragment_linked_functions,
+                    ],
+                ))
+        {
+            return Err(Fault::new(
+                Status::Unsupported,
+                "render pipeline on hosted lavapipe",
+            ));
+        }
         let connection = call.connection;
         let memory = &mut *call.memory;
         let pipeline = RenderPipelineRequest {
@@ -177,6 +200,15 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     pub(super) fn new_compute_pipeline(&mut self, call: &mut Call) -> Result<(), Fault> {
         let request: NewComputePipelineRequest = call.request()?;
         let flags = flags(request.flags)?;
+        if self.device.is_hosted_lavapipe()
+            && (!flags.is_empty()
+                || !hosted_pipeline_inputs(&request.archives, &[request.linked_functions]))
+        {
+            return Err(Fault::new(
+                Status::Unsupported,
+                "compute pipeline on hosted lavapipe",
+            ));
+        }
         let connection = call.connection;
         let pipeline = ComputePipelineRequest {
             compute_function: self.object(connection, request.compute_function)?,
@@ -426,6 +458,20 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             })?,
         })
     }
+}
+
+fn hosted_pipeline_inputs(
+    archives: &PipelineArchivesRecord,
+    stages: &[LinkedFunctionsRecord],
+) -> bool {
+    archives.searched.length == 0
+        && archives.added_to == 0
+        && archives.required == 0
+        && stages.iter().all(|linked| {
+            linked.functions.length == 0
+                && linked.private_functions.length == 0
+                && linked.libraries.length == 0
+        })
 }
 
 fn flags(raw: u64) -> Result<PipelineFlags, Fault> {

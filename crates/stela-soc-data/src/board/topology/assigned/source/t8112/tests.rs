@@ -20,6 +20,14 @@ fn authored(prepared: bool) -> Vec<u8> {
     authored_config(prepared, None)
 }
 fn authored_config(prepared: bool, harvesting: Option<&[u8]>) -> Vec<u8> {
+    authored_with_clusters(prepared, harvesting, false, 4)
+}
+fn authored_with_clusters(
+    prepared: bool,
+    harvesting: Option<&[u8]>,
+    legacy_clusters: bool,
+    boot_cpu: u32,
+) -> Vec<u8> {
     let mut cpus = Vec::new();
     let mut records = Vec::new();
     for pe in 0..8u32 {
@@ -37,7 +45,7 @@ fn authored_config(prepared: bool, harvesting: Option<&[u8]>) -> Vec<u8> {
                 ),
                 (
                     "state",
-                    if prepared && pe == 4 {
+                    if prepared && pe == boot_cpu {
                         b"running\0".to_vec()
                     } else {
                         b"waiting\0".to_vec()
@@ -87,6 +95,9 @@ fn authored_config(prepared: bool, harvesting: Option<&[u8]>) -> Vec<u8> {
     ];
     if let Some(value) = harvesting {
         properties.push(("acc-harvesting", value.to_vec()));
+    }
+    if legacy_clusters {
+        properties.push(("clusters", words(&[4, 4])));
     }
     let pmgr = encode(properties, &[]);
     let aic = encode(
@@ -241,6 +252,51 @@ fn authored_t8112_nonzero_bsp_keeps_canonical_full_graph_and_source_coordinates(
     let mut wrong = identity(&original, 0x24);
     wrong.original_tree_sha256 = [0; 32];
     assert!(BspSource::t8112(&original, &prepared, wrong, 0x100, 0).is_err());
+}
+
+#[test]
+fn j473_legacy_restore_keeps_both_complexes_in_physical_order() {
+    let original = authored_with_clusters(false, None, true, 0);
+    let prepared = authored_with_clusters(true, None, true, 0);
+    let identity = identity(&original, 0x24);
+    for (count, expected) in [
+        (2, &[0, 0x100][..]),
+        (3, &[0, 1, 0x100]),
+        (4, &[0, 1, 2, 0x100]),
+        (5, &[0, 1, 2, 3, 0x100]),
+        (6, &[0, 1, 2, 3, 0x100, 0x101]),
+        (7, &[0, 1, 2, 3, 0x100, 0x101, 0x102]),
+        (8, &[0, 1, 2, 3, 0x100, 0x101, 0x102, 0x103]),
+    ] {
+        let source =
+            BspSource::t8112_assigned(&original, &prepared, identity, 0, 0, count).unwrap();
+        let resources = source.resources();
+        let regs = resources
+            .slots
+            .iter()
+            .map(|slot| slot.reg)
+            .collect::<Vec<_>>();
+        assert_eq!(regs, expected);
+        assert_eq!(resources.clusters.len(), 2);
+        assert_eq!(source.graph().domains.len(), 12);
+    }
+    assert!(
+        BspSource::t8112_assigned(&original, &prepared, identity, 0, 0, 1)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("worker for each")
+    );
+    let p_boot = authored_with_clusters(true, None, true, 4);
+    assert!(
+        BspSource::t8112_assigned(&original, &p_boot, identity, 0x100, 0, 4)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("efficiency CPU as BSP")
+    );
+    let full = BspSource::t8112_assigned(&original, &p_boot, identity, 0x100, 0, 8).unwrap();
+    assert_eq!(full.resources().slots[0].reg, 0x100);
 }
 
 #[test]

@@ -380,6 +380,85 @@ impl Capabilities {
         .run()
     }
 
+    #[cfg(any(test, feature = "metal-linked"))]
+    pub(super) fn hosted_lavapipe(device: &PhysicalDevice) -> super::error::Result<Self> {
+        let platform = Platform {
+            architecture: String::from("llvmpipe"),
+            location: DeviceLocation::Unspecified,
+            location_number: 0,
+            max_transfer_rate: 0,
+            headless: true,
+            removable: false,
+            linear_row_alignment: 4,
+            linear_offset_alignment: 4,
+            sparse_page_bytes: 0,
+        };
+        let mut capabilities = Self::derive(
+            device,
+            &platform,
+            ShaderFeatures::COMPUTE | ShaderFeatures::VERTEX_FRAGMENT,
+            ApiFeatures::EMPTY,
+        );
+        let qualified = FormatCapabilities::COLOR | FormatCapabilities::BLIT;
+        let formats = [PixelFormat::Rgba8Unorm, PixelFormat::Bgra8Unorm];
+        super::error::require(
+            capabilities.supports_texture_sample_count(1)
+                && formats.iter().all(|&format| {
+                    let supported = capabilities.format(format);
+                    supported.contains(qualified)
+                        && !supported.contains(FormatCapabilities::RAW_RENDER)
+                }),
+            "single-sample RGBA8 and BGRA8 attachments for hosted lavapipe",
+        )?;
+        capabilities.formats =
+            PixelFormats::Listed(Box::new(formats.map(|format| (format, qualified))));
+        capabilities.families.clear();
+        capabilities.vertex_formats.clear();
+        capabilities.texture_sample_counts = SampleCounts::C1;
+        capabilities.read_write_texture_tier = ReadWriteTextureTier::None;
+        capabilities.supports_32bit_float_filtering = false;
+        capabilities.supports_32bit_msaa = false;
+        capabilities.supports_bc_texture_compression = false;
+        capabilities.depth24_stencil8_supported = false;
+        capabilities.depth_resolve_modes = ResolveModes::EMPTY;
+        capabilities.stencil_resolve_modes = ResolveModes::EMPTY;
+        capabilities.max_sampler_anisotropy = 1.0;
+        capabilities.sampler_mirror_clamp_to_edge = false;
+        capabilities.sampler_reduction_modes = false;
+        capabilities.dual_source_blending = false;
+        capabilities.alpha_to_one = false;
+        capabilities.depth_clamp = false;
+        capabilities.wireframe = false;
+        capabilities.line_modes = false;
+        capabilities.view_min_lod = false;
+        capabilities.memoryless_render_targets = false;
+        capabilities.stencil_export = false;
+        capabilities.stencil_follows_depth = false;
+        capabilities.sparse_volumes = false;
+        capabilities.sparse_samples.clear();
+        let limits = &mut capabilities.limits;
+        limits.max_texture_dimension_1d = 0;
+        limits.max_texture_dimension_3d = 0;
+        limits.max_texture_dimension_cube = 0;
+        limits.max_texture_array_length = 1;
+        limits.max_texture_buffer_width = 0;
+        limits.max_color_attachments = 1;
+        limits.max_viewports = 1;
+        limits.max_vertex_amplification_count = 1;
+        // The wire has no argument buffer tier below Tier1. Zero limits
+        // and refusal of argument encoders describe this profile's support.
+        limits.max_argument_buffer_sampler_count = 0;
+        limits.max_argument_buffer_resources = 0;
+        limits.max_threadgroup_memory_length = 0;
+        capabilities.gaps.push(Gap {
+            capability: String::from(
+                "hosted lavapipe exposes only buffer compute and single-sample color rendering",
+            ),
+            cause: Cause::Api,
+        });
+        Ok(capabilities)
+    }
+
     pub fn supports_family(&self, family: GpuFamily) -> bool {
         self.families.contains(&family)
     }

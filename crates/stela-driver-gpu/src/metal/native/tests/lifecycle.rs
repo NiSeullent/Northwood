@@ -101,6 +101,28 @@ impl MemoryExporter for Exporter {
     }
 }
 
+impl HostMemoryExporter for Exporter {
+    fn lease(&self, _: &[MemoryRange]) -> Result<HostAllocation> {
+        unreachable!()
+    }
+}
+
+impl GuestCopyProvider for Exporter {
+    unsafe fn lease(&self, _: &[MemoryRange]) -> Result<Box<dyn GuestCopyLease>> {
+        unreachable!()
+    }
+}
+
+impl GuestCopyLease for Exporter {
+    fn read_into(&self, _: u64, _: &mut [u8]) -> Result<()> {
+        unreachable!()
+    }
+
+    fn publish_from(&self, _: u64, _: &[u8]) -> Result<()> {
+        unreachable!()
+    }
+}
+
 unsafe extern "system" fn instance_proc(
     _: vk::Instance,
     _: *const core::ffi::c_char,
@@ -170,10 +192,12 @@ fn backend(device: ash::Device, drops: &Arc<AtomicUsize>) -> NativeBackend {
         unsignaled: Vec::new(),
         mappings: BTreeMap::new(),
         memories: crate::metal::native::memory::Memories::new(1024),
-        exporter: ManuallyDrop::new(exporter.clone()),
+        exporter: ManuallyDrop::new(Some(exporter.clone())),
+        host_imports: ManuallyDrop::new(None),
+        copy_imports: ManuallyDrop::new(None),
         outside: Arc::new(crate::metal::native::NativeOutside::new(
             outside_device,
-            exporter,
+            Some(exporter),
             false,
             || {},
         )),
@@ -212,11 +236,35 @@ fn failed_device_idle_keeps_the_export_owner() {
         frees: AtomicUsize::new(0),
     };
     let drops = Arc::new(AtomicUsize::new(0));
-    let backend = backend(device(&calls), &drops);
+    let host_drops = Arc::new(AtomicUsize::new(0));
+    let copied_drops = Arc::new(AtomicUsize::new(0));
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let mut backend = backend(device(&calls), &drops);
+    backend.host_imports = ManuallyDrop::new(Some(host_memory::Imports::new(
+        Box::new(Exporter(host_drops.clone())),
+        &backend.instance,
+        &backend.device,
+        vk::PhysicalDevice::null(),
+        NonZeroU64::MIN,
+    )));
+    let mut copies = copy_memory::Imports::new(Box::new(Exporter(copied_drops.clone())));
+    copies.owned.insert(
+        1,
+        copy_memory::Import {
+            lease: Box::new(Exporter(lease_drops.clone())),
+            token: NonZeroU64::new(43).unwrap(),
+            bytes: 4096,
+        },
+    );
+    copies.checkpoint = Some((vk::Semaphore::from_raw(17), 1));
+    backend.copy_imports = ManuallyDrop::new(Some(copies));
     drop(backend);
     assert_eq!(calls.waits.load(Ordering::Relaxed), 1);
     assert_eq!(calls.frees.load(Ordering::Relaxed), 0);
     assert_eq!(drops.load(Ordering::Relaxed), 0);
+    assert_eq!(host_drops.load(Ordering::Relaxed), 0);
+    assert_eq!(copied_drops.load(Ordering::Relaxed), 0);
+    assert_eq!(lease_drops.load(Ordering::Relaxed), 0);
 }
 
 #[test]

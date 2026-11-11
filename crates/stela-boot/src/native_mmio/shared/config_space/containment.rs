@@ -1,5 +1,11 @@
 //! Retain the original PCI fabric after disabling each captured function.
 use super::*;
+#[cfg(feature = "diagnostics")]
+mod glk;
+#[cfg(feature = "diagnostics")]
+mod lpss;
+#[cfg(feature = "diagnostics")]
+mod observations;
 use alloc::rc::Rc;
 use core::{any::Any, cell::RefCell, cmp::Reverse, fmt};
 use stela_boot_core::ecam::topology;
@@ -35,6 +41,27 @@ impl<'a> ContainedPci<'a> {
 
     pub(crate) fn functions(&self) -> usize {
         self.functions
+    }
+
+    /// Vendor and device IDs from the retained census, without config I/O.
+    pub(crate) fn device_ids(&self) -> Result<Vec<(u16, u16)>, Error> {
+        let cohort = self
+            .source
+            .pci_slots
+            .0
+            .try_borrow()
+            .map_err(|_| Error::Busy)?;
+        let Cohort::Parked(fabric) = &*cohort else {
+            return Err(Error::Unavailable);
+        };
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(fabric.slots.len())
+            .map_err(|_| Error::Exhausted)?;
+        ids.extend(fabric.slots.iter().map(|slot| {
+            let id = slot.header.identity;
+            (id as u16, (id >> 16) as u16)
+        }));
+        Ok(ids)
     }
 
     /// Original populated bridge routes in upstream-first order.

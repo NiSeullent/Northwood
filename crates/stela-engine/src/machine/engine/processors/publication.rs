@@ -6,7 +6,9 @@ use super::Host;
 use alloc::{sync::Arc, vec::Vec};
 
 mod service;
-pub use service::{HostEffect, HostEffectCommand, HostEffectReceipt, WorkerServices};
+pub use service::{
+    HostEffect, HostEffectCommand, HostEffectReceipt, RamCpuMappingRevocation, WorkerServices,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerId(pub usize);

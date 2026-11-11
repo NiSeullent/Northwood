@@ -20,10 +20,11 @@ use core::{
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use stela_drivers::block::{BlockDevice, BlockError, Submission};
+use stela_drivers::block::{BlockDevice, BlockError, Finished, Request, Submission};
 use stela_runtime::pc::boot_log::{PENDING_BYTES, Pending, Unkept, Writer};
 
 mod terminal;
+pub(crate) mod volume_log;
 pub(crate) use terminal::{panic, print_stack_at};
 
 /// One engine-wide value. The mount runs on one processor and its handlers
@@ -439,7 +440,7 @@ static RECORD: Global<Pending<[u8; PENDING_BYTES]>> =
 
 /// An open log, the blocks that hold it and its position in the record.
 struct Sink {
-    writer: Writer,
+    writer: SinkWriter,
     device: Box<dyn BlockDevice>,
     kind: Log,
     stored: u64,
@@ -452,6 +453,54 @@ struct Sink {
     began: Option<u64>,
     /// The store's request in progress on the device.
     request: Option<Submission>,
+}
+
+enum SinkWriter {
+    Binary(Writer),
+    Volume(volume_log::Writer),
+}
+
+impl SinkWriter {
+    fn stage(&mut self, record: &Pending<[u8; PENDING_BYTES]>, stored: u64) -> u64 {
+        match self {
+            Self::Binary(writer) => {
+                let Ok(reached) = record.copy_since(stored, |bytes| {
+                    writer.append(bytes);
+                    Ok::<_, Infallible>(())
+                });
+                reached
+            }
+            Self::Volume(writer) => writer.stage(record, stored),
+        }
+    }
+
+    fn storing(&self) -> bool {
+        match self {
+            Self::Binary(writer) => writer.storing(),
+            Self::Volume(writer) => writer.storing(),
+        }
+    }
+
+    fn begin_store(&mut self) -> bool {
+        match self {
+            Self::Binary(writer) => writer.begin_store(),
+            Self::Volume(writer) => writer.begin_store(),
+        }
+    }
+
+    fn next_request(&mut self) -> Option<Request> {
+        match self {
+            Self::Binary(writer) => writer.next_request(),
+            Self::Volume(writer) => writer.next_request(),
+        }
+    }
+
+    fn completed(&mut self, result: Finished) -> Result<(), BlockError> {
+        match self {
+            Self::Binary(writer) => writer.completed(result),
+            Self::Volume(writer) => writer.completed(result),
+        }
+    }
 }
 
 impl Sink {
@@ -509,6 +558,8 @@ pub enum Log {
     Firmware,
     /// The USB's file through Stela's drivers.
     Usb,
+    /// The readable data-volume file through Stela's drivers.
+    Volume,
 }
 
 /// The open logs, which any processor may flush or report: reached only
@@ -600,16 +651,47 @@ impl<const N: usize> Write for Text<N> {
 /// Stop the marker's firmware timer, store the logs and close those the
 /// firmware holds, then stop writing to the firmware's console: called just before boot services end, which
 /// take both with them.
-pub fn leave_boot_services() {
+pub(crate) fn leave_boot_services() -> Option<crate::log_file::VolumeLog> {
     crate::firmware::stop_ticker();
     // The engine's copy of this image has a queue of its own: send this
     // one's now, bounded, and the loader's last lines directly.
     unqueue_serial();
+    let volume_log = crate::log_file::save_loader_log();
     flush_log();
-    with_sinks(true, |sinks| {
-        sinks.retain(|sink| sink.kind != Log::Firmware)
-    });
+    drop_firmware_log();
     disable_firmware_console();
+    volume_log
+}
+
+/// Release the firmware file without writing additional output.
+pub(crate) fn drop_firmware_log() {
+    with_sinks(true, |sinks| {
+        sinks.retain(|sink| sink.kind != Log::Firmware);
+    });
+}
+
+/// Copy the latest complete lines of the firmware record without holding the
+/// output lock during filesystem writes.
+pub(crate) fn loader_log_tail(buffer: &mut [u8]) -> Option<(usize, bool, u64)> {
+    exclusive(|| {
+        let record = RECORD.0.try_borrow().ok()?;
+        let end = record.pushed();
+        let from = end.saturating_sub(buffer.len() as u64);
+        let mut written = 0;
+        record
+            .copy_since(from, |bytes| -> Result<(), ()> {
+                let end = written + bytes.len();
+                buffer
+                    .get_mut(written..end)
+                    .ok_or(())?
+                    .copy_from_slice(bytes);
+                written = end;
+                Ok(())
+            })
+            .ok()?;
+        Some((written, from != 0, end))
+    })
+    .flatten()
 }
 
 /// The relocated engine has its own statics, not the loader image's updated
@@ -699,6 +781,24 @@ pub fn add_log(
     .unwrap_or(0);
     writer.flush(&mut *device).map_err(Unopened::Store)?;
     writer.verify(&mut *device).map_err(Unopened::Unkept)?;
+    add_sink(SinkWriter::Binary(writer), device, kind, stored);
+    Ok(())
+}
+
+pub(crate) fn add_volume_log(
+    writer: volume_log::Writer,
+    device: Box<dyn BlockDevice>,
+    record_start: u64,
+) {
+    add_sink(
+        SinkWriter::Volume(writer),
+        device,
+        Log::Volume,
+        record_start,
+    );
+}
+
+fn add_sink(writer: SinkWriter, device: Box<dyn BlockDevice>, kind: Log, stored: u64) {
     with_sinks(true, |sinks| {
         sinks.push(Sink {
             writer,
@@ -712,7 +812,6 @@ pub fn add_log(
             request: None,
         })
     });
-    Ok(())
 }
 
 /// Store what every open log lacks and close them all, before the disks
@@ -727,6 +826,11 @@ pub fn close_logs() {
 /// machine-state store stops the machine. Output printed during the flush
 /// is not recorded.
 pub fn flush_log() {
+    // A blocking flush first completes an earlier asynchronous submission,
+    // so the subsequent pass can stage output through the current position.
+    if STORING.load(Ordering::Acquire) {
+        flush_where(|_| false, true);
+    }
     flush_where(|_| true, true);
 }
 
@@ -740,7 +844,7 @@ pub fn flush_due() {
     flush_where(
         |sink| {
             let seconds = match sink.kind {
-                Log::Usb => USB_FLUSH_SECONDS,
+                Log::Usb | Log::Volume => USB_FLUSH_SECONDS,
                 _ => MACHINE_FLUSH_SECONDS,
             };
             now.wrapping_sub(sink.flushed) >= seconds * hz
@@ -784,11 +888,7 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
                     return;
                 };
                 for sink in sinks.iter_mut().filter(|sink| is_due(sink)) {
-                    let Ok(reached) = record.copy_since(sink.stored, |bytes| {
-                        sink.writer.append(bytes);
-                        Ok::<_, Infallible>(())
-                    });
-                    sink.stored = reached;
+                    sink.stored = sink.writer.stage(&record, sink.stored);
                 }
             });
         }
@@ -829,6 +929,14 @@ pub fn millis_since(start: u64) -> u64 {
     }
 }
 
+/// Record a boot milestone with a timestamp also present in serial captures.
+pub fn boot_stage(name: &str) {
+    arguments(format_args!(
+        "BOOT STAGE name={name} elapsed_ms={}\n",
+        millis_since(0),
+    ));
+}
+
 /// Report each open log's stores so far and the milliseconds they took.
 pub fn report_log_stores() {
     let hz = TSC_HZ.load(Ordering::Relaxed).max(1);
@@ -845,6 +953,7 @@ pub fn report_log_stores() {
             Log::Machine => "machine",
             Log::Firmware => "firmware",
             Log::Usb => "usb",
+            Log::Volume => "data volume",
         };
         arguments(format_args!(
             "BOOT LOG {name} stores={stores} ms={millis}\n"
@@ -881,6 +990,9 @@ pub fn terminate(code: u32) -> ! {
     // Why it stopped is at the end of what is queued, and the log's USB disk
     // may be what stopped.
     unqueue_serial();
+    if FIRMWARE_CONSOLE.load(Ordering::Acquire) {
+        let _ = crate::log_file::save_loader_log();
+    }
     flush_log();
     halt(code)
 }
@@ -920,6 +1032,17 @@ fn stopped(message: &str, next: &str) {
     } else if FIRMWARE_CONSOLE.load(Ordering::Relaxed) {
         firmware_console("\nStela stopped: ");
         firmware_console(message);
+        firmware_console("\n");
+    }
+}
+
+/// Report a loader check using the active console or firmware text output.
+pub(crate) fn boot_diagnostic(text: &str) {
+    arguments(format_args!("BOOT DIAGNOSTICS {text}\n"));
+    if console::active() {
+        crate::status::info(text);
+    } else {
+        firmware_console(text);
         firmware_console("\n");
     }
 }

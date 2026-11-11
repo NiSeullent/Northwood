@@ -6,11 +6,17 @@
 //!
 //! Each check ends with a `CHECK name PASS|FAIL|SKIP detail` line:
 //!
+//! - `memory`, `devices-pci`, `firmware`: the boot memory budget,
+//!   firmware-observed PCI candidates and installed firmware resources.
+//! - `profile`, `devices`, `network`, `swap`: hardware profile, boot I/O, observed link carrier and
+//!   read-only inspection of prepared swap stores.
 //! - `cpu`, `tsc`, before ExitBootServices: the CPUID report and the
 //!   x86-64-v2 floor; the TSC measured against the firmware's stall.
 //! - `storage`, `gpt`: every disk the PC storage drivers bring up, and the
 //!   GPT of each, read only, with every partition's unique GUID, name and
 //!   size.
+//! - `install-target`: whether the saved install choice matches a unique
+//!   native disk and a non-ESP GPT partition, using the install resolver.
 //! - `log`: with `--nor-file`, the persistent boot log in a preallocated
 //!   file on a USB disk's FAT32 volume, laid out as a machine-state
 //!   partition (`pc::boot_log`); `stela boot-log FILE --offset 0` reads it.
@@ -38,7 +44,7 @@ use crate::{
         nor,
         power::HostPowerControl,
     },
-    firmware, output,
+    firmware, host_firmware, output,
     paging::{self, PAGE},
     storage,
 };
@@ -49,22 +55,27 @@ use core::{
     fmt,
     sync::atomic::{AtomicU64, Ordering},
 };
-use stela_boot_core::options::HostCheck;
+use northwood_config::{Swap, SwapLocation};
+use stela_boot_core::{host_memory::Profile, options::HostCheck};
 use stela_contracts::refuse;
 use stela_drivers::{
     Handoff, PlatformCaptures,
     block::{BlockDevice, Shared, Transport},
     bus::dma::RegionAllocator,
     input::{Input, InputDevice},
-    probe::probe,
+    probe::{probe, probe_with_minimum},
 };
 use stela_runtime::pc::{
     self, boot_log,
     fat32::Fat32,
     gpt::{self, Guid},
     power::HostPower,
+    storage::{StorageError, Target, verify_target},
 };
 use uefi::boot;
+
+mod inventory;
+mod summary;
 
 const BEAT_SECONDS: u64 = 10;
 /// The stop code at `--deadline`.
@@ -170,11 +181,22 @@ struct Machine {
     /// Activated table/catalog owner; no hardware grant from metadata.
     active_tables: Option<paging::ActivatedTables>,
     options: HostCheck,
+    memory_profile: Option<Profile>,
+    swap_policy: Swap,
     timing: Timing,
     screen: Option<Framebuffer>,
     storage: Option<Handoff>,
+    minimum: Option<storage::minimum::Prepared>,
     /// Board captures for the storage probe; Wi-Fi files are not read here.
     captures: PlatformCaptures,
+    /// The GPT partition the firmware launched, for read-only swap checks.
+    boot_partition: Option<Guid>,
+    /// The saved install choice read from the startup volume before EBS.
+    install_target: core::result::Result<Option<Target>, &'static str>,
+    /// The data log is writable only when native storage confirms USB.
+    volume_log: Option<crate::log_file::VolumeLog>,
+    wifi_candidate: Option<&'static str>,
+    wifi_observed: bool,
     power: Option<HostPower>,
     apic_base: u64,
     stack_top: usize,
@@ -195,8 +217,14 @@ impl Machine {
 }
 
 /// Run the host check from `stela.cfg`'s `options`; never returns.
-pub fn boot(options: Vec<u8>) -> ! {
-    let (mut machine, tables) = prepare(&options).unwrap_or_else(|error| output::fatal(error));
+pub fn boot(
+    options: Vec<u8>,
+    resources: host_firmware::Resources,
+    settings: core::result::Result<Option<Vec<u8>>, &'static str>,
+    install_target: core::result::Result<Option<Target>, &'static str>,
+) -> ! {
+    let (mut machine, tables) = prepare(&options, &resources, settings, install_target)
+        .unwrap_or_else(|error| output::fatal(error));
     let stack = machine.stack_top;
     // SAFETY: boot services have ended; the tables map the image, the heap,
     // the stack, every RAM byte in use, the framebuffer and the registers
@@ -224,10 +252,22 @@ pub fn boot(options: Vec<u8>) -> ! {
 
 /// Before ExitBootServices: the options, the CPU and TSC checks, and what
 /// the rest needs from the firmware; then leave boot services.
-fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
+fn prepare(
+    options: &[u8],
+    resources: &host_firmware::Resources,
+    settings: core::result::Result<Option<Vec<u8>>, &'static str>,
+    install_target: core::result::Result<Option<Target>, &'static str>,
+) -> Result<(Machine, paging::Tables)> {
     let text = core::str::from_utf8(options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let options = HostCheck::parse(text).map_err(stela_boot_core::options::Error::message)?;
     let started = rdtsc();
+    let (boot_partition, usb_boot) = crate::log_file::diagnostic_boot_device();
+    if !usb_boot || options.no_volume_log {
+        crate::log_file::set_volume_log(false);
+    }
+    if !usb_boot {
+        output::drop_firmware_log();
+    }
     output::arguments(format_args!("HOST CHECK {}\n", text.trim()));
     for line in cpu::report() {
         output::arguments(format_args!("CPU {line}\n"));
@@ -242,14 +282,37 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
             deadline: options.deadline.map(|seconds| started + seconds * tsc_hz),
         },
         options,
+        memory_profile: None,
+        swap_policy: Swap::default(),
         screen: Framebuffer::from_firmware(),
         storage: None,
-        captures: storage::captures(Default::default()),
+        minimum: None,
+        captures: storage::captures(resources.wifi_observations()),
+        boot_partition,
+        install_target,
+        volume_log: None,
+        wifi_candidate: None,
+        wifi_observed: false,
         power: crate::system::host_power(),
         apic_base: apic::base_msr(),
         stack_top: 0,
         checks: Vec::new(),
     };
+    match crate::system::diagnostic_memory() {
+        Ok((profile, detail)) => {
+            machine.memory_profile = profile;
+            machine.record(
+                "memory",
+                if profile.is_some() {
+                    Verdict::Pass
+                } else {
+                    Verdict::Fail
+                },
+                detail,
+            );
+        }
+        Err(error) => machine.record("memory", Verdict::Fail, format!("{error}")),
+    }
     let missing = cpu::missing_floor();
     machine.record(
         "cpu",
@@ -273,25 +336,107 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
             crate::firmware::tsc_source()
         ),
     );
+    let pci_ids = inventory::firmware(&mut machine, resources);
+    // SAFETY: main passed the loader's validated immutable resources,
+    // and the standalone diagnostic retains their identity mapping.
+    let catalog = unsafe { host_firmware::identity_catalog(resources) }
+        .inspect_err(|error| {
+            output::arguments(format_args!("HOST CHECK firmware catalog: {error}\n"))
+        })
+        .ok()
+        .flatten();
+    profile(&mut machine, settings, catalog.as_deref(), &pci_ids);
     match storage::discover() {
-        Ok(handoff) => machine.storage = Some(handoff),
+        Ok(mut handoff) => {
+            handoff.firmware = catalog;
+            machine.storage = Some(handoff);
+            machine.minimum = storage::minimum::Prepared::capture()
+                .inspect_err(|error| {
+                    output::arguments(format_args!(
+                        "HOST CHECK native clock unavailable: {error}\n"
+                    ));
+                })
+                .ok();
+        }
         Err(error) => machine.record("storage", Verdict::Fail, format!("no PCI access: {error}")),
     }
     let guard = firmware::pages(firmware::STACK_PAGES + 1)?;
     machine.stack_top = guard + (firmware::STACK_PAGES + 1) * PAGE;
     let image = firmware::Image::loaded()?;
     let mut tables = firmware::tables(&image, [0, guard], machine.screen.as_ref())?;
+    if let Some(minimum) = machine.minimum.as_mut()
+        && let Err(error) = minimum.map(&mut tables)
+    {
+        output::arguments(format_args!(
+            "HOST CHECK native clock mapping unavailable: {error}\n"
+        ));
+        machine.minimum = None;
+    }
     for range in machine.storage.iter().flat_map(|handoff| &handoff.mapped) {
         tables.device(range.start as usize, range.end as usize)?;
     }
     let registers = (machine.apic_base & apic::BASE_ADDRESS) as usize;
     tables.device(registers, registers + PAGE)?;
-    crate::output::leave_boot_services();
+    machine.volume_log = crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; the heap,
     // stack and tables are LOADER_DATA, which Stela keeps.
     let map = unsafe { boot::exit_boot_services(None) };
     core::mem::forget(map);
     Ok((machine, tables))
+}
+
+fn profile(
+    machine: &mut Machine,
+    settings: core::result::Result<Option<Vec<u8>>, &'static str>,
+    catalog: Option<&stela_drivers::firmware::Catalog>,
+    pci_ids: &[(u16, u16)],
+) {
+    use crate::engine::northwood::{firmware_primary_hid, profile_configuration};
+
+    let wire = match settings {
+        Ok(wire) => wire,
+        Err(error) => {
+            machine.record(
+                "config",
+                Verdict::Skip,
+                format!("{error}. Using boot defaults."),
+            );
+            None
+        }
+    };
+    let mut automatic = false;
+    let observe = |hid: &str| {
+        let evidence = firmware_primary_hid(hid);
+        automatic |= evidence == Some(true);
+        evidence
+    };
+    let effective = match profile_configuration(wire.as_deref(), catalog, pci_ids, observe) {
+        Ok(effective) => effective,
+        Err(error) => {
+            machine.record(
+                "profile",
+                Verdict::Skip,
+                format!("settings refused: {error}"),
+            );
+            return;
+        }
+    };
+    let northwood = &effective.config.northwood;
+    let (verdict, detail) = match effective.profile {
+        Some(id) if automatic => (Verdict::Pass, format!("{id} (automatic)")),
+        Some(id) => (Verdict::Pass, format!("{id} (configured)")),
+        None if effective.hid_unavailable => (
+            Verdict::Skip,
+            String::from("automatic profile needs verified ACPI primary HID"),
+        ),
+        None if !northwood.auto_profile => (
+            Verdict::Skip,
+            String::from("no profile selected (effective AutoProfile=false)"),
+        ),
+        None => (Verdict::Skip, String::from("no hardware profile selected")),
+    };
+    machine.swap_policy = effective.config.memory.swap;
+    machine.record("profile", verdict, detail);
 }
 
 /// The checks after ExitBootServices, on Stela's own stack and tables.
@@ -324,7 +469,19 @@ extern "sysv64" fn run(machine: &mut Machine) -> ! {
     }
     let mut keyboards = match machine.storage.take() {
         Some(handoff) => disks(machine, &handoff),
-        None => Vec::new(),
+        None => {
+            for check in [
+                "devices",
+                "graphics",
+                "input",
+                "network",
+                "swap",
+                "install-target",
+            ] {
+                machine.record(check, Verdict::Skip, String::from("native PCI unavailable"));
+            }
+            Vec::new()
+        }
     };
     timer(machine);
     match (machine.screen, band) {
@@ -343,8 +500,25 @@ extern "sysv64" fn run(machine: &mut Machine) -> ! {
 fn disks(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice> {
     // SAFETY: one CPU after ExitBootServices; `dma` was reserved for this.
     let mut dma = unsafe { RegionAllocator::new(handoff.dma.clone()) };
+    let minimum = machine.minimum.take().and_then(|minimum| {
+        let root = machine.active_tables.as_ref()?;
+        // SAFETY: this is the original standalone BSP and root after EBS.
+        unsafe { minimum.attach(root) }
+            .inspect_err(|error| {
+                output::arguments(format_args!("HOST CHECK native clock refused: {error}\n"));
+            })
+            .ok()
+    });
     // SAFETY: this handoff describes the running machine and its tables.
-    let mut devices = unsafe { probe(handoff, machine.captures, &mut dma) };
+    let mut devices = unsafe {
+        match minimum {
+            Some(minimum) => probe_with_minimum(handoff, machine.captures, &mut dma, minimum),
+            None => probe(handoff, machine.captures, &mut dma),
+        }
+    };
+    if let Some(log) = machine.volume_log.take() {
+        resume_usb_volume(&mut devices.disks, log);
+    }
     for window in &devices.unmapped {
         output::arguments(format_args!("STORAGE UNMAPPED ecam={window:x?}\n"));
     }
@@ -390,7 +564,9 @@ fn disks(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice> {
             devices.inputs.len()
         ),
     );
+    inventory::attached(machine, &mut devices);
     let (mut internal, mut tables) = (0, 0);
+    let mut swap = inventory::Swap::new(&machine.swap_policy);
     for device in &mut devices.disks {
         let id = device.identity().clone();
         output::arguments(format_args!(
@@ -407,6 +583,7 @@ fn disks(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice> {
         internal += usize::from(is_internal);
         match gpt::read(&mut **device) {
             Ok(table) => {
+                swap.observe(&mut **device, &table, machine.boot_partition);
                 tables += usize::from(is_internal);
                 output::arguments(format_args!(
                     "  GPT disk={} partitions={}\n",
@@ -437,6 +614,26 @@ fn disks(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice> {
         },
         format!("internal NVMe/AHCI disks={internal} with a GPT={tables} (read only)"),
     );
+    let (verdict, detail) = match &machine.install_target {
+        Ok(None) => (Verdict::Skip, "no saved install target"),
+        Err(reason) => (Verdict::Fail, *reason),
+        Ok(Some(target)) => match verify_target(&mut devices.disks, target) {
+            Ok(()) => (
+                Verdict::Pass,
+                "saved disk and GPT partition matched (read only)",
+            ),
+            Err(error) => (Verdict::Fail, install_target_failure(error)),
+        },
+    };
+    machine.record("install-target", verdict, detail.into());
+    let requires_store = machine.swap_policy.enabled
+        && (machine.memory_profile == Some(Profile::Paged)
+            || !machine.swap_policy.partition.is_empty()
+            || matches!(
+                machine.swap_policy.location,
+                SwapLocation::Partition | SwapLocation::VolumeFile
+            ));
+    swap.report(machine, requires_store);
     match machine.options.nor_file.clone() {
         Some((guid, path)) => {
             let (verdict, detail) = match open_log(&mut devices.disks, guid, &path) {
@@ -448,6 +645,42 @@ fn disks(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice> {
         None => machine.record("log", Verdict::Skip, String::from("no --nor-file")),
     }
     core::mem::take(&mut devices.inputs)
+}
+
+/// Explain a failed lookup without echoing the saved serial or partition GUID.
+fn install_target_failure(error: StorageError) -> &'static str {
+    match error {
+        StorageError::NoDisk { .. } => "saved disk was not found by native storage",
+        StorageError::AmbiguousDisk(..) => "several native disks match the saved serial",
+        StorageError::Table(_) => "cannot read a valid GPT from the saved disk",
+        StorageError::NoPartition(_) => "saved partition was not found on the disk",
+        StorageError::AmbiguousPartition(_) => "several partitions match the saved GUID",
+        StorageError::SystemPartition(_) => "saved partition is an EFI system partition",
+        StorageError::Device(_) | StorageError::Mismatch { .. } => {
+            "native disk verification failed"
+        }
+    }
+}
+
+/// Keep the readable diagnostics on the same prepared USB data volume.
+/// Return a shared whole-disk view for the subsequent read-only GPT check.
+fn resume_usb_volume(devices: &mut Vec<Box<dyn BlockDevice>>, log: crate::log_file::VolumeLog) {
+    use pc::storage::{Named, open_shared};
+    let request = Named::Unique(Guid(log.partition));
+    match open_shared(devices, &[request]) {
+        Ok(mut partitions) => {
+            let partition = partitions
+                .pop()
+                .expect("the selected diagnostics partition");
+            devices.push(Box::new(partition.device().shared().whole()));
+            if partition.disk().transport == Transport::Usb {
+                crate::log_file::resume_diagnostic_volume(Box::new(partition), log);
+            }
+        }
+        Err((_, error)) => output::arguments(format_args!(
+            "BOOT LOG diagnostics data volume left out: {error}\n"
+        )),
+    }
 }
 
 /// Keep the output in the file at `path` on USB partition `guid`.
@@ -730,9 +963,14 @@ fn finish(machine: &mut Machine, keyboards: &mut [InputDevice]) -> ! {
         machine.timing.tsc_hz,
         crate::engine::storage::HostDisks::none(),
     );
+    let restart = if keyboards.is_empty() {
+        ""
+    } else {
+        "Press a key to restart. "
+    };
+    summary::show(machine, restart);
     output::arguments(format_args!(
-        "\n>>> The log is saved; powering off is safe now. Press a key to restart, or press the \
-         power button (or hold it 4 s) to power off.\n"
+        "\n>>> The log is saved. {restart}Press the power button (or hold it 4 s) to turn off.\n"
     ));
     output::flush_log();
     // Keys held from the last prompt do not count.

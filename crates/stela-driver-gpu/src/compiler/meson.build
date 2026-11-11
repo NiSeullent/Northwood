@@ -176,6 +176,14 @@ if with_amd_llvm
   test('stela_amd_llvm_float', stela_amd_llvm_float_test, suite : 'stela')
 endif
 
+stela_air_soft_half_test = executable(
+  'stela_air_soft_half_test',
+  ['tests/air_soft_half.c', 'air_soft_half.c'],
+  include_directories : [inc_include, inc_src, inc_gpu],
+  dependencies : [idep_nir, idep_mesautil],
+)
+test('stela_air_soft_half', stela_air_soft_half_test, suite : 'stela')
+
 stela_air_llvm = get_option('air-llvm-library')
 if stela_air_llvm != ''
   if not ['darwin', 'linux'].contains(host_machine.system())
@@ -191,7 +199,7 @@ if stela_air_llvm != ''
   stela_air = static_library(
     'stela_air_to_nir',
     ['air_to_nir.c', 'air_metadata.c', 'air_texture.c', 'air_call.c', 'air_math.c',
-     'air_precise.c', 'air_simd.c',
+     'air_precise.c', 'air_simd.c', 'air_soft_half.c',
      'air_matrix.c', 'air_constants.c', 'air_calls.c', 'air_commands.c', 'air_log.c',
      'air_stitch.c'],
     include_directories : [inc_include, inc_src, inc_gpu],
@@ -392,13 +400,24 @@ if stela_air_llvm != ''
     build_rpath : fs.parent(stela_air_llvm),
   )
   test('stela_air_mesh', stela_air_mesh_test, suite : 'stela')
+  metal_compiler_test_sources = ['tests/metal_compiler.c']
+  metal_compiler_test_deps = stela_air_test_dependencies
+  metal_compiler_test_args = stela_air_test_args
+  if host_machine.system() == 'linux'
+    vulkan_loader = dependency('vulkan', required : false)
+    if vulkan_loader.found()
+      metal_compiler_test_sources += ['tests/lavapipe_air.c']
+      metal_compiler_test_deps += [vulkan_loader]
+      metal_compiler_test_args += ['-DSTELA_TEST_LAVAPIPE=1']
+    endif
+  endif
   stela_metal_compiler_test = executable(
     'stela_metal_compiler_test',
-    'tests/metal_compiler.c',
+    metal_compiler_test_sources,
     include_directories : [inc_include, inc_src, inc_gpu],
-    dependencies : stela_air_test_dependencies,
+    dependencies : metal_compiler_test_deps,
     link_with : [stela_metal_compiler, stela_metal_abi, stela_air_test_links],
-    c_args : stela_air_test_args,
+    c_args : metal_compiler_test_args,
     build_rpath : fs.parent(stela_air_llvm),
   )
   test('stela_metal_compiler', stela_metal_compiler_test, suite : 'stela')

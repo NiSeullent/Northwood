@@ -414,6 +414,38 @@ mod tests {
     }
     #[test]
     #[ignore = "oracle: STELA_IWLWIFI_IMAGES"]
+    fn pinned_api_46_images_encode_queue_zero_dqa_without_a_command_version_row() {
+        use crate::wifi::intel::firmware::legacy::Sku;
+
+        let root = std::env::var("STELA_IWLWIFI_IMAGES").expect("firmware directory");
+        for sku in [Sku::Cnvi9000, Sku::WirelessAc9260] {
+            let bytes =
+                std::fs::read(std::path::Path::new(&root).join(sku.firmware_name())).unwrap();
+            let firmware = Firmware::parse(&bytes).unwrap();
+            assert_eq!(firmware.api_version(), 46);
+            assert!(firmware.supports_capability(12));
+            assert!(firmware.command_version(5, 0).is_none());
+
+            let request = Control::dqa(&firmware).unwrap().unwrap();
+            assert_eq!(request.kind(), Kind::Dqa);
+            assert_eq!(
+                request.id(),
+                Id {
+                    group: 5,
+                    opcode: 0,
+                    version: 0,
+                }
+            );
+            assert_eq!(request.bytes(), &0u32.to_le_bytes());
+            let command = Command::encode(request.id(), 0, 11, request.bytes()).unwrap();
+            assert_eq!(command.sequence(), 11);
+            assert_eq!(command.bytes(), &[0, 5, 11, 0, 4, 0, 0, 0, 0, 0, 0, 0]);
+            assert!(command.remainder().is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "oracle: STELA_IWLWIFI_IMAGES"]
     fn images_preserve_capability_skips_and_real_control_schemas() {
         let root = std::env::var("STELA_IWLWIFI_IMAGES").unwrap();
         for family in [Family::Ax200, Family::Ax210] {

@@ -70,6 +70,12 @@ pub enum Error {
     MissingAudioMode,
     MissingNetworkUrl,
     DuplicateNetworkCheck,
+    NetworkCheckGetHttps,
+    MissingNetworkCheckRange,
+    NetworkCheckRangeExtent,
+    NetworkCheckRangeEtag,
+    NetworkCheckRangeLimit,
+    NetworkCheckReopen,
     MissingEcid,
     Ecid,
     MissingStorage,
@@ -188,6 +194,20 @@ impl Error {
             Self::MissingAudioMode => "missing audio check mode",
             Self::MissingNetworkUrl => "missing network check URL",
             Self::DuplicateNetworkCheck => "duplicate network check",
+            Self::NetworkCheckGetHttps => "--network-check-get requires an HTTPS URL",
+            Self::MissingNetworkCheckRange => {
+                "--network-check-range requires URL FIRST LAST TOTAL ETAG"
+            }
+            Self::NetworkCheckRangeExtent => "--network-check-range requires FIRST <= LAST < TOTAL",
+            Self::NetworkCheckRangeEtag => {
+                "--network-check-range requires a nonempty strong quoted ETag"
+            }
+            Self::NetworkCheckRangeLimit => {
+                "at most two --network-check-range options are supported"
+            }
+            Self::NetworkCheckReopen => {
+                "--network-check-reopen requires two ranges of the same pinned HTTP object"
+            }
             Self::MissingEcid => "missing ECID",
             Self::Ecid => "--ecid takes one nonzero ECID",
             Self::MissingStorage => "missing ANS storage partition",

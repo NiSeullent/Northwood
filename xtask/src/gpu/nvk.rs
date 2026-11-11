@@ -59,8 +59,8 @@ const OPTIONS: [&str; 21] = [
 /// size, which `ralloc_total_size` sums for the Metal compiler's NIR budget.
 /// The block header is private to the unit and its size is the same either way.
 const SIZED_UNIT: &str = "src/util/ralloc.c";
-/// The Vulkan drivers the image links, as Meson's targets.
-const DRIVERS: [&str; 1] = ["src/nouveau/vulkan/libvulkan_nouveau.so"];
+/// The NVK driver target in Meson's Linux plan.
+pub(super) const DRIVER: &str = "src/nouveau/vulkan/libvulkan_nouveau.so";
 /// Tools the configuration asks for that nothing runs.
 const UNUSED_TOOLS: [&str; 2] = ["mesa_clc", "vtn_bindgen2"];
 /// What Mesa's configuration asks of `glslangValidator`, only for the compute
@@ -120,7 +120,7 @@ const STAND_INS: [&str; 7] = [
     "submit_thread",
 ];
 /// The Metal compiler service, under `compiler`, built with an NVK unit's flags.
-const AIR: [&str; 16] = [
+const AIR: [&str; 17] = [
     "air_call",
     "air_calls",
     "air_commands",
@@ -131,6 +131,7 @@ const AIR: [&str; 16] = [
     "air_matrix",
     "air_metadata",
     "air_simd",
+    "air_soft_half",
     "air_stitch",
     "air_texture",
     "air_to_nir",
@@ -514,6 +515,24 @@ fn object_name(output: &str) -> String {
     output.replace(['/', '.'], "_") + ".o"
 }
 
+pub(super) fn object_inputs(
+    build: &Path,
+    ninja: &Path,
+    path: Option<&Path>,
+    target: &str,
+) -> Result<BTreeSet<String>> {
+    let mut command = Command::new(ninja);
+    command.args(["-t", "inputs", target]).current_dir(build);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    Ok(capture(&mut command)?
+        .lines()
+        .filter(|input| input.ends_with(".o"))
+        .map(str::to_owned)
+        .collect())
+}
+
 /// The units the drivers link, with Stela's stand-ins and C library.
 fn units(
     build: &Path,
@@ -523,17 +542,7 @@ fn units(
     common: &[String],
     cxx: &[String],
 ) -> Result<Vec<Unit>> {
-    let linked = capture(
-        Command::new(ninja)
-            .args(["-t", "inputs"])
-            .args(DRIVERS)
-            .current_dir(build)
-            .env("PATH", path),
-    )?;
-    let linked: BTreeSet<&str> = linked
-        .lines()
-        .filter(|input| input.ends_with(".o"))
-        .collect();
+    let linked = object_inputs(build, ninja, Some(path), DRIVER)?;
     let database: Value =
         serde_json::from_str(&fs::read_to_string(build.join("compile_commands.json"))?)?;
     let mut units = Vec::new();

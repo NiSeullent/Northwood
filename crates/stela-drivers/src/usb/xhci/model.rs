@@ -13,6 +13,14 @@ use super::*;
 pub(crate) use crate::bus::dma::{RegionAllocator, TestRegion};
 
 impl Controller {
+    pub(crate) fn test_claim_native(&mut self, id: SlotId) -> Result<(), BlockError> {
+        self.claim_native(id)
+    }
+
+    pub(crate) fn test_slot_dma_entry(&self, id: SlotId) -> u64 {
+        self.dcbaa.read(usize::from(id.hardware_slot()) * 8)
+    }
+
     /// Install a hostile register surface after fixture construction. Identity
     /// admission must fail before even a readiness read can reach this surface.
     pub(crate) fn forbid_mmio(&mut self) {

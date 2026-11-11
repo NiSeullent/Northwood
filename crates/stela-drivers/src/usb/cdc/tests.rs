@@ -609,4 +609,164 @@ fn malformed_parameters_and_short_size_commands_abort_before_ncm_data_activation
     }
 }
 
+pub(crate) fn rndis_configuration(value: u8, signature: [u8; 3]) -> Vec<u8> {
+    let mut bytes = vec![
+        9,
+        2,
+        53,
+        0,
+        2,
+        value,
+        0,
+        0x80,
+        50,
+        9,
+        4,
+        0,
+        0,
+        1,
+        signature[0],
+        signature[1],
+        signature[2],
+        0,
+        5,
+        0x24,
+        6,
+        0,
+        1, // Union, with control interface 0 and data interface 1.
+        7,
+        5,
+        0x81,
+        3,
+        8,
+        0,
+        1,
+        9,
+        4,
+        1,
+        0,
+        2,
+        DATA_CLASS,
+        0,
+        0,
+        0,
+        7,
+        5,
+        0x82,
+        2,
+        64,
+        0,
+        0,
+        7,
+        5,
+        0x02,
+        2,
+        64,
+        0,
+        0,
+    ];
+    let length = bytes.len() as u16;
+    bytes[2..4].copy_from_slice(&length.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn rndis_binds_through_ep0_and_exchanges_ethernet_frames() {
+    let configuration = rndis_configuration(42, [RNDIS_WIRELESS, 1, 3]);
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let (controller, hardware) = unconfigured_cancellation_controller_with_configurations(
+        &mut dma,
+        core::slice::from_ref(&configuration),
+    );
+    let shared = Rc::new(RefCell::new(controller));
+    let mut device = model::addressed_device(&shared.borrow(), vec![configuration]);
+    model::select(&mut device).unwrap();
+    let reply = setup(0xa1, 1, 0, 0, 1024);
+    let words = |fields: &[u32]| {
+        fields
+            .iter()
+            .flat_map(|field| field.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let mut address = words(&[0x8000_0004, 30, 2, 0, 6, 16]);
+    address.extend([2, 0x53, 0x54, 0, 0, 1]);
+    hardware.borrow_mut().control_replies.extend([
+        (
+            reply,
+            words(&[0x8000_0002, 52, 1, 0, 1, 0, 1, 0, 1, 1558, 0, 0, 0]),
+        ),
+        (reply, address),
+        (reply, words(&[0x8000_0005, 16, 3, 0])),
+    ]);
+    hardware
+        .borrow_mut()
+        .extend_events((0..3).map(|_| vec![1, 0, 0, 0, 0, 0, 0, 0]));
+
+    let mut found = Found::default();
+    bind(&shared, device, &mut dma, &mut found);
+    assert!(found.failures.is_empty(), "{:?}", found.failures);
+    assert_eq!(found.links.len(), 1);
+    let link = &mut found.links[0];
+    assert_eq!(link.mac(), Mac([2, 0x53, 0x54, 0, 0, 1]));
+    assert!(link.location.contains("RNDIS 02:53:54:00:00:01"));
+    let state = hardware.borrow();
+    assert_eq!(state.configuration_seen_before_endpoints, [42]);
+    assert!(state.control_replies.is_empty());
+    let commands: Vec<_> = state
+        .setup
+        .iter()
+        .filter(|(req, _)| req[0] == 0x21)
+        .collect();
+    assert_eq!(commands.len(), 3);
+    assert_eq!(commands[0].1, words(&[2, 24, 1, 1, 0, 16384]));
+    assert_eq!(commands[1].1, words(&[4, 28, 2, 0x0101_0102, 0, 0, 0]));
+    assert_eq!(
+        commands[2].1,
+        words(&[5, 32, 3, 0x0001_010e, 4, 20, 0, 0x0d])
+    );
+    drop(state);
+
+    let frame = vec![0xa5; 20];
+    link.transmit(&frame).unwrap();
+    let output = hardware.borrow().outgoing.clone();
+    assert_eq!(
+        output.len(),
+        1,
+        "RNDIS should send one TD with its terminator"
+    );
+    assert_eq!(output[0].len(), 65);
+    assert_eq!(output[0][64], 0);
+    let mut received = output[0][..64].to_vec();
+    received.extend(&output[0]);
+    hardware.borrow_mut().push_acl(received);
+    assert_eq!(link.receive().unwrap(), Some(frame.clone()));
+    assert_eq!(link.receive().unwrap(), Some(frame));
+    assert_eq!(link.receive().unwrap(), None);
+}
+
+#[test]
+fn rndis_quarantines_a_notification_td_that_cannot_be_cancelled() {
+    const RESET_ENDPOINT_COMMAND: u32 = 14;
+    let configuration = rndis_configuration(42, [COMMUNICATIONS, 2, 0xff]);
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let (controller, hardware) = unconfigured_cancellation_controller_with_configurations(
+        &mut dma,
+        core::slice::from_ref(&configuration),
+    );
+    let shared = Rc::new(RefCell::new(controller));
+    let mut device = model::addressed_device(&shared.borrow(), vec![configuration]);
+    model::select(&mut device).unwrap();
+    let id = device.id;
+    hardware.borrow_mut().halt_transfer = Some(3);
+    hardware.borrow_mut().fail = Some((RESET_ENDPOINT_COMMAND, CONTEXT_STATE_ERROR));
+
+    let mut found = Found::default();
+    bind(&shared, device, &mut dma, &mut found);
+    assert!(found.links.is_empty());
+    assert_eq!(found.failures.len(), 1);
+    assert!(hardware.borrow().seen.contains(&RESET_ENDPOINT_COMMAND));
+    assert!(hardware.borrow().active[3].is_some());
+    assert!(shared.borrow_mut().device(id).is_err());
+}
+
 pub(crate) mod generation;

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: x86 host checks
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-checks-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  x86:
+    if: github.event.deleted != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Check formatting
+        run: cargo fmt -p stela-boot-core -p stela-drivers -p northwood -p northwood-config -- --check
+      - name: Lint host code and tests
+        run: cargo clippy --locked -p stela-boot-core -p stela-drivers -p northwood -p northwood-config --all-targets
+      - name: Run host tests
+        run: cargo test --locked -p stela-boot-core -p stela-drivers -p northwood -p northwood-config

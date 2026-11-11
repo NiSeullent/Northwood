@@ -14,7 +14,7 @@ use crate::metal::{
     error::{Error, Result, ensure, require},
     hazard::FULL,
     heap::{self, HeapAllocator, HeapDescriptor, SizeAndAlign},
-    pass::{AttachmentView, TestedCopy},
+    pass::{AttachmentView, StagedColor, TestedCopy},
     pixel_format::{Description, Encoding},
     resource::{
         self, CpuAccess, ShaderViews, SubresourceLayout, TextureDescriptor, TexturePlan,
@@ -27,7 +27,9 @@ use crate::metal::{
     vulkan::{
         BufferCreate, BufferUsage, Format, ImageAspects, ImageCreate, ImageTiling, ImageType,
         ImageUsage, ImageViewType, MemoryProperties, SampleCounts,
-        backend::{Backend, BufferAllocation, Descriptor, Object, Outside, PreparedImport},
+        backend::{
+            Backend, BufferAllocation, Descriptor, GuestRows, Object, Outside, PreparedImport,
+        },
         command::{BufferImageCopy, Command, SparseBind},
         object::{
             Buffer, BufferInfo, BufferView, Image, ImageInfo, ImageView, ImageViewInfo, Memory,
@@ -103,6 +105,13 @@ enum Backing {
     },
     /// Aliases a buffer's memory (linear textures and texture buffers).
     Buffer(BufferId),
+    /// A separate renderable image whose attachment loads and stores go
+    /// through a host-pointer buffer. The image's allocation is owned.
+    StagedBuffer {
+        buffer: BufferId,
+        region: BufferImageCopy,
+        bytes: u64,
+    },
     /// Maps pages of a sparse heap.
     Sparse(HeapId),
 }
@@ -118,7 +127,7 @@ impl Backing {
                 allocated_size: size,
                 heap_offset: offset,
             },
-            Self::Buffer(_) | Self::Sparse(_) => Placement::default(),
+            Self::Buffer(_) | Self::StagedBuffer { .. } | Self::Sparse(_) => Placement::default(),
         }
     }
 }
@@ -301,7 +310,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         prepared: Option<PreparedImport>,
     ) -> Result<MemoryId> {
         self.ensure_admission()?;
-        let bytes = ranges.iter().map(|range| range.bytes).sum();
+        let bytes = ranges.iter().try_fold(0u64, |total, range| {
+            total
+                .checked_add(range.bytes)
+                .ok_or(Error::Invalid("guest memory length"))
+        })?;
         let memory = match prepared {
             Some(prepared) => self.backend.adopt_import(prepared, token)?,
             None => self.backend.import_memory(ranges, token)?,
@@ -397,7 +410,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         )?;
         let ImportObject { memory, bytes } = *self.resources.imports.get(id.0)?;
         ensure(length <= bytes, "the buffer is longer than its memory")?;
-        let plan = resource::buffer(&self.capabilities, length, options)?;
+        let copied = self.backend.is_guest_copy_import(memory);
+        let mut plan = resource::buffer(&self.capabilities, length, options)?;
+        if copied {
+            require(
+                options.storage_mode == StorageMode::Shared,
+                "copied guest buffers require shared storage",
+            )?;
+            plan.info.usage = BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST;
+        }
         let (buffer, address) = self.backend.create_placed_buffer(&plan.info, memory, 0)?;
         self.resources.imports.remove(id.0)?;
         self.allocated -= bytes;
@@ -405,7 +426,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             BufferAllocation {
                 buffer,
                 memory,
-                address,
+                address: if copied { 0 } else { address },
                 allocated: bytes,
             },
             length,
@@ -466,6 +487,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             address: buffer.address,
             length: buffer.length,
         })
+    }
+
+    pub(crate) fn is_guest_copy_buffer(&self, id: BufferId) -> Result<bool> {
+        Ok(self
+            .backend
+            .is_guest_copy_import(self.resources.buffers.get(id.0)?.memory))
     }
 
     pub fn buffer_placement(&self, id: BufferId) -> Result<Placement> {
@@ -529,6 +556,18 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     /// `newTextureWithDescriptor:`.
     pub fn new_texture(&mut self, descriptor: &TextureDescriptor) -> Result<TextureId> {
+        if self.is_hosted_lavapipe() {
+            require(
+                descriptor.texture_type == TextureType::D2
+                    && descriptor.array_length == 1
+                    && descriptor.mipmap_level_count == 1
+                    && descriptor.sample_count == 1
+                    && descriptor.options.storage_mode == StorageMode::Private
+                    && descriptor.usage == TextureUsage::RENDER_TARGET
+                    && descriptor.swizzle.is_identity(),
+                "a hosted lavapipe texture is a private single-sample 2D render target",
+            )?;
+        }
         let start = self.timing.now();
         let plan = resource::texture(&self.capabilities, descriptor)?;
         let start = self.timing.since(Phase::TexturePlan, start);
@@ -774,6 +813,38 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         Ok(self.resources.textures.get(id.0)?.id)
     }
 
+    pub(crate) fn is_staged_buffer_texture(&self, id: TextureId) -> Result<bool> {
+        Ok(matches!(
+            self.resources.textures.get(id.0)?.backing,
+            Backing::StagedBuffer { .. }
+        ))
+    }
+
+    pub(super) fn staged_color(&self, id: TextureId) -> Result<Option<StagedColor>> {
+        let texture = self.resources.textures.get(id.0)?;
+        let Backing::StagedBuffer { buffer, region, .. } = texture.backing else {
+            return Ok(None);
+        };
+        let buffer = self.resources.buffers.get(buffer.0)?;
+        Ok(Some(StagedColor {
+            buffer: buffer.buffer,
+            image: texture
+                .image
+                .ok_or(Error::Invalid("staged texture image"))?,
+            region,
+            guest_rows: self
+                .backend
+                .is_guest_copy_import(buffer.memory)
+                .then_some(GuestRows {
+                    memory: buffer.memory,
+                    offset: region.buffer_offset,
+                    stride: u64::from(region.buffer_row_length) * 4,
+                    bytes: u64::from(region.extent[0]) * 4,
+                    count: region.extent[1],
+                }),
+        }))
+    }
+
     pub fn texture_descriptor(&self, id: TextureId) -> Result<&TextureDescriptor> {
         Ok(&self.resources.textures.get(id.0)?.descriptor)
     }
@@ -813,6 +884,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// The texture's image, for blits.
     pub fn texture_image(&self, id: TextureId) -> Result<Image> {
         let texture = self.resources.textures.get(id.0)?;
+        if matches!(texture.backing, Backing::StagedBuffer { .. }) {
+            return Err(Error::Unsupported("blits of host buffer render targets"));
+        }
         if texture.second_plane.is_some() {
             return Err(Error::Unsupported("blits of two-plane textures"));
         }
@@ -828,6 +902,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         view: &TextureViewDescriptor,
     ) -> Result<TextureId> {
         let texture = self.resources.textures.get(parent.0)?;
+        if matches!(texture.backing, Backing::StagedBuffer { .. }) {
+            return Err(Error::Unsupported("views of host buffer render targets"));
+        }
         if texture.second_plane.is_some() {
             return Err(Error::Unsupported("views of two-plane textures"));
         }
@@ -878,6 +955,42 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             buffer.memory_offset,
             buffer.length,
         );
+        let copied = self.backend.is_guest_copy_import(memory);
+        let staging = descriptor.texture_type != TextureType::TextureBuffer
+            && (self.backend.is_host_pointer_import(memory) || copied);
+        require(
+            !(self.is_hosted_lavapipe() || copied) || staging,
+            "hosted lavapipe buffer textures require a directly imported shared BGRA8 target",
+        )?;
+        if staging {
+            require(
+                buffer.options.storage_mode == StorageMode::Shared
+                    && matches!(buffer.backing, Backing::Owned(_)),
+                "host buffer render targets require a directly imported shared buffer",
+            )?;
+            let (plan, region) = resource::staged_buffer_texture(
+                &self.capabilities,
+                descriptor,
+                length,
+                offset,
+                bytes_per_row,
+            )?;
+            let (image, memory, bytes) = self.backend.create_image(&plan.image, plan.memory)?;
+            self.allocated += bytes;
+            self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
+            self.book_texture_over(buffer_id, descriptor);
+            return self.finish_texture(
+                image,
+                descriptor,
+                &plan,
+                Backing::StagedBuffer {
+                    buffer: buffer_id,
+                    region,
+                    bytes,
+                },
+                Some(memory),
+            );
+        }
         let texture = if descriptor.texture_type == TextureType::TextureBuffer {
             let info = resource::texture_buffer(
                 &self.capabilities,
@@ -1009,7 +1122,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     .get(id.0)
                     .ok()
                     .and_then(|texture| match texture.backing {
-                        Backing::Buffer(buffer) => self
+                        Backing::Buffer(buffer) | Backing::StagedBuffer { buffer, .. } => self
                             .resources
                             .buffers
                             .get(buffer.0)
@@ -1213,6 +1326,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         id: TextureId,
         view: AttachmentView<()>,
     ) -> Result<ResourceId> {
+        require(
+            !self.is_staged_buffer_texture(id)?,
+            "framebuffer reads of host buffer render targets",
+        )?;
         if self.has_extended_planes(id) {
             return Ok(self.extended_working(id, view)?.id);
         }
@@ -1940,6 +2057,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     }
 
     fn cpu_access(&self, texture: &TextureObject) -> Result<()> {
+        if matches!(texture.backing, Backing::StagedBuffer { .. }) {
+            return Err(Error::Unsupported(
+                "CPU texture copies of host buffer render targets",
+            ));
+        }
         if texture.second_plane.is_some() {
             // The CPU reaches the IOSurface's planes itself.
             return Err(Error::Unsupported("CPU copies of two-plane textures"));
@@ -2141,6 +2263,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             (Backing::Buffer(buffer), _) => {
                 self.resources.buffers.get_mut(buffer.0)?.dependents -= 1
             }
+            (Backing::StagedBuffer { buffer, bytes, .. }, memory) => {
+                if let Some(memory) = memory {
+                    self.release_memory(memory, bytes);
+                }
+                self.resources.buffers.get_mut(buffer.0)?.dependents -= 1;
+            }
             (Backing::Sparse(heap), _) => self.resources.heaps.get_mut(heap.0)?.resources -= 1,
         }
         Ok(())
@@ -2306,6 +2434,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         )?;
         let ImportObject { memory, bytes } = *self.resources.imports.get(id.0)?;
         // Its memory is whole pages, as the Mac rounds a heap.
+        require(
+            !self.backend.is_guest_copy_import(memory),
+            "a heap over copied guest memory",
+        )?;
         ensure(
             bytes == plan.size.next_multiple_of(heap::PAGE),
             "the heap is not the size of its memory",
@@ -2796,7 +2928,7 @@ type AliasedRanges = (HeapId, (u64, u64), Option<(u64, u64)>);
 
 fn owned_bytes(backing: Backing) -> u64 {
     match backing {
-        Backing::Owned(bytes) => bytes,
+        Backing::Owned(bytes) | Backing::StagedBuffer { bytes, .. } => bytes,
         _ => 0,
     }
 }

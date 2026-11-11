@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: license checks
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  licenses:
+    if: github.event.deleted != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check newly added source licenses and changed payloads
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            BASE=$(git merge-base HEAD "refs/remotes/origin/$DEFAULT_BRANCH")
+          fi
+          python3 .github/scripts/check_licenses.py "$BASE"
+      - name: Test license guard
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts

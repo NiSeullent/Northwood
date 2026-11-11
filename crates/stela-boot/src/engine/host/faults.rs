@@ -158,6 +158,7 @@ pub(super) fn resolve(
     write: bool,
     unprivileged: bool,
 ) -> Result<(mmu::Translation, u64), FaultCause> {
+    let ram = state.native_ram()?;
     let regime = state.regime.as_ref().ok_or(FaultCause::NonCanonical)?;
     let access = if write { Access::Write } else { Access::Read };
     let requester = mmu::Requester {
@@ -166,6 +167,17 @@ pub(super) fn resolve(
     };
     let virtual_page = address & !(PAGE - 1);
     if let Some(physical) = state.tlb.device_physical(address, requester, write) {
+        if let Some(frame) = state.nonresident_frame(physical, 1) {
+            return Err(FaultCause::NonresidentRam { frame });
+        }
+        if state.registered_ram.is_some()
+            && ram
+                .physical_page(physical & !(PAGE - 1), PAGE, tables::ADDRESS)
+                .map_err(|_| FaultCause::RamBinding)?
+                .is_some()
+        {
+            return Err(FaultCause::RamBinding);
+        }
         // The cached translation already passed both stages and data
         // permissions. Watchpoint passes can change without a new walk.
         return Err(if regime.watch.blocks(virtual_page) {
@@ -174,26 +186,33 @@ pub(super) fn resolve(
             FaultCause::Device { physical }
         });
     }
-    let translation = match mmu::translate(
-        &regime.controls,
-        address,
-        access,
-        requester,
-        &mut GuestTables::new(state),
-    ) {
+    let mut tables = GuestTables::new(state);
+    let outcome = mmu::translate(&regime.controls, address, access, requester, &mut tables);
+    if let Some(frame) = tables.nonresident {
+        return Err(FaultCause::NonresidentRam { frame });
+    }
+    if tables.binding_failed {
+        return Err(FaultCause::RamBinding);
+    }
+    let translation = match outcome {
         Outcome::Mapped(translation) => translation,
         Outcome::Fault(fault) => return Err(FaultCause::Guest(fault)),
         Outcome::Unsupported(unsupported) => return Err(FaultCause::Translation(unsupported)),
     };
+    let page = translation.physical & !(PAGE - 1);
+    if let Some(frame) = state.nonresident_frame(page, PAGE as usize) {
+        return Err(FaultCause::NonresidentRam { frame });
+    }
+    let host = ram
+        .physical_page(page, PAGE, tables::ADDRESS)
+        .map_err(|_| FaultCause::RamBinding)?;
     if regime.watch.blocks(virtual_page) {
         return Err(FaultCause::Watched);
     }
     if regime.tag_blocks(address, translation.attributes) {
         return Err(FaultCause::TagChecked);
     }
-    let page = translation.physical & !(PAGE - 1);
-    let Some(host) = state.host_physical(page) else {
-        // This walker makes no AF or dirty descriptor updates.
+    let Some(host) = host else {
         state.tlb.record_device(address, requester, translation);
         return Err(FaultCause::Device {
             physical: translation.physical,
@@ -216,6 +235,9 @@ pub(crate) fn page_fault(
     let state = state();
     if !in_code(state, frame.rip) {
         super::super::interrupts::fatal(frame);
+    }
+    if state.registered_ram.is_some() && state.native_ram_execution.is_none() {
+        return abandon(state, frame, address, write, FaultCause::RamBinding, saved);
     }
     state.follow_native();
     state.follow_pan(frame.rflags & RFLAGS_AC == 0);
@@ -294,12 +316,12 @@ pub(crate) fn page_fault(
         state.record_lower(root, entry);
     }
     state.extents[half].record(address, translation.size, translation.global);
+    state.fills += 1;
     // The rest of the leaf's window has the same translation and rights:
     // map its RAM pages that are not watched now, as a TLB entry covers
     // the whole leaf. Pages that were absent need no flush. A Tagged leaf
     // whose tags are checked maps only the passed page.
     if tag_checks[half] && translation.attributes == mmu::attributes::TAGGED {
-        state.fills += 1;
         return;
     }
     const { assert!(FILL_WINDOW.is_power_of_two() && FILL_WINDOW <= tables::LARGE) };
@@ -309,20 +331,41 @@ pub(crate) fn page_fault(
             .physical
             .wrapping_sub(address)
             .wrapping_add(first);
+        // The prefill bypasses resolve. Skip it if any page in its window
+        // could alias a nonresident frame.
+        if physical.checked_add(last - first).is_none()
+            || state
+                .nonresident_frame(physical, (last - first + 1) as usize)
+                .is_some()
+        {
+            return;
+        }
         // Contiguous backing is common. Look up the first page once, then
         // fall back to page lookups past the end of that physical run.
-        let (first_host, available) = state.run(physical).unwrap_or((0, 0));
+        let Ok(ram) = state.native_ram() else {
+            return;
+        };
+        let Ok(run) = ram.physical_run(physical, last - first + 1) else {
+            return;
+        };
+        let (first_host, available) = run.unwrap_or((0, 0));
         let table = slot.wrapping_sub(tables::index(virtual_page, 0));
         let watch = &state.regime.as_ref().expect("checked above").watch;
         let watched = watch.overlaps(first, last);
         let mut page = first;
+        let mut prefills = 0;
         loop {
             if page != virtual_page && (!watched || !watch.blocks(page)) {
                 let offset = page - first;
-                let host = if offset < available {
-                    first_host.checked_add(offset)
+                let host = if offset + PAGE <= available {
+                    first_host
+                        .checked_add(offset)
+                        .filter(|host| host & !tables::ADDRESS == 0)
                 } else {
-                    state.host_physical(physical.wrapping_add(offset))
+                    match ram.physical_page(physical + offset, PAGE, tables::ADDRESS) {
+                        Ok(host) => host,
+                        Err(_) => break,
+                    }
                 };
                 if let Some(host) = host {
                     // SAFETY: the power-of-two prefill window is contained
@@ -333,7 +376,7 @@ pub(crate) fn page_fault(
                             .add(tables::index(page, 0))
                             .write_volatile((host & tables::ADDRESS) | rights)
                     };
-                    state.prefills += 1;
+                    prefills += 1;
                 }
             }
             if page >= last & !(PAGE - 1) {
@@ -341,8 +384,8 @@ pub(crate) fn page_fault(
             }
             page += PAGE;
         }
+        state.prefills += prefills;
     }
-    state.fills += 1;
 }
 
 /// #GP or #UD inside native code ends the block; elsewhere it is fatal.

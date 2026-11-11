@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[package]
+name = "northwood"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Northwood installer and configuration tools for translated arm64 macOS boot"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "northwood"
+path = "src/main.rs"
+
+[features]
+installer = ["dep:stela-cli"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+hex.workspace = true
+plist = "1"
+northwood-config = { path = "../northwood-config" }
+stela-boot-core = { workspace = true, features = ["config-validation"] }
+stela-cli = { workspace = true, optional = true }
+
+tempfile.workspace = true
+
+[lints]
+workspace = true

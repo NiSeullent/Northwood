@@ -34,6 +34,7 @@ use crate::{
 use alloc::{sync::Arc, vec::Vec};
 use core::arch::{asm, global_asm};
 use stela_boot_core::native_resources::{CodeExtents, MAX_CODE_PARTS, code_part_bytes};
+use stela_compiler::context::memory::MemoryStatus;
 use stela_compiler::{GuestState, block::BlockExit};
 use stela_contracts::refuse;
 use stela_engine::machine::FaultCause;
@@ -45,6 +46,7 @@ use stela_engine::machine::NativeFault;
 use stela_engine::machine::NativeView;
 use stela_engine::machine::Regime;
 use stela_engine::machine::engine::GlobalSpan;
+use stela_engine::machine::engine::NativeEntryError;
 use stela_engine::machine::engine::installed_code::InstalledCodeCache;
 use stela_engine::machine::mmu;
 use stela_engine::machine::mmu::Access;
@@ -56,6 +58,7 @@ use stela_engine::machine::mmu::shadow::Kept;
 use stela_engine::machine::mmu::tlbi::Everywhere;
 use stela_engine::machine::mmu::tlbi::Reach;
 use stela_engine::machine::mmu::translated::Tlb;
+use stela_engine::memory::domain::{ExecutionLoanAttempt, MemoryExecutionLoan};
 
 mod bare_host;
 pub(crate) mod chain_check;
@@ -80,7 +83,7 @@ use stela_boot_core::ram;
 mod translated;
 pub(crate) use local::activated_base;
 pub(crate) use local::context::RootIdentity;
-#[cfg(feature = "nvk")]
+#[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
 pub(crate) use local::processor;
 use local::state;
 
@@ -89,6 +92,11 @@ use local::state;
 #[cfg(feature = "nvk")]
 pub(crate) fn guest_runs(guest: u64, bytes: u64, action: impl FnMut(u64, u64)) -> bool {
     ram::runs(&local::state().ram, guest, bytes, action)
+}
+
+#[cfg(feature = "nvk")]
+pub(crate) fn guest_dma_owner() -> Option<Arc<stela_engine::memory::RegisteredSystemRam>> {
+    local::state().registered_ram.clone()
 }
 pub(crate) use local::{MmioRoots, Owner as HostOwner};
 pub use ram::RamRange;
@@ -427,6 +435,12 @@ struct Recorded {
 pub struct State {
     ram: Vec<RamRange>,
     registered_ram: Option<alloc::sync::Arc<stela_engine::memory::RegisteredSystemRam>>,
+    /// Scope for an actual serialized native entry, reachable by its x86
+    /// faults and translated helper on this GS owner until native return.
+    native_ram_execution: Option<MemoryExecutionLoan>,
+    /// The generation that may have left shadow, TLB or bounce aliases.
+    /// A changed generation refuses entry until full rebinding is implemented.
+    native_ram_generation: Option<u64>,
     pool: Pool,
     /// Engine root without any guest mapping.
     host_root: u64,
@@ -656,6 +670,8 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
         local::install(State {
             ram: config.ram,
             registered_ram: None,
+            native_ram_execution: None,
+            native_ram_generation: None,
             pool,
             host_root,
             window_root: config.window_root,
@@ -942,6 +958,70 @@ impl State {
         self.run(guest).map(|(host, _)| host)
     }
 
+    fn begin_native_ram(&mut self) -> Result<(), NativeEntryError> {
+        assert!(
+            !self.native && self.native_ram_execution.is_none(),
+            "nested native block entry"
+        );
+        if let Some(owner) = &self.registered_ram {
+            let loan = match owner.try_cpu_execution_loan() {
+                Ok(ExecutionLoanAttempt::Acquired(loan)) => loan,
+                Ok(ExecutionLoanAttempt::ServiceBusy) => {
+                    return Err(NativeEntryError::RamServiceBusy);
+                }
+                Err(MemoryStatus::Domain) => {
+                    return Err(NativeEntryError::Refused(
+                        "registered RAM native execution refused: memory domain error",
+                    ));
+                }
+                Err(MemoryStatus::Unsupported) => {
+                    return Err(NativeEntryError::Refused(
+                        "registered RAM native execution refused: unsupported memory target",
+                    ));
+                }
+                Err(_) => {
+                    return Err(NativeEntryError::Refused(
+                        "registered RAM native execution refused: memory admission error",
+                    ));
+                }
+            };
+            let generation = owner
+                .cpu_binding(&loan)
+                .map_err(|_| {
+                    NativeEntryError::Refused("registered RAM could not validate native execution")
+                })?
+                .generation();
+            if self
+                .native_ram_generation
+                .is_some_and(|cached| cached != generation)
+            {
+                return Err(NativeEntryError::Refused(
+                    "registered RAM generation changed with potentially live CPU aliases",
+                ));
+            }
+            self.native_ram_generation = Some(generation);
+            self.native_ram_execution = Some(loan);
+        }
+        Ok(())
+    }
+
+    fn native_ram(&self) -> Result<ram::NativeRam<'_>, FaultCause> {
+        ram::NativeRam::new(
+            &self.ram,
+            self.registered_ram.as_deref(),
+            self.native_ram_execution
+                .as_ref()
+                .zip(self.native_ram_generation),
+        )
+        .map_err(|_| FaultCause::RamBinding)
+    }
+
+    fn nonresident_frame(&self, physical: u64, bytes: usize) -> Option<u64> {
+        self.registered_ram
+            .as_ref()?
+            .nonresident_frame(physical, bytes)
+    }
+
     /// The longest RAM run starting at `guest`, as (host, bytes).
     fn run(&self, guest: u64) -> Option<(u64, u64)> {
         ram::run(&self.ram, guest)
@@ -954,18 +1034,26 @@ impl State {
     }
 
     fn reset_shadow(&mut self, cause: Cause) {
-        if !self.legacy_translations_dirty {
+        if self.clear_shadow(cause) {
+            self.tlb.clear();
+            self.reload();
+        } else {
             // Device translations can exist without any populated RAM view.
             self.tlb.clear_devices();
-            return;
+        }
+    }
+
+    /// Remove the shadow tables without choosing a root to load.
+    fn clear_shadow(&mut self, cause: Cause) -> bool {
+        if !self.legacy_translations_dirty {
+            return false;
         }
         self.clear(LOWER);
         self.clear(UPPER);
-        self.tlb.clear();
         self.resets += 1;
         self.reset_causes[cause as usize] += 1;
-        self.reload();
         self.legacy_translations_dirty = false;
+        true
     }
 
     /// Drop the lower half's translations only, and the kept halves.
@@ -1235,6 +1323,8 @@ impl State {
 struct GuestTables<'a> {
     state: &'a State,
     descriptors: Option<stela_engine::memory::system_ram::DescriptorReader<'a>>,
+    nonresident: Option<u64>,
+    binding_failed: bool,
 }
 
 impl<'a> GuestTables<'a> {
@@ -1245,14 +1335,34 @@ impl<'a> GuestTables<'a> {
                 .registered_ram
                 .as_ref()
                 .map(|ram| ram.descriptor_reader()),
+            nonresident: None,
+            binding_failed: false,
         }
+    }
+
+    fn descriptor_result<T>(
+        &mut self,
+        physical: u64,
+        result: core::result::Result<T, MemoryStatus>,
+    ) -> Option<T> {
+        if matches!(result, Err(MemoryStatus::Nonresident)) {
+            // Residency cannot change during the native execution loan.
+            self.nonresident = Some(
+                self.state
+                    .nonresident_frame(physical, core::mem::size_of::<u64>())
+                    .expect("native descriptor reported nonresident without a frame"),
+            );
+        }
+        self.binding_failed |= matches!(result, Err(MemoryStatus::Domain));
+        result.ok()
     }
 }
 
 impl mmu::TableMemory for GuestTables<'_> {
     fn read_descriptor(&mut self, physical: u64) -> Option<u64> {
         if let Some(descriptors) = &mut self.descriptors {
-            return descriptors.read_descriptor(physical).ok();
+            let result = descriptors.read_descriptor(physical);
+            return self.descriptor_result(physical, result);
         }
         let host = self.state.host_physical(physical)?;
         // SAFETY: guest RAM through the physmap.
@@ -1260,7 +1370,8 @@ impl mmu::TableMemory for GuestTables<'_> {
     }
     fn update_descriptor(&mut self, physical: u64, old: u64, new: u64) -> Option<bool> {
         if let Some(descriptors) = &self.descriptors {
-            return descriptors.update_descriptor(physical, old, new).ok();
+            let result = descriptors.update_descriptor(physical, old, new);
+            return self.descriptor_result(physical, result);
         }
         let host = self.state.host_physical(physical)?;
         let slot = layout::physical(host) as *mut u64;
@@ -1280,6 +1391,7 @@ fn native_return(code: NativeCode, exit: BlockExit, entered: u64) -> NativeExit 
     crate::native_mmio::shootdown::service();
     let state = state();
     state.native = false;
+    let _ram_execution = state.native_ram_execution.take();
     state.native_ticks += rdtsc() - entered;
     #[cfg(feature = "native-profile")]
     state.native_profile.exit(exit.kind);

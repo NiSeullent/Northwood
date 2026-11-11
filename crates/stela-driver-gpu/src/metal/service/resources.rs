@@ -123,6 +123,15 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         let request: NewBufferTextureRequest = call.request()?;
         let buffer = self.object::<BufferId>(call.connection, request.buffer)?;
         let descriptor = texture_descriptor(&request.descriptor)?;
+        if self.device.is_hosted_lavapipe()
+            && (descriptor.pixel_format != PixelFormat::Bgra8Unorm
+                || request.second_bytes_per_row != 0)
+        {
+            return Err(Fault::new(
+                Status::Unsupported,
+                "buffer texture on hosted lavapipe",
+            ));
+        }
         let plane = |offset, bytes_per_row| PlaneLayout {
             offset,
             bytes_per_row,

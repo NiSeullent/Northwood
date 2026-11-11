@@ -1,4 +1,17 @@
 use super::*;
+
+#[test]
+fn fragmented_firmware_can_retry_with_a_smaller_contiguous_heap() {
+    let free = 3478 * MIB;
+    let preferred = sizes(free, 4, 4).unwrap();
+    let fallback = fragmented_sizes(free, 4, 4).unwrap();
+    assert_eq!(preferred.profile, Profile::Compact);
+    assert_eq!(fallback.profile, Profile::Paged);
+    assert_eq!(fallback.heap, 640 * MIB);
+    assert!(fallback.heap < preferred.heap);
+    assert!(fallback.guest > preferred.guest);
+    assert!(fragmented_sizes(MIN_PHYSICAL - 1, 4, 4).is_err());
+}
 use alloc::string::ToString;
 
 /// Free RAM a PC of `installed` GiB shows Stela: firmware keeps about 3 %.
@@ -120,47 +133,42 @@ fn a_128_gib_host_grows_the_heap_with_its_share_window_and_pes() {
     assert!(sizes.guest > 100 * GIB);
 }
 
-/// Heap, code, pool and guest MiB for `runners` PEs at `free` GiB, or None
-/// when not even the compact profile's floors fit. At 4 GiB the compact
-/// profile boots 2 and 8 runners (and 64 runners at 8 GiB), where the
-/// standard one's floors do not fit; 24 and 64 runners' pools and heap
-/// shares alone pass 4 GiB.
+/// Heap, code, pool and guest MiB for `runners` PEs at `free` GiB. At 4 GiB
+/// the compact profile fits 2 and 8 runners, and requests for 24 or 64 use
+/// the paged profile with four workers.
 #[test]
 fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
     for (runners, free, expected) in [
-        (2, 4, Some([1518, 68, 76, 2434])),
-        (2, 8, Some([2560, 260, 162, 5210])),
-        (2, 16, Some([2560, 260, 292, 13272])),
-        (2, 30, Some([2848, 260, 466, 27146])),
-        (2, 128, Some([11210, 260, 1602, 118000])),
-        (8, 4, Some([1528, 144, 268, 2156])),
-        (8, 8, Some([2816, 528, 538, 4310])),
-        (8, 16, Some([3328, 1040, 1058, 10958])),
-        (8, 30, Some([3712, 1040, 1724, 24244])),
-        (8, 128, Some([12074, 1040, 6104, 111854])),
-        (24, 4, None),
-        (24, 8, Some([2816, 560, 768, 4048])),
-        (24, 16, Some([3328, 1072, 1058, 10926])),
-        (24, 30, Some([4864, 1968, 1624, 22264])),
-        (24, 128, Some([13354, 2096, 5992, 109630])),
-        (64, 4, None),
-        (64, 8, Some([3520, 640, 1024, 3008])),
-        (64, 16, Some([3412, 1152, 2048, 9772])),
-        (64, 30, Some([5504, 2048, 2048, 21120])),
-        (64, 128, Some([13994, 2176, 5958, 108944])),
+        (2, 4, [1518, 68, 76, 2434]),
+        (2, 8, [2560, 260, 162, 5210]),
+        (2, 16, [2560, 260, 292, 13272]),
+        (2, 30, [2848, 260, 466, 27146]),
+        (2, 128, [11210, 260, 1602, 118000]),
+        (8, 4, [1528, 144, 268, 2156]),
+        (8, 8, [2816, 528, 538, 4310]),
+        (8, 16, [3328, 1040, 1058, 10958]),
+        (8, 30, [3712, 1040, 1724, 24244]),
+        (8, 128, [12074, 1040, 6104, 111854]),
+        (24, 4, [1152, 72, 64, 2792]),
+        (24, 8, [2816, 560, 768, 4048]),
+        (24, 16, [3328, 1072, 1058, 10926]),
+        (24, 30, [4864, 1968, 1624, 22264]),
+        (24, 128, [13354, 2096, 5992, 109630]),
+        (64, 4, [1152, 72, 64, 2792]),
+        (64, 8, [3520, 640, 1024, 3008]),
+        (64, 16, [3412, 1152, 2048, 9772]),
+        (64, 30, [5504, 2048, 2048, 21120]),
+        (64, 128, [13994, 2176, 5958, 108944]),
     ] {
-        let actual = sizes(free * GIB, runners, runners)
-            .ok()
-            .map(|sizes| [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB));
-        assert_eq!(actual, expected, "{runners} PEs, {free} GiB");
-        if let Some([_, _, pool, guest]) = actual {
-            // The pool's total stays within an eighth of the guest, or each
-            // runner's floor, whatever the PE count.
-            assert!(
-                pool <= (guest / 8).max(runners as u64 * 32),
-                "{runners} {free}"
-            );
-        }
+        let sizes = sizes(free * GIB, runners, runners).unwrap();
+        let split = [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB);
+        assert_eq!(split, expected, "{runners} PEs, {free} GiB");
+        // The pool's total stays within an eighth of the guest, or each
+        // reserved runner's floor, whatever the requested PE count.
+        assert!(
+            sizes.pool <= (sizes.guest / 8).max(sizes.cores as u64 * 32 * MIB),
+            "{runners} {free}"
+        );
     }
 }
 
@@ -234,32 +242,82 @@ fn the_heap_grows_with_the_host_between_its_bounds() {
     assert!(HEAP_FLOOR < small && small < large && large < HEAP_CEILING);
 }
 
-/// Under the compact floors the refusal names what they need: eight
-/// runners' 3600 MiB (a 128 MiB window and its records, 128 MiB of pools,
-/// the 1 GiB heap, 16 MiB per PE and the guest's 2 GiB) round up to 4 GB,
-/// as do two runners' 3300 MiB.
 #[test]
-fn too_little_ram_says_how_much_is_needed() {
-    let refusal = sizes(3 * GIB, 8, 8).unwrap_err();
+fn below_two_gib_refuses_with_the_host_minimum() {
+    let refusal = sizes(MIN_PHYSICAL - ALIGNMENT, 8, 8).unwrap_err();
     assert_eq!(
         refusal.to_string(),
-        "this PC has 3.0 GB of RAM free; Stela needs at least 4 GB free: \
-         2 GB for macOS and the rest for its own memory"
+        "this PC has 1.9 GB of RAM free; Stela needs at least 2 GB free to start the guest"
     );
-    assert!(sizes(3599 * MIB, 8, 8).is_err());
-    assert!(sizes(3600 * MIB, 8, 8).is_ok());
-    let two_cores = sizes(3 * GIB, 2, 2).unwrap_err();
-    assert!(
-        two_cores.to_string().contains("at least 4 GB"),
-        "{two_cores}"
+    assert!(sizes(MIN_PHYSICAL - 1, 1, 1).is_err());
+    assert_eq!(sizes(MIN_PHYSICAL, 1, 1).unwrap().profile, Profile::Paged);
+}
+
+#[test]
+fn paged_reserves_backed_ram_and_valid_native_partitions_from_two_gib() {
+    use crate::native_resources::partition;
+    use crate::topology::MAX_CORES;
+
+    for cores in [1, 2, 4, 6, 8, 16, MAX_CORES] {
+        for runners in [1, cores] {
+            for free in (MIN_PHYSICAL..=4 * GIB).step_by(ALIGNMENT as usize) {
+                let sizes = sizes(free, cores, runners).unwrap();
+                if sizes.profile != Profile::Paged {
+                    assert_eq!(sizes.cores, cores);
+                    continue;
+                }
+                assert_eq!(sizes.cores, cores.min(4));
+                assert!(
+                    sizes.guest >= GIB,
+                    "{free} bytes, {cores} cores, {runners} runners"
+                );
+                assert!(sizes.heap.is_multiple_of(ALIGNMENT));
+                assert!(sizes.code.bytes.is_multiple_of(ALIGNMENT));
+                assert!(sizes.pool.is_multiple_of(ALIGNMENT));
+                assert!(sizes.guest.is_multiple_of(ALIGNMENT));
+                assert_eq!(
+                    sizes.heap
+                        + sizes.code.bytes
+                        + sizes.pool
+                        + sizes.guest
+                        + PAGED_HANDOFF_RESERVE,
+                    free
+                );
+                let resident = guest_dram(4 * GIB, sizes.guest);
+                assert_eq!(resident.reported, sizes.guest);
+                assert_eq!(pack_budget(free, cores, runners), 0);
+                let running = runners.min(sizes.cores);
+                for slot in 0..sizes.cores {
+                    partition(sizes.cores, running, slot, sizes.code.bytes, sizes.pool).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lenovo_reported_free_ram_gets_a_paged_budget() {
+    let sizes = sizes(2764 * MIB, 4, 4).unwrap();
+    assert_eq!(sizes.profile, Profile::Paged);
+    assert_eq!(sizes.cores, 4);
+    assert_eq!(
+        [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|bytes| bytes / MIB),
+        [640, 72, 64, 1972]
     );
-    assert!(sizes(3299 * MIB, 2, 2).is_err());
-    assert_eq!(sizes(3300 * MIB, 2, 2).unwrap().profile, Profile::Compact);
-    // Where the standard profile does not fit yet, the compact one boots;
-    // from there up the standard one.
-    assert_eq!(sizes(5 * GIB, 2, 2).unwrap().profile, Profile::Compact);
-    assert_eq!(sizes(6 * GIB, 2, 2).unwrap().profile, Profile::Standard);
-    assert_eq!(sizes(free(8), 2, 2).unwrap().profile, Profile::Standard);
+}
+
+#[test]
+fn paged_reaches_the_compact_guest_floor_before_the_boundary() {
+    for (cores, threshold_mib) in [(2, 3300), (4, 3336)] {
+        let threshold = threshold_mib * MIB;
+        let below = sizes(threshold - ALIGNMENT, cores, cores).unwrap();
+        let at = sizes(threshold, cores, cores).unwrap();
+        assert_eq!(below.profile, Profile::Paged);
+        assert_eq!(at.profile, Profile::Compact);
+        assert_eq!(below.guest, GUEST_COMPACT_FLOOR);
+        assert_eq!(at.guest, GUEST_COMPACT_FLOOR);
+        assert!(below.heap < at.heap);
+    }
 }
 
 /// A 4 GB PC (3968 MiB free, the firmware keeping 3 %) boots in the compact
@@ -315,7 +373,7 @@ fn a_tight_4_gb_pc_keeps_the_guest_its_floor() {
     assert_eq!(least.guest, GUEST_COMPACT_FLOOR);
     assert_eq!(least.heap, 1152 * MIB);
     assert_eq!(least.pool, 64 * MIB);
-    assert!(sizes(3335 * MIB, 4, 4).is_err());
+    assert_eq!(sizes(3335 * MIB, 4, 4).unwrap().profile, Profile::Paged);
 }
 
 fn sizes_at(free: u64) -> Sizes {

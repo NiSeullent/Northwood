@@ -9,6 +9,19 @@ use super::*;
 const PROMOTION_RUNS: u32 = 1024;
 const PROMOTION_CELLS: u32 = 256;
 
+pub(super) fn native_instruction_incomplete(step: &Step) -> bool {
+    matches!(
+        step,
+        Err(Stop::Unsupported(Requirement {
+            kind: RequirementKind::NativePreparation(_)
+                | RequirementKind::NativeRamServiceBusy
+                | RequirementKind::NonresidentRam { .. }
+                | RequirementKind::RamTransfer { .. },
+            ..
+        }))
+    )
+}
+
 impl<H: Host, D: Devices> Machine<H, D> {
     /// Run until a stop. `budget` limits executed blocks (0 = unlimited).
     pub fn run(&mut self, budget: u64) -> Stop {
@@ -199,6 +212,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
             Fetched::Checked(word) => {
                 let step = self.checked_instruction(pc, word);
+                if native_instruction_incomplete(&step) {
+                    self.cpu.step_advance = false;
+                    return step;
+                }
                 if !core::mem::take(&mut self.pacm_written) && pacm {
                     self.cpu.pstate.pacm = false;
                 }
@@ -216,6 +233,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let step = self.execute(index, if single { 0 } else { self.chain_budget() });
         if self.native_failure.is_some() {
+            return step;
+        }
+        if native_instruction_incomplete(&step) {
+            // A stopped instruction does not consume PACM or advance
+            // architectural single-step state.
+            self.cpu.step_advance = false;
             return step;
         }
         if !core::mem::take(&mut self.pacm_written) && pacm {
@@ -282,7 +305,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let entered = self.timing_start();
         // SAFETY: installed by this machine since the last discard, for the system-mode block ABI;
         // chained blocks and thunks too.
-        let exit = unsafe { self.host.execute(entry, &mut self.cpu.state) };
+        let exit = unsafe { self.host.try_execute(entry, &mut self.cpu.state) };
         if self.mirrors.switches.len != 0 {
             self.take_thread_switches();
         }
@@ -300,6 +323,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.cpu.pstate.pan = !self.cpu.pstate.pan;
             self.sync_host_regime();
         }
+        let exit = exit.map_err(|reason| {
+            self.unsupported(match reason {
+                NativeEntryError::RamServiceBusy => RequirementKind::NativeRamServiceBusy,
+                NativeEntryError::Refused(detail) => {
+                    RequirementKind::NativePreparation(detail.into())
+                }
+            })
+        })?;
         let remaining = self.chain.budget().load(Ordering::Relaxed);
         let (block, retired, hits, _) = self.chain.completed();
         self.promotion_runs = self.promotion_runs.wrapping_add(1);

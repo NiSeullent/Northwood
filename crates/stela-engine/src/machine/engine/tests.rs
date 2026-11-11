@@ -135,6 +135,9 @@ pub(super) struct FakeHost {
     /// What the next native blocks return, in order: unit tests do not
     /// run native code.
     pub(super) exits: Vec<NativeExit>,
+    /// Refuse the next native entry before applying any simulated effects.
+    pub(super) native_entry_refusal: Option<NativeEntryError>,
+    pub(super) device_site_ram: Option<DeviceSiteRam>,
     /// A translation store, for the tests that give the host one.
     pub(super) store: Option<stored::tests::MemoryStore>,
     /// Pages whose fetch the host refuses, and its answers.
@@ -176,6 +179,20 @@ impl Host for FakeHost {
     fn memory_barrier(&mut self) {
         self.memory_barriers += 1;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn device_site_ram(
+        &self,
+    ) -> Result<Option<DeviceSiteRam>, stela_compiler::context::memory::MemoryStatus> {
+        Ok(self.device_site_ram.as_ref().map(|entry| DeviceSiteRam {
+            ram: Arc::clone(&entry.ram),
+            expected_generation: entry.expected_generation,
+        }))
+    }
+
+    fn device_site_has_retained_ram(&self, page: u64) -> bool {
+        page.checked_sub(self.base)
+            .is_some_and(|offset| offset < self.ram.len() as u64)
     }
 
     fn read_ram(&mut self, physical: u64, buffer: &mut [u8]) -> bool {
@@ -330,6 +347,17 @@ impl Host for FakeHost {
             fault.registers = stela_compiler::x86_64::pinned::capture(state);
         }
         exit
+    }
+    unsafe fn try_execute(
+        &mut self,
+        code: NativeCode,
+        state: &mut GuestState,
+    ) -> Result<NativeExit, NativeEntryError> {
+        if let Some(reason) = self.native_entry_refusal.take() {
+            return Err(reason);
+        }
+        // SAFETY: the caller supplies the installed block under the same contract.
+        Ok(unsafe { self.execute(code, state) })
     }
     fn set_regime(&mut self, regime: &Regime) {
         self.regimes.push(*regime);
@@ -561,6 +589,8 @@ pub(super) fn board_on<D: Devices>(
         live_patch_start: 0,
         chained: None,
         exits: Vec::new(),
+        native_entry_refusal: None,
+        device_site_ram: None,
         store: None,
         refused: Vec::new(),
         fetch_checks: 0,
@@ -8813,6 +8843,65 @@ fn software_step_runs_one_instruction_then_takes_ec_0x32() {
     machine.cpu.step_advance = true;
     machine.system_instruction(0xd400_0001).unwrap(); // svc #0
     assert_eq!(machine.cpu.read(SystemRegister::SPSR_EL1) & 1 << 21, 0);
+}
+
+#[test]
+fn refused_native_entry_preserves_pacm_and_active_software_step() {
+    const REFUSAL: &str = "registered RAM native execution refused: memory domain error";
+    check_native_entry_refusal(
+        NativeEntryError::Refused(REFUSAL),
+        RequirementKind::NativePreparation(REFUSAL.into()),
+    );
+}
+
+#[test]
+fn native_ram_service_busy_preserves_pacm_and_active_software_step() {
+    check_native_entry_refusal(
+        NativeEntryError::RamServiceBusy,
+        RequirementKind::NativeRamServiceBusy,
+    );
+}
+
+fn check_native_entry_refusal(refusal: NativeEntryError, expected: RequirementKind) {
+    let mut machine = debug_machine(1);
+    // ERET to EL0 makes the step active-not-pending.
+    machine.cpu.registers.set(SystemRegister::ELR_EL1, 0, BASE);
+    machine
+        .cpu
+        .registers
+        .set(SystemRegister::SPSR_EL1, 0, 1 << 21);
+    machine.system_instruction(0xd69f_03e0).unwrap();
+    // The fixture executed ERET outside step(), which normally consumes
+    // the instruction's PACM write marker before the next dispatch.
+    machine.pacm_written = false;
+    machine.cpu.pstate.pacm = true;
+    machine.host.native_entry_refusal = Some(refusal);
+    machine.host.exits.push(NativeExit::Exit {
+        next_pc: BASE + 4,
+        kind: ExitKind::Fallthrough as u64,
+    });
+    let retired = machine.cpu.retired;
+
+    assert!(matches!(
+        machine.step(),
+        Err(Stop::Unsupported(Requirement {
+            pc: BASE,
+            kind,
+            ..
+        })) if kind == expected
+    ));
+    assert_eq!(machine.cpu.pc, BASE);
+    assert_eq!(machine.cpu.retired, retired);
+    assert!(machine.cpu.pstate.pacm);
+    assert!(machine.cpu.pstate.ss);
+    assert!(!machine.cpu.step_advance);
+    assert_eq!(machine.host.exits.len(), 1);
+
+    machine.step().unwrap();
+    assert_eq!(machine.cpu.pc, BASE + 4);
+    assert_eq!(machine.cpu.retired, retired + 1);
+    assert!(!machine.cpu.pstate.pacm);
+    assert!(!machine.cpu.pstate.ss);
 }
 
 #[test]

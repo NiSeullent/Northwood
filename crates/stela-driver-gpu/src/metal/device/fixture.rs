@@ -22,7 +22,8 @@ use crate::metal::{
     stitching::StitchedGraph,
     vulkan::{
         backend::{
-            Backend, BufferAllocation, Descriptor, Object, Outside, PreparedImport, Requirements,
+            Backend, BufferAllocation, Descriptor, GuestRows, Object, Outside, PreparedImport,
+            Requirements,
         },
         command::BufferImageCopy,
         object::{
@@ -169,6 +170,11 @@ pub(crate) struct MockBackend {
     pub(crate) invalidated: Vec<(Memory, u64, u64)>,
     /// Host memory each imported memory is, by memory.
     pub(crate) imports: BTreeMap<u64, (Vec<MemoryRange>, NonZeroU64)>,
+    pub(crate) host_pointer_imports: bool,
+    pub(crate) guest_copy_imports: bool,
+    pub(crate) guest_copy_wait_reaches: bool,
+    pub(crate) guest_copy_steps: Vec<GuestCopyStep>,
+    pub(crate) guest_copy_publish_error: Option<Error>,
     /// Driver work outside the service's turn, when a test gives it.
     pub(crate) outside: Option<alloc::sync::Arc<MockOutside>>,
     /// The word a test's GPU writes as the completion marker, when the
@@ -193,6 +199,15 @@ pub(crate) struct MockBackend {
     /// The bytes of each host image copy into an image, which copies out
     /// of it read back.
     pub(crate) image_bytes: BTreeMap<u64, Vec<u8>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum GuestCopyStep {
+    Wait(Semaphore, u64),
+    Checkpoint(Segment),
+    Load(GuestRows),
+    Store(GuestRows),
+    Submit(Vec<(Semaphore, u64)>),
 }
 
 impl MockBackend {
@@ -243,6 +258,31 @@ impl Backend for MockBackend {
 
     fn physical_device(&self) -> &PhysicalDevice {
         self.physical.as_ref().unwrap()
+    }
+    fn is_host_pointer_import(&self, memory: Memory) -> bool {
+        self.host_pointer_imports && self.imports.contains_key(&memory.0)
+    }
+    fn uses_guest_copy_transport(&self) -> bool {
+        self.guest_copy_imports
+    }
+    fn is_guest_copy_import(&self, memory: Memory) -> bool {
+        self.guest_copy_imports && self.imports.contains_key(&memory.0)
+    }
+    fn finish_guest_copy_segment(&mut self, segment: Segment) -> Result<()> {
+        assert!(!segment.copies_guest_rows() && segment.signals.is_empty());
+        self.guest_copy_steps
+            .push(GuestCopyStep::Checkpoint(segment));
+        Ok(())
+    }
+    unsafe fn read_guest_rows(&mut self, rows: GuestRows) -> Result<()> {
+        assert!(self.is_guest_copy_import(rows.memory));
+        self.guest_copy_steps.push(GuestCopyStep::Load(rows));
+        Ok(())
+    }
+    unsafe fn publish_guest_rows(&mut self, rows: GuestRows) -> Result<()> {
+        assert!(self.is_guest_copy_import(rows.memory));
+        self.guest_copy_steps.push(GuestCopyStep::Store(rows));
+        self.guest_copy_publish_error.map_or(Ok(()), Err)
     }
     fn allocate_memory(&mut self, _: u64, _: MemoryRequest, _: u32) -> Result<Memory> {
         Ok(Memory(self.id()))
@@ -548,9 +588,27 @@ impl Backend for MockBackend {
         Ok(())
     }
     fn wait_semaphore(&mut self, semaphore: Semaphore, value: u64, _: u64) -> Result<bool> {
+        if self.guest_copy_imports && self.semaphores[&semaphore.0] < value {
+            self.guest_copy_steps
+                .push(GuestCopyStep::Wait(semaphore, value));
+            if self.guest_copy_wait_reaches
+                && self.promised.get(&semaphore.0).copied().unwrap_or(0) >= value
+            {
+                self.complete(semaphore, value);
+            }
+        }
         Ok(self.semaphores[&semaphore.0] >= value)
     }
     fn submit(&mut self, segments: &[Segment]) -> Result<()> {
+        if self.guest_copy_imports {
+            assert!(!segments.iter().any(Segment::copies_guest_rows));
+            self.guest_copy_steps.push(GuestCopyStep::Submit(
+                segments
+                    .iter()
+                    .flat_map(|segment| segment.signals.iter().copied())
+                    .collect(),
+            ));
+        }
         for segment in segments {
             for &(semaphore, value) in &segment.waits {
                 let reached = self.semaphores.get(&semaphore.0).copied().unwrap_or(0);

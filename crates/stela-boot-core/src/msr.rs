@@ -186,6 +186,7 @@ const MTRR: Bit = Bit::new(1, Edx, 12);
 const PAT_BIT: Bit = Bit::new(1, Edx, 16);
 const X2APIC_BIT: Bit = Bit::new(1, Ecx, 21);
 const TSC_ADJUST_BIT: Bit = Bit::new(7, Ebx, 1);
+const HARDWARE_FEEDBACK: Bit = Bit::new(6, Ecx, 0);
 const ARCH_CAPABILITIES_BIT: Bit = Bit::new(7, Edx, 29);
 /// Intel IBRS/IBPB (CPUID 7 EDX 26), AMD IBPB (8000_0008h EBX 12).
 const IBPB: [Bit; 2] = [Bit::new(7, Edx, 26), Bit::new(0x8000_0008, Ebx, 12)];
@@ -195,6 +196,9 @@ const XFD_BIT: Bit = Bit::sub(0xd, 1, Eax, 4);
 
 pub const APIC_BASE: Msr = Msr::new(0x1b, Gate::Cpuid(APIC));
 pub const TSC_ADJUST: Msr = Msr::new(0x3b, Gate::Cpuid(TSC_ADJUST_BIT));
+/// Intel P-state hardware coordination feedback (CPUID.06H:ECX[0]).
+pub const MPERF: Msr = Msr::new(0xe7, Gate::Cpuid(HARDWARE_FEEDBACK));
+pub const APERF: Msr = Msr::new(0xe8, Gate::Cpuid(HARDWARE_FEEDBACK));
 pub const PRED_CMD: Msr = Msr::new(0x49, Gate::AnyCpuid(&IBPB));
 pub const MTRR_CAP: Msr = Msr::new(0xfe, Gate::Cpuid(MTRR));
 pub const ARCH_CAPABILITIES: Msr = Msr::new(0x10a, Gate::Cpuid(ARCH_CAPABILITIES_BIT));

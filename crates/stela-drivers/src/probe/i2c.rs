@@ -8,15 +8,22 @@
 //! Every controller and GPIO controller attaches once and is shared by the
 //! devices on it.
 use super::PlatformError;
-use crate::bus::i2c::{
-    self, Address as I2cAddress,
-    timing::{self, BusSpeed, Counts, Firmware},
+use crate::bus::{
+    i2c::{
+        self, Address as I2cAddress,
+        timing::{self, BusSpeed, Counts, Firmware},
+    },
+    lpss, pci,
 };
 use crate::platform::acpi::{
     Value,
     resources::{Descriptor, GpioKind, Polarity, Resource, SerialKind},
 };
 use alloc::{string::String, vec::Vec};
+
+mod quirks;
+use quirks::HidOverrides;
+pub use quirks::{HidMatch, HidQuirk, HidSetting};
 
 /// `_HID`s of HID-over-I²C devices, as Linux `i2c_hid_acpi_match`.
 pub(crate) const HID_OVER_I2C: &[&str] = &["ACPI0C50", "PNP0C50"];
@@ -220,6 +227,7 @@ pub(crate) fn hardware_id(value: Option<Value<'_>>) -> Option<String> {
 /// The PCI location `_ADR` gives a function on a root bus: the device in
 /// bits 16..32 and the function in bits 0..16.
 pub(crate) fn pci_location(adr: u64, segment: u16, bus: u8) -> Option<crate::bus::pci::Address> {
+    let adr = u32::try_from(adr).ok()?;
     let (device, function) = ((adr >> 16) & 0xffff, adr & 0xffff);
     (device < 32 && function < 8).then_some(crate::bus::pci::Address {
         segment,
@@ -227,6 +235,31 @@ pub(crate) fn pci_location(adr: u64, segment: u16, bus: u8) -> Option<crate::bus
         device: device as u8,
         function: function as u8,
     })
+}
+
+/// Resolve the ACPI companion against the read-only PCI scan before requesting
+/// ownership. This identity still has to match the returned stopped function.
+fn lpss_profile(
+    pci: &[pci::Identity],
+    address: pci::Address,
+) -> Result<(pci::Identity, lpss::Profile), PlatformError> {
+    let mut matches = pci.iter().filter(|id| id.address == address);
+    let id = *matches.next().ok_or(PlatformError::Refused(
+        "I2C ACPI controller is absent from the PCI scan",
+    ))?;
+    if matches.next().is_some() {
+        return Err(PlatformError::Refused(
+            "ambiguous I2C ACPI controller in PCI scan",
+        ));
+    }
+    let profile = lpss::Profile::select(lpss::Identity {
+        vendor: id.vendor,
+        device: id.device,
+        subsystem_vendor: 0,
+        subsystem_device: 0,
+    })
+    .map_err(|_| PlatformError::I2cPciMismatch(id))?;
+    Ok((id, profile))
 }
 
 /// The timing of a bus whose devices connect at `speeds`.
@@ -249,10 +282,7 @@ mod attach {
             i2c::{Bus, DesignWare, Operation},
             lpss,
             mmio::owned::{CacheAttribute, Mapping, Protection},
-            pci::{
-                Bar,
-                requester::{FunctionRole, StoppedRequester},
-            },
+            pci::Bar,
         },
         input::{
             InputDevice,
@@ -269,7 +299,7 @@ mod attach {
                 gpio::{Direction, LinePolicy, NativeController},
             },
         },
-        probe::{Devices, NativeServices, ServiceError},
+        probe::{Devices, NativeServices, ServiceError, services::LpssI2cObservation},
     };
     use alloc::{boxed::Box, format, rc::Rc};
     use core::{cell::RefCell, mem::ManuallyDrop};
@@ -341,26 +371,30 @@ mod attach {
     /// a 125 Hz report rate, as fast as common I²C touchpads report.
     const POLL_INTERVAL_US: u64 = 8_000;
 
-    /// A device whose only interrupt is an APIC interrupt, which no driver
-    /// here unmasks or samples: its input register is read on a timer.
+    /// A HID device whose input register is read on a timer. A forced poll
+    /// keeps any claimed GPIO pin owned and masked.
     struct PolledInterrupt {
         clock: Clock,
+        pin: Option<PinInterrupt>,
+        interval_us: u64,
         /// When the next read is due.
         due: u64,
     }
 
     impl hid_i2c::Interrupt for PolledInterrupt {
-        /// The APIC interrupt has no route of its own here: the mount leaves
-        /// it masked, and nothing it delivers is waited on.
         fn mask_and_drain(&mut self) -> Result<(), InterruptError> {
-            Ok(())
+            match &mut self.pin {
+                Some(pin) => pin.mask_and_drain(),
+                // The APIC interrupt has no route of its own here.
+                None => Ok(()),
+            }
         }
         fn asserted(&mut self) -> Result<bool, InterruptError> {
             let now = self.clock.now_us();
             if now < self.due {
                 return Ok(false);
             }
-            self.due = now.saturating_add(POLL_INTERVAL_US);
+            self.due = now.saturating_add(self.interval_us);
             Ok(true)
         }
         fn polled(&self) -> bool {
@@ -368,12 +402,40 @@ mod attach {
         }
     }
 
+    #[cfg(test)]
+    #[test]
+    fn polled_input_uses_its_selected_interval() {
+        use crate::test_clock;
+        use hid_i2c::Interrupt;
+
+        let _time = test_clock::virtualize();
+        let clock = Clock {
+            ticks_per_microsecond: 1,
+        };
+        for interval_us in [POLL_INTERVAL_US, 20_000] {
+            let mut interrupt = PolledInterrupt {
+                clock,
+                pin: None,
+                interval_us,
+                due: clock.now_us(),
+            };
+            assert!(interrupt.polled());
+            assert_eq!(interrupt.mask_and_drain(), Ok(()));
+            assert_eq!(interrupt.asserted(), Ok(true));
+            test_clock::advance(clock, interval_us / 2);
+            assert_eq!(interrupt.asserted(), Ok(false));
+            test_clock::advance(clock, interval_us / 2);
+            assert_eq!(interrupt.asserted(), Ok(true));
+        }
+    }
+
     type Attached<T> = Vec<(String, T)>;
 
     /// What one probe attached, shared by the devices found after it.
-    struct Shared {
+    struct Shared<'a> {
         buses: Attached<SharedBus>,
         gpios: Attached<Rc<RefCell<gpio::native::Device>>>,
+        pci: &'a [pci::Identity],
     }
 
     /// Attach every HID-over-I²C device and touchpad the namespace lists,
@@ -383,6 +445,7 @@ mod attach {
         session: &Session,
         clock: Clock,
         devices: &mut Devices,
+        pci: &[pci::Identity],
     ) {
         let mut found: Vec<(Handle<'_>, Kind)> = Vec::new();
         let kinds = HID_OVER_I2C
@@ -407,6 +470,7 @@ mod attach {
         let mut shared = Shared {
             buses: Vec::new(),
             gpios: Vec::new(),
+            pci,
         };
         for (handle, kind) in found {
             let location = handle.path().unwrap_or_else(|_| String::from("I2C device"));
@@ -417,6 +481,7 @@ mod attach {
                 handle,
                 kind,
                 &location,
+                services.hid_quirks(),
                 &mut shared,
                 &mut devices.owners,
             ) {
@@ -488,7 +553,8 @@ mod attach {
         handle: Handle<'_>,
         kind: Kind,
         location: &str,
-        shared: &mut Shared,
+        quirks: &[HidQuirk<'_>],
+        shared: &mut Shared<'_>,
         owners: &mut Vec<Box<dyn core::any::Any>>,
     ) -> Result<Option<InputDevice>, PlatformError> {
         if kind == Kind::Hid && listed(session, handle, NOT_HID_OVER_I2C)? {
@@ -505,25 +571,77 @@ mod attach {
         };
         let device = DeviceResources::inspect(handle).map_err(PlatformError::Acpi)?;
         let connection = connection(device.descriptors())?;
+        let observer = if kind == Kind::Hid {
+            services.lpss_i2c_observer()
+        } else {
+            None
+        };
+        let hid = if kind == Kind::Hid && (!quirks.is_empty() || observer.is_some()) {
+            hardware_id(handle.evaluate(Some("_HID"), &[]).ok().flatten())
+        } else {
+            None
+        };
+        let path = location.starts_with('\\').then_some(location);
+        let overrides = if kind == Kind::Hid && !quirks.is_empty() {
+            HidOverrides::resolve(quirks, hid.as_deref(), path)?
+        } else {
+            HidOverrides::default()
+        };
+        let address = overrides.address(connection.address)?;
         let register = if kind == Kind::Hid {
-            descriptor_register(
-                handle
-                    .evaluate(
-                        Some("_DSM"),
-                        &[
-                            Argument::Buffer(&HID_DSM),
-                            Argument::Integer(1),
-                            Argument::Integer(1),
-                            Argument::Package(&[]),
-                        ],
-                    )
-                    .map_err(acpi)?,
-            )?
+            overrides.descriptor(|| {
+                descriptor_register(
+                    handle
+                        .evaluate(
+                            Some("_DSM"),
+                            &[
+                                Argument::Buffer(&HID_DSM),
+                                Argument::Integer(1),
+                                Argument::Integer(1),
+                                Argument::Package(&[]),
+                            ],
+                        )
+                        .map_err(acpi)?,
+                )
+            })?
         } else {
             0
         };
         let controller = handle.child(&connection.controller).map_err(acpi)?;
-        let bus = bus(services, session, clock, controller, shared, owners)?;
+        let observe_lpss = |pci, controller: &str| {
+            if let (Some(report), Some(device), Some(hid)) = (observer, path, hid.as_deref())
+                && matches!(hid.len(), 7 | 8)
+                && hid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            {
+                report(LpssI2cObservation {
+                    pci,
+                    hid,
+                    device,
+                    controller,
+                    address: connection.address,
+                    speed: connection.speed,
+                    gpio_interrupt: connection.interrupt.is_some(),
+                    descriptor: register,
+                });
+            }
+        };
+        let bus = bus(
+            services,
+            session,
+            clock,
+            controller,
+            shared,
+            owners,
+            observe_lpss,
+        )?;
+        let polled = |pin, interval_us| PolledInterrupt {
+            clock,
+            pin,
+            interval_us,
+            due: clock.now_us(),
+        };
         let interrupt: Box<dyn hid_i2c::Interrupt> = match &connection.interrupt {
             Some(pin) => {
                 let gpio = handle.child(&pin.controller).map_err(acpi)?;
@@ -546,14 +664,17 @@ mod attach {
                     .map_err(acpi)?;
                 hid_i2c::Interrupt::mask_and_drain(&mut interrupt)
                     .map_err(|_| PlatformError::Refused("the interrupt pin could not be masked"))?;
-                Box::new(interrupt)
+                match overrides.poll_interval_us() {
+                    Some(interval) => Box::new(polled(Some(interrupt), interval)),
+                    None => Box::new(interrupt),
+                }
             }
             // Only HID-over-I²C defines an empty input register, which makes
             // reading it without an interrupt safe.
-            None if kind == Kind::Hid => Box::new(PolledInterrupt {
-                clock,
-                due: clock.now_us(),
-            }),
+            None if kind == Kind::Hid => Box::new(polled(
+                None,
+                overrides.poll_interval_us().unwrap_or(POLL_INTERVAL_US),
+            )),
             None => {
                 return Err(PlatformError::Refused(
                     "I2C touchpad whose only interrupt is an APIC interrupt, which a polled driver cannot read",
@@ -562,7 +683,6 @@ mod attach {
         };
         power_on(handle)?;
         let bus: Box<dyn Bus> = Box::new(bus);
-        let address = connection.address;
         let touchpad = |driver| {
             Ok(Some(InputDevice::Touchpad(Box::new(TouchpadInput::new(
                 driver,
@@ -635,8 +755,9 @@ mod attach {
         session: &Session,
         clock: Clock,
         controller: Handle<'_>,
-        shared: &mut Shared,
+        shared: &mut Shared<'_>,
         owners: &mut Vec<Box<dyn core::any::Any>>,
+        observe_lpss: impl FnOnce(pci::Identity, &str),
     ) -> Result<SharedBus, PlatformError> {
         let path = controller.path().map_err(acpi)?;
         if let Some((_, bus)) = shared.buses.iter().find(|(at, _)| *at == path) {
@@ -711,9 +832,13 @@ mod attach {
                     };
                 Controller::Acpi(engine)
             }
-            None => Controller::Lpss(lpss_controller(
-                services, session, clock, controller, config, owners,
-            )?),
+            None => {
+                let (observed, profile) = lpss_identity(session, controller, &path, shared.pci)?;
+                observe_lpss(observed, &path);
+                Controller::Lpss(lpss_controller(
+                    services, clock, config, observed, profile, owners,
+                )?)
+            }
         };
         let bus = SharedBus(Rc::new(RefCell::new(attached)));
         shared.buses.push((path, bus.clone()));
@@ -755,14 +880,12 @@ mod attach {
     }
 
     /// The Intel LPSS function `controller` is the companion of.
-    fn lpss_controller(
-        services: &dyn NativeServices,
+    fn lpss_identity(
         session: &Session,
-        clock: Clock,
         controller: Handle<'_>,
-        config: impl Fn(timing::Board) -> i2c::Config,
-        owners: &mut Vec<Box<dyn core::any::Any>>,
-    ) -> Result<lpss::I2c<lpss::NativeRegisters, Clock>, PlatformError> {
+        path: &str,
+        pci: &[pci::Identity],
+    ) -> Result<(pci::Identity, lpss::Profile), PlatformError> {
         let integer = |handle: Handle<'_>, name: &str| -> Result<Option<u64>, PlatformError> {
             if handle.child(name).is_err() {
                 return Ok(None);
@@ -777,7 +900,6 @@ mod attach {
         let adr = integer(controller, "_ADR")?.ok_or(PlatformError::Refused(
             "I2C controller is neither on PCI nor an AMD controller",
         ))?;
-        let path = controller.path().map_err(acpi)?;
         let parent =
             path.rsplit_once('.')
                 .map(|(parent, _)| parent)
@@ -788,42 +910,43 @@ mod attach {
         if !listed(session, parent, &["PNP0A08", "PNP0A03"])? {
             return Err(PlatformError::Refused("I2C controller behind a PCI bridge"));
         }
-        let bus = integer(parent, "_BBN")?.unwrap_or(0) as u8;
-        let segment = integer(parent, "_SEG")?.unwrap_or(0) as u16;
+        let bus = u8::try_from(integer(parent, "_BBN")?.unwrap_or(0))
+            .map_err(|_| PlatformError::Refused("I2C controller PCI root _BBN out of range"))?;
+        let segment = u16::try_from(integer(parent, "_SEG")?.unwrap_or(0))
+            .map_err(|_| PlatformError::Refused("I2C controller PCI root _SEG out of range"))?;
         let address = pci_location(adr, segment, bus)
             .ok_or(PlatformError::Refused("I2C controller _ADR out of range"))?;
-        let requester = services.claim_stopped(address).map_err(native)?;
-        let mut function = ManuallyDrop::new(requester.into_function());
-        let identity = lpss::Identity {
-            vendor: function.vendor,
-            device: function.device,
-            subsystem_vendor: 0,
-            subsystem_device: 0,
-        };
-        let inspected = (|| {
-            let profile = lpss::Profile::select(identity).map_err(PlatformError::Lpss)?;
-            let bars = function.bars().map_err(PlatformError::Config)?;
-            Ok((profile, bars))
-        })();
-        let (profile, bars) = match inspected {
-            Ok(observed) => observed,
+        lpss_profile(pci, address)
+    }
+
+    fn lpss_controller(
+        services: &dyn NativeServices,
+        clock: Clock,
+        config: impl Fn(timing::Board) -> i2c::Config,
+        observed: pci::Identity,
+        profile: lpss::Profile,
+        owners: &mut Vec<Box<dyn core::any::Any>>,
+    ) -> Result<lpss::I2c<lpss::NativeRegisters, Clock>, PlatformError> {
+        let address = observed.address;
+        let requester = services
+            .claim_stopped(address)
+            .map_err(|error| PlatformError::I2cPciStop(observed, error))?;
+        let mut requester = ManuallyDrop::new(requester);
+        if requester.identity() != observed {
+            owners.push(Box::new(requester));
+            return Err(PlatformError::I2cPciStop(
+                observed,
+                ServiceError::Claim(pci::requester::ClaimError::IdentityChanged),
+            ));
+        }
+        let bars = match requester.bars() {
+            Ok(bars) => bars,
             Err(error) => {
-                owners.push(Box::new(function));
-                return Err(error);
-            }
-        };
-        // SAFETY: the mount claimed this function stopped, and sizing its BARs
-        // with decode off left it so.
-        let requester = match unsafe {
-            StoppedRequester::from_stopped_pci(
-                ManuallyDrop::into_inner(function),
-                FunctionRole::Physical,
-            )
-        } {
-            Ok(requester) => ManuallyDrop::new(requester),
-            Err((error, function)) => {
-                owners.push(Box::new(ManuallyDrop::new(function)));
-                return Err(native(ServiceError::Claim(error)));
+                owners.push(Box::new(requester));
+                return Err(PlatformError::I2cPciStop(
+                    observed,
+                    ServiceError::Claim(error),
+                ));
             }
         };
         let mapped = match bars[0] {
@@ -868,7 +991,7 @@ mod attach {
     fn gpio_controller(
         services: &dyn NativeServices,
         handle: Handle<'_>,
-        shared: &mut Shared,
+        shared: &mut Shared<'_>,
     ) -> Result<Rc<RefCell<gpio::native::Device>>, PlatformError> {
         let path = handle.path().map_err(acpi)?;
         if let Some((_, gpio)) = shared.gpios.iter().find(|(at, _)| *at == path) {
@@ -1085,5 +1208,41 @@ mod tests {
         assert_eq!((address.device, address.function), (0x15, 1));
         assert!(pci_location(0x0020_0000, 0, 0).is_none());
         assert!(pci_location(0x0015_0008, 0, 0).is_none());
+        assert!(pci_location(0x1_0015_0001, 0, 0).is_none());
+    }
+
+    #[test]
+    fn lpss_requires_the_unique_pci_function_named_by_acpi() {
+        let address = pci_location(0x0015_0001, 0, 0).unwrap();
+        let controller = pci::Identity {
+            address,
+            vendor: 0x8086,
+            device: 0x31ba,
+            class: [0x0c, 0x80, 0],
+        };
+        let gpu = pci::Identity {
+            device: 0x3185,
+            class: [3, 0x80, 0],
+            ..controller
+        };
+        let other_bus = pci::Identity {
+            address: pci::Address { bus: 1, ..address },
+            ..controller
+        };
+        let (observed, profile) = lpss_profile(&[other_bus, controller], address).unwrap();
+        assert_eq!(observed, controller);
+        assert_eq!(profile.device(), 0x31ba);
+        assert!(matches!(
+            lpss_profile(&[other_bus], address),
+            Err(PlatformError::Refused(_))
+        ));
+        assert_eq!(
+            lpss_profile(&[gpu], address),
+            Err(PlatformError::I2cPciMismatch(gpu))
+        );
+        assert!(matches!(
+            lpss_profile(&[controller, gpu], address),
+            Err(PlatformError::Refused(_))
+        ));
     }
 }

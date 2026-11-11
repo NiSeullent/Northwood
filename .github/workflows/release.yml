@@ -1,20 +1,25 @@
-# One self-contained `stela` per platform. `stela` embeds stela.efi, which
+# Both CLIs per platform embed the same northwood.efi, which
 # carries the StelaGPU kext; the kext carries the Metal bundle and Stela.app.
-# So the chain runs: Stela.app (macOS) -> stela.efi (Linux) -> stela for
+# So the chain runs: Stela.app (macOS) -> northwood.efi (Linux) -> CLIs for
 # Linux, Windows and macOS -> release.
 #
-# Runs only for a pushed `v*` tag, and publishes that tag's release.
-name: release
+# A pushed `v*` tag publishes a release. A `diag-*` tag publishes a
+# diagnostics build as a prerelease. Scheduled and manual runs build
+# downloadable artifacts with read-only permissions.
+name: build and release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "diag-*"]
+  schedule:
+    - cron: "17 19 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: build-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 defaults:
@@ -29,7 +34,7 @@ env:
   # The release body and each archive's INSTALL.txt. Plain text that also
   # reads as Markdown.
   ABOUT: |-
-    Stela boots unmodified Apple silicon macOS on x86-64 PCs. It is very experimental.
+    Northwood uses Stela to boot Apple silicon macOS on x86-64 PCs. It is experimental.
 
     Requirements:
 
@@ -42,13 +47,28 @@ env:
     Install:
 
     1. Unpack the archive for your system.
-    2. On the PC that will run macOS, run sudo ./stela setup (Linux, macOS) or double-click stela.exe (Windows).
+    2. Run sudo ./northwood setup on Linux or macOS. On Windows, run northwood.exe setup or open stela.exe for the setup wizard.
     3. Choose the USB stick, the macOS version and the Mac model, then confirm. Setup erases the USB stick.
     4. Boot the PC from the USB stick.
 
     You are responsible for following Apple's software license agreement and terms of use.
 
 jobs:
+  upstream-merge:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the merge against Stela main
+        run: |
+          git fetch --no-tags https://github.com/tylertms/Stela.git refs/heads/main
+          printf 'Northwood %s\nStela %s\n' "$(git rev-parse HEAD)" "$(git rev-parse FETCH_HEAD)"
+          git merge-tree --write-tree HEAD FETCH_HEAD
+
   version:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -57,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Check the tag against the workspace version
+      - name: Read workspace version and check release inputs
         id: version
         run: |
           version="$(awk '/^\[workspace.package\]/{s=1;next} s && /^\[/{exit} s && /^version = /{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)"
@@ -65,11 +85,11 @@ jobs:
             echo "::error::Cargo.toml has no [workspace.package] version"
             exit 1
           fi
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" == v* && "$GITHUB_REF_NAME" != "v$version" ]]; then
             echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version (expected v$version)"
             exit 1
           fi
-          for path in LICENSE NOTICE LICENSES; do
+          for path in LICENSE NOTICE LICENSES LICENSING.md CREDITS.md; do
             if [[ ! -e "$path" ]]; then
               echo "::error::$path is missing; a release ships LICENSE, NOTICE and LICENSES/"
               exit 1
@@ -105,7 +125,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     env:
-      SOURCE: stela-v${{ needs.version.outputs.version }}-source
+      SOURCE: northwood-v${{ needs.version.outputs.version }}-source
     steps:
       - uses: actions/checkout@v5
 
@@ -213,19 +233,24 @@ jobs:
           find third_party crates/stela-driver-gpu -path '*/.git' -prune -o -type f -print0 \
             | xargs -0 touch -h -d '2000-01-01T00:00:00Z'
 
-      - name: Build stela.efi
+      - name: Build northwood.efi
         run: |
-          cargo xtask boot build --release
+          args=(--release)
+          if [[ "$GITHUB_REF" == refs/tags/diag-* ]]; then
+            args+=(--diagnostics)
+          fi
+          cargo xtask boot build "${args[@]}"
           efi=target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
           [[ "$(head -c 2 "$efi")" == MZ ]] || { echo "::error::$efi is not a PE image"; exit 1; }
-          cp "$efi" dist/stela.efi
-          ls -l dist/stela.efi
-          { echo "stela.efi: $(stat -c %s dist/stela.efi) bytes"; echo "sha256 $(sha256sum dist/stela.efi | cut -d' ' -f1)"; } >> "$GITHUB_STEP_SUMMARY"
+          cp "$efi" dist/northwood.efi
+          ls -l dist/northwood.efi
+          printf 'northwood.efi: %s bytes\nsha256 %s\n' \
+            "$(stat -c %s dist/northwood.efi)" "$(sha256sum dist/northwood.efi | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: stela-efi
-          path: dist/stela.efi
+          name: northwood-efi
+          path: dist/northwood.efi
           if-no-files-found: error
           retention-days: 7
 
@@ -248,7 +273,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
-      ARCHIVE: stela-v${{ needs.version.outputs.version }}-${{ matrix.platform }}
+      ARCHIVE: northwood-v${{ needs.version.outputs.version }}-${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v5
 
@@ -256,7 +281,7 @@ jobs:
         run: |
           # Mbed TLS takes -mllvm --disable-select-optimize, LLVM 15 and newer.
           case "$RUNNER_OS" in
-            Windows) echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH" ;;
+            Windows) printf '%s\n' 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH" ;;
             Linux)
               [[ -d /usr/lib/llvm-15/bin ]] || { sudo apt-get update -q && sudo apt-get install -y -q clang-15; }
               echo /usr/lib/llvm-15/bin >> "$GITHUB_PATH"
@@ -289,45 +314,49 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: stela-efi
+          name: northwood-efi
           path: efi
 
-      - name: Build stela
+      - name: Build both CLIs
         run: |
-          export STELA_EFI="$PWD/efi/stela.efi"
+          export STELA_EFI="$PWD/efi/northwood.efi"
           for target in ${{ matrix.targets }}; do
-            cargo build --release --locked -p stela-cli --target "$target"
+            cargo build --release --locked -p stela-cli -p northwood --features northwood/installer --target "$target"
           done
           mkdir -p "$ARCHIVE"
-          case "$RUNNER_OS" in
-            Windows) cp target/x86_64-pc-windows-msvc/release/stela.exe "$ARCHIVE/" ;;
-            macOS)
-              lipo -create -output "$ARCHIVE/stela" \
-                target/aarch64-apple-darwin/release/stela target/x86_64-apple-darwin/release/stela
-              codesign --force --sign - "$ARCHIVE/stela"
-              lipo -info "$ARCHIVE/stela"
-              ;;
-            *) cp target/x86_64-unknown-linux-gnu/release/stela "$ARCHIVE/" ;;
-          esac
+          for name in northwood stela; do
+            case "$RUNNER_OS" in
+              Windows) cp "target/x86_64-pc-windows-msvc/release/$name.exe" "$ARCHIVE/" ;;
+              macOS)
+                lipo -create -output "$ARCHIVE/$name" \
+                  "target/aarch64-apple-darwin/release/$name" "target/x86_64-apple-darwin/release/$name"
+                codesign --force --sign - "$ARCHIVE/$name"
+                lipo -info "$ARCHIVE/$name"
+                ;;
+              *) cp "target/x86_64-unknown-linux-gnu/release/$name" "$ARCHIVE/" ;;
+            esac
+          done
 
-      - name: Check stela
+      - name: Check both CLIs
         run: |
-          binary="$(ls "$ARCHIVE"/stela*)"
-          expected="stela ${{ needs.version.outputs.version }}"
-          actual="$("$binary" --version)"
-          [[ "$actual" == "$expected" ]] || { echo "::error::$binary --version printed '$actual', not '$expected'"; exit 1; }
           python=python3
-          if [[ "$RUNNER_OS" == Windows ]]; then python=python; fi
-          "$python" -c 'import sys; sys.exit(open(sys.argv[1], "rb").read() not in open(sys.argv[2], "rb").read())' efi/stela.efi "$binary" \
-            || { echo "::error::$binary does not hold the stela.efi the efi job built"; exit 1; }
-          size="$(wc -c < "$binary")"
-          "$binary" setup --help >/dev/null
-          echo "$ARCHIVE: $size bytes" >> "$GITHUB_STEP_SUMMARY"
+          suffix=
+          if [[ "$RUNNER_OS" == Windows ]]; then python=python; suffix=.exe; fi
+          for name in northwood stela; do
+            binary="$ARCHIVE/$name$suffix"
+            expected="$name ${{ needs.version.outputs.version }}"
+            actual="$("$binary" --version)"
+            [[ "$actual" == "$expected" ]] || { echo "::error::$binary --version printed '$actual', not '$expected'"; exit 1; }
+            "$python" -c 'import sys; sys.exit(open(sys.argv[1], "rb").read() not in open(sys.argv[2], "rb").read())' efi/northwood.efi "$binary" \
+              || { echo "::error::$binary does not hold northwood.efi"; exit 1; }
+            "$binary" setup --help >/dev/null
+            printf '%s: %s bytes\n' "$binary" "$(wc -c < "$binary")" >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - name: Package
         run: |
           printf '%s\n' "$INSTALL" > "$ARCHIVE/INSTALL.txt"
-          cp -R LICENSE NOTICE LICENSES "$ARCHIVE/"
+          cp -R LICENSE NOTICE LICENSES LICENSING.md CREDITS.md "$ARCHIVE/"
           if [[ "$RUNNER_OS" == Windows ]]; then
             7z a -tzip -bso0 "$ARCHIVE.zip" "$ARCHIVE"
           else
@@ -343,6 +372,7 @@ jobs:
           compression-level: 0
 
   release:
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/diag-'))
     needs: [version, cli]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -355,32 +385,45 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: stela-v*
+          pattern: northwood-v*
           path: dist
           merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: northwood-efi
+          path: dist
 
       - name: Checksums and notes
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           tag="v$VERSION"
-          count="$(ls dist | wc -l)"
-          [[ "$count" == 4 ]] || { echo "::error::expected 3 archives and the source, found $count: $(ls dist)"; exit 1; }
+          for asset in northwood.efi "northwood-$tag-linux-x86_64.tar.gz" "northwood-$tag-windows-x86_64.zip" \
+            "northwood-$tag-macos-universal.tar.gz" "northwood-$tag-source.tar.zst"; do
+            [[ -s "dist/$asset" ]] || { echo "::error::missing $asset"; exit 1; }
+          done
           (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
           # The first release lists no changes.
           previous="$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)"
           {
+            if [[ "$GITHUB_REF_NAME" == diag-* ]]; then
+              echo "Diagnostic prerelease. The IdeaPad 1 15IGL7 has booted Diagnostics from a physical USB."
+              echo "Internal Intel CNVi Wi-Fi association, complete macOS installation and installed boot are still under development."
+              echo
+            fi
             printf '%s\n\n' "$ABOUT"
             echo "Downloads:"
             echo
-            echo "- Linux x86-64 (glibc 2.35 or newer): stela-$tag-linux-x86_64.tar.gz"
-            echo "- Windows x86-64: stela-$tag-windows-x86_64.zip"
-            echo "- macOS, Apple silicon and Intel: stela-$tag-macos-universal.tar.gz"
-            echo "- Source, with every submodule at its pin and Stela's patches: stela-$tag-source.tar.zst"
+            echo "- Linux x86-64 (glibc 2.35 or newer): northwood-$tag-linux-x86_64.tar.gz"
+            echo "- Windows x86-64: northwood-$tag-windows-x86_64.zip"
+            echo "- macOS, Apple silicon and Intel: northwood-$tag-macos-universal.tar.gz"
+            echo "- Source, with every submodule at its pin and Stela's patches: northwood-$tag-source.tar.zst"
+            echo "- UEFI boot program: northwood.efi"
             echo "- SHA256SUMS: each file's SHA-256"
             echo
             printf '%s\n\n' "$INSTALL"
-            echo "License: Stela's code is GPL-2.0-or-later. The boot program stela.efi links code from Linux and is GPL-2.0-only; the stela program is GPL-3.0-or-later. Each archive has LICENSE, NOTICE and LICENSES/. The source archive is the complete corresponding source of these binaries."
+            echo "Northwood's source defaults to GPL-2.0-or-later. The UEFI boot program is distributed under GPL-2.0-only. Both CLI programs are distributed under GPL-3.0-or-later. See LICENSE, NOTICE, LICENSES/, LICENSING.md and CREDITS.md in the archives."
             if [[ -n "$previous" ]]; then
               total="$(git rev-list --count --no-merges "$previous..$GITHUB_REF_NAME")"
               echo
@@ -398,7 +441,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [[ "$GITHUB_REF_NAME" == diag-* ]]; then
+            if gh release view "$GITHUB_REF_NAME" --json isPrerelease --jq '.isPrerelease' > release-state.txt; then
+              [[ "$(cat release-state.txt)" == true ]]
+              gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+              gh release edit "$GITHUB_REF_NAME" --notes-file notes.txt
+              exit
+            fi
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag --prerelease --latest=false \
+              --title "Northwood $GITHUB_REF_NAME" --notes-file notes.txt
+            exit
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --verify-tag \
-            --title "Stela $GITHUB_REF_NAME" \
+            --title "Northwood $GITHUB_REF_NAME" \
             --notes-file notes.txt

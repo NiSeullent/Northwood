@@ -6,8 +6,9 @@ use super::{
     wire::{
         self, Empty, Fault, Handle, Record, Status, Value,
         commands::{
-            BufferLayoutRecord, CommandBufferCode, CommandCode, CommandHeader, CommitRequest,
-            DepthStencilRecord, EventCommand, PatchSourceRecord, SampleCounters, StencilRecord,
+            BlitCode, BufferLayoutRecord, CommandBufferCode, CommandCode, CommandHeader,
+            CommitRequest, ComputeCode, DepthStencilRecord, EventCommand, PatchSourceRecord,
+            RenderCode, SampleCounters, StencilRecord,
         },
     },
 };
@@ -21,6 +22,7 @@ use crate::metal::{
         render::PatchSource,
     },
     device::{BufferId, SamplerId, TextureId},
+    error::Error,
     pipeline::{DepthStencilDescriptor, DepthStencilState, StencilDescriptor, depth_stencil},
     shader::Compiler,
     timing::{Detail, Phase, Timed},
@@ -181,6 +183,12 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         code: CommandCode,
         payload: Payload,
     ) -> Result<(), Fault> {
+        if self.device.is_hosted_lavapipe() && !hosted_command(code) {
+            return Err(Fault::new(
+                Status::Unsupported,
+                "command on hosted lavapipe",
+            ));
+        }
         match code {
             CommandCode::CommandBuffer(code) => {
                 self.command_buffer(connection, commands, code, payload)
@@ -267,9 +275,11 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     }
 
     fn buffer_ref(&self, connection: NonZeroU64, handle: u64) -> Result<BufferRef, Fault> {
-        Ok(self
-            .device
-            .buffer(self.object::<BufferId>(connection, handle)?)?)
+        let buffer = self.object::<BufferId>(connection, handle)?;
+        if self.device.is_guest_copy_buffer(buffer)? {
+            return Err(Error::Unsupported("direct access to a copied guest buffer").into());
+        }
+        Ok(self.device.buffer(buffer)?)
     }
 
     /// The buffer `handle` names, or none for nil.
@@ -301,9 +311,11 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         if handle == 0 {
             return Ok(ResourceId::NULL);
         }
-        Ok(self
-            .device
-            .texture_resource_id(self.object::<TextureId>(connection, handle)?)?)
+        let texture = self.object::<TextureId>(connection, handle)?;
+        if self.device.is_staged_buffer_texture(texture)? {
+            return Err(Error::Unsupported("shader bindings of host buffer render targets").into());
+        }
+        Ok(self.device.texture_resource_id(texture)?)
     }
 
     /// The `gpuResourceID` of the sampler `handle` names, null for nil.
@@ -325,6 +337,41 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             blocks: self.device.texture_blocks(id)?,
         })
     }
+}
+
+fn hosted_command(code: CommandCode) -> bool {
+    matches!(
+        code,
+        CommandCode::CommandBuffer(
+            CommandBufferCode::EndEncoding
+                | CommandBufferCode::SignalEvent
+                | CommandBufferCode::WaitForEvent
+        ) | CommandCode::Compute(
+            ComputeCode::Begin
+                | ComputeCode::SetPipeline
+                | ComputeCode::SetBuffer
+                | ComputeCode::SetBufferOffset
+                | ComputeCode::SetBytes
+                | ComputeCode::DispatchThreadgroups
+                | ComputeCode::DispatchThreads
+        ) | CommandCode::Blit(
+            BlitCode::Begin
+                | BlitCode::CopyBuffer
+                | BlitCode::CopyBufferToTexture
+                | BlitCode::CopyTextureToBuffer
+                | BlitCode::FillBuffer
+        ) | CommandCode::Render(
+            RenderCode::Begin
+                | RenderCode::SetPipeline
+                | RenderCode::SetBuffer
+                | RenderCode::SetBufferOffset
+                | RenderCode::SetBytes
+                | RenderCode::SetViewports
+                | RenderCode::SetScissorRects
+                | RenderCode::SetColorStoreAction
+                | RenderCode::DrawPrimitives
+        )
+    )
 }
 
 /// An argument table index.

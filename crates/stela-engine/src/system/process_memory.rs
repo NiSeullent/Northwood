@@ -17,6 +17,7 @@ use crate::memory::{
     policy::{LowerAddressProfile, MemoryControls, TagCheckFaultMode},
 };
 use alloc::sync::Arc;
+use stela_compiler::context::memory::address::{AddressAddChecks, EffectiveAddressChecks};
 use stela_compiler::{GuestState, context::memory::MemoryStatus};
 #[cfg(feature = "std")]
 use stela_compiler::{
@@ -88,6 +89,8 @@ const TCR_TAG_CHECK_MASK_LOWER: u64 = 1 << 57;
 const TCR_EXTENDED_TAG_LOWER: u64 = 1 << 60;
 const TCR_UNSUPPORTED: u64 = TCR_TAG_CHECK_MASK_LOWER | TCR_EXTENDED_TAG_LOWER;
 const SOURCE_PSTATE_MASK: u64 = NZCV_MASK | DAIF_MASK | PSTATE_MODE_MASK;
+const UNCHECKED_ADDRESS_CHECKS: EffectiveAddressChecks =
+    EffectiveAddressChecks::new(AddressAddChecks::Disabled, AddressAddChecks::Disabled);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessMemoryError {
@@ -154,19 +157,45 @@ pub struct ProcessMemoryFeatures {
     cpa: pointer_checks::CpaFeature,
 }
 
+enum Atomicity {
+    Lse2,
+    BaseOrLse2,
+}
+
 impl ProcessMemoryFeatures {
-    /// Only source CPA0/CPA1 facts resolve both AddressAdd levels without
-    /// extended controls. CPA2 never inherits that unchecked specialization.
-    pub(crate) fn unchecked_address_checks(
-        &self,
-    ) -> Option<stela_compiler::context::memory::address::EffectiveAddressChecks> {
-        use stela_compiler::context::memory::address::{AddressAddChecks, EffectiveAddressChecks};
+    /// CPA0 and CPA1 permit unchecked AddressAdd at both access levels.
+    /// The fixed process's CPA2 scope resolves its checks separately.
+    pub(crate) fn unchecked_address_checks(&self) -> Option<EffectiveAddressChecks> {
         match self.cpa {
-            pointer_checks::CpaFeature::Absent | pointer_checks::CpaFeature::Arithmetic => Some(
-                EffectiveAddressChecks::new(AddressAddChecks::Disabled, AddressAddChecks::Disabled),
-            ),
+            pointer_checks::CpaFeature::Absent | pointer_checks::CpaFeature::Arithmetic => {
+                Some(UNCHECKED_ADDRESS_CHECKS)
+            }
             pointer_checks::CpaFeature::Checked => None,
         }
+    }
+
+    /// Resolve the canonical system's address arithmetic. Its checked memory
+    /// policy separately admits each instruction's host and backing needs.
+    /// Base atomicity here does not qualify a fixed process memory scope.
+    pub(crate) fn canonical_address_checks(
+        identification: &Snapshot,
+    ) -> Result<EffectiveAddressChecks, ProcessMemoryError> {
+        let read = |register| {
+            identification
+                .read(register)
+                .map_err(ProcessMemoryError::Identification)
+        };
+        let _ = Self::require_unchecked_cpa(read(Register::IdAa64Isar3El1)?)?;
+        identification
+            .base_spe_absence()
+            .map_err(ProcessMemoryError::Identification)?;
+        Self::check_memory_ids(
+            read(Register::IdAa64Mmfr0El1)?,
+            read(Register::IdAa64Mmfr2El1)?,
+            read(Register::IdAa64Pfr1El1)?,
+            Atomicity::BaseOrLse2,
+        )?;
+        Ok(UNCHECKED_ADDRESS_CHECKS)
     }
 
     /// Derive these facts from the snapshot. Missing IDs are unsupported.
@@ -194,15 +223,7 @@ impl ProcessMemoryFeatures {
         id_aa64pfr1_el1: u64,
         base_spe_absence: BaseSpeAbsence,
     ) -> Result<Self, ProcessMemoryError> {
-        let cpa = pointer_checks::CpaFeature::from_raw(id_aa64isar3_el1)
-            .map_err(ProcessMemoryError::PointerChecks)?;
-        if cpa == pointer_checks::CpaFeature::Checked {
-            return Err(ProcessMemoryError::UnsupportedFeature {
-                register: "ID_AA64ISAR3_EL1",
-                field: "CPA",
-                value: id_aa64isar3_el1 & ISAR3_CPA_MASK,
-            });
-        }
+        let cpa = Self::require_unchecked_cpa(id_aa64isar3_el1)?;
         Self::from_qualified_ids(
             id_aa64mmfr0_el1,
             id_aa64mmfr2_el1,
@@ -212,6 +233,21 @@ impl ProcessMemoryFeatures {
         )
     }
 
+    fn require_unchecked_cpa(
+        id_aa64isar3_el1: u64,
+    ) -> Result<pointer_checks::CpaFeature, ProcessMemoryError> {
+        let cpa = pointer_checks::CpaFeature::from_raw(id_aa64isar3_el1)
+            .map_err(ProcessMemoryError::PointerChecks)?;
+        if cpa == pointer_checks::CpaFeature::Checked {
+            return Err(ProcessMemoryError::UnsupportedFeature {
+                register: "ID_AA64ISAR3_EL1",
+                field: "CPA",
+                value: id_aa64isar3_el1 & ISAR3_CPA_MASK,
+            });
+        }
+        Ok(cpa)
+    }
+
     fn from_qualified_ids(
         id_aa64mmfr0_el1: u64,
         id_aa64mmfr2_el1: u64,
@@ -219,6 +255,24 @@ impl ProcessMemoryFeatures {
         base_spe_absence: BaseSpeAbsence,
         cpa: pointer_checks::CpaFeature,
     ) -> Result<Self, ProcessMemoryError> {
+        Self::check_memory_ids(
+            id_aa64mmfr0_el1,
+            id_aa64mmfr2_el1,
+            id_aa64pfr1_el1,
+            Atomicity::Lse2,
+        )?;
+        Ok(Self {
+            _base_spe_absence: base_spe_absence,
+            cpa,
+        })
+    }
+
+    fn check_memory_ids(
+        id_aa64mmfr0_el1: u64,
+        id_aa64mmfr2_el1: u64,
+        id_aa64pfr1_el1: u64,
+        atomicity: Atomicity,
+    ) -> Result<(), ProcessMemoryError> {
         let granule = (id_aa64mmfr0_el1 >> MMFR0_TGRAN4_SHIFT) & ID_FIELD_MASK;
         if !matches!(granule, TGRAN4_SUPPORTED | TGRAN4_LPA2) {
             return Err(ProcessMemoryError::UnsupportedFeature {
@@ -227,32 +281,25 @@ impl ProcessMemoryFeatures {
                 value: granule,
             });
         }
-        for (register, field, value, expected) in [
-            (
-                "ID_AA64MMFR2_EL1",
-                "AT",
-                (id_aa64mmfr2_el1 >> MMFR2_AT_SHIFT) & ID_FIELD_MASK,
-                MMFR2_AT_LSE2,
-            ),
-            (
-                "ID_AA64PFR1_EL1",
-                "MTE",
-                (id_aa64pfr1_el1 >> PFR1_MTE_SHIFT) & ID_FIELD_MASK,
-                FEATURE_ABSENT,
-            ),
-        ] {
-            if value != expected {
-                return Err(ProcessMemoryError::UnsupportedFeature {
-                    register,
-                    field,
-                    value,
-                });
-            }
+        let at = (id_aa64mmfr2_el1 >> MMFR2_AT_SHIFT) & ID_FIELD_MASK;
+        if at != MMFR2_AT_LSE2
+            && !(at == FEATURE_ABSENT && matches!(atomicity, Atomicity::BaseOrLse2))
+        {
+            return Err(ProcessMemoryError::UnsupportedFeature {
+                register: "ID_AA64MMFR2_EL1",
+                field: "AT",
+                value: at,
+            });
         }
-        Ok(Self {
-            _base_spe_absence: base_spe_absence,
-            cpa,
-        })
+        let mte = (id_aa64pfr1_el1 >> PFR1_MTE_SHIFT) & ID_FIELD_MASK;
+        if mte != FEATURE_ABSENT {
+            return Err(ProcessMemoryError::UnsupportedFeature {
+                register: "ID_AA64PFR1_EL1",
+                field: "MTE",
+                value: mte,
+            });
+        }
+        Ok(())
     }
 }
 

@@ -83,6 +83,12 @@ impl Failure {
     pub fn is_quarantined(&self) -> bool {
         self.retained.state == State::Failed
     }
+
+    /// The legacy handoff's result, if initialization reached that step.
+    /// Later controller failures do not undo a verified SMI disable.
+    pub(crate) fn legacy_released(&self) -> Option<bool> {
+        self.retained.legacy_released
+    }
 }
 
 // Internal trait lets the DMA peer execute the identical production controller.
@@ -332,6 +338,7 @@ impl Controller {
             owner: Rc::new(()),
             state: State::Failed,
             fault: None,
+            legacy_released: None,
             operational: 0,
             ports: Vec::new(),
             roots: 0,
@@ -355,6 +362,7 @@ impl Controller {
         }
     }
     pub(super) fn initialize_inner(&mut self) -> Result<(), Error> {
+        self.legacy_released = None;
         self.hw().validate()?;
         let caps = self.read(0)?;
         if caps >> 16 != 0x100 {
@@ -376,7 +384,9 @@ impl Controller {
         self.ports = (0..ports + CHILDREN).map(|_| None).collect();
         self.power_control = hcs & 16 != 0;
         self.companions = hcs & (15 << 12) != 0;
+        self.legacy_released = Some(false);
         self.legacy(((hcc >> 8) & 255) as u16)?;
+        self.legacy_released = Some(true);
         self.put(INTR, 0)?;
         let command = self.op(CMD)?;
         if self.op(STS)? & HALT != 0 {
@@ -477,7 +487,9 @@ impl Controller {
                 // EHCI USBLEGCTLSTS SMI enables0..5,13..15; high RW1C
                 // statuses29..31. Do not replay reserved/RO lower bits.
                 self.hw().config_write(offset + 4, 0xe000_0000)?;
-                if self.hw().config_read(offset + 4)? & 0xe03f != 0 {
+                if self.hw().config_read(offset + 4)? & crate::usb::handoff::EHCI_LEGACY_SMI_ENABLES
+                    != 0
+                {
                     return Err(Error::Register);
                 }
             }

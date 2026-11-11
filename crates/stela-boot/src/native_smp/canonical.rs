@@ -195,7 +195,15 @@ unsafe fn reserve_with_limit(
             ),
         }
     }
-    .map(Arc::new)
+    .and_then(|mut ram| {
+        if handoff.memory_profile == stela_boot_core::host_memory::Profile::Paged {
+            ram.enable_descriptor_frame_leases()?;
+            crate::output::arguments(format_args!(
+                "NATIVE RAM canonical frame leases enabled (16 KiB)\n"
+            ));
+        }
+        Ok(Arc::new(ram))
+    })
     .map_err(|error| {
         crate::output::arguments(format_args!(
             "NATIVE RAM registration refused cause={error:?}\n"
@@ -311,7 +319,10 @@ pub(crate) unsafe fn prepare_with_locks<'host, D: Devices>(
     }
     machine
         .install_shared_memory_for_active_processors(ram, &EventDomain::new())
-        .map_err(|_| {
+        .map_err(|error| {
+            crate::output::arguments(format_args!(
+                "NATIVE CANONICAL cold installation refused: {error:?}\n"
+            ));
             refuse!("cold source controls/canonical CPU ownership refused before entry")
         })?;
     // Initial handoff bindings must settle before any physical worker owner

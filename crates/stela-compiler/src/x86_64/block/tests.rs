@@ -1846,6 +1846,98 @@ fn hosted_result_chain_keeps_both_zlib_compare_inputs() {
     assert!(!dit.x86_64_code[dit.source_map[2].1..].starts_with(&held_compare));
 }
 
+#[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn native_loop_drains_a_two_word_bitset_with_and_without_bmi1() {
+    use crate::{
+        Anchor, GuestState, Options, TargetCpu,
+        block::{BlockProfile, Features},
+        x86_64::{NativeSystem, chain::ChainControl, native, pinned::entered},
+    };
+
+    // X16 and X17 contain the remaining bits. X19 points to marker bytes.
+    // Each iteration clears the first bit, marks its byte, and tallies its
+    // index. The independent X24 countdown keeps a faulty loop bounded.
+    let words = [
+        0xaa11_020a_u32, // orr x10, x16, x17
+        0xb400_028a,     // cbz x10, done
+        0xdac0_0204,     // rbit x4, x16
+        0xdac0_1084,     // clz x4, x4
+        0xdac0_0228,     // rbit x8, x17
+        0xdac0_1108,     // clz x8, x8
+        0x1101_0108,     // add w8, w8, #64
+        0xf100_021f,     // cmp x16, #0
+        0x1a88_1083,     // csel w3, w4, w8, ne
+        0x5280_0020,     // mov w0, #1
+        0x9ac3_2002,     // lsl x2, x0, x3
+        0xf27a_007f,     // tst x3, #64
+        0x9a9f_0048,     // csel x8, x2, xzr, eq
+        0x9a9f_1042,     // csel x2, x2, xzr, ne
+        0x8a28_0210,     // bic x16, x16, x8
+        0x8a22_0231,     // bic x17, x17, x2
+        0x3823_6a60,     // strb w0, [x19, x3]
+        0x9100_06d6,     // add x22, x22, #1
+        0x8b03_02f7,     // add x23, x23, x3
+        0xd100_0718,     // sub x24, x24, #1
+        0xb5ff_fd98,     // cbnz x24, loop
+        0xd503_201f,     // done: nop
+    ];
+    let source: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let entry = GuestAddress(0x1000);
+    let done = entry.0 + source.len() as u64 - 4;
+    let profile = BlockProfile::new(Features::SYSTEM_MODE);
+    let native_system = NativeSystem {
+        self_loops: true,
+        loop_counts: true,
+        ..NativeSystem::NONE
+    };
+    let base = TargetCpu::X86_64_V2;
+    let host = TargetCpu::detect();
+    for target in [
+        base,
+        base.with_lzcnt(),
+        base.with_bmi1(),
+        base.with_lzcnt().with_bmi1(),
+    ] {
+        if !host.supports(target) {
+            continue;
+        }
+        let options = Options::new(profile, target).with_native_system(native_system);
+        let block = crate::compile(&source, entry, &options).unwrap();
+        assert!(block.self_loop);
+        assert_eq!(block.source_bytes, source.len() - 4);
+        let code = entered(&block.native.x86_64_code);
+        let mut control = ChainControl::default();
+        let mut marks = [0u8; 128];
+        let mut state = GuestState::default();
+        state.anchors[Anchor::Control] = (&mut control as *mut ChainControl) as u64;
+        state.x[16] = 0x8000_0000_0001_0001;
+        state.x[17] = 0x8000_0000_0000_0102;
+        state.x[19] = marks.as_mut_ptr() as u64;
+        state.x[24] = 128;
+        let bits = [0, 16, 63, 65, 72, 127];
+        let mut next = entry.0;
+        for _ in 0..=bits.len() {
+            assert_eq!(next, entry.0);
+            next = native::run(&code, &mut state);
+            if next == done {
+                break;
+            }
+        }
+        assert_eq!(next, done, "{target:?}");
+        assert!(control.loop_iterated > 0);
+        assert_eq!((state.x[16], state.x[17]), (0, 0), "{target:?}");
+        assert_eq!(state.x[22], bits.len() as u64, "{target:?}");
+        assert_eq!(state.x[23], bits.iter().sum::<usize>() as u64, "{target:?}");
+        assert_eq!(state.x[24], 128 - bits.len() as u64, "{target:?}");
+        let mut expected = [0u8; 128];
+        for bit in bits {
+            expected[bit] = 1;
+        }
+        assert_eq!(marks, expected, "{target:?}");
+    }
+}
+
 #[test]
 fn system_address_pair_keeps_source_rows_and_the_following_fault_boundary() {
     use crate::{Lifter, TargetCpu, aarch64::Decoder, block::RecoverySiteKind};

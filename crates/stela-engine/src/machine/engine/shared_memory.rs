@@ -11,7 +11,9 @@ mod terminal;
 pub(super) use terminal::ExecutionDomain;
 #[cfg(feature = "native-profile")]
 mod source_profile;
-pub use host::{HeldRamService, NativeTransport, ServiceHost, ServiceTransport};
+pub use host::{
+    CpuMappingsRevokedFrame, HeldRamService, NativeTransport, ServiceHost, ServiceTransport,
+};
 #[cfg(feature = "native-profile")]
 pub use source_profile::Statistics as NativeSourceStatistics;
 

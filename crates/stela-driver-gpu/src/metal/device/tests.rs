@@ -2850,6 +2850,429 @@ fn framebuffer_reads_of_a_linear_attachment_run_on_its_copy() {
     assert_eq!((order.as_str(), pairs.len()), ("be", 0));
 }
 
+fn staged_pass(
+    staged: TextureId,
+    load_action: LoadAction,
+    store_action: StoreAction,
+) -> RenderPassRequest {
+    let mut colors = [None; MAX_COLOR_ATTACHMENTS];
+    colors[0] = Some(AttachmentRequest {
+        texture: staged,
+        level: 0,
+        slice: 0,
+        depth_plane: 0,
+        resolve: None,
+        load_action,
+        store_action,
+        store_action_options: StoreActionOptions::EMPTY,
+        clear: [0.25, 0.5, 0.75, 1.0],
+        surface: None,
+    });
+    RenderPassRequest {
+        color_attachments: colors,
+        depth_attachment: None,
+        depth_resolve_filter: MultisampleDepthResolveFilter::Sample0,
+        stencil_attachment: None,
+        stencil_resolve_filter: MultisampleStencilResolveFilter::Sample0,
+        visibility_result_buffer: None,
+        visibility_result_type: VisibilityResultType::Reset,
+        render_target_array_length: 0,
+        render_target_width: 0,
+        render_target_height: 0,
+        default_raster_sample_count: 0,
+        tile_memory: Default::default(),
+        sample_positions: Vec::new(),
+        rasterization_rate_map: false,
+        counter_samples: Vec::new(),
+    }
+}
+
+#[test]
+fn host_buffer_attachments_copy_on_load_and_final_store() {
+    use crate::metal::{pass::AttachmentSlot, vulkan::Access};
+    use core::num::NonZeroU64;
+    use stela_contracts::gate::MemoryRange;
+
+    let mut backend = MockBackend::new();
+    backend.host_pointer_imports = true;
+    let mut device = device_on(backend);
+    let shared = options(StorageMode::Shared);
+    let token = NonZeroU64::new(42).unwrap();
+    let memory = device
+        .import_memory(
+            &[MemoryRange {
+                address: 0x1000,
+                bytes: 4096,
+            }],
+            token,
+        )
+        .unwrap();
+    let buffer = device.new_imported_buffer(memory, 4096, shared).unwrap();
+    let host = device.buffer(buffer).unwrap().buffer;
+    let descriptor = TextureDescriptor {
+        width: 17,
+        height: 3,
+        options: shared,
+        ..texture(PixelFormat::Bgra8Unorm, TextureUsage::RENDER_TARGET)
+    };
+    assert!(
+        device
+            .new_texture_from_buffer(buffer, &descriptor, 3, 128)
+            .is_err()
+    );
+    assert!(
+        device
+            .new_texture_from_buffer(buffer, &descriptor, 32, 64)
+            .is_err()
+    );
+    assert!(
+        device
+            .new_texture_from_buffer(buffer, &descriptor, 3800, 128)
+            .is_err()
+    );
+    assert!(
+        device
+            .new_texture_from_buffer(
+                buffer,
+                &TextureDescriptor {
+                    usage: TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ,
+                    ..descriptor
+                },
+                32,
+                128
+            )
+            .is_err()
+    );
+    let staged = device
+        .new_texture_from_buffer(buffer, &descriptor, 32, 128)
+        .unwrap();
+    assert!(device.is_staged_buffer_texture(staged).unwrap());
+    assert!(device.texture_bytes(staged) > 0);
+    assert_eq!(device.texture_resource_id(staged), Ok(ResourceId::NULL));
+    assert!(device.texture_image(staged).is_err());
+    assert!(device.destroy_buffer(buffer).is_err());
+
+    // The same shape over an ordinary allocation retains the NVK alias path.
+    let ordinary = device.new_buffer(4096, shared).unwrap();
+    let linear = device
+        .new_texture_from_buffer(ordinary, &descriptor, 0, 256)
+        .unwrap();
+    assert!(!device.is_staged_buffer_texture(linear).unwrap());
+    assert!(device.texture_image(linear).is_ok());
+
+    let pass = |load, store| staged_pass(staged, load, store);
+    let event = device.new_event().unwrap();
+    let semaphore = device.event_semaphore(event).unwrap();
+    let mut commands = device.new_command_buffer();
+    commands
+        .encode_wait_for_event(&mut device.resolver(), semaphore, 1)
+        .unwrap();
+    device
+        .begin_render(
+            &mut commands,
+            &pass(LoadAction::Clear, StoreAction::Unknown),
+        )
+        .unwrap();
+    assert!(
+        commands
+            .set_store_action(
+                AttachmentSlot::Color(0),
+                StoreAction::CustomSampleDepthStore
+            )
+            .is_err()
+    );
+    commands
+        .set_store_action(AttachmentSlot::Color(0), StoreAction::Store)
+        .unwrap();
+    commands.end_encoding(&mut device.resolver()).unwrap();
+    device
+        .begin_render(
+            &mut commands,
+            &pass(LoadAction::Load, StoreAction::DontCare),
+        )
+        .unwrap();
+    commands.end_encoding(&mut device.resolver()).unwrap();
+    commands
+        .encode_signal_event(&mut device.resolver(), semaphore, 2)
+        .unwrap();
+    let serial = device.commit(commands).unwrap();
+    assert!(device.holds());
+    assert!(device.backend().submissions.is_empty());
+    device.destroy_texture(staged).unwrap();
+    device.destroy_buffer(buffer).unwrap();
+    assert_eq!(device.retired(), None);
+    assert!(!device.backend().destroyed.contains(&Object::Buffer(host)));
+
+    device.set_signaled_value(event, 1).unwrap();
+    let recording = device
+        .backend()
+        .submissions
+        .iter()
+        .flatten()
+        .find(|segment| segment.signals.contains(&(semaphore, 2)))
+        .unwrap();
+    let commands = &recording.commands;
+    let relevant: Vec<_> = commands
+        .iter()
+        .enumerate()
+        .filter(|(_, command)| {
+            matches!(
+                command,
+                Command::BeginRendering(_)
+                    | Command::EndRendering
+                    | Command::CopyBufferToImage { .. }
+                    | Command::CopyImageToBuffer { .. }
+            )
+        })
+        .collect();
+    let [
+        (first, Command::BeginRendering(_)),
+        (_, Command::EndRendering),
+        (
+            store,
+            Command::CopyImageToBuffer {
+                src: image,
+                dst,
+                region,
+            },
+        ),
+        (
+            load,
+            Command::CopyBufferToImage {
+                src,
+                dst: next_image,
+                region: next_region,
+            },
+        ),
+        (_, Command::BeginRendering(_)),
+        (_, Command::EndRendering),
+    ] = relevant.as_slice()
+    else {
+        panic!("wrong staged render sequence: {relevant:?}")
+    };
+    assert_eq!((*dst, *src), (host, host));
+    assert_eq!(image, next_image);
+    assert_eq!(region, next_region);
+    assert_eq!(region.buffer_offset, 32);
+    assert_eq!(region.buffer_row_length, 32);
+    assert_eq!(region.extent, [17, 3, 1]);
+    let image = *image;
+    assert!(
+        !commands[..*first]
+            .iter()
+            .any(|command| matches!(command, Command::CopyBufferToImage { .. }))
+    );
+    assert!(commands[*store + 1..*load].iter().any(|command| matches!(
+        command,
+        Command::Barrier(barrier) if barrier.src_access == Access::TRANSFER_WRITE
+            && barrier.dst_stages == PipelineStages::HOST && barrier.dst_access == Access::HOST_READ
+    )));
+    assert!(commands[*store + 1..*load].iter().any(|command| matches!(
+        command,
+        Command::Barrier(barrier) if barrier.src_access == Access::TRANSFER_WRITE
+            && barrier.dst_access.contains(Access::TRANSFER_READ)
+    )));
+    complete(&mut device, serial);
+    assert!(device.backend().destroyed.contains(&Object::Image(image)));
+    assert!(device.backend().destroyed.contains(&Object::Buffer(host)));
+    assert_eq!(device.retired(), Some(token));
+}
+
+fn copied_guest_target() -> (TestDevice, BufferId, TextureId) {
+    use core::num::NonZeroU64;
+    use stela_contracts::gate::MemoryRange;
+
+    let mut backend = MockBackend::new();
+    backend.guest_copy_imports = true;
+    backend.marker = Some(alloc::boxed::Box::new(core::sync::atomic::AtomicU32::new(
+        0,
+    )));
+    let mut device = device_on(backend);
+    let shared = options(StorageMode::Shared);
+    let memory = device
+        .import_memory(
+            &[MemoryRange {
+                address: 4096,
+                bytes: 4096,
+            }],
+            NonZeroU64::new(43).unwrap(),
+        )
+        .unwrap();
+    let buffer = device.new_imported_buffer(memory, 4096, shared).unwrap();
+    assert_eq!(device.buffer(buffer).unwrap().address, 0);
+    let descriptor = TextureDescriptor {
+        width: 17,
+        height: 3,
+        options: shared,
+        ..texture(PixelFormat::Bgra8Unorm, TextureUsage::RENDER_TARGET)
+    };
+    let target = device
+        .new_texture_from_buffer(buffer, &descriptor, 32, 128)
+        .unwrap();
+    (device, buffer, target)
+}
+
+#[test]
+fn copied_guest_load_waits_for_actual_event_and_private_checkpoint() {
+    use super::fixture::GuestCopyStep;
+    use crate::metal::vulkan::Access;
+
+    let (mut device, buffer, texture) = copied_guest_target();
+    assert!(device.completion_word().is_none());
+    device.backend().guest_copy_wait_reaches = true;
+    let input = device.new_event().unwrap();
+    let output = device.new_event().unwrap();
+    let ready = device.event_semaphore(input).unwrap();
+    let visible = device.event_semaphore(output).unwrap();
+    let mut render = device.new_command_buffer();
+    render
+        .encode_wait_for_event(&mut device.resolver(), ready, 1)
+        .unwrap();
+    device
+        .begin_render(
+            &mut render,
+            &staged_pass(texture, LoadAction::Load, StoreAction::Store),
+        )
+        .unwrap();
+    render.end_encoding(&mut device.resolver()).unwrap();
+    render
+        .encode_signal_event(&mut device.resolver(), visible, 1)
+        .unwrap();
+    device.commit_on(1, 1, render).unwrap();
+    assert!(device.holds());
+    assert!(device.backend().guest_copy_steps.is_empty());
+
+    // The native storage and wire stay live even when the frontend releases
+    // both objects before the event's producer reaches the queue.
+    let host = device.buffer(buffer).unwrap().buffer;
+    device.destroy_texture(texture).unwrap();
+    device.destroy_buffer(buffer).unwrap();
+    assert_eq!(device.retired(), None);
+    assert!(!device.backend().destroyed.contains(&Object::Buffer(host)));
+
+    let mut producer = device.new_command_buffer();
+    producer
+        .encode_signal_event(&mut device.resolver(), ready, 1)
+        .unwrap();
+    device.commit_on(1, 2, producer).unwrap();
+    let [
+        GuestCopyStep::Submit(produces),
+        GuestCopyStep::Wait(waited, 1),
+        GuestCopyStep::Checkpoint(fence),
+        GuestCopyStep::Load(read),
+        GuestCopyStep::Checkpoint(gpu),
+        GuestCopyStep::Store(written),
+        GuestCopyStep::Submit(published),
+    ] = &device.backend().guest_copy_steps[..]
+    else {
+        panic!("copy order {:?}", device.backend().guest_copy_steps)
+    };
+    assert!(produces.contains(&(ready, 1)));
+    assert_eq!(*waited, ready);
+    assert!(fence.commands.is_empty());
+    assert_eq!(read, written);
+    assert_eq!(
+        (read.offset, read.stride, read.bytes, read.count),
+        (32, 128, 68, 3)
+    );
+    assert!(gpu.signals.is_empty());
+    let upload = gpu
+        .commands
+        .iter()
+        .position(|command| matches!(command, Command::CopyBufferToImage { .. }))
+        .unwrap();
+    let render = gpu
+        .commands
+        .iter()
+        .position(|command| matches!(command, Command::BeginRendering(_)))
+        .unwrap();
+    let download = gpu
+        .commands
+        .iter()
+        .position(|command| matches!(command, Command::CopyImageToBuffer { .. }))
+        .unwrap();
+    assert!(upload < render && render < download);
+    assert!(gpu.commands[download+1..].iter().any(|command| matches!(
+        command, Command::Barrier(barrier)
+            if barrier.src_access == Access::TRANSFER_WRITE && barrier.dst_access == Access::HOST_READ
+    )));
+    assert!(published.contains(&(visible, 1)));
+    assert_eq!(device.retired(), None);
+    device.backend().finish();
+    device.poll().unwrap();
+    assert!(device.backend().destroyed.contains(&Object::Buffer(host)));
+    assert_eq!(device.retired().map(core::num::NonZeroU64::get), Some(43));
+}
+
+#[test]
+fn copied_guest_load_does_not_read_after_a_promised_wait_times_out() {
+    use super::fixture::GuestCopyStep;
+
+    let (mut device, _, texture) = copied_guest_target();
+    let input = device.new_event().unwrap();
+    let ready = device.event_semaphore(input).unwrap();
+    let mut producer = device.new_command_buffer();
+    producer
+        .encode_signal_event(&mut device.resolver(), ready, 1)
+        .unwrap();
+    device.commit_on(1, 2, producer).unwrap();
+    let mut render = device.new_command_buffer();
+    render
+        .encode_wait_for_event(&mut device.resolver(), ready, 1)
+        .unwrap();
+    device
+        .begin_render(
+            &mut render,
+            &staged_pass(texture, LoadAction::Load, StoreAction::Store),
+        )
+        .unwrap();
+    render.end_encoding(&mut device.resolver()).unwrap();
+    assert_eq!(device.commit_on(1, 1, render), Err(Error::DeviceLost));
+    assert!(matches!(
+        &device.backend().guest_copy_steps[..],
+        [GuestCopyStep::Submit(_), GuestCopyStep::Wait(event, 1)] if *event == ready
+    ));
+}
+
+#[test]
+fn copied_guest_store_failure_never_publishes_completion_and_keeps_the_wire() {
+    use super::{fixture::GuestCopyStep, lifecycle::QuiesceStatus};
+
+    let (mut device, buffer, texture) = copied_guest_target();
+    device.backend().guest_copy_publish_error = Some(Error::Invalid("partial canonical write"));
+    let event = device.new_event().unwrap();
+    let visible = device.event_semaphore(event).unwrap();
+    let mut commands = device.new_command_buffer();
+    device
+        .begin_render(
+            &mut commands,
+            &staged_pass(texture, LoadAction::Clear, StoreAction::Store),
+        )
+        .unwrap();
+    commands.end_encoding(&mut device.resolver()).unwrap();
+    commands
+        .encode_signal_event(&mut device.resolver(), visible, 1)
+        .unwrap();
+    assert_eq!(device.commit_for(1, commands), Err(Error::DeviceLost));
+    assert!(matches!(
+        &device.backend().guest_copy_steps[..],
+        [GuestCopyStep::Checkpoint(_), GuestCopyStep::Store(_)]
+    ));
+    assert!(device.backend().submissions.is_empty());
+    assert_eq!(device.completed_serial(), 0);
+    assert_eq!(device.poll(), Err(Error::DeviceLost));
+    device.abandon(1);
+    device.destroy_texture(texture).unwrap();
+    let host = device.buffer(buffer).unwrap().buffer;
+    device.destroy_buffer(buffer).unwrap();
+    assert!(!device.backend().destroyed.contains(&Object::Buffer(host)));
+    assert_eq!(device.retired(), None);
+    assert_eq!(
+        device.quiesce_step(),
+        QuiesceStatus::Unproven(Error::DeviceLost)
+    );
+}
+
 #[test]
 fn render_passes_resolve_cached_attachment_views() {
     let mut device = device();

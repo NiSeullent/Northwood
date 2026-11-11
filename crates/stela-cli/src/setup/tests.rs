@@ -2,6 +2,7 @@ use super::record::{RECORD_KIND, RECORD_SCHEMA};
 use super::*;
 use host::{Cpu, Disk, Partition, PartitionInfo, Volume};
 use std::collections::BTreeMap;
+use stela_boot_core::options::System;
 use stela_loader::mount_interface::Choices;
 use stela_soc_data::nor::nvram::Variables;
 
@@ -19,6 +20,8 @@ fn partitions_are_named_alone_or_by_device_path() {
         "/dev/nvme0n1p2",
         "--nor",
         "sdc3",
+        "--volume-swap-bytes",
+        "34359738368",
     ])
     .unwrap()
     .command
@@ -28,6 +31,7 @@ fn partitions_are_named_alone_or_by_device_path() {
     let setup = setup.request();
     assert_eq!(setup.target.as_deref(), Some("nvme0n1p2"));
     assert_eq!(setup.nor.as_deref(), Some("sdc3"));
+    assert_eq!(setup.volume_swap_bytes, Some(32 * GIB));
 }
 
 /// A computer whose volumes and disks the test declares.
@@ -43,6 +47,8 @@ pub(super) struct FakeHost {
     /// Where `mount` mounts a partition; others refuse.
     pub(super) mountable: BTreeMap<String, PathBuf>,
     pub(super) nvidia_gpus: std::cell::RefCell<Vec<u16>>,
+    /// Opt-in whole-disk setup for fixtures with blank test directories.
+    erase_as: Option<&'static str>,
 }
 
 impl FakeHost {
@@ -59,6 +65,7 @@ impl FakeHost {
             unmounted: Default::default(),
             mountable: BTreeMap::new(),
             nvidia_gpus: Default::default(),
+            erase_as: None,
         }
     }
 
@@ -152,6 +159,14 @@ impl Host for FakeHost {
     }
     fn disks(&self) -> Result<Vec<Disk>> {
         Ok(self.disks.clone())
+    }
+    fn erase(&self, disk: &str, name: &str) -> Result<()> {
+        if let Some(expected) = self.erase_as {
+            assert_eq!(disk, "disk5");
+            assert_eq!(name, expected);
+            return Ok(());
+        }
+        bail!("this computer cannot erase {disk} into {name}")
     }
 }
 
@@ -270,6 +285,7 @@ fn command(f: &Fixture, usb: &Path) -> Request {
         // `snapshot` reads every file it compares. The default bound's
         // shrinking to fit is `translations::choose`'s to test.
         translation_store_bytes: Some(translations::MIN_PACK_BYTES),
+        volume_swap_bytes: None,
         host_firmware_cache: None,
         confirm_disk: None,
         confirmed: false,
@@ -542,6 +558,8 @@ fn setup_installs_from_the_usb_and_uninstall_restores_it() {
     let choices = Choices::parse(&fs::read_to_string(f.esp.join(CHOICES_PATH)).unwrap()).unwrap();
     let names: Vec<&str> = choices.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["macOS", INSTALL_CHOICE]);
+    assert!(!System::parse(&choices.entries[0].options).unwrap().input);
+    assert!(System::parse(&choices.entries[1].options).unwrap().input);
     assert_eq!(
         fs::read(f.esp.join(efi::LOADER)).unwrap(),
         efi_image(b"stela")
@@ -625,8 +643,66 @@ fn setup_places_bundles_on_fat32_data_volume() {
     assert!(volume.join("stela/install").is_dir());
     assert!(!f.esp.join("stela").exists());
     assert!(f.esp.join(efi::LOADER).is_file());
+    let logs = volume.join(mount_interface::VOLUME_LOG_DIRECTORY);
+    let path = logs.join(mount_interface::VOLUME_LOG_SLOTS[0]);
+    let blank = fs::read(&path).unwrap();
+    assert_eq!(blank.len(), mount_interface::VOLUME_LOG_BYTES);
+    assert_eq!(mount_interface::volume_log_sequence(&blank), Some(0));
+    let mut written = b"STELA loader boot log #2 version=0.1.0\nHOST MEMORY free=1500M\n".to_vec();
+    written.resize(blank.len(), b' ');
+    fs::write(&path, &written).unwrap();
+    volume_log::prepare(&record(&f)).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), written);
+    let text = rerun(&f, |c| c.action = Action::BootLog).unwrap();
+    assert!(text.contains("HOST MEMORY free=1500M\n"), "{text}");
     uninstall(&environment(&f.host), &volume, false).unwrap();
     assert!(!volume.join("stela").exists());
+}
+
+#[test]
+fn setup_mutation_refuses_a_stale_mount_on_another_disk() {
+    let mut f = fixture(GIB / 32, false);
+    add_stela(&mut f);
+    let volume = stela_volume(&f);
+    let mut network = command(&f, &volume);
+    network.install_image = Some(InstallImage::Network);
+    setup(&environment(&f.host), network).unwrap();
+
+    f.host
+        .volumes
+        .insert(volume.clone(), (FileSystem::Fat, 64 * GIB, Some("disk0")));
+    let before = (snapshot(&f.esp), snapshot(&volume));
+    let error = read_record(&environment(&f.host), &f.esp).unwrap_err();
+    assert!(
+        error.to_string().contains("not mounted on the same disk"),
+        "{error}"
+    );
+
+    for partition in f
+        .host
+        .disks
+        .iter_mut()
+        .flat_map(|disk| &mut disk.partitions)
+    {
+        if partition.mount.as_ref() == Some(&volume) {
+            partition.mount = None;
+        }
+    }
+    let environment = environment(&f.host);
+    let (inspected, _, _) = record::read_inspection_record(&environment, &f.esp).unwrap();
+    assert_eq!(inspected.volume, volume);
+    for error in [
+        read_record(&environment, &f.esp).unwrap_err(),
+        uninstall(&environment, &f.esp, false).unwrap_err(),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("mount the setup's data partition"),
+            "{error}"
+        );
+    }
+    assert_eq!((snapshot(&f.esp), snapshot(&volume)), before);
 }
 
 #[test]
@@ -1153,7 +1229,7 @@ fn targetless_setup_defers_disk_selection_to_efi() {
     assert!(error.contains("chosen in stela.efi"), "{error}");
 }
 
-fn rerun(f: &Fixture, configure: impl Fn(&mut Request)) -> Result<String> {
+fn rerun(f: &Fixture, configure: impl FnOnce(&mut Request)) -> Result<String> {
     let mut command = command(f, &f.esp);
     command.ipsw = None;
     command.model = None;
@@ -1367,12 +1443,21 @@ fn installed_disk_preserves_boot_choices_and_partitions() {
             "--system --storage {region} --nor {SERIAL}:{NOR_GUID} --bundle \
              \\stela\\boot\\{build}\\{} --ecid {ecid} \
              --install \\stela\\install\\{build}\\payload.json --install-source \
-             {} --development-restore",
+             {} --development-restore --input",
             bundle::leaf_of(Kind::Restore, Some(ecid), current()),
             STELA_GUID.to_ascii_uppercase()
         )
     );
     let restore_bundle = record.restore_bundle(Kind::Restore, Some(ecid)).unwrap();
+    let mut legacy = record.clone();
+    legacy.bundles[0].kind = Kind::Update;
+    let line = legacy
+        .restore_line(Kind::Update, &legacy.installs[0])
+        .unwrap()
+        .unwrap();
+    let options = System::parse(&line).unwrap();
+    assert!(options.update_restore);
+    assert!(!options.input);
     assert!(
         bundle::verify(
             &restore_bundle.directory(&record.volume),
@@ -1415,7 +1500,7 @@ fn installed_disk_preserves_boot_choices_and_partitions() {
     assert!(line.contains("--install-source"), "{line}");
     assert!(
         line.trim_end()
-            .ends_with("--verify-on-read --development-restore"),
+            .ends_with("--verify-on-read --development-restore --input"),
         "{line}"
     );
     // Setup itself writes neither partition.
@@ -1795,6 +1880,560 @@ fn same_revision_update_preserves_options() {
     assert_eq!(fs::read(&options).unwrap(), custom);
     assert_eq!(fs::read(f.esp.join(RECORD)).unwrap(), before_record);
     assert!(update(false).unwrap().contains("already installed"));
+}
+
+fn northwood_efi_image(tag: &[u8]) -> Vec<u8> {
+    use stela_loader::mount_interface::layout::Layout;
+
+    let mut image = efi_image(tag);
+    image.extend_from_slice(&Layout::MOUNT_CAPABILITY);
+    image.extend_from_slice(&::northwood_config::MOUNT_CAPABILITY);
+    image
+}
+
+fn swap_setup_fixture() -> (Fixture, Request) {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    f.host.volumes.get_mut(&stela_volume(&f)).unwrap().1 = 128 << 20;
+    fs::write(&f.efi, northwood_efi_image(b"Northwood USB swap")).unwrap();
+    let mut request = command(&f, &f.esp);
+    request.volume_swap_bytes = Some(::northwood_config::Swap::default().bytes);
+    request.translation_store_bytes = Some(0);
+    (f, request)
+}
+
+#[test]
+fn setup_repairs_and_uninstalls_only_its_recorded_swap_store() {
+    use std::io::Read;
+    use stela_loader::mount_interface::layout::{self, Layout};
+    use stela_runtime::pc::swap::{DEFAULT_VOLUME_MAX_BYTES, HEADER_BYTES, Header, volume::Config};
+
+    let (mut f, mut request) = swap_setup_fixture();
+    let data = stela_volume(&f);
+    let directory = data.join(Layout::Northwood.data_path(layout::DATA_SWAP));
+    request.dry_run = true;
+    let plan = setup(&environment(&f.host), request).unwrap();
+    assert!(plan.contains(&*directory.to_string_lossy()), "{plan}");
+    assert!(
+        plan.contains(&format!("of {} requested", host::bytes_text(32 * GIB))),
+        "{plan}"
+    );
+    assert!(!directory.exists());
+    let mut request = command(&f, &f.esp);
+    request.volume_swap_bytes = Some(32 * GIB);
+    request.translation_store_bytes = Some(0);
+    setup(&environment(&f.host), request).unwrap();
+    let installed = read_record(&environment(&f.host), &f.esp).unwrap();
+    assert!(installed.complete);
+    let store = installed.volume_swap.as_ref().unwrap();
+    assert_eq!(store.requested_bytes, 32 * GIB);
+    assert!(store.bytes < 64 << 20);
+    assert_eq!(
+        store.partition_guid.to_lowercase(),
+        STELA_GUID.to_lowercase()
+    );
+    let status = rerun(&f, |request| request.action = Action::Status).unwrap();
+    assert!(status.contains(&*directory.to_string_lossy()), "{status}");
+    let config = directory.join("swap.cfg");
+    let extent = directory.join("0000.swp");
+    let owner = directory.join("owner.cfg");
+    let check = || {
+        let bytes = fs::read(&config).unwrap();
+        assert_eq!(
+            Config::parse(&bytes, 512, DEFAULT_VOLUME_MAX_BYTES)
+                .unwrap()
+                .bytes(),
+            store.bytes
+        );
+        let mut header = [0; HEADER_BYTES];
+        let mut file = fs::File::open(&extent).unwrap();
+        file.read_exact(&mut header).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), store.bytes);
+        assert_eq!(
+            Header::decode(&header, store.bytes)
+                .unwrap()
+                .store_uuid()
+                .to_string(),
+            store.guid
+        );
+    };
+    check();
+    let notes = directory.join("notes.txt");
+    fs::write(&notes, b"personal files").unwrap();
+    let unrelated = data.join("keep.ipsw");
+    fs::copy(&f.ipsw, &unrelated).unwrap();
+    let unchanged = |f: &Fixture| {
+        assert_eq!(fs::read(&notes).unwrap(), b"personal files");
+        assert_eq!(fs::read(&unrelated).unwrap(), fs::read(&f.ipsw).unwrap());
+    };
+    fs::remove_file(&config).unwrap();
+    fs::remove_file(&extent).unwrap();
+    let repair = rerun(&f, |request| {
+        request.action = Action::Repair;
+        request.dry_run = true;
+    })
+    .unwrap();
+    assert!(repair.contains(&*directory.to_string_lossy()), "{repair}");
+    assert!(!config.exists() && !extent.exists());
+    let info = &mut f.host.partitions.get_mut(STELA_PARTITION).unwrap().0;
+    let guid = std::mem::replace(
+        &mut info.guid,
+        "5E1A0000-0000-4000-8000-0000000000BB".into(),
+    );
+    for action in [Action::Repair, Action::Uninstall] {
+        let error = rerun(&f, |request| request.action = action).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("recorded swap data partition"),
+            "{error:#}"
+        );
+    }
+    unchanged(&f);
+    assert!(owner.exists() && !config.exists() && !extent.exists());
+    f.host.partitions.get_mut(STELA_PARTITION).unwrap().0.guid = guid;
+    rerun(&f, |request| request.action = Action::Repair).unwrap();
+    check();
+    unchanged(&f);
+    let uninstall = rerun(&f, |request| {
+        request.action = Action::Uninstall;
+        request.dry_run = true;
+    })
+    .unwrap();
+    for path in [&config, &extent, &owner] {
+        assert!(uninstall.contains(&*path.to_string_lossy()), "{uninstall}");
+        assert!(path.is_file());
+    }
+    assert!(
+        !uninstall.contains(&*notes.to_string_lossy()),
+        "{uninstall}"
+    );
+    rerun(&f, |request| request.action = Action::Uninstall).unwrap();
+    assert!(!config.exists() && !extent.exists() && !owner.exists());
+    unchanged(&f);
+}
+
+#[test]
+fn old_setup_records_leave_unmanaged_swap_alone() {
+    use stela_loader::mount_interface::layout::{self, Layout};
+
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    let record = record(&f);
+    assert!(record.volume_swap.is_none());
+    assert!(
+        !fs::read_to_string(f.esp.join(RECORD))
+            .unwrap()
+            .contains("volume_swap")
+    );
+    let directory = record
+        .volume
+        .join(Layout::Legacy.data_path(layout::DATA_SWAP));
+    fs::create_dir_all(&directory).unwrap();
+    let file = directory.join("swap.cfg");
+    fs::write(&file, b"bytes 33554432\n").unwrap();
+    for action in [Action::Repair, Action::Uninstall] {
+        rerun(&f, |request| request.action = action).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"bytes 33554432\n");
+    }
+}
+
+#[test]
+#[ignore = "requires mkfs.fat and mtools for a private raw FAT32 image"]
+fn wizard_usb_swap_round_trips_through_private_fat32_image() {
+    use stela_runtime::pc::swap::{DEFAULT_VOLUME_MAX_BYTES, volume};
+
+    let (f, request) = swap_setup_fixture();
+    println!("{}", setup(&environment(&f.host), request).unwrap());
+    let record = read_record(&environment(&f.host), &f.esp).unwrap();
+    let store = record.volume_swap.unwrap();
+    let path = PathBuf::from(std::env::var_os("NORTHWOOD_FEAT07_WIZARD_IMAGE").unwrap());
+    let esp = path.with_extension("esp.fat32");
+    for (image, label, source, size) in [
+        (
+            &path,
+            "NORTHWOOD",
+            record.volume.join(record.layout.data_dir()),
+            128 << 20,
+        ),
+        (&esp, "ESP", f.esp.join("EFI"), 64 << 20),
+    ] {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(image)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        let formatted = std::process::Command::new("mkfs.fat")
+            .args(["-F", "32", "-s", "1", "-n", label])
+            .arg(image)
+            .status()
+            .unwrap();
+        assert!(formatted.success());
+        let copied = std::process::Command::new("mcopy")
+            .args(["-s", "-i"])
+            .arg(image)
+            .arg(source)
+            .arg("::/")
+            .status()
+            .unwrap();
+        assert!(copied.success());
+    }
+    let metadata = volume::inspect(
+        crate::apfs::open_image(&path).unwrap(),
+        512,
+        DEFAULT_VOLUME_MAX_BYTES,
+    )
+    .unwrap();
+    assert_eq!(metadata.config.bytes(), store.bytes);
+    assert_eq!(metadata.header.store_uuid().to_string(), store.guid);
+    println!(
+        "{}: {} bytes, store {}",
+        path.display(),
+        store.bytes,
+        store.guid
+    );
+}
+
+#[test]
+fn status_reports_latest_usb_memory_and_swap_observations() {
+    use stela_loader::mount_interface::{
+        VOLUME_LOG_BYTES, VOLUME_LOG_SLOTS,
+        layout::{self, Layout},
+    };
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    fs::write(&f.efi, northwood_efi_image(b"Northwood diagnostics")).unwrap();
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    let status = || rerun(&f, |request| request.action = Action::Status).unwrap();
+    assert!(status().contains("no readable USB boot log"));
+
+    let northwood = f.esp.join(Layout::Northwood.esp_path(layout::BOOT_LOG));
+    let legacy = f.esp.join(Layout::Legacy.esp_path(layout::BOOT_LOG));
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::write(
+        &legacy,
+        crate::boot_log::tests::region(&[
+            "HOST MEMORY free=4008M profile=compact\nHOST SWAP no verified store; mode=resident\n",
+            "HOST MEMORY free=1446M cores=1\nCHECK memory FAIL usable=0x5a600000 minimum=0x80000000 cores=1\n",
+        ]),
+    )
+    .unwrap();
+    let refused = status();
+    assert!(refused.contains(&*legacy.to_string_lossy()), "{refused}");
+    assert!(
+        refused.contains("1446 MiB (2048 MiB required)"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("boot refused before selecting a profile"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("press a key at USB startup and choose Diagnostics"),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains("4008 MiB") && !refused.contains("resident mode"),
+        "{refused}"
+    );
+    assert!(refused.contains("No problems found."), "{refused}");
+
+    fs::write(
+        &northwood,
+        crate::boot_log::tests::region(&["HOST MEMORY free=2406M heap=536M profile=paged\n\
+             HOST SWAP candidate=partition state=Idle bytes=34359738368 mode=resident\n"]),
+    )
+    .unwrap();
+    let boot = status();
+    assert!(boot.contains(&*northwood.to_string_lossy()), "{boot}");
+    assert!(
+        boot.contains("2406 MiB") && boot.contains("Paged"),
+        "{boot}"
+    );
+    assert!(
+        boot.contains("partition candidate verified (32768 MiB); resident mode"),
+        "{boot}"
+    );
+    assert!(
+        !boot.contains("next diagnostic") && !boot.contains("1446 MiB"),
+        "{boot}"
+    );
+
+    fs::remove_file(northwood).unwrap();
+    fs::remove_file(legacy).unwrap();
+    let volume = stela_volume(&f);
+    let slot = volume
+        .join(Layout::Northwood.data_path(layout::DATA_LOGS))
+        .join(VOLUME_LOG_SLOTS[0]);
+    let mut snapshot = b"STELA loader boot log #7 fixture\n\
+        [    3.201] CHECK memory PASS usable=2364 MiB, minimum=2048 MiB, one-worker estimate=paged\n\
+        [    3.202] CHECK swap PASS boot data volume=fixture capacity=16 MiB (read only)\n"
+        .to_vec();
+    snapshot.resize(VOLUME_LOG_BYTES, b' ');
+    fs::write(&slot, snapshot).unwrap();
+    let snapshot = status();
+    assert!(snapshot.contains(&*slot.to_string_lossy()), "{snapshot}");
+    assert!(
+        snapshot.contains("2364 MiB")
+            && snapshot.contains("Paged (one-worker diagnostic estimate)"),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot.contains("data volume verified (16 MiB) (read-only diagnostic)"),
+        "{snapshot}"
+    );
+}
+
+#[test]
+#[ignore = "requires extracted FEAT-07 GPT/FAT32 image fixtures"]
+fn status_reads_boot_logs_from_gpt_image_fixtures() {
+    use stela_loader::mount_interface::layout::{self, Layout};
+    let images = PathBuf::from(std::env::var_os("NORTHWOOD_FEAT07_FIXTURES").unwrap());
+    for (name, layout, expected) in [
+        ("legacy", Layout::Legacy, &["3944 MiB", "Compact"][..]),
+        (
+            "northwood",
+            Layout::Northwood,
+            &[
+                "2670 MiB",
+                "Paged",
+                "data volume candidate verified",
+                "resident mode",
+            ][..],
+        ),
+        (
+            "no-log",
+            Layout::Northwood,
+            &["no readable USB boot log"][..],
+        ),
+    ] {
+        let mut f = fixture(64 * GIB, false);
+        add_stela(&mut f);
+        if layout == Layout::Northwood {
+            fs::write(
+                &f.efi,
+                northwood_efi_image(b"Northwood GPT diagnostic fixture"),
+            )
+            .unwrap();
+        }
+        setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+        let source = images.join(name).join("esp-ring.bin");
+        fs::copy(&source, f.esp.join(layout.esp_path(layout::BOOT_LOG))).unwrap();
+        let status = rerun(&f, |request| request.action = Action::Status).unwrap();
+        for expected in expected {
+            assert!(
+                status.contains(expected),
+                "{name}: missing {expected}:\n{status}"
+            );
+        }
+        println!("{name}: {}", source.display());
+        for line in status.lines().filter(|line| {
+            let line = line.trim_start();
+            ["last boot", "usable RAM", "memory profile", "swap"]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        }) {
+            println!("{line}");
+        }
+    }
+}
+
+#[test]
+fn status_and_boot_log_read_northwood_setup_with_legacy_fallback() {
+    use ::northwood_config::BootTimeout;
+    use stela_loader::mount_interface::layout::{self, Layout};
+
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    let image = northwood_efi_image(b"northwood");
+    fs::write(&f.efi, &image).unwrap();
+    let mut erase = command(&f, Path::new("disk5"));
+    erase.dry_run = true;
+    let plan = erase.dispatch(&environment(&f.host)).unwrap();
+    assert!(plan.contains("would erase disk5"), "{plan}");
+    assert!(plan.contains("FAT32 volume named NORTHWOOD"), "{plan}");
+
+    assert!(snapshot(&f.esp).is_empty());
+    f.host.erase_as = Some("NORTHWOOD");
+    let mut create = command(&f, Path::new("disk5"));
+    create.confirmed = true;
+    setup(&environment(&f.host), create).unwrap();
+    let layout = Layout::Northwood;
+    let legacy = Layout::Legacy;
+    let volume = stela_volume(&f);
+    let modern_record = f.esp.join(layout.esp_path(layout::RECORD));
+    let config = f.esp.join(layout.esp_path(layout::CONFIG));
+    let loader = f.esp.join(efi::LOADER);
+    assert_eq!(fs::read(&loader).unwrap(), image);
+    assert!(modern_record.is_file());
+    assert!(config.is_file());
+    for directory in [
+        layout::DATA_BOOT,
+        layout::DATA_INSTALL,
+        layout::DATA_STORE,
+        layout::DATA_LOGS,
+    ] {
+        assert!(
+            volume.join(layout.data_path(directory)).is_dir(),
+            "{directory}"
+        );
+    }
+    assert!(!f.esp.join(legacy.esp_dir()).exists());
+    assert!(!volume.join(legacy.data_dir()).exists());
+
+    let status = rerun(&f, |request| request.action = Action::Status).unwrap();
+    assert!(status.contains("Northwood setup"), "{status}");
+    assert!(
+        status.contains(&*modern_record.to_string_lossy()),
+        "{status}"
+    );
+    assert!(status.contains("No problems found."), "{status}");
+    assert!(status.contains("nwconfig.plist valid"), "{status}");
+
+    let timeout = 17;
+    rerun(&f, |request| {
+        request.action = Action::Configure;
+        request.chooser_timeout = Some(command::Wait::Seconds(timeout));
+    })
+    .unwrap();
+    let record = read_record(&environment(&f.host), &f.esp).unwrap();
+    assert_eq!(record.layout, layout);
+    assert_eq!(record.chooser_timeout, Some(timeout));
+    let parsed = ::northwood_config::parse(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(parsed.config.boot.timeout, BootTimeout::Seconds(timeout));
+    assert!(!f.esp.join(legacy.esp_dir()).exists());
+
+    let old_loader = f._dir.path().join("legacy-loader.efi");
+    fs::write(&old_loader, efi_image(b"stela")).unwrap();
+    let before = (snapshot(&f.esp), snapshot(&volume));
+    let error = rerun(&f, |request| {
+        request.action = Action::UpdateStela;
+        request.efi = Some(old_loader.clone());
+    })
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("cannot boot a Northwood setup"),
+        "{error:#}"
+    );
+    assert_eq!((snapshot(&f.esp), snapshot(&volume)), before);
+
+    let next_image = northwood_efi_image(b"northwood update");
+    fs::write(&f.efi, &next_image).unwrap();
+    rerun(&f, |request| request.action = Action::UpdateStela).unwrap();
+    assert_eq!(fs::read(&loader).unwrap(), next_image);
+    assert!(!f.esp.join(legacy.esp_dir()).exists());
+    assert!(!volume.join(legacy.data_dir()).exists());
+
+    let modern_log = f.esp.join(layout.esp_path(layout::BOOT_LOG));
+    let legacy_log = f.esp.join(legacy.esp_path(layout::BOOT_LOG));
+    let legacy_bytes = crate::boot_log::tests::region(&["legacy boot log\n"]);
+    fs::create_dir_all(legacy_log.parent().unwrap()).unwrap();
+    fs::write(&legacy_log, &legacy_bytes).unwrap();
+    fs::write(&modern_log, b"empty log").unwrap();
+    let log = rerun(&f, |request| request.action = Action::BootLog).unwrap();
+    assert!(log.contains("legacy boot log\n"), "{log}");
+
+    let modern_bytes = crate::boot_log::tests::region(&["Northwood boot log\n"]);
+    fs::write(&modern_log, &modern_bytes).unwrap();
+    let log = rerun(&f, |request| request.action = Action::BootLog).unwrap();
+    assert!(log.contains("Northwood boot log\n"), "{log}");
+    assert!(!log.contains("legacy boot log\n"), "{log}");
+    assert_eq!(fs::read(&modern_log).unwrap(), modern_bytes);
+    assert_eq!(fs::read(&legacy_log).unwrap(), legacy_bytes);
+    let legacy_record = f.esp.join(legacy.esp_path(layout::RECORD));
+    assert!(!legacy_record.exists());
+
+    fs::copy(&modern_record, &legacy_record).unwrap();
+    let status = rerun(&f, |request| request.action = Action::Status).unwrap();
+    assert!(status.contains("Northwood setup"), "{status}");
+    assert!(
+        status.contains(&*modern_record.to_string_lossy()),
+        "{status}"
+    );
+    let before = (snapshot(&f.esp), snapshot(&volume));
+    let error = rerun(&f, |request| {
+        request.action = Action::Configure;
+        request.chooser_timeout = Some(command::Wait::Seconds(timeout + 1));
+    })
+    .unwrap_err();
+    let description = format!("{error:#}");
+    assert!(
+        description.contains("both") && description.contains("setup record"),
+        "{description}"
+    );
+    assert_eq!((snapshot(&f.esp), snapshot(&volume)), before);
+    fs::remove_file(legacy_record).unwrap();
+    rerun(&f, |request| request.action = Action::Uninstall).unwrap();
+    assert!(!modern_record.exists());
+    assert!(!loader.exists());
+    assert!(!volume.join(layout.data_path(layout::DATA_BOOT)).exists());
+    assert_eq!(fs::read(legacy_log).unwrap(), legacy_bytes);
+}
+
+#[test]
+fn northwood_loader_update_and_repair_keep_the_legacy_setup_layout() {
+    use ::northwood_config::{BootTimeout, plist};
+    use stela_loader::mount_interface::layout::{self, Layout};
+
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    let legacy = Layout::Legacy;
+    let modern = Layout::Northwood;
+    let legacy_record = f.esp.join(legacy.esp_path(layout::RECORD));
+    let legacy_options = f.esp.join(legacy.esp_path(layout::OPTIONS));
+    let legacy_choices = f.esp.join(legacy.esp_path(layout::CHOICES));
+    let volume = stela_volume(&f);
+    let before = record(&f);
+    assert_eq!(before.layout, legacy);
+    let options = fs::read(&legacy_options).unwrap();
+
+    let next = northwood_efi_image(b"northwood update");
+    fs::write(&f.efi, &next).unwrap();
+    rerun(&f, |request| request.action = Action::UpdateStela).unwrap();
+    assert_eq!(fs::read(f.esp.join(efi::LOADER)).unwrap(), next);
+    let updated = record(&f);
+    assert_eq!(updated.layout, legacy);
+    assert_eq!(updated.installs, before.installs);
+    assert!(legacy_record.is_file());
+    assert_eq!(fs::read(&legacy_options).unwrap(), options);
+    assert!(!f.esp.join(modern.esp_dir()).exists());
+    assert!(!volume.join(modern.data_dir()).exists());
+
+    fs::remove_file(&legacy_options).unwrap();
+    fs::remove_file(&legacy_choices).unwrap();
+    rerun(&f, |request| request.action = Action::Repair).unwrap();
+    assert_eq!(fs::read(&legacy_options).unwrap(), options);
+    assert!(legacy_choices.is_file());
+    assert!(volume.join(legacy.data_path(layout::DATA_BOOT)).is_dir());
+    assert!(!f.esp.join(modern.esp_dir()).exists());
+    assert!(!volume.join(modern.data_dir()).exists());
+    let status = rerun(&f, |request| request.action = Action::Status).unwrap();
+    assert!(status.contains("Stela setup"), "{status}");
+    assert!(status.contains("No problems found."), "{status}");
+
+    // An earlier Northwood build could leave a migration plist on a
+    // legacy USB. Keep the record and data in the original layout, but
+    // synchronize setup's fields in that plist without erasing user edits.
+    let default =
+        stela_boot_core::options::System::parse(std::str::from_utf8(&options).unwrap()).unwrap();
+    let choices = Choices::parse(&fs::read_to_string(&legacy_choices).unwrap()).unwrap();
+    let mut document = northwood_config::dictionary(&default, Some(&choices)).unwrap();
+    document.insert("FutureSetting".into(), plist::Value::Boolean(true));
+    let migration = f.esp.join(modern.esp_path(layout::CONFIG));
+    fs::create_dir_all(migration.parent().unwrap()).unwrap();
+    fs::write(&migration, plist::to_xml(&document)).unwrap();
+    rerun(&f, |request| {
+        request.action = Action::Configure;
+        request.chooser_timeout = Some(command::Wait::Seconds(18));
+    })
+    .unwrap();
+    let parsed = ::northwood_config::parse(&fs::read(&migration).unwrap()).unwrap();
+    assert_eq!(parsed.config.boot.timeout, BootTimeout::Seconds(18));
+    assert_eq!(parsed.warnings, ["FutureSetting"]);
+    assert!(!f.esp.join(modern.esp_path(layout::RECORD)).exists());
+    assert!(!volume.join(modern.data_dir()).exists());
 }
 
 #[test]
@@ -2817,11 +3456,17 @@ fn repair_restores_recorded_state() {
     fs::write(&ramdisk, [0u8; 10]).unwrap();
     fs::write(f.esp.join(LOADER_PATH), b"MZ damaged").unwrap();
     fs::write(f.esp.join("EFI/stela/stela.cfg"), b"--system\n").unwrap();
+    let choices = f.esp.join(CHOICES_PATH);
+    let old_choices = fs::read_to_string(&choices)
+        .unwrap()
+        .replace(" --input", "");
+    fs::write(&choices, old_choices).unwrap();
     let error = status().unwrap_err().to_string();
     assert!(error.contains("problems:"), "{error}");
     assert!(error.contains("ramdisk.img"), "{error}");
     assert!(error.contains("not the version setup installed"), "{error}");
     assert!(error.contains("stela.cfg differs"), "{error}");
+    assert!(error.contains("(choices.cfg) differ"), "{error}");
     // ... an update puts the loader back ...
     rerun(&f, |c| {
         c.action = Action::UpdateStela;
@@ -3685,6 +4330,7 @@ fn wifi_configuration_applies_to_all_boot_choices() {
 
 #[test]
 fn firmware_action_checks_capability_and_dry_run() {
+    use clap::Parser as _;
     let mut f = fixture(64 * GIB, false);
     add_stela(&mut f);
     setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
@@ -3696,6 +4342,8 @@ fn firmware_action_checks_capability_and_dry_run() {
             c.action = Action::HostFirmwareFetch {
                 requirements: Some(inventory.clone()),
                 gpu: None,
+                profile: None,
+                offline: false,
             };
             c.dry_run = true;
         })
@@ -3721,13 +4369,41 @@ fn firmware_action_checks_capability_and_dry_run() {
         c.action = Action::HostFirmwareFetch {
             requirements: Some(inventory.clone()),
             gpu: None,
+            profile: None,
+            offline: false,
         };
         c.host_firmware_cache = Some(cache.clone());
         c.dry_run = true;
     })
     .unwrap();
-    assert!(report.contains("1 exact observed bindings"));
+    assert!(report.contains("1 exact firmware bindings"));
     assert!(report.contains("3872 bytes"));
+    let parsed = |options: &[&str]| {
+        crate::Cli::try_parse_from(
+            ["stela", "setup", "host-firmware", "fetch", "--usb"]
+                .into_iter()
+                .chain([f.esp.to_str().unwrap()])
+                .chain(options.iter().copied()),
+        )
+    };
+    assert!(parsed(&["--offline"]).is_err());
+    assert!(parsed(&["--profile", "unknown-model"]).is_err());
+    let crate::Command::Setup(profile) = parsed(&[
+        "--profile",
+        "15igl7",
+        "--offline",
+        "--cache",
+        cache.to_str().unwrap(),
+        "--dry-run",
+    ])
+    .unwrap()
+    .command
+    else {
+        panic!("not a firmware setup command");
+    };
+    let report = profile.request().dispatch(&environment(&f.host)).unwrap();
+    assert!(report.contains("3 exact firmware bindings"));
+    assert!(report.contains("iwlwifi-9000-pu-b0-jf-b0-46.ucode"));
     assert_eq!(snapshot(&f.esp), before);
     assert!(!cache.exists());
 }

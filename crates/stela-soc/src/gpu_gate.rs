@@ -362,7 +362,7 @@ mod tests {
     use alloc::vec::Vec;
     use std::sync::Mutex;
     use stela_contracts::{
-        gate::CallerMemory,
+        gate::{CallerMemory, window::IMPORT_TOKEN_WRITABLE},
         interrupt::{InterruptSink, Wire},
     };
 
@@ -503,6 +503,8 @@ mod tests {
 
     #[test]
     fn the_kernel_names_the_memory_a_connection_imports() {
+        const DESCRIPTOR: u64 = 8;
+        const WRITABLE: u64 = DESCRIPTOR | IMPORT_TOKEN_WRITABLE;
         let service = Arc::new(Service(Mutex::new(Log::default())));
         let mut gate = Gate::new(0, service.clone(), IRQ);
         store(&mut gate, 0, OPEN, 1).unwrap();
@@ -513,7 +515,7 @@ mod tests {
             store(&mut gate, 0, IMPORT_BYTES, bytes).unwrap();
         }
         assert!(store(&mut gate, 0, IMPORT, page).is_err(), "no token yet");
-        store(&mut gate, 0, IMPORT_TOKEN, 9).unwrap();
+        store(&mut gate, 0, IMPORT_TOKEN, WRITABLE).unwrap();
         store(&mut gate, 0, IMPORT, page).unwrap();
         serve(&mut gate, 0);
         assert_eq!(load(&mut gate, IMPORTED), 0x1001);
@@ -532,22 +534,25 @@ mod tests {
                     }
                 ]
                 .to_vec(),
-                9
+                WRITABLE
             )]
         );
         // Ranges go with their import.
+        store(&mut gate, 0, IMPORT_TOKEN, DESCRIPTOR).unwrap();
         store(&mut gate, 0, IMPORT, page).unwrap();
         serve(&mut gate, 0);
-        assert_eq!(service.0.lock().unwrap().imported[1].1, []);
+        assert_eq!(
+            service.0.lock().unwrap().imported[1],
+            (1, Vec::new(), DESCRIPTOR)
+        );
 
         assert!(store(&mut gate, 0, IMPORT, page + 1).is_err());
-        service.0.lock().unwrap().retired.push(9);
-        store(&mut gate, 0, RETIRE, 1).unwrap();
-        serve(&mut gate, 0);
-        assert_eq!(load(&mut gate, RETIRED), 9);
-        store(&mut gate, 0, RETIRE, 1).unwrap();
-        serve(&mut gate, 0);
-        assert_eq!(load(&mut gate, RETIRED), 0);
+        service.0.lock().unwrap().retired.extend([DESCRIPTOR, WRITABLE]);
+        for token in [WRITABLE, DESCRIPTOR, 0] {
+            store(&mut gate, 0, RETIRE, 1).unwrap();
+            serve(&mut gate, 0);
+            assert_eq!(load(&mut gate, RETIRED), token);
+        }
     }
 
     /// Runs what PE `cpu`'s store left, as its step does.

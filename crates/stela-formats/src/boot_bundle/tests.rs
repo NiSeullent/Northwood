@@ -68,6 +68,219 @@ fn machine() -> Machine {
     }
 }
 
+fn tiled_kernel_manifest(first: &[u8], second: &[u8], tree: &[u8]) -> Manifest {
+    let file = [first, second].concat();
+    let json = manifest_json(&file, tree);
+    let mut manifest = Manifest::parse(json.as_bytes()).unwrap();
+    manifest.regions[0].bytes = first.len() as u64;
+    manifest.regions[0].sha256 = crate::sha256(first);
+    let second = Region {
+        name: "BootKC-later".into(),
+        file: "kernel.img".into(),
+        file_offset: first.len() as u64,
+        bytes: second.len() as u64,
+        memory_bytes: 0x4000,
+        guest_pa: BASE + 0x8000,
+        sha256: crate::sha256(second),
+        virtual_address: None,
+    };
+    // The source parts are ordered by file offset, independently of the
+    // manifest's guest load order.
+    manifest.regions.insert(0, second);
+    manifest.top_of_kernel_data = BASE + 0xc000;
+    manifest
+}
+
+fn verify_kernel_parts<'a>(
+    manifest: &'a Manifest,
+    parts: &'a [FilePart<'a>],
+    tree: &'a [u8],
+) -> Result<Verified<'a>, BundleError> {
+    manifest.verify_files(&|name| match name {
+        "kernel.img" => Some(FileData::Parts(parts)),
+        "devicetree.adt" => Some(FileData::Whole(tree)),
+        _ => None,
+    })
+}
+
+#[test]
+fn loads_discontiguous_verified_parts_in_manifest_order() -> Result<(), BundleError> {
+    let staged = [0x12, 0x34, 0xee, 0x56, 0x78, 0x9a];
+    let first = &staged[..2];
+    let second = &staged[3..];
+    let tree = [0x11; 20];
+    let manifest = tiled_kernel_manifest(first, second, &tree);
+    let parts = [
+        FilePart {
+            offset: 0,
+            bytes: first,
+        },
+        FilePart {
+            offset: 2,
+            bytes: second,
+        },
+    ];
+    let verified = verify_kernel_parts(&manifest, &parts, &tree)?;
+    let mut actual = vec![0xff; 0xc000];
+    let mut writes = Vec::new();
+    let image = verified.load(
+        &machine(),
+        &mut |bytes| {
+            bytes.fill(0x42);
+            Ok(())
+        },
+        &mut |pa, bytes| {
+            if pa == BASE || pa == BASE + 0x8000 {
+                writes.push((pa, bytes.as_ptr()));
+            }
+            write_into(&mut actual, pa, bytes)
+        },
+    )?;
+    assert_eq!(
+        writes,
+        [(BASE + 0x8000, second.as_ptr()), (BASE, first.as_ptr())]
+    );
+    assert_eq!(image.regions[0].name, "BootKC-later");
+    assert_eq!(&actual[..2], first);
+    assert_eq!(&actual[0x8000..0x8003], second);
+
+    let whole = [first, second].concat();
+    let verified = manifest.verify(&|name| match name {
+        "kernel.img" => Some(whole.as_slice()),
+        "devicetree.adt" => Some(tree.as_slice()),
+        _ => None,
+    })?;
+    let mut expected = vec![0xff; 0xc000];
+    verified.load(
+        &machine(),
+        &mut |bytes| {
+            bytes.fill(0x42);
+            Ok(())
+        },
+        &mut |pa, bytes| write_into(&mut expected, pa, bytes),
+    )?;
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
+fn part_backing_rejects_gaps_aliases_short_parts_and_bad_hashes() {
+    let first = FilePart {
+        offset: 0,
+        bytes: b"ab",
+    };
+    let second = FilePart {
+        offset: 2,
+        bytes: b"cde",
+    };
+    let tree = [0x11; 20];
+    let mut manifest = tiled_kernel_manifest(first.bytes, second.bytes, &tree);
+    for parts in [
+        &[][..],
+        &[first][..],
+        &[second, first],
+        &[
+            first,
+            FilePart {
+                offset: 1,
+                ..second
+            },
+        ],
+        &[
+            first,
+            FilePart {
+                offset: 3,
+                ..second
+            },
+        ],
+        &[
+            first,
+            FilePart {
+                bytes: b"",
+                ..second
+            },
+        ],
+        &[
+            first,
+            FilePart {
+                bytes: b"cd",
+                ..second
+            },
+        ],
+        &[FilePart {
+            bytes: b"abcde",
+            ..first
+        }],
+    ] {
+        assert!(matches!(
+            verify_kernel_parts(&manifest, parts, &tree),
+            Err(BundleError::File { name, .. }) if name == "kernel.img"
+        ));
+    }
+    let tampered = [
+        first,
+        FilePart {
+            bytes: b"cdf",
+            ..second
+        },
+    ];
+    assert!(matches!(
+        verify_kernel_parts(&manifest, &tampered, &tree),
+        Err(BundleError::Region { name, .. }) if name == "BootKC-later"
+    ));
+
+    let parts = [first, second];
+    manifest.files[0].bytes += 1;
+    assert!(matches!(
+        verify_kernel_parts(&manifest, &parts, &tree),
+        Err(BundleError::File { .. })
+    ));
+    manifest.files[0].bytes -= 1;
+    for offset in [1, 3, u64::MAX] {
+        manifest.regions[0].file_offset = offset;
+        assert!(matches!(
+            verify_kernel_parts(&manifest, &parts, &tree),
+            Err(BundleError::File { .. })
+        ));
+    }
+    manifest.regions[0].file_offset = 2;
+    manifest.regions[0].memory_bytes = 2;
+    assert!(matches!(
+        verify_kernel_parts(&manifest, &parts, &tree),
+        Err(BundleError::Region { .. })
+    ));
+    manifest.regions[0].memory_bytes = 0x4000;
+    manifest.files.push(manifest.files[0].clone());
+    assert!(matches!(
+        verify_kernel_parts(&manifest, &parts, &tree),
+        Err(BundleError::File { .. })
+    ));
+}
+
+#[test]
+fn whole_backing_still_hashes_bytes_outside_manifest_regions() {
+    let tree = [0x11; 20];
+    let mut manifest = tiled_kernel_manifest(b"ab", b"cde", &tree);
+    let whole = b"abcdeX";
+    manifest.files[0].bytes = whole.len() as u64;
+    manifest.files[0].sha256 = crate::sha256(whole);
+    for (bytes, valid) in [(whole, true), (b"abcdeY", false)] {
+        let result = manifest.verify(&|name| match name {
+            "kernel.img" => Some(bytes.as_slice()),
+            "devicetree.adt" => Some(tree.as_slice()),
+            _ => None,
+        });
+        if valid {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(
+                result,
+                Err(BundleError::File { name, .. }) if name == "kernel.img"
+            ));
+        }
+    }
+}
+
 #[test]
 fn admission_ledger_defaults_conservatively_and_preserves_exact_evidence() {
     let json = manifest_json(&[0xaa; 100], &[0x11; 20]);

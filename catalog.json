@@ -1,0 +1,655 @@
+{
+  "abi": [
+    1,
+    0
+  ],
+  "modules": [
+    {
+      "id": "DisplayInventory",
+      "implementation": "pci-display",
+      "class": "gpu",
+      "status": "check-only",
+      "source": "crates/stela-driver-gpu/src/lib.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "NVModern",
+      "implementation": "nouveau-nvk",
+      "class": "gpu",
+      "status": "implemented",
+      "source": "third_party/linux/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c",
+      "license": "MIT",
+      "tier": "A",
+      "firmware": [],
+      "firmware_profile": "nouveau PMC_BOOT_0 chipset and pinned GSP-RM recipes"
+    },
+    {
+      "id": "UHCI",
+      "implementation": "uhci-handoff",
+      "class": "usb-host",
+      "status": "check-only",
+      "source": "crates/stela-drivers/src/usb/handoff.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "OHCI",
+      "implementation": "ohci-handoff",
+      "class": "usb-host",
+      "status": "check-only",
+      "source": "crates/stela-drivers/src/usb/handoff.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "EHCI",
+      "implementation": "ehci",
+      "class": "usb-host",
+      "status": "implemented",
+      "source": "crates/stela-drivers/src/usb/ehci.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "XHCI",
+      "implementation": "xhci-handoff",
+      "class": "usb-host",
+      "status": "check-only",
+      "source": "crates/stela-drivers/src/usb/handoff.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "IntelVMD",
+      "implementation": "vmd",
+      "class": "storage",
+      "status": "implemented",
+      "source": "crates/stela-driver-base/src/bus/vmd.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "BroadcomEth",
+      "implementation": "tg3",
+      "class": "ethernet",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/tg3.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "AquantiaEth",
+      "implementation": "atlantic",
+      "class": "ethernet",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/aqtion.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "AMDSFH",
+      "implementation": "amd-sfh",
+      "class": "input",
+      "status": "check-only",
+      "source": "crates/stela-drivers/src/input/sfh.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "IntelISH",
+      "implementation": "intel-ish",
+      "class": "input",
+      "status": "check-only",
+      "source": "crates/stela-drivers/src/input/ish.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "IntelWiFi",
+      "implementation": "iwlwifi",
+      "class": "wifi",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/wifi/intel.rs",
+      "license": "GPL-2.0-only OR BSD-3-Clause",
+      "tier": "A",
+      "firmware": [],
+      "firmware_profile": "iwlwifi family, board and observed RF identity; wireless-regdb"
+    },
+    {
+      "id": "MediaTekWiFi",
+      "implementation": "mt7925e",
+      "class": "wifi",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/wifi/mediatek.rs",
+      "license": "BSD-3-Clause-Clear",
+      "tier": "A",
+      "firmware": [
+        "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin",
+        "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin",
+        "regulatory.db"
+      ],
+      "firmware_profile": null
+    },
+    {
+      "id": "RealtekWiFi",
+      "implementation": "rtw88_8822ce",
+      "class": "wifi",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/wifi/realtek.rs",
+      "license": "GPL-2.0-only OR BSD-3-Clause",
+      "tier": "A",
+      "firmware": [
+        "rtw88/rtw8822c_fw.bin",
+        "regulatory.db"
+      ],
+      "firmware_profile": null
+    },
+    {
+      "id": "IntelBT",
+      "implementation": "btintel_pcie",
+      "class": "bluetooth",
+      "status": "implemented",
+      "source": "crates/stela-drivers/src/bluetooth/intel_pcie.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": "btintel PCIe controller identity"
+    },
+    {
+      "id": "BroadcomBT",
+      "implementation": "hci_bcm4377",
+      "class": "bluetooth",
+      "status": "implemented",
+      "source": "crates/stela-drivers/src/bluetooth/bcm4377.rs",
+      "license": "MIT",
+      "tier": "A",
+      "firmware": [],
+      "firmware_profile": "BCM4377 chip, board and controller identity"
+    },
+    {
+      "id": "HDA",
+      "implementation": "snd_hda_intel",
+      "class": "audio",
+      "status": "implemented",
+      "source": "crates/stela-driver-audio/src/hda/pci.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "USB4",
+      "implementation": "thunderbolt",
+      "class": "usb-host",
+      "status": "implemented",
+      "source": "crates/stela-driver-base/src/bus/thunderbolt.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "VirtioBlock",
+      "implementation": "virtio-blk",
+      "class": "storage",
+      "status": "implemented",
+      "source": "crates/stela-driver-storage/src/virtio.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "NVMe",
+      "implementation": "nvme",
+      "class": "storage",
+      "status": "implemented",
+      "source": "crates/stela-driver-storage/src/nvme.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "XHCI",
+      "implementation": "xhci",
+      "class": "usb-host",
+      "status": "implemented",
+      "source": "crates/stela-drivers/src/usb/xhci.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "VirtioNet",
+      "implementation": "virtio-net",
+      "class": "ethernet",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/virtio.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "IntelEth",
+      "implementation": "igc",
+      "class": "ethernet",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/igc.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "IntelEth",
+      "implementation": "e1000e",
+      "class": "ethernet",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/e1000e.rs",
+      "license": "BSD-3-Clause AND GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "IntelEth",
+      "implementation": "e1000e-pch",
+      "class": "ethernet",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/e1000e/pch/cold/attach.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "IntelEth",
+      "implementation": "igb",
+      "class": "ethernet",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/igb.rs",
+      "license": "GPL-2.0-only",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "AtherosEth",
+      "implementation": "alx",
+      "class": "ethernet",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/alx.rs",
+      "license": "GPL-2.0-or-later AND ISC",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "RealtekEth",
+      "implementation": "r8169",
+      "class": "ethernet",
+      "status": "implemented",
+      "source": "crates/stela-driver-net/src/realtek.rs",
+      "license": "GPL-2.0-only AND GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": "r8169 MAC revision"
+    },
+    {
+      "id": "VirtioInput",
+      "implementation": "virtio-input",
+      "class": "input",
+      "status": "implemented",
+      "source": "crates/stela-drivers/src/input/virtio.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "RtsxReader",
+      "implementation": "rtsx_pci",
+      "class": "storage",
+      "status": "implemented",
+      "source": "crates/stela-driver-storage/src/rtsx.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "SDHCI",
+      "implementation": "sdhci",
+      "class": "storage",
+      "status": "implemented",
+      "source": "crates/stela-driver-storage/src/sdhci.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    },
+    {
+      "id": "AHCI",
+      "implementation": "ahci",
+      "class": "storage",
+      "status": "implemented",
+      "source": "crates/stela-driver-storage/src/ahci.rs",
+      "license": "GPL-2.0-or-later",
+      "tier": "B",
+      "firmware": [],
+      "firmware_profile": null
+    }
+  ],
+  "nvmodern_chipsets": [
+    {
+      "chipset": "0x162",
+      "name": "TU102",
+      "architecture": "Turing",
+      "display": true,
+      "firmware": [
+        "nvidia/tu102/gsp/booter_load-570.144.bin",
+        "nvidia/tu102/gsp/booter_unload-570.144.bin",
+        "nvidia/tu102/gsp/bootloader-570.144.bin",
+        "nvidia/tu102/gsp/gen_bootloader-570.144.bin",
+        "nvidia/tu102/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x164",
+      "name": "TU104",
+      "architecture": "Turing",
+      "display": true,
+      "firmware": [
+        "nvidia/tu104/gsp/booter_load-570.144.bin",
+        "nvidia/tu104/gsp/booter_unload-570.144.bin",
+        "nvidia/tu104/gsp/bootloader-570.144.bin",
+        "nvidia/tu104/gsp/gen_bootloader-570.144.bin",
+        "nvidia/tu104/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x166",
+      "name": "TU106",
+      "architecture": "Turing",
+      "display": true,
+      "firmware": [
+        "nvidia/tu106/gsp/booter_load-570.144.bin",
+        "nvidia/tu106/gsp/booter_unload-570.144.bin",
+        "nvidia/tu106/gsp/bootloader-570.144.bin",
+        "nvidia/tu106/gsp/gen_bootloader-570.144.bin",
+        "nvidia/tu106/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x167",
+      "name": "TU117",
+      "architecture": "Turing",
+      "display": true,
+      "firmware": [
+        "nvidia/tu117/gsp/booter_load-570.144.bin",
+        "nvidia/tu117/gsp/booter_unload-570.144.bin",
+        "nvidia/tu117/gsp/bootloader-570.144.bin",
+        "nvidia/tu117/gsp/gen_bootloader-570.144.bin",
+        "nvidia/tu117/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x168",
+      "name": "TU116",
+      "architecture": "Turing",
+      "display": true,
+      "firmware": [
+        "nvidia/tu116/gsp/booter_load-570.144.bin",
+        "nvidia/tu116/gsp/booter_unload-570.144.bin",
+        "nvidia/tu116/gsp/bootloader-570.144.bin",
+        "nvidia/tu116/gsp/gen_bootloader-570.144.bin",
+        "nvidia/tu116/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x170",
+      "name": "GA100",
+      "architecture": "Ampere",
+      "display": false,
+      "firmware": [
+        "nvidia/ga100/gsp/booter_load-570.144.bin",
+        "nvidia/ga100/gsp/booter_unload-570.144.bin",
+        "nvidia/ga100/gsp/bootloader-570.144.bin",
+        "nvidia/ga100/gsp/gen_bootloader-570.144.bin",
+        "nvidia/ga100/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x172",
+      "name": "GA102",
+      "architecture": "Ampere",
+      "display": true,
+      "firmware": [
+        "nvidia/ga102/gsp/booter_load-570.144.bin",
+        "nvidia/ga102/gsp/booter_unload-570.144.bin",
+        "nvidia/ga102/gsp/bootloader-570.144.bin",
+        "nvidia/ga102/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x173",
+      "name": "GA103",
+      "architecture": "Ampere",
+      "display": true,
+      "firmware": [
+        "nvidia/ga103/gsp/booter_load-570.144.bin",
+        "nvidia/ga103/gsp/booter_unload-570.144.bin",
+        "nvidia/ga103/gsp/bootloader-570.144.bin",
+        "nvidia/ga103/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x174",
+      "name": "GA104",
+      "architecture": "Ampere",
+      "display": true,
+      "firmware": [
+        "nvidia/ga104/gsp/booter_load-570.144.bin",
+        "nvidia/ga104/gsp/booter_unload-570.144.bin",
+        "nvidia/ga104/gsp/bootloader-570.144.bin",
+        "nvidia/ga104/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x176",
+      "name": "GA106",
+      "architecture": "Ampere",
+      "display": true,
+      "firmware": [
+        "nvidia/ga106/gsp/booter_load-570.144.bin",
+        "nvidia/ga106/gsp/booter_unload-570.144.bin",
+        "nvidia/ga106/gsp/bootloader-570.144.bin",
+        "nvidia/ga106/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x177",
+      "name": "GA107",
+      "architecture": "Ampere",
+      "display": true,
+      "firmware": [
+        "nvidia/ga107/gsp/booter_load-570.144.bin",
+        "nvidia/ga107/gsp/booter_unload-570.144.bin",
+        "nvidia/ga107/gsp/bootloader-570.144.bin",
+        "nvidia/ga107/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x180",
+      "name": "GH100",
+      "architecture": "Hopper",
+      "display": false,
+      "firmware": [
+        "nvidia/gh100/gsp/bootloader-570.144.bin",
+        "nvidia/gh100/gsp/fmc-570.144.bin",
+        "nvidia/gh100/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x192",
+      "name": "AD102",
+      "architecture": "Ada",
+      "display": true,
+      "firmware": [
+        "nvidia/ad102/gsp/booter_load-570.144.bin",
+        "nvidia/ad102/gsp/booter_unload-570.144.bin",
+        "nvidia/ad102/gsp/bootloader-570.144.bin",
+        "nvidia/ad102/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x193",
+      "name": "AD103",
+      "architecture": "Ada",
+      "display": true,
+      "firmware": [
+        "nvidia/ad103/gsp/booter_load-570.144.bin",
+        "nvidia/ad103/gsp/booter_unload-570.144.bin",
+        "nvidia/ad103/gsp/bootloader-570.144.bin",
+        "nvidia/ad103/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x194",
+      "name": "AD104",
+      "architecture": "Ada",
+      "display": true,
+      "firmware": [
+        "nvidia/ad104/gsp/booter_load-570.144.bin",
+        "nvidia/ad104/gsp/booter_unload-570.144.bin",
+        "nvidia/ad104/gsp/bootloader-570.144.bin",
+        "nvidia/ad104/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x196",
+      "name": "AD106",
+      "architecture": "Ada",
+      "display": true,
+      "firmware": [
+        "nvidia/ad106/gsp/booter_load-570.144.bin",
+        "nvidia/ad106/gsp/booter_unload-570.144.bin",
+        "nvidia/ad106/gsp/bootloader-570.144.bin",
+        "nvidia/ad106/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x197",
+      "name": "AD107",
+      "architecture": "Ada",
+      "display": true,
+      "firmware": [
+        "nvidia/ad107/gsp/booter_load-570.144.bin",
+        "nvidia/ad107/gsp/booter_unload-570.144.bin",
+        "nvidia/ad107/gsp/bootloader-570.144.bin",
+        "nvidia/ad107/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x1a0",
+      "name": "GB100",
+      "architecture": "Blackwell",
+      "display": false,
+      "firmware": [
+        "nvidia/gb100/gsp/bootloader-570.144.bin",
+        "nvidia/gb100/gsp/fmc-570.144.bin",
+        "nvidia/gb100/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x1a2",
+      "name": "GB102",
+      "architecture": "Blackwell",
+      "display": false,
+      "firmware": [
+        "nvidia/gb102/gsp/bootloader-570.144.bin",
+        "nvidia/gb102/gsp/fmc-570.144.bin",
+        "nvidia/gb102/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x1b2",
+      "name": "GB202",
+      "architecture": "Blackwell",
+      "display": true,
+      "firmware": [
+        "nvidia/gb202/gsp/bootloader-570.144.bin",
+        "nvidia/gb202/gsp/fmc-570.144.bin",
+        "nvidia/gb202/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x1b3",
+      "name": "GB203",
+      "architecture": "Blackwell",
+      "display": true,
+      "firmware": [
+        "nvidia/gb203/gsp/bootloader-570.144.bin",
+        "nvidia/gb203/gsp/fmc-570.144.bin",
+        "nvidia/gb203/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x1b5",
+      "name": "GB205",
+      "architecture": "Blackwell",
+      "display": true,
+      "firmware": [
+        "nvidia/gb205/gsp/bootloader-570.144.bin",
+        "nvidia/gb205/gsp/fmc-570.144.bin",
+        "nvidia/gb205/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x1b6",
+      "name": "GB206",
+      "architecture": "Blackwell",
+      "display": true,
+      "firmware": [
+        "nvidia/gb206/gsp/bootloader-570.144.bin",
+        "nvidia/gb206/gsp/fmc-570.144.bin",
+        "nvidia/gb206/gsp/gsp-570.144.bin"
+      ]
+    },
+    {
+      "chipset": "0x1b7",
+      "name": "GB207",
+      "architecture": "Blackwell",
+      "display": true,
+      "firmware": [
+        "nvidia/gb207/gsp/bootloader-570.144.bin",
+        "nvidia/gb207/gsp/fmc-570.144.bin",
+        "nvidia/gb207/gsp/gsp-570.144.bin"
+      ]
+    }
+  ]
+}

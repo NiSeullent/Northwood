@@ -8,7 +8,7 @@ use sha2::{Digest as _, Sha256};
 use stela_engine::translations::pack::Layout;
 use stela_engine::translations::{
     Digest,
-    pack::{self, HEADER_BYTES, Pack, PackError},
+    pack::{HEADER_BYTES, PackError, PackIndex},
 };
 
 /// Why a pack was not written in place.
@@ -127,6 +127,8 @@ pub struct Within {
     /// The pack's first bytes to read: its index and every record that ends
     /// within the budget.
     pub length: u64,
+    /// The full pack's size as declared by the verified index.
+    pub pack_length: u64,
     /// The records that end within the budget, and the others.
     pub records: usize,
     pub omitted: usize,
@@ -137,24 +139,20 @@ pub struct Within {
 /// pack's records lie anywhere after its index, so its first bytes up to the
 /// last end within `limit` hold every record that ends within it: a usable
 /// pack once [`trim`] names only those. `Err` when the index fails the
-/// checks `Pack::parse` makes of it; a [`Within::length`] past `limit` when
+/// checks [`PackIndex::parse`] makes of it; a [`Within::length`] past `limit` when
 /// the index alone passes it.
 pub fn within(prefix: &[u8], translator: &Digest, limit: u64) -> Result<Within, PackError> {
-    Pack::length(prefix, translator)?;
-    let start = pack::prefix_bytes(prefix, translator)?;
-    let count = (start - HEADER_BYTES - CHECKSUM_BYTES) / INDEX_ENTRY_BYTES;
+    let index = PackIndex::parse(prefix, translator)?;
     let mut within = Within {
-        length: start as u64,
+        length: index.prefix_bytes() as u64,
+        pack_length: index.length(),
         records: 0,
         omitted: 0,
     };
-    for index in 0..count {
-        let (offset, bytes) = entry(prefix, index);
-        // `Pack::length` checked that the sum does not overflow.
-        let end = offset + bytes;
-        if end <= limit {
+    for (_, range) in index.iter() {
+        if range.end <= limit {
             within.records += 1;
-            within.length = within.length.max(end);
+            within.length = within.length.max(range.end);
         } else {
             within.omitted += 1;
         }
@@ -209,7 +207,7 @@ fn entry(pack: &[u8], index: usize) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stela_engine::translations::pack::Piece;
+    use stela_engine::translations::pack::{self, Pack, Piece};
     #[test]
     fn a_pack_is_written_over_its_files_extents_and_never_past_them() {
         use stela_drivers::block::RamDisk;
@@ -367,6 +365,7 @@ mod tests {
             whole,
             Within {
                 length: bytes.len() as u64,
+                pack_length: bytes.len() as u64,
                 records: 40,
                 omitted: 0
             }
@@ -376,6 +375,7 @@ mod tests {
         let limit = (prefix.len() + (bytes.len() - prefix.len()) / 2) as u64;
         let part = within(prefix, &translator, limit).unwrap();
         assert!(part.length <= limit && part.length > prefix.len() as u64);
+        assert_eq!(part.pack_length, bytes.len() as u64);
         assert!(part.records > 0 && part.omitted > 0);
         assert_eq!(part.records + part.omitted, 40);
         let mut read = bytes[..part.length as usize].to_vec();

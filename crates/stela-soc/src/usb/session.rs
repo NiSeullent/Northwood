@@ -4,7 +4,7 @@
 use super::{
     BusPeer, MAX_PACKET,
     host::{Descriptor, Host, TransferStatus},
-    mux::{Backpressure, Mux, State, StreamId, StreamState},
+    mux::{Backpressure, Mux, State, StreamId, StreamState, StreamStats},
     plist::{self, Channel},
 };
 use crate::Result;
@@ -110,6 +110,9 @@ impl Session {
     pub fn backpressure(&self) -> Backpressure {
         self.mux.backpressure()
     }
+    pub fn stream_stats(&self, stream: StreamId) -> Option<StreamStats> {
+        self.mux.stream_stats(stream)
+    }
     pub fn state(&self, stream: StreamId) -> Result<StreamState> {
         self.mux.stream_state(stream)
     }
@@ -152,6 +155,7 @@ impl Session {
         if self.generation.is_none() {
             return Ok(false);
         }
+        self.mux.observe_time(now);
         // Log backpressure cannot discard a diagnostic or grow without bound.
         if self.logs.len() >= 32 {
             return Ok(false);

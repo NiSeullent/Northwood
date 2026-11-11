@@ -281,24 +281,52 @@ fn unload(request: &Request, seconds: u64) -> bool {
     request.done.load(Ordering::Acquire) != 0
 }
 
+pub(super) enum ExportFailure {
+    /// Linux received no runs and all CPU mappings have retired.
+    Unpublished,
+    /// The caller must keep the original frame ownership.
+    Uncertain,
+}
+
 /// A dma-buf of `runs` and the host's mapping of them, for the GPU's service.
-pub(super) fn export(runs: &[client::Run]) -> Option<(c_int, NonNull<u8>)> {
-    let address = map_runs(runs)?;
-    let fd = submit(Operation::Export(runs.as_ptr(), runs.len()));
-    let Ok(fd) = c_int::try_from(fd).and_then(|fd| u32::try_from(fd).map(|_| fd)) else {
-        crate::output::arguments(format_args!("GPU export of {} runs: {fd}\n", runs.len()));
-        let bytes = runs.iter().map(|run| run.bytes).sum();
+pub(super) fn export(
+    runs: &[client::Run],
+    bytes: u64,
+    before_mapping: impl FnOnce(),
+) -> Result<(c_int, NonNull<u8>), ExportFailure> {
+    let address = map_runs(runs, bytes, before_mapping)?;
+    let result = submit(Operation::Export(runs.as_ptr(), runs.len()));
+    if result < 0 {
+        crate::output::arguments(format_args!(
+            "GPU export of {} runs: {result}\n",
+            runs.len()
+        ));
+        // Linux has received the runs. A negative result installs no fd,
+        // but final dma-buf release can be deferred and has no receipt here.
         unmap_export(address.as_ptr() as u64, bytes);
-        return None;
-    };
-    Some((fd, address))
+        return Err(ExportFailure::Uncertain);
+    }
+    let fd = c_int::try_from(result).map_err(|_| ExportFailure::Uncertain)?;
+    Ok((fd, address))
 }
 
 /// The host's mapping of `runs`, in one piece.
-fn map_runs(runs: &[client::Run]) -> Option<NonNull<u8>> {
-    let gpu = installed()?;
-    let pages: u64 = runs.iter().map(|run| run.bytes / PAGE).sum();
-    let address = gpu.window.reserve(pages as usize)?;
+fn map_runs(
+    runs: &[client::Run],
+    bytes: u64,
+    before_mapping: impl FnOnce(),
+) -> Result<NonNull<u8>, ExportFailure> {
+    let gpu = installed().ok_or(ExportFailure::Unpublished)?;
+    let pages = usize::try_from(bytes / PAGE).map_err(|_| ExportFailure::Unpublished)?;
+    let address = gpu
+        .window
+        .reserve(pages)
+        .ok_or(ExportFailure::Unpublished)?;
+    let Some(pointer) = NonNull::new(address as *mut u8) else {
+        gpu.window.release(address, pages);
+        return Err(ExportFailure::Unpublished);
+    };
+    before_mapping();
     let mut next = address;
     for run in runs {
         for page in 0..run.bytes / PAGE {
@@ -306,24 +334,33 @@ fn map_runs(runs: &[client::Run]) -> Option<NonNull<u8>> {
                 .window
                 .install(next, run.physical + page * PAGE, Cache::WriteBack)
             {
-                unmap_export(address, pages * PAGE);
-                return None;
+                return Err(cancel_export_mapping(address, bytes));
             }
             next += PAGE;
         }
     }
-    NonNull::new(address as *mut u8)
+    Ok(pointer)
+}
+
+fn cancel_export_mapping(address: u64, bytes: u64) -> ExportFailure {
+    if unmap_export(address, bytes) {
+        ExportFailure::Unpublished
+    } else {
+        ExportFailure::Uncertain
+    }
 }
 
 /// Ends the host's mapping of an export.
-pub(super) fn unmap_export(address: u64, bytes: u64) {
+pub(super) fn unmap_export(address: u64, bytes: u64) -> bool {
     let (Some(gpu), pages) = (installed(), (bytes / PAGE) as usize) else {
-        return;
+        return false;
     };
     // A processor that kept the translation keeps the addresses too.
     if gpu.window.remove(address, pages) {
         gpu.window.release(address, pages);
+        return true;
     }
+    false
 }
 
 /// Closes a descriptor Linux gave out.
@@ -409,6 +446,7 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 let gpu = installed().expect("requests are posted to a running environment");
                 // A completion waiter's file is a nouveau client: freed after
                 // the stop began, its RM objects outlive GSP's unload.
+                #[cfg(feature = "nvk")]
                 if !super::waiter::wait_gone() {
                     output::arguments(format_args!(
                         "GPU completion waiter still open at the stop\n"
@@ -534,7 +572,7 @@ fn serve(gpu: &Installed, request: &Request) {
     if let Some(slot) = slot {
         slot.1.store(started, Ordering::Relaxed);
     }
-    let shot = crate::native_mmio::shootdown::count();
+    let shot = super::shootdowns();
     // SAFETY: an original task entered in the canonical Linux owner. The
     // poster keeps the operation's inputs until it is done.
     let result = unsafe { perform(gpu, request.operation) };
@@ -545,7 +583,7 @@ fn serve(gpu: &Installed, request: &Request) {
     let took = host::rdtsc().wrapping_sub(started);
     count(&SERVED, code, took);
     // A report between the two reads cleared the count.
-    let now_shot = crate::native_mmio::shootdown::count();
+    let now_shot = super::shootdowns();
     let during = now_shot.checked_sub(shot).unwrap_or(now_shot);
     note_slowest(code, took, during);
     if request.complete(result) {
@@ -1324,6 +1362,42 @@ pub(super) fn now_ns() -> u64 {
     stela_libc_now_ns()
 }
 
+pub(super) fn relax() {
+    // A waiter may be retiring a mapping, which waits for this processor.
+    crate::native_mmio::shootdown::service();
+    if on_boot() {
+        super::pump_waiting();
+    }
+    hint::spin_loop();
+}
+
+#[cfg(feature = "pthread-runtime-probe")]
+pub(super) fn probe_pthread() -> Result<(), i32> {
+    unsafe extern "C" {
+        fn stela_pthread_runtime_probe() -> c_int;
+    }
+    // SAFETY: the boot CPU has returned from Linux dispatch, with the exact
+    // owner published. The C probe retains its storage through any failure.
+    let stage = unsafe { stela_pthread_runtime_probe() };
+    if stage == 0 { Ok(()) } else { Err(stage) }
+}
+
+#[cfg(feature = "pthread-runtime-probe")]
+#[unsafe(no_mangle)]
+extern "C" fn stela_pthread_probe_waiting(word: *const c_uint) -> bool {
+    relax();
+    SLEEPING
+        .iter()
+        .any(|slot| slot.load(Ordering::SeqCst).cast_const() == word)
+}
+
+#[cfg(feature = "pthread-runtime-probe")]
+#[unsafe(no_mangle)]
+extern "C" fn stela_pthread_probe_retired() -> bool {
+    relax();
+    installed().is_some_and(|gpu| gpu.service.children.borrow().is_empty())
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn stela_libc_thread_start(
     body: unsafe extern "C" fn(*mut c_void),
@@ -1344,7 +1418,7 @@ unsafe extern "C" fn stela_libc_wait(word: *const c_uint, value: c_uint, deadlin
         return hint::spin_loop();
     };
     let Some(thread) = current_thread(gpu) else {
-        return super::gate::relax();
+        return relax();
     };
     let sleeping = &SLEEPING[thread.core as usize - PROCESSORS];
     sleeping.store(word.cast_mut(), Ordering::SeqCst);
@@ -1434,11 +1508,13 @@ extern "C" fn stela_libc_drm_munmap(address: *mut c_void, _size: usize) -> c_int
     if result < 0 { result as c_int } else { 1 }
 }
 
+#[cfg(feature = "nvk")]
 #[unsafe(no_mangle)]
 extern "C" fn stela_libc_drm_devices() -> c_uint {
     installed().map_or(0, |gpu| gpu.start.bound.len() as c_uint)
 }
 
+#[cfg(feature = "nvk")]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn stela_libc_drm_device(index: c_uint, device: *mut DrmDevice) {
     if let Some(found) = installed().and_then(|gpu| gpu.start.bound.get(index as usize)) {

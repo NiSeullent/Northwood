@@ -9492,7 +9492,7 @@ translate(const void *bitcode, size_t size, const char *entry,
                  const nir_shader_compiler_options *nir_options,
                  const struct stela_air_options *options,
                  struct stela_air_error *error, const struct stela_air_stage_options *stage,
-                 bool *folded_early)
+                 bool *folded_early, enum stela_air_backend_profile profile)
 {
    struct stela_air_error local_error = {0};
    if (!error)
@@ -9500,6 +9500,7 @@ translate(const void *bitcode, size_t size, const char *entry,
    *error = (struct stela_air_error){0};
    struct translator t = {.options = options, .error = error, .stage_options = stage};
    bool compute = compute_like(&t);
+   const bool software_half = profile != STELA_AIR_BACKEND_NATIVE;
    if (!bitcode || size < 4 || size > AIR_MAX_BITCODE_BYTES ||
        memcmp(bitcode, "BC\xc0\xde", 4) || !entry || !*entry || !nir_options ||
        !options || !options->max_instructions || (options->constant_count && !options->constants) ||
@@ -9507,6 +9508,17 @@ translate(const void *bitcode, size_t size, const char *entry,
        (compute && (!options->workgroup_size[0] ||
        !options->workgroup_size[1] || !options->workgroup_size[2]))) {
       fail(&t, STELA_AIR_INPUT, "invalid AIR bitcode/options");
+      return NULL;
+   }
+   if (software_half && (options->tile ||
+       (stage && stage->stage != STELA_AIR_VERTEX && stage->stage != STELA_AIR_FRAGMENT))) {
+      fail(&t, STELA_AIR_TARGET, "software binary16 supports kernels and ordinary vertex/fragment stages");
+      return NULL;
+   }
+   if (software_half && stage &&
+       (stage->amplified || stage->self_tests || stage->attachments || stage->samples > 1 ||
+        stage->extended_range || stage->vertex_input_words)) {
+      fail(&t, STELA_AIR_TARGET, "software vertex/fragment specialization requires ordinary single-sample render IO");
       return NULL;
    }
    if (stage && (stage->stage < STELA_AIR_VERTEX || stage->stage > STELA_AIR_MESH ||
@@ -9624,6 +9636,10 @@ translate(const void *bitcode, size_t size, const char *entry,
    t.max_threadgroup_buffers = t.metadata.max_threadgroup_buffers;
    t.denorms_disable = t.metadata.denorms_disable;
    t.fast_math = t.metadata.fast_math;
+   if (profile == STELA_AIR_BACKEND_SOFTWARE && stage && !t.denorms_disable) {
+      fail(&t, STELA_AIR_TARGET, "software vertex/fragment requires FP32 flush-to-zero metadata");
+      goto done;
+   }
    bool threadgroup_globals;
    if (!stela_air_metadata_globals(&t.metadata, &threadgroup_globals))
       goto done;
@@ -9650,6 +9666,44 @@ translate(const void *bitcode, size_t size, const char *entry,
                  !stela_air_fold_absent(&t.metadata, fn, t.render.arguments.arguments,
                                         t.render.arguments.count)))
       goto done;
+   if (software_half && stage) {
+      if (t.render.entry.patch) {
+         fail(&t, STELA_AIR_TARGET, "software binary16 does not support tessellation");
+         goto done;
+      }
+      if (t.render.entry.imageblock_bytes) {
+         fail(&t, STELA_AIR_TARGET, "software vertex/fragment does not support imageblocks");
+         goto done;
+      }
+      /* AIR can represent narrow stage IO as 32-bit NIR variables followed
+       * by conversions. Check the actual AIR interface before it widens. */
+      for (unsigned i = 0; i < t.render.entry.input_count; i++) {
+         const struct stela_air_stage_io *io = &t.render.inputs[i];
+         if (!io->absent && io->used &&
+             (io->semantic == STELA_AIR_ATTACHMENT || io->semantic == STELA_AIR_BARYCENTRIC ||
+              io->per_primitive)) {
+            fail(&t, STELA_AIR_TARGET, "software fragment does not support framebuffer fetch, barycentrics or per-primitive inputs");
+            goto done;
+         }
+         if ((io->semantic == STELA_AIR_VERTEX_INPUT || io->semantic == STELA_AIR_VARYING) &&
+             stage_bits(io->primitive) != 32) {
+            fail(&t, STELA_AIR_TARGET, "software vertex/fragment requires 32-bit stage inputs");
+            goto done;
+         }
+      }
+      for (unsigned i = 0; i < t.render.entry.output_count; i++) {
+         const struct stela_air_stage_io *io = &t.render.outputs[i];
+         /* The primary color reaches a 32-bit NIR variable. Its exact half
+          * to float widening is lowered along with the shader's arithmetic. */
+         bool half_color = stage->stage == STELA_AIR_FRAGMENT &&
+                           io->semantic == STELA_AIR_RENDER_TARGET &&
+                           io->primitive == STELA_AIR_HALF && io->index == 0;
+         if (stage_bits(io->primitive) != 32 && !half_color) {
+            fail(&t, STELA_AIR_TARGET, "software stage requires 32-bit outputs or a half color target");
+            goto done;
+         }
+      }
+   }
    if (!linked_references(&t, fn) || !cfg_prepare(&t, fn))
       goto done;
    t.entry = fn;
@@ -9688,7 +9742,8 @@ translate(const void *bitcode, size_t size, const char *entry,
    /* Texture calls' loops and branches use the derefs made before them;
     * each use takes its own copy in its block, as backends take them. */
    nir_rematerialize_derefs_in_use_blocks_impl(t.b.impl);
-   nir_shader_alu_pass(t.b.shader, weaken_fma, nir_metadata_all, NULL);
+   if (!software_half)
+      nir_shader_alu_pass(t.b.shader, weaken_fma, nir_metadata_all, NULL);
    /* Metal keeps half denormals in every mode. Only half users declare it, so
     * backends without FP16 controls still take FP32-only shaders. */
    if (t.fp_checked && half_arithmetic(t.b.shader))
@@ -9750,6 +9805,14 @@ translate(const void *bitcode, size_t size, const char *entry,
       }
    }
 
+   if (software_half) {
+      const char *reason;
+      if (!stela_air_lower_software_half_profile(t.b.shader, profile, &reason)) {
+         fail(&t, STELA_AIR_TARGET, "unsupported software binary16: %s", reason);
+         goto done;
+      }
+      nir_shader_alu_pass(t.b.shader, weaken_fma, nir_metadata_all, NULL);
+   }
    if (stage || t.shared_resources || t.shared_barriers)
       nir_shader_gather_info(t.b.shader, nir_shader_get_entrypoint(t.b.shader));
    nir_validate_shader(t.b.shader, stage ? "AIR bounded render translation" : "AIR bounded compute translation");
@@ -9775,7 +9838,16 @@ stela_air_to_nir(const void *bitcode, size_t size, const char *entry,
                   const nir_shader_compiler_options *nir_options,
                   const struct stela_air_options *options, struct stela_air_error *error)
 {
-   return translate(bitcode, size, entry, nir_options, options, error, NULL, NULL);
+   return translate(bitcode, size, entry, nir_options, options, error, NULL, NULL, STELA_AIR_BACKEND_NATIVE);
+}
+
+nir_shader *
+stela_air_software_to_nir(const void *bitcode, size_t size, const char *entry,
+                         const nir_shader_compiler_options *nir_options,
+                         const struct stela_air_options *options,
+                         enum stela_air_backend_profile profile, struct stela_air_error *error)
+{
+   return translate(bitcode, size, entry, nir_options, options, error, NULL, NULL, profile);
 }
 
 nir_shader *
@@ -9787,14 +9859,15 @@ stela_air_stage_to_nir(const void *bitcode, size_t size, const char *entry,
       if (error) *error = (struct stela_air_error){.kind = STELA_AIR_INPUT};
       return NULL;
    }
-   return translate(bitcode, size, entry, nir_options, &options->resources, error, options, NULL);
+   return translate(bitcode, size, entry, nir_options, &options->resources, error, options, NULL,
+                    STELA_AIR_BACKEND_NATIVE);
 }
 
-nir_shader *
-stela_air_metal_stage_to_nir(const void *bitcode, size_t size, const char *entry,
-                              const nir_shader_compiler_options *nir_options,
-                              const struct stela_air_stage_options *options,
-                              struct stela_air_error *error)
+static nir_shader *
+metal_stage_to_nir(const void *bitcode, size_t size, const char *entry,
+                    const nir_shader_compiler_options *nir_options,
+                    const struct stela_air_stage_options *options,
+                    struct stela_air_error *error, enum stela_air_backend_profile profile)
 {
    if (!options)
       return stela_air_stage_to_nir(bitcode, size, entry, nir_options, options, error);
@@ -9803,11 +9876,31 @@ stela_air_metal_stage_to_nir(const void *bitcode, size_t size, const char *entry
       error = &local_error;
    bool folded_early = false;
    nir_shader *shader = translate(bitcode, size, entry, nir_options, &options->resources, error,
-                                  options, &folded_early);
+                                  options, &folded_early, profile);
    /* Only a fragment that attempted the early pass can retry. Its temporary
     * LLVM module and NIR are already gone, and the second call cannot fold
     * early again. Avoid extra work after an allocation refusal. */
    if (!shader && folded_early && error->kind != STELA_AIR_ALLOCATION)
-      return stela_air_stage_to_nir(bitcode, size, entry, nir_options, options, error);
+      return translate(bitcode, size, entry, nir_options, &options->resources, error,
+                        options, NULL, profile);
    return shader;
+}
+
+nir_shader *
+stela_air_metal_stage_to_nir(const void *bitcode, size_t size, const char *entry,
+                             const nir_shader_compiler_options *nir_options,
+                             const struct stela_air_stage_options *options,
+                             struct stela_air_error *error)
+{
+   return metal_stage_to_nir(bitcode, size, entry, nir_options, options, error, STELA_AIR_BACKEND_NATIVE);
+}
+
+nir_shader *
+stela_air_metal_software_stage_to_nir(const void *bitcode, size_t size, const char *entry,
+                                      const nir_shader_compiler_options *nir_options,
+                                      const struct stela_air_stage_options *options,
+                                      enum stela_air_backend_profile profile,
+                                      struct stela_air_error *error)
+{
+   return metal_stage_to_nir(bitcode, size, entry, nir_options, options, error, profile);
 }

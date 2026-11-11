@@ -10,7 +10,7 @@ mod bluetooth_platform;
 #[cfg(feature = "diagnostics")]
 mod media_check;
 #[cfg(feature = "diagnostics")]
-mod minimum;
+pub(crate) mod minimum;
 use crate::Result;
 use stela_boot_core::storage as options;
 use stela_contracts::refuse;

@@ -15,6 +15,7 @@ use crate::bus::pci::regs;
 use core::mem::ManuallyDrop;
 
 mod child;
+pub mod cold;
 pub mod spi;
 pub use child::{AttachError, AttachFailure, AttachStage, I2c, I2cFailure, Retired};
 
@@ -180,6 +181,46 @@ pub struct NativeRegisters {
     mapping: Mapping,
     base: u64,
 }
+
+/// Match the retained register mapping to BAR0 and current PCI decoding.
+fn native_window(config: &OwnedConfig, mapping: &Mapping) -> Result<u64, Error> {
+    let low = config.read32(0x10)?;
+    if low == u32::MAX || low & 9 != 0 || !matches!(low & 6, 0 | 4) {
+        return Err(Error::Mapping);
+    }
+    let high = if low & 6 == 4 {
+        config.read32(0x14)?
+    } else {
+        0
+    };
+    if high == u32::MAX {
+        return Err(Error::Mapping);
+    }
+    let base = u64::from(high) << 32 | u64::from(low & !15);
+    let span = mapping.physical_span().map_err(Error::Mmio)?;
+    if base == 0
+        || span.start() != base
+        || span.bytes() < WINDOW_BYTES as u64
+        || mapping.attribute().map_err(Error::Mmio)? != CacheAttribute::Uncached
+        || mapping.protection().map_err(Error::Mmio)? != Protection::ReadWrite
+    {
+        return Err(Error::Mapping);
+    }
+    let pointer = mapping.address(0, WINDOW_BYTES).map_err(Error::Mmio)?;
+    if !(pointer.as_ptr() as usize).is_multiple_of(4) {
+        return Err(Error::Mapping);
+    }
+    // Keep the source's memory decode, with no DMA or interrupt publish.
+    let command = config.read16(regs::COMMAND)?;
+    if command == u16::MAX
+        || command & (regs::COMMAND_MASTER | regs::COMMAND_MEMORY | regs::COMMAND_INTX_DISABLE)
+            != regs::COMMAND_MEMORY | regs::COMMAND_INTX_DISABLE
+    {
+        return Err(Error::Configuration);
+    }
+    Ok(base)
+}
+
 impl NativeRegisters {
     /// # Safety
     /// Mapping is this stopped function's exclusive BAR0 reservation at
@@ -200,43 +241,7 @@ impl NativeRegisters {
         let checked = (|| {
             stopped.map_err(Error::Claim)?;
             let (function, mapping) = &mut *resources;
-            let config = function.config();
-            let low = config.read32(0x10)?;
-            if low == u32::MAX || low & 9 != 0 || !matches!(low & 6, 0 | 4) {
-                return Err(Error::Mapping);
-            }
-            let high = if low & 6 == 4 {
-                config.read32(0x14)?
-            } else {
-                0
-            };
-            if high == u32::MAX {
-                return Err(Error::Mapping);
-            }
-            let base = u64::from(high) << 32 | u64::from(low & !15);
-            let span = mapping.physical_span().map_err(Error::Mmio)?;
-            if base == 0
-                || span.start() != base
-                || span.bytes() < WINDOW_BYTES as u64
-                || mapping.attribute().map_err(Error::Mmio)? != CacheAttribute::Uncached
-                || mapping.protection().map_err(Error::Mmio)? != Protection::ReadWrite
-            {
-                return Err(Error::Mapping);
-            }
-            let pointer = mapping.address(0, WINDOW_BYTES).map_err(Error::Mmio)?;
-            if !(pointer.as_ptr() as usize).is_multiple_of(4) {
-                return Err(Error::Mapping);
-            }
-            // Keep the source's memory decode, with no DMA or interrupt publish.
-            let command = config.read16(regs::COMMAND)?;
-            if command == u16::MAX
-                || command
-                    & (regs::COMMAND_MASTER | regs::COMMAND_MEMORY | regs::COMMAND_INTX_DISABLE)
-                    != regs::COMMAND_MEMORY | regs::COMMAND_INTX_DISABLE
-            {
-                return Err(Error::Configuration);
-            }
-            Ok(base)
+            native_window(function.config(), mapping)
         })();
         match checked {
             Ok(base) => {

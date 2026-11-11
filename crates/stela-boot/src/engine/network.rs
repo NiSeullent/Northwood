@@ -18,13 +18,14 @@ use super::storage::RestoreRoot;
 use crate::Refusal;
 use crate::Result;
 use crate::output;
-use alloc::{format, rc::Rc, string::String, sync::Arc, vec::Vec};
+use alloc::{collections::VecDeque, format, rc::Rc, string::String, sync::Arc, vec::Vec};
 use core::{cell::RefCell, mem::ManuallyDrop};
 use stela_contracts::refuse;
 use stela_drivers::{
     Clock,
     net::{Link, LinkError, Mac},
     probe::Adapter,
+    usb::xhci::SlotId,
 };
 use stela_runtime::net::{
     HttpPost, HttpRequest, HttpTransfer, NetError, Stack, TlsUnavailable, Transfer,
@@ -83,6 +84,14 @@ impl RootLink {
         Self {
             device: ManuallyDrop::new(device),
             root,
+        }
+    }
+
+    fn usb_slot(&self) -> Option<SlotId> {
+        match &*self.device {
+            Adapter::Usb(link) => Some(link.slot_id()),
+            Adapter::UsbVendor(link) => Some(link.slot_id()),
+            _ => None,
         }
     }
 }
@@ -327,13 +336,219 @@ impl HostNetwork {
         last: u64,
         etag: &str,
     ) -> Result<HttpTransfer, NetError> {
+        self.open_download(url, first, last, Some(etag))
+    }
+
+    fn open_download(
+        &mut self,
+        url: &str,
+        first: u64,
+        last: u64,
+        etag: Option<&str>,
+    ) -> Result<HttpTransfer, NetError> {
         self.stack.open_http(
             url,
-            HttpRequest::range(first, last, Some(etag)),
+            HttpRequest::range(first, last, etag),
             DOWNLOAD_BUFFER,
             self.security.clone(),
         )
     }
+
+    /// Read one bounded public object prefix through the restore download path.
+    #[cfg(feature = "diagnostics")]
+    pub fn check_public_range(&mut self, url: &str) -> Result<(u64, Vec<u8>), NetError> {
+        use stela_runtime::net::http::{Ranged, Scheme, Url, head};
+
+        const LAST_BYTE: u64 = 4095;
+        if Url::parse(url).map_err(NetError::Url)?.scheme != Scheme::Https {
+            return Err(NetError::Invalid("the range check requires HTTPS"));
+        }
+        let mut transfer = self.open_download(url, 0, LAST_BYTE, None)?;
+        let mut range = None;
+        let mut body = Vec::new();
+        let start = output::now();
+        let result = loop {
+            let received = self.read_download(&mut transfer, |bytes, closed| {
+                if range.is_none() {
+                    // Stack::read_http delivers the complete accepted header in
+                    // the first callback, including any initial body bytes.
+                    let response = head(bytes, closed)?
+                        .ok_or(NetError::Truncated("HTTPS range check header"))?;
+                    let Some((0, last, size)) = response.range else {
+                        return Err(NetError::Invalid("HTTPS range check response extent"));
+                    };
+                    if last != (size - 1).min(LAST_BYTE) {
+                        return Err(NetError::Invalid("HTTPS range check response extent"));
+                    }
+                    range = Some(Ranged::new(0, last));
+                }
+                range
+                    .as_mut()
+                    .expect("range header checked above")
+                    .feed(bytes, closed, |data| body.extend_from_slice(data))
+            });
+            match received {
+                Ok(true) => break Ok(()),
+                Ok(false) if output::millis_since(start) < 30_000 => {
+                    if let Err(error) = self.wait(50_000) {
+                        break Err(error);
+                    }
+                }
+                Ok(false) => break Err(NetError::Timeout("HTTPS range check")),
+                Err(error) => break Err(error),
+            }
+        };
+        self.close_download(transfer);
+        result?;
+        let size = range
+            .and_then(|range| range.size)
+            .ok_or(NetError::Truncated("HTTPS range check body"))?;
+        Ok((size, body))
+    }
+
+    /// Exercise pinned restore downloads together, retaining only their prefixes.
+    #[cfg(feature = "diagnostics")]
+    pub fn check_exact_ranges(
+        &mut self,
+        checks: &[stela_boot_core::options::NetworkCheckRange],
+    ) -> bool {
+        use stela_runtime::net::http::Ranged;
+
+        const SAMPLE_BYTES: u64 = 16 * 1024;
+        let mut transfers: Vec<_> = checks
+            .iter()
+            .map(|check| {
+                let range =
+                    Ranged::with_identity(check.first, check.last, &check.etag, check.total)?;
+                let transfer = self.download(&check.url, check.first, check.last, &check.etag)?;
+                Ok::<_, NetError>((transfer, range, Vec::new(), None))
+            })
+            .collect();
+        let start = output::now();
+        let mut wait_error = None;
+        loop {
+            let mut pending = false;
+            for (check, transfer) in checks.iter().zip(&mut transfers) {
+                let Ok((transfer, range, prefix, result)) = transfer else {
+                    continue;
+                };
+                if result.is_some() {
+                    continue;
+                }
+                let sample = (check.last - check.first + 1).min(SAMPLE_BYTES) as usize;
+                match self.read_download(transfer, |bytes, closed| {
+                    let done = range.feed(bytes, closed, |data| {
+                        let take = data.len().min(sample - prefix.len());
+                        prefix.extend_from_slice(&data[..take]);
+                    })?;
+                    Ok(done || prefix.len() == sample)
+                }) {
+                    Ok(true) => *result = Some(Ok(())),
+                    Ok(false) => pending = true,
+                    Err(error) => *result = Some(Err(error)),
+                }
+            }
+            if !pending || output::millis_since(start) >= 35_000 {
+                break;
+            }
+            if let Err(error) = self.wait(50_000) {
+                wait_error = Some(error);
+                break;
+            }
+        }
+        let mut passed = true;
+        for (index, (check, transfer)) in checks.iter().zip(transfers).enumerate() {
+            let (header, prefix, result) = match transfer {
+                Ok((transfer, range, prefix, result)) => {
+                    self.close_download(transfer);
+                    (range.size.is_some(), prefix, result)
+                }
+                Err(error) => (false, Vec::new(), Some(Err(error))),
+            };
+            let elapsed_ms = output::millis_since(start);
+            if matches!(result, Some(Ok(()))) {
+                output::arguments(format_args!(
+                    "NETWORK EXACT RANGE id={index} first={} last={} object={} status=206 bytes={} sha256={} elapsed_ms={elapsed_ms}\n",
+                    check.first,
+                    check.last,
+                    check.total,
+                    prefix.len(),
+                    stela_formats::sha256(&prefix),
+                ));
+                continue;
+            }
+            passed = false;
+            let timeout = NetError::Timeout("exact range check");
+            let error = result
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .or(wait_error.as_ref())
+                .unwrap_or(&timeout);
+            output::arguments(format_args!(
+                "NETWORK EXACT RANGE id={index} first={} last={} accepted_header={header} bytes={} elapsed_ms={elapsed_ms} error={error}\n",
+                check.first,
+                check.last,
+                prefix.len(),
+            ));
+        }
+        passed
+    }
+
+    /// Fill the first range's TCP receive queue, abort it, then reopen on the
+    /// same network stack as a remote restore does on a distant archive read.
+    #[cfg(feature = "diagnostics")]
+    pub fn check_reopened_range(
+        &mut self,
+        first: &stela_boot_core::options::NetworkCheckRange,
+        next: &stela_boot_core::options::NetworkCheckRange,
+    ) -> Result<bool, NetError> {
+        use stela_runtime::net::http::Ranged;
+
+        let mut range = Ranged::with_identity(first.first, first.last, &first.etag, first.total)?;
+        let mut transfer = self.download(&first.url, first.first, first.last, &first.etag)?;
+        let start = output::now();
+        let primed = (|| {
+            let mut consumed = 0usize;
+            while consumed == 0 {
+                let ended = self.read_download(&mut transfer, |bytes, closed| {
+                    range.feed(bytes, closed, |body| consumed += body.len())
+                })?;
+                if ended {
+                    return Err(NetError::Invalid("the prime range completed before abort"));
+                }
+                if output::millis_since(start) >= 30_000 {
+                    return Err(NetError::Timeout("range reopen prime body"));
+                }
+                if consumed == 0 {
+                    self.wait(50_000)?;
+                }
+            }
+            loop {
+                self.stack.poll()?;
+                let (queued, capacity) =
+                    self.stack
+                        .http_receive_queue(&transfer)
+                        .ok_or(NetError::Invalid(
+                            "range reopen prime requires a plain socket",
+                        ))?;
+                if queued == capacity {
+                    return Ok((queued, consumed));
+                }
+                if output::millis_since(start) >= 30_000 {
+                    return Err(NetError::Timeout("range reopen prime receive queue"));
+                }
+                self.wait(50_000)?;
+            }
+        })();
+        self.close_download(transfer);
+        let (queued, consumed) = primed?;
+        output::arguments(format_args!(
+            "NETWORK EXACT RANGE REOPEN aborted first={} consumed_bytes={consumed} full_queue_bytes={queued}\n",
+            first.first,
+        ));
+        Ok(self.check_exact_ranges(core::slice::from_ref(next)))
+    }
+
     pub fn read_download(
         &mut self,
         transfer: &mut HttpTransfer,
@@ -467,13 +682,16 @@ impl stela_runtime::restore::tss::Transport for Offline {
 /// address, so the guest is that adapter on the host's network and the
 /// adapter needs no promiscuous mode. Frames move between engine slices.
 pub struct GuestNetwork {
-    link: RootLink,
+    link: Option<RootLink>,
+    root: u64,
+    /// Late adapters can wait for the guest hub to acknowledge a disconnect.
+    available: VecDeque<RootLink>,
     up: Option<bool>,
     /// The first link refusal, reported once.
     refused: bool,
     /// Frames read from the host adapter that the guest's receive queue
     /// had no room for yet, delivered first at the next turn.
-    received: alloc::collections::VecDeque<Vec<u8>>,
+    received: VecDeque<Vec<u8>>,
 }
 
 /// Frames read from the host adapter in one service turn at most, outside
@@ -482,32 +700,95 @@ const RECEIVE_BURST: usize = 64;
 
 impl GuestNetwork {
     /// The second adapter when the mount's own client (`wants_client`)
-    /// keeps the first, otherwise the first.
-    pub fn open(links: &mut Links, wants_client: bool) -> Result<Self> {
+    /// keeps the first, otherwise the first. Keep the guest port reserved if
+    /// no host link is free yet.
+    pub fn open(links: &mut Links, wants_client: bool) -> Self {
         let index = usize::from(wants_client);
-        if links.devices.len() <= index {
-            return Err(refuse!(
-                "the guest network needs host network adapter {adapter} of its own; {found} found",
-                adapter = index + 1,
-                found = links.devices.len()
+        let link = (index < links.devices.len())
+            .then(|| RootLink::new(links.devices.remove(index), links.root));
+        if let Some(link) = &link {
+            Self::report_adapter(link);
+        } else {
+            output::arguments(format_args!(
+                "GUEST NETWORK waiting for a USB network adapter\n"
             ));
         }
-        let device = links.devices.remove(index);
-        output::arguments(format_args!(
-            "GUEST NETWORK adapter {} mac={}\n",
-            device.location(),
-            device.mac()
-        ));
-        Ok(Self {
-            link: RootLink::new(device, links.root),
+        Self {
+            link,
+            root: links.root,
+            available: VecDeque::new(),
             up: None,
             refused: false,
-            received: alloc::collections::VecDeque::new(),
-        })
+            received: VecDeque::new(),
+        }
     }
 
-    pub fn mac(&self) -> Mac {
-        self.link.mac()
+    pub fn mac(&self) -> Option<Mac> {
+        self.link.as_ref().map(Link::mac)
+    }
+
+    fn report_adapter(link: &RootLink) {
+        output::arguments(format_args!(
+            "GUEST NETWORK adapter {} mac={}\n",
+            link.device.location(),
+            link.mac()
+        ));
+    }
+
+    /// Retire exact generations before forwarding another frame. Drop host
+    /// owners outside the guest devices' lock and signal the guest hub even
+    /// if a replacement has already arrived in the same poll.
+    pub(super) fn usb_changed(
+        &mut self,
+        board: &super::parallel::Board,
+        added: Vec<Adapter>,
+        removed: &[SlotId],
+    ) {
+        let retired = |link: &RootLink| link.usb_slot().is_some_and(|slot| removed.contains(&slot));
+        if self.link.as_ref().is_some_and(retired) {
+            board.serve(AppleDevices::detach_network);
+            self.link = None;
+            self.received.clear();
+            self.refused = false;
+            output::arguments(format_args!("GUEST NETWORK host USB adapter removed\n"));
+            self.status(None);
+        }
+        self.available.retain(|link| !retired(link));
+        self.available.extend(
+            added
+                .into_iter()
+                .map(|link| RootLink::new(link, self.root))
+                .filter(|link| !retired(link)),
+        );
+    }
+
+    pub(super) fn has_work(&self) -> bool {
+        self.link.is_some() || !self.available.is_empty()
+    }
+
+    /// Publish a new MAC as a fresh virtual USB function. The hub defers
+    /// publication while the previous disconnect is pending at the guest.
+    pub(super) fn activate(&mut self, board: &super::parallel::Board) -> bool {
+        if self.link.is_some() {
+            return true;
+        }
+        while let Some(link) = self.available.front() {
+            let mac = link.mac();
+            match board.serve(|devices| devices.attach_network(mac)) {
+                Ok(true) => {
+                    Self::report_adapter(link);
+                    self.link = self.available.pop_front();
+                    self.up = None;
+                    return true;
+                }
+                Ok(false) => return false,
+                Err(error) => {
+                    output::arguments(format_args!("GUEST NETWORK hotplug refused: {error}\n"));
+                    self.available.pop_front();
+                }
+            }
+        }
+        false
     }
 
     /// Report the guest's link state as `status` gives it.
@@ -531,7 +812,10 @@ impl GuestNetwork {
             return;
         }
         while self.received.len() < RECEIVE_BURST {
-            match self.link.receive() {
+            let Some(link) = self.link.as_mut() else {
+                break;
+            };
+            match link.receive() {
                 Ok(Some(frame)) => self.received.push_back(frame),
                 Ok(None) => break,
                 Err(error) => {
@@ -565,7 +849,10 @@ impl GuestNetwork {
     pub fn transmit(&mut self, frames: Vec<Vec<u8>>) -> Option<Vec<u8>> {
         let mut reusable = None;
         for frame in frames {
-            if let Err(error) = self.link.transmit(&frame) {
+            let Some(link) = self.link.as_mut() else {
+                return reusable;
+            };
+            if let Err(error) = link.transmit(&frame) {
                 self.refuse(error.into());
             }
             reusable = Some(frame);

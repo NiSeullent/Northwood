@@ -1,6 +1,11 @@
 //! One recovered cohort, one stop, and ordered consuming bus accesses.
 use super::*;
+use crate::memory::{
+    domain::MemoryExecutionLoan,
+    system_ram::{DescriptorReader, REGISTERED_FRAME_BYTES, RamPageKind, RegisteredSystemRam},
+};
 use shared_memory::RecoveredDeviceAccess;
+use stela_compiler::context::memory::MemoryStatus;
 
 /// The most instructions a machine completes as device sites: one past
 /// them takes the fault path, as before it learned any.
@@ -29,9 +34,192 @@ struct SiteAccess {
     address: u64,
     write: bool,
     bytes: u64,
+    alignment: u64,
+}
+
+pub(super) fn ram_refused() -> RequirementKind {
+    RequirementKind::NativePreparation("could not verify registered RAM binding".into())
+}
+
+/// One registered scalar or vector element, pinned across its walk and copy.
+pub(super) struct OperandRam {
+    ram: Arc<RegisteredSystemRam>,
+    execution: MemoryExecutionLoan,
+}
+
+impl OperandRam {
+    pub(super) fn tables(&self) -> SiteTables<'_> {
+        SiteTables::new(&self.ram)
+    }
+
+    pub(super) fn resident(
+        &self,
+        host: &impl Host,
+        pieces: impl Iterator<Item = (u64, usize)>,
+    ) -> Result<bool, RequirementKind> {
+        let binding = self
+            .ram
+            .cpu_binding(&self.execution)
+            .map_err(|_| ram_refused())?;
+        let mut resident = true;
+        let frame_bytes = REGISTERED_FRAME_BYTES as u64;
+        for (physical, length) in pieces {
+            let frame = physical & !(frame_bytes - 1);
+            if physical - frame + length as u64 > frame_bytes {
+                return Err(ram_refused());
+            }
+            match binding
+                .classify_page(frame, REGISTERED_FRAME_BYTES)
+                .map_err(|_| ram_refused())?
+            {
+                RamPageKind::Resident => {}
+                RamPageKind::Nonresident { frame } => {
+                    return Err(RequirementKind::NonresidentRam { frame });
+                }
+                RamPageKind::Unmapped => {
+                    if (0..frame_bytes)
+                        .step_by(FETCH_PAGE as usize)
+                        .any(|offset| host.device_site_has_retained_ram(frame + offset))
+                    {
+                        return Err(ram_refused());
+                    }
+                    resident = false;
+                }
+            }
+        }
+        Ok(resident)
+    }
+
+    /// Copy previously admitted pieces, retaining the completed prefix on failure.
+    ///
+    /// # Safety
+    /// The staging slice is private and disjoint from registered RAM and all
+    /// live native frames. The pieces were admitted under this same loan.
+    pub(super) unsafe fn transfer(
+        &self,
+        host: &mut impl Host,
+        pieces: impl Iterator<Item = (u64, usize)>,
+        staging: &mut [u8],
+        write: bool,
+    ) -> Result<(), RequirementKind> {
+        host.speculation_barrier();
+        let mut offset = 0;
+        for (physical, length) in pieces {
+            let part = &mut staging[offset..offset + length];
+            // SAFETY: the canonical owner remains pinned and part is private staging.
+            let result = unsafe {
+                if write {
+                    self.ram.publish_physical(physical, part)
+                } else {
+                    self.ram.read_physical_progress(physical, part)
+                }
+            };
+            if let Err(fault) = result {
+                return Err(RequirementKind::RamTransfer {
+                    physical,
+                    write,
+                    completed: offset + fault.completed,
+                    status: fault.status,
+                });
+            }
+            offset += length;
+        }
+        Ok(())
+    }
+}
+
+/// Keep descriptor failures that the architectural walker cannot express.
+pub(super) struct SiteTables<'a> {
+    ram: &'a RegisteredSystemRam,
+    descriptors: DescriptorReader<'a>,
+    refusal: Option<RequirementKind>,
+}
+
+impl<'a> SiteTables<'a> {
+    pub(super) fn new(ram: &'a RegisteredSystemRam) -> Self {
+        Self {
+            ram,
+            descriptors: ram.descriptor_reader(),
+            refusal: None,
+        }
+    }
+
+    pub(super) fn translate(
+        &mut self,
+        controls: &mmu::Controls,
+        address: u64,
+        access: mmu::Access,
+        requester: mmu::Requester,
+    ) -> Result<Translated, RequirementKind> {
+        let outcome = mmu::translate(controls, address, access, requester, self);
+        self.outcome(outcome)
+    }
+
+    pub(super) fn outcome(&mut self, outcome: Translated) -> Result<Translated, RequirementKind> {
+        match self.refusal.take() {
+            Some(reason) => Err(reason),
+            None => Ok(outcome),
+        }
+    }
+
+    fn descriptor<T>(&mut self, physical: u64, result: Result<T, MemoryStatus>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(MemoryStatus::Translation) => None,
+            Err(status) => {
+                if self.refusal.is_none() {
+                    self.refusal = Some(if status == MemoryStatus::Nonresident {
+                        self.ram
+                            .nonresident_frame(physical, 8)
+                            .map(|frame| RequirementKind::NonresidentRam { frame })
+                            .unwrap_or_else(ram_refused)
+                    } else {
+                        ram_refused()
+                    });
+                }
+                None
+            }
+        }
+    }
+}
+
+impl mmu::TableMemory for SiteTables<'_> {
+    fn read_descriptor(&mut self, physical: u64) -> Option<u64> {
+        let result = self.descriptors.read_descriptor(physical);
+        self.descriptor(physical, result)
+    }
+
+    fn update_descriptor(&mut self, physical: u64, old: u64, new: u64) -> Option<bool> {
+        let result = self.descriptors.update_descriptor(physical, old, new);
+        self.descriptor(physical, result)
+    }
 }
 
 impl<H: Host, D: Devices> Machine<H, D> {
+    pub(super) fn operand_ram(&self) -> Result<Option<OperandRam>, RequirementKind> {
+        let registered = self.host.device_site_ram().map_err(|_| ram_refused())?;
+        if self.cpu.canonical_memory.as_ref().is_some_and(|memory| {
+            !registered
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(&owner.ram, memory.ram_owner()))
+        }) {
+            return Err(ram_refused());
+        }
+        let Some(DeviceSiteRam {
+            ram,
+            expected_generation,
+        }) = registered
+        else {
+            return Ok(None);
+        };
+        let execution = ram.cpu_execution_loan().map_err(|_| ram_refused())?;
+        let binding = ram.cpu_binding(&execution).map_err(|_| ram_refused())?;
+        if expected_generation.is_some_and(|expected| binding.generation() != expected) {
+            return Err(ram_refused());
+        }
+        Ok(Some(OperandRam { ram, execution }))
+    }
+
     /// The physical address of the instruction at `pc` of block `index`,
     /// unless the block is a single instruction's.
     pub(super) fn device_site_of(&self, index: usize, pc: u64) -> Option<u64> {
@@ -145,12 +333,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
             | ScalarLoadAddress::RegisterOffset { base, .. } => Some(base),
             ScalarLoadAddress::Literal { .. } => None,
         };
-        let (address, write, bytes, base) =
+        let (address, write, bytes, alignment, base) =
             if let Some(load) = ScalarLoad::from_instruction(&instruction) {
                 let address = load.address();
                 (
                     self.scalar_address(address).0,
                     false,
+                    u64::from(load.bytes()),
                     u64::from(load.bytes()),
                     base(&address)?,
                 )
@@ -159,6 +348,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 (
                     self.scalar_address(address).0,
                     true,
+                    u64::from(store.bytes()),
                     u64::from(store.bytes()),
                     base(&address)?,
                 )
@@ -173,7 +363,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             {
                 let write = matches!(transfer, MemoryTransfer::Store);
                 let address = self.immediate_address(base, displacement, mode);
-                (address, write, 2 * u64::from(bytes), base)
+                (address, write, 2 * u64::from(bytes), u64::from(bytes), base)
             } else {
                 return None;
             };
@@ -181,7 +371,89 @@ impl<H: Host, D: Devices> Machine<H, D> {
             address,
             write,
             bytes,
+            alignment,
         })
+    }
+
+    fn device_site_target(&mut self, access: &SiteAccess) -> Result<Option<u64>, RequirementKind> {
+        let kind = if access.write {
+            mmu::Access::Write
+        } else {
+            mmu::Access::Read
+        };
+        let registered = self.host.device_site_ram().map_err(|_| ram_refused())?;
+        let canonical = self
+            .cpu
+            .canonical_memory
+            .as_ref()
+            .map(|memory| memory.ram_owner());
+        if canonical.is_some_and(|ram| {
+            self.serial_hold.is_none()
+                || !registered
+                    .as_ref()
+                    .is_some_and(|site| Arc::ptr_eq(&site.ram, ram))
+        }) {
+            return Err(ram_refused());
+        }
+        let Some(DeviceSiteRam {
+            ram,
+            expected_generation,
+        }) = registered
+        else {
+            let Translated::Mapped(translation) = self.translate_data(access.address, kind) else {
+                return Ok(None);
+            };
+            let last = access.address.wrapping_add(access.bytes - 1);
+            let page = translation.physical & !(FETCH_PAGE - 1);
+            return Ok((!self.host.read_ram(page, &mut [0])
+                && !self.watch.overlaps(access.address, last))
+            .then_some(translation.physical));
+        };
+        // The promoted path consumes only a one-page operand. Other shapes
+        // take the original native checks, including architectural alignment.
+        let Some(last) = access.address.checked_add(access.bytes - 1) else {
+            return Ok(None);
+        };
+        if !access.address.is_multiple_of(access.alignment) || (access.address ^ last) >= FETCH_PAGE
+        {
+            return Ok(None);
+        }
+        let execution = ram.cpu_execution_loan().map_err(|_| ram_refused())?;
+        let binding = ram.cpu_binding(&execution).map_err(|_| ram_refused())?;
+        if expected_generation.is_some_and(|expected| binding.generation() != expected) {
+            return Err(ram_refused());
+        }
+        // The site remembers only the instruction, so translate its current
+        // VA and classify the resulting GPA under this same execution loan.
+        let translation = SiteTables::new(&ram).translate(
+            &self.cpu.controls(self.cpu.regime()),
+            access.address,
+            kind,
+            self.cpu.requester(),
+        )?;
+        let Translated::Mapped(translation) = translation else {
+            return Ok(None);
+        };
+        let page = translation.physical & !(FETCH_PAGE - 1);
+        if translation.physical - page + access.bytes > FETCH_PAGE {
+            return Ok(None);
+        }
+        match binding
+            .classify_page(page, FETCH_PAGE as usize)
+            .map_err(|_| ram_refused())?
+        {
+            RamPageKind::Nonresident { frame } => Err(RequirementKind::NonresidentRam { frame }),
+            RamPageKind::Resident => Ok(None),
+            RamPageKind::Unmapped if self.host.device_site_has_retained_ram(page) => {
+                Err(ram_refused())
+            }
+            RamPageKind::Unmapped => {
+                Ok((!self.watch.overlaps(access.address, last)).then_some(translation.physical))
+            }
+        }
+        // The loan ends before synchronous device work, which may borrow
+        // the RAM service. The stopped serialized cohort stays held, and
+        // the registered GPA geometry remains fixed for this boot.
     }
 
     /// Complete the instruction at the device site `pc`, block `index`'s
@@ -192,22 +464,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn complete_device_site(&mut self, index: usize, pc: u64) -> Step {
         let physical = self.code.blocks[index].physical;
         let word = self.code.blocks[index].terminal;
-        let access = self.site_access(pc, word);
-        let device = access.and_then(|access| {
-            let kind = if access.write {
-                mmu::Access::Write
-            } else {
-                mmu::Access::Read
-            };
-            let Translated::Mapped(translation) = self.translate_data(access.address, kind) else {
-                return None;
-            };
-            let last = access.address.wrapping_add(access.bytes - 1);
-            let page = translation.physical & !(FETCH_PAGE - 1);
-            let ram = self.host.read_ram(page, &mut [0]);
-            (!ram && !self.watch.overlaps(access.address, last))
-                .then_some((access, translation.physical))
-        });
+        let device = match self.site_access(pc, word) {
+            Some(access) => match self.device_site_target(&access) {
+                Ok(target) => target.map(|target| (access, target)),
+                Err(reason) => return Err(self.unsupported(reason)),
+            },
+            None => None,
+        };
         let site = self.device_sites.entry(physical).or_default();
         match device {
             Some((access, target)) => {

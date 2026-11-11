@@ -291,7 +291,7 @@ pub(super) fn add(environment: &Environment<'_>, command: &Request) -> Result<St
         writeln!(
             text,
             "  remove         {}",
-            kept.directory(&record.volume).display()
+            kept.directory_in(&record.volume, record.layout).display()
         )?;
     }
     for note in &notes {
@@ -348,7 +348,7 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
             writeln!(
                 text,
                 "  remove         {}",
-                kept.directory(&record.volume).display()
+                kept.directory_in(&record.volume, record.layout).display()
             )?;
         }
     }
@@ -389,7 +389,11 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
             ssid: ssid.clone(),
             country: command.wifi_country.clone(),
         };
-        writeln!(text, "  {}", super::wifi::describe(&network, &record.esp))?;
+        writeln!(
+            text,
+            "  {}",
+            super::wifi::describe_in(&network, &record.esp, record.layout)
+        )?;
         record.wifi = Some(network);
     }
     if let Some(ipv4) = command.ipv4 {
@@ -413,7 +417,10 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
         writeln!(
             text,
             "  Wi-Fi          off; remove {}",
-            record.esp.join(super::wifi::KEY_PATH).display()
+            record
+                .esp
+                .join(super::wifi::key_path(record.layout))
+                .display()
         )?;
     }
     if !command.usb4_approve.is_empty() {
@@ -433,16 +440,21 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
         return Ok(text);
     }
     if let Some(passphrase) = &command.wifi_passphrase {
-        super::wifi::write_key(&record.esp, passphrase)?;
+        super::wifi::write_key_in(&record.esp, passphrase, record.layout)?;
     }
     publish(&mut record)?;
     write_record(&record.esp.clone(), &record)?;
     super::remove_bundles(&record, &removed_bundles)?;
     if command.wifi.is_some() {
         let mount_image = fs::read(record.esp.join(super::LOADER_PATH))?;
-        super::firmware::provision_wifi(environment.host, &record.esp, &mount_image)?;
+        super::firmware::provision_wifi_in(
+            environment.host,
+            &record.esp,
+            record.layout,
+            &mount_image,
+        )?;
     }
-    let key = record.esp.join(super::wifi::KEY_PATH);
+    let key = record.esp.join(super::wifi::key_path(record.layout));
     if command.no_wifi && key.is_file() {
         fs::remove_file(key)?;
     }

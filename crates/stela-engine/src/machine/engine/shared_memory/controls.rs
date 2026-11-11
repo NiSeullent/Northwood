@@ -128,9 +128,10 @@ impl Controls {
             core::array::from_fn(|index| (IDENTIFICATION_PAIRS[index].0, ids[index]));
         let identification =
             Arc::new(Snapshot::declared(name, &values).map_err(|_| MemoryStatus::Unsupported)?);
-        let address_checks = ProcessMemoryFeatures::from_snapshot(&identification)
-            .map_err(|_| MemoryStatus::Unsupported)?
-            .unchecked_address_checks();
+        let address_checks = Some(
+            ProcessMemoryFeatures::canonical_address_checks(&identification)
+                .map_err(|_| MemoryStatus::Unsupported)?,
+        );
         let identity = stela_formats::sha256(
             alloc::format!(
                 "{:?} {:?} {:?} {} {:?} {}",
@@ -223,22 +224,21 @@ pub(super) mod tests {
     use super::*;
     use {
         crate::machine::CpuProfile, crate::machine::exception::Pstate,
-        crate::machine::identification, stela_contracts::Chip,
+        crate::machine::identification, crate::system::process_memory::ProcessMemoryError,
+        stela_compiler::TargetCpu, stela_contracts::Chip,
     };
     pub(in crate::machine::engine::shared_memory) fn captured()
     -> (Cpu, CpuProfile, Vec<SystemRegister>) {
+        captured_with(TargetCpu::X86_64_V2.with_atomic_load16())
+    }
+
+    fn captured_with(target: TargetCpu) -> (Cpu, CpuProfile, Vec<SystemRegister>) {
         let chip = Chip::AppleM1;
         let profile = CpuProfile {
             name: "source-bound-m1-shared-controls-fixture",
             chip,
             counter_frequency: 24_000_000,
-            fixed: identification::derive(
-                chip,
-                // Concurrent PEs' LDAPR needs the 16-byte atomic load.
-                stela_compiler::TargetCpu::X86_64_V2.with_atomic_load16(),
-                true,
-                identification::Speculation::NONE,
-            ),
+            fixed: identification::derive(chip, target, true, identification::Speculation::NONE),
             processors: Vec::new(),
         };
         let mut cpu = Cpu::of(chip, 0x1000, Pstate::reset(1));
@@ -247,6 +247,42 @@ pub(super) mod tests {
         cpu.registers
             .set_raw(SystemRegister::SCTLR_EL1, 0, SCTLR_M | SCTLR_C | (1 << 12));
         (cpu, profile, missing)
+    }
+
+    #[test]
+    fn canonical_base_atomicity_does_not_qualify_fixed_process_memory() {
+        let (mut cpu, profile, missing) = captured_with(TargetCpu::X86_64_V2);
+        let controls = Controls::capture(&cpu, profile.name, &missing).unwrap();
+        assert!(controls.address_checks.is_some());
+        assert!(controls.instructions(InstructionRequirements::LSE).is_ok());
+        let mmfr2 = controls
+            .identification
+            .read(Register::IdAa64Mmfr2El1)
+            .unwrap();
+        assert_eq!(mmfr2 >> 32 & 15, 0);
+        assert!(matches!(
+            ProcessMemoryFeatures::from_snapshot(&controls.identification),
+            Err(ProcessMemoryError::UnsupportedFeature {
+                register: "ID_AA64MMFR2_EL1",
+                field: "AT",
+                value: 0,
+            })
+        ));
+        for (register, unsupported) in [
+            (SystemRegister::ID_AA64MMFR2_EL1, 2 << 32),
+            (SystemRegister::ID_AA64MMFR0_EL1, 15 << 28),
+            (SystemRegister::ID_AA64PFR1_EL1, 1 << 8),
+            (SystemRegister::ID_AA64ISAR3_EL1, 2),
+            (SystemRegister::ID_AA64DFR0_EL1, 1 << 32),
+        ] {
+            let saved = cpu.read(register);
+            cpu.registers.set_raw(register, 0, saved | unsupported);
+            assert!(
+                Controls::capture(&cpu, profile.name, &missing).is_err(),
+                "{register:?}"
+            );
+            cpu.registers.set_raw(register, 0, saved);
+        }
     }
     #[test]
     fn fp_memory_admission_tracks_cpacr_and_cptr_permissions() {

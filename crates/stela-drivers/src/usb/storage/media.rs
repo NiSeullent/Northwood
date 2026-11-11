@@ -73,6 +73,33 @@ impl<T: Scsi> Owner<T> {
             .iter()
             .any(|unit| unit.lun == lun && unit.valid.get())
     }
+
+    /// Check the one current publication before the class owner is consumed.
+    /// A pending probe or reset attention must finish on the shared path.
+    pub(super) fn check_reservation(&self, disk: &Disk<Self>) -> Result<(), ReservationError> {
+        if !self.pending.is_empty() || disk.running.is_some() {
+            return Err(ReservationError::Busy);
+        }
+        let [unit] = self.units.as_slice() else {
+            return Err(ReservationError::UnsupportedMedia);
+        };
+        if self.expecting_reset
+            || self.rebound
+            || !unit.valid.get()
+            || !Rc::ptr_eq(&unit.valid, &disk.media)
+            || unit.lun != disk.lun
+            || unit.identity != disk.identity
+        {
+            return Err(ReservationError::Stale);
+        }
+        if unit.removable || disk.removable || disk.identity.read_only {
+            return Err(ReservationError::UnsupportedMedia);
+        }
+        if Rc::strong_count(&unit.valid) != 2 || Rc::weak_count(&unit.valid) != 0 {
+            return Err(ReservationError::Aliased);
+        }
+        Ok(())
+    }
     /// Whether `lun` is removable; a unit not yet published is assumed so.
     fn removable(&self, lun: T::Lun) -> bool {
         let units = self.units.iter().map(|unit| (unit.lun, unit.removable));

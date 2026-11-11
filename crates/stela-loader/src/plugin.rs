@@ -45,6 +45,29 @@ const CS_HASHTYPE_SHA256: u8 = 2;
 /// `CS_CodeDirectory` through `execSegFlags`.
 const CODE_DIRECTORY_BYTES: usize = 88;
 
+pub const CODE_RESOURCES_PATH: &str = "Contents/_CodeSignature/CodeResources";
+
+/// The external files sealed into each slice's code directory.
+#[derive(Clone, Copy)]
+pub struct BundleSeal {
+    info: [u8; HASH_BYTES],
+    resources: [u8; HASH_BYTES],
+}
+
+impl BundleSeal {
+    pub fn new(info: &[u8], resources: &[u8]) -> Self {
+        Self {
+            info: Sha256::digest(info).into(),
+            resources: Sha256::digest(resources).into(),
+        }
+    }
+
+    /// Special slots -3 (resources), -2 (no requirements) and -1 (Info.plist).
+    fn slots(self) -> [[u8; HASH_BYTES]; 3] {
+        [self.resources, [0; HASH_BYTES], self.info]
+    }
+}
+
 /// What every process that loads the plugin has loaded already, which the
 /// image names so its imports need nothing else.
 const LIBRARIES: [&str; 5] = [
@@ -764,7 +787,12 @@ impl<'a> Slice<'a> {
 
     /// Lays the sections out, applies every reference and writes the Mach-O.
     /// Addresses in the file's two section segments equal file offsets.
-    fn link(mut self, identifier: &str, uuid: [u8; 16]) -> Result<Vec<u8>> {
+    fn link(
+        mut self,
+        identifier: &str,
+        uuid: [u8; 16],
+        seal: Option<BundleSeal>,
+    ) -> Result<Vec<u8>> {
         let order = self.order();
         let commands = commands_bytes(order.len());
         let header_bytes = (size_of::<macho::MachHeader64<LE>>() + commands) as u64;
@@ -784,7 +812,7 @@ impl<'a> Slice<'a> {
         // dyld validates pointer alignment even for the empty symbol/string tables.
         let strings = (linkedit + fixups.len() as u64).next_multiple_of(8);
         let signature_offset = (strings + 1).next_multiple_of(16);
-        let signature_bytes = signature_size(identifier, signature_offset);
+        let signature_bytes = signature_size(identifier, signature_offset, seal);
         let end = signature_offset + signature_bytes;
 
         let sections = |region: Region| -> Vec<&Section> {
@@ -853,7 +881,7 @@ impl<'a> Slice<'a> {
         }
         let start: usize = fit(linkedit, "the link edit's offset")?;
         file[start..start + fixups.len()].copy_from_slice(&fixups);
-        let signature = sign(&file, identifier, text_bytes);
+        let signature = sign(&file, identifier, text_bytes, seal);
         require!(
             signature.len() as u64 == signature_bytes,
             "the signature's size"
@@ -1111,15 +1139,18 @@ impl Header<'_> {
 }
 
 /// The signature's size for a file signed to `code_limit`.
-fn signature_size(identifier: &str, code_limit: u64) -> u64 {
+fn signature_size(identifier: &str, code_limit: u64, seal: Option<BundleSeal>) -> u64 {
     let slots = code_limit.div_ceil(HASH_PAGE);
-    20 + (CODE_DIRECTORY_BYTES + identifier.len() + 1) as u64 + slots * HASH_BYTES as u64
+    let special = seal.map_or(0, |seal| size_of_val(&seal.slots()));
+    20 + (CODE_DIRECTORY_BYTES + identifier.len() + 1 + special) as u64 + slots * HASH_BYTES as u64
 }
 
 /// The ad-hoc signature of `file`, whose first `text_bytes` are executable.
-fn sign(file: &[u8], identifier: &str, text_bytes: u64) -> Vec<u8> {
+fn sign(file: &[u8], identifier: &str, text_bytes: u64, seal: Option<BundleSeal>) -> Vec<u8> {
     let slots = file.len().div_ceil(HASH_PAGE as usize);
-    let hash_offset = CODE_DIRECTORY_BYTES + identifier.len() + 1;
+    let special = seal.map(BundleSeal::slots);
+    let special = special.as_slice().as_flattened();
+    let hash_offset = CODE_DIRECTORY_BYTES + identifier.len() + 1 + size_of_val(special);
     let directory_bytes = hash_offset + slots * HASH_BYTES;
     let mut directory = Vec::with_capacity(directory_bytes);
     let word = |bytes: &mut Vec<u8>, value: u32| bytes.extend_from_slice(&value.to_be_bytes());
@@ -1127,10 +1158,17 @@ fn sign(file: &[u8], identifier: &str, text_bytes: u64) -> Vec<u8> {
     word(&mut directory, CSMAGIC_CODEDIRECTORY);
     word(&mut directory, directory_bytes as u32);
     word(&mut directory, CS_SUPPORTSEXECSEG);
-    word(&mut directory, CS_ADHOC | CS_LINKER_SIGNED);
+    word(
+        &mut directory,
+        if seal.is_some() {
+            CS_ADHOC
+        } else {
+            CS_ADHOC | CS_LINKER_SIGNED
+        },
+    );
     word(&mut directory, hash_offset as u32);
     word(&mut directory, CODE_DIRECTORY_BYTES as u32);
-    word(&mut directory, 0);
+    word(&mut directory, special.len() as u32);
     word(&mut directory, slots as u32);
     word(&mut directory, file.len() as u32);
     directory.extend_from_slice(&[HASH_BYTES as u8, CS_HASHTYPE_SHA256, 0, HASH_PAGE_SHIFT]);
@@ -1145,6 +1183,7 @@ fn sign(file: &[u8], identifier: &str, text_bytes: u64) -> Vec<u8> {
     quad(&mut directory, 0);
     directory.extend_from_slice(identifier.as_bytes());
     directory.push(0);
+    directory.extend_from_slice(special.as_flattened());
     for chunk in file.chunks(HASH_PAGE as usize) {
         directory.extend_from_slice(&Sha256::digest(chunk));
     }
@@ -1161,6 +1200,15 @@ fn sign(file: &[u8], identifier: &str, text_bytes: u64) -> Vec<u8> {
 /// Each slice's CDHash in a fat plugin [`link`] wrote: the truncated SHA-256
 /// of its code directory, which a trust cache lists.
 pub fn code_hashes(file: &[u8]) -> Result<Vec<CodeHash>> {
+    code_hashes_with_seal(file, None)
+}
+
+/// The verified CDHashes of a bundle, including its Info.plist and resource seal.
+pub fn bundle_code_hashes(file: &[u8], seal: BundleSeal) -> Result<Vec<CodeHash>> {
+    code_hashes_with_seal(file, Some(seal))
+}
+
+fn code_hashes_with_seal(file: &[u8], seal: Option<BundleSeal>) -> Result<Vec<CodeHash>> {
     use object::read::macho::{FatArch, MachHeader, MachOFatFile32};
 
     let fat = MachOFatFile32::parse(file).within(|| refuse!("the plugin is not a fat file"))?;
@@ -1196,14 +1244,14 @@ pub fn code_hashes(file: &[u8]) -> Result<Vec<CodeHash>> {
                 .get(offset..)
                 .filter(|blob| blob.len() == bytes)
                 .ok_or(refuse!("a plugin signature exceeds its slice"))?;
-            code_hash(signed, blob)
+            code_hash(signed, blob, seal)
         })
         .collect()
 }
 
 /// Validate the SHA-256 signature layout this linker writes before trusting
 /// its directory. Every range stays inside its containing slice or blob.
-fn code_hash(signed: &[u8], blob: &[u8]) -> Result<CodeHash> {
+fn code_hash(signed: &[u8], blob: &[u8], seal: Option<BundleSeal>) -> Result<CodeHash> {
     fn word(bytes: &[u8], at: usize) -> Result<usize> {
         let value = bytes
             .get(at..)
@@ -1222,12 +1270,14 @@ fn code_hash(signed: &[u8], blob: &[u8]) -> Result<CodeHash> {
     let directory = blob
         .get(20..)
         .ok_or(refuse!("a plugin signature has no directory"))?;
+    let special = seal.map(BundleSeal::slots);
+    let special = special.as_slice().as_flattened();
     require!(
         directory.len() >= CODE_DIRECTORY_BYTES
             && word(directory, 0)? == CSMAGIC_CODEDIRECTORY as usize
             && word(directory, 4)? == directory.len()
             && word(directory, 8)? == CS_SUPPORTSEXECSEG as usize
-            && word(directory, 24)? == 0
+            && word(directory, 24)? == special.len()
             && word(directory, 32)? == signed.len()
             && directory[36..40] == [HASH_BYTES as u8, CS_HASHTYPE_SHA256, 0, HASH_PAGE_SHIFT],
         "a plugin slice's code directory is malformed or unsupported"
@@ -1238,15 +1288,22 @@ fn code_hash(signed: &[u8], blob: &[u8]) -> Result<CodeHash> {
         .get(start..)
         .filter(|_| start >= CODE_DIRECTORY_BYTES)
         .ok_or(refuse!("a plugin's code hashes exceed its directory"))?;
+    let special_start = start
+        .checked_sub(size_of_val(special))
+        .ok_or(refuse!("a plugin's bundle hashes exceed its directory"))?;
     require!(
         identifier == CODE_DIRECTORY_BYTES
             && directory
-                .get(identifier..start)
+                .get(identifier..special_start)
                 .is_some_and(|name| name.last() == Some(&0))
             && hashes.len().is_multiple_of(HASH_BYTES)
             && hashes.len() / HASH_BYTES == word(directory, 28)?
             && word(directory, 28)? == signed.len().div_ceil(HASH_PAGE as usize),
         "a plugin's code hash table is malformed"
+    );
+    require!(
+        directory[special_start..start] == *special.as_flattened(),
+        "a plugin's Info.plist or CodeResources hash differs from its signature"
     );
     for (page, hash) in signed
         .chunks(HASH_PAGE as usize)
@@ -1266,12 +1323,25 @@ fn code_hash(signed: &[u8], blob: &[u8]) -> Result<CodeHash> {
 /// bytes go in the bundle as its executable. Each slice's signature names
 /// `identifier`.
 pub fn link(identifier: &str, slices: &[Vec<&[u8]>]) -> Result<Vec<u8>> {
+    link_slices(identifier, slices, None)
+}
+
+/// Links a bundle whose code directory also seals Info.plist and CodeResources.
+pub fn link_bundle(identifier: &str, slices: &[Vec<&[u8]>], seal: BundleSeal) -> Result<Vec<u8>> {
+    link_slices(identifier, slices, Some(seal))
+}
+
+fn link_slices(
+    identifier: &str,
+    slices: &[Vec<&[u8]>],
+    seal: Option<BundleSeal>,
+) -> Result<Vec<u8>> {
     let mut linked = Vec::with_capacity(slices.len());
     for objects in slices {
         let slice = Slice::new(objects)?;
         let subtype = slice.subtype;
         let uuid = uuid(iter::once(identifier.as_bytes()).chain(objects.iter().copied()));
-        linked.push((subtype, slice.link(identifier, uuid)?));
+        linked.push((subtype, slice.link(identifier, uuid, seal)?));
     }
     let mut file = Vec::new();
     let mut word = |value: u32| file.extend_from_slice(&value.to_be_bytes());

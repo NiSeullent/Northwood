@@ -41,8 +41,10 @@ use stela_engine::translations::{
     Digest,
     pack::{self, HEADER_BYTES, PackError},
 };
+use stela_loader::mount_interface::layout::{DATA_STORE, Layout};
 
 /// The store's directory on its volume.
+#[cfg(test)]
 pub(super) const DIRECTORY: &str = "stela/store";
 /// The bound setup gives `stela.efi`.
 pub(super) const CONFIG: &str = "store.cfg";
@@ -72,15 +74,22 @@ pub(super) const PACKS_KEPT: usize = 1;
 /// The store a setup keeps.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct Store {
+    /// Inherited from the enclosing setup record after reading it.
+    #[serde(skip, default = "legacy_layout")]
+    pub(super) layout: Layout,
     /// The FAT32 volume of the USB that holds it.
     pub(super) volume: PathBuf,
     /// One pack's bound.
     pub(super) pack_bytes: u64,
 }
 
+fn legacy_layout() -> Layout {
+    Layout::Legacy
+}
+
 impl Store {
     pub(super) fn directory(&self) -> PathBuf {
-        self.volume.join(DIRECTORY)
+        self.volume.join(self.layout.data_path(DATA_STORE))
     }
 
     fn config_text(&self) -> String {
@@ -358,8 +367,19 @@ fn fitting(room: u64) -> u64 {
 /// The default bound shrinks to what fits; below [`MIN_PACK_BYTES`] the
 /// setup keeps no store, which the returned note says. A requested bound
 /// that does not fit is refused with the sizes.
+#[cfg(test)]
 pub(super) fn choose(
     host: &dyn Host,
+    candidates: &[&Path],
+    planned: impl Fn(&Path) -> u64,
+    requested: Option<u64>,
+) -> Result<(Option<Store>, Option<String>)> {
+    choose_in(host, Layout::Legacy, candidates, planned, requested)
+}
+
+pub(super) fn choose_in(
+    host: &dyn Host,
+    layout: Layout,
     candidates: &[&Path],
     planned: impl Fn(&Path) -> u64,
     requested: Option<u64>,
@@ -391,6 +411,7 @@ pub(super) fn choose(
             continue;
         }
         let existing = Store {
+            layout,
             volume: volume.to_path_buf(),
             pack_bytes: MAX_PACK_BYTES,
         }
@@ -429,6 +450,7 @@ pub(super) fn choose(
         }
         return Ok((
             Some(Store {
+                layout,
                 volume: volume.to_path_buf(),
                 pack_bytes,
             }),
@@ -450,7 +472,7 @@ pub(super) fn choose(
 pub(super) fn checked_directory(store: &Store) -> Result<PathBuf> {
     let directory = store.directory();
     ensure!(
-        directory.ends_with(DIRECTORY),
+        directory.ends_with(store.layout.data_path(DATA_STORE)),
         "the setup record names an unexpected translation store {}",
         directory.display()
     );
@@ -478,10 +500,13 @@ pub(super) mod tests {
     fn packs_are_checked_by_header_and_the_newest_ids_are_kept() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store {
+            layout: Layout::Northwood,
             volume: dir.path().to_path_buf(),
             pack_bytes: 4096,
         };
         store.publish().unwrap();
+        assert_eq!(store.directory(), dir.path().join("northwood/store"));
+        assert!(!dir.path().join(DIRECTORY).exists());
         assert!(store.config_intact());
         assert!(store.spare_ready());
         assert!(store.repairs().is_empty(), "{:?}", store.repairs());
@@ -541,6 +566,7 @@ pub(super) mod tests {
     fn repair_keeps_a_valid_mixed_pack() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store {
+            layout: Layout::Legacy,
             volume: dir.path().to_path_buf(),
             pack_bytes: 4096,
         };
@@ -568,6 +594,7 @@ pub(super) mod tests {
     fn spare_failure_preserves_configuration_and_packs() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store {
+            layout: Layout::Legacy,
             volume: dir.path().to_path_buf(),
             pack_bytes: 4096,
         };

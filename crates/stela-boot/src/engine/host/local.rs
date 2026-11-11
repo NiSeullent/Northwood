@@ -169,6 +169,12 @@ impl Owner {
                     bytes: bytes as u64,
                 }),
         );
+        if incoming
+            .iter()
+            .any(|range| !(range.guest | range.host | range.bytes).is_multiple_of(super::PAGE))
+        {
+            return Err(refuse!("canonical RAM placement is not whole x86 pages"));
+        }
         // End the mutable state borrow before checking the same root
         // identity and closing old RAM-absence/publication generations.
         let _ = state;

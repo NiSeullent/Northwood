@@ -1,13 +1,135 @@
 //! Native coherent host/table-walker transfers through the canonical RAM owner.
-use super::{Region, RegisteredSystemRam};
+use super::RegisteredSystemRam;
 use crate::memory::{access, backing::AccessKind, domain::PublicationFault};
+use alloc::{sync::Arc, vec::Vec};
+use core::ops::Range;
 use stela_compiler::{TargetCpu, context::memory::MemoryStatus};
+use stela_contracts::gate::MemoryRange;
+
+/// Ordered guest ranges behind a wired buffer. It lends no host address for
+/// a guest frame, so a device can use a separate allocation for its pixels.
+pub struct WiredRam {
+    ram: Arc<RegisteredSystemRam>,
+    spans: Vec<WiredSpan>,
+    bytes: u64,
+}
+
+struct WiredSpan {
+    logical: u64,
+    physical: u64,
+    bytes: u64,
+}
+
+impl WiredRam {
+    /// Checks the whole writable layout before a transfer can change bytes.
+    /// Logical order is preserved, including when physical ranges go
+    /// backwards or have holes between them.
+    pub fn new(
+        ram: Arc<RegisteredSystemRam>,
+        ranges: &[MemoryRange],
+    ) -> Result<Self, MemoryStatus> {
+        let mut spans = Vec::new();
+        spans
+            .try_reserve_exact(ranges.len())
+            .map_err(|_| MemoryStatus::Domain)?;
+        let mut bytes = 0u64;
+        for range in ranges {
+            let length = usize::try_from(range.bytes).map_err(|_| MemoryStatus::Translation)?;
+            if length == 0 {
+                return Err(MemoryStatus::InvalidRequest);
+            }
+            range
+                .address
+                .checked_add(range.bytes)
+                .ok_or(MemoryStatus::Translation)?;
+            ram.check_dma_range(range.address, length, true)?;
+            spans.push(WiredSpan {
+                logical: bytes,
+                physical: range.address,
+                bytes: range.bytes,
+            });
+            bytes = bytes
+                .checked_add(range.bytes)
+                .ok_or(MemoryStatus::Translation)?;
+        }
+        spans.sort_unstable_by_key(|span| span.physical);
+        if bytes == 0
+            || spans
+                .windows(2)
+                .any(|pair| pair[0].physical + pair[0].bytes > pair[1].physical)
+        {
+            return Err(MemoryStatus::InvalidRequest);
+        }
+        spans.sort_unstable_by_key(|span| span.logical);
+        Ok(Self { ram, spans, bytes })
+    }
+
+    /// Read a logical span into a private device allocation.
+    ///
+    /// # Safety
+    /// The guest's original descriptor keeps the ranges wired. The output
+    /// is private, disjoint from registered RAM and idle on the device.
+    pub unsafe fn read_into(&self, offset: u64, output: &mut [u8]) -> Result<(), PublicationFault> {
+        self.transfer(offset, output.len(), |address, range| {
+            // SAFETY: the caller keeps the wire and output through the copy.
+            unsafe { self.ram.read_physical_progress(address, &mut output[range]) }
+        })
+    }
+
+    /// Publish a logical span from a completed device operation.
+    /// On failure `completed` counts the logical bytes already published.
+    ///
+    /// # Safety
+    /// The guest's bidirectional descriptor keeps the ranges wired. The
+    /// source is private and coherent, and the device has completed its writes.
+    pub unsafe fn publish_from(&self, offset: u64, source: &[u8]) -> Result<(), PublicationFault> {
+        self.transfer(offset, source.len(), |address, range| {
+            // SAFETY: the source is idle and the caller keeps the descriptor.
+            unsafe { self.ram.publish_physical(address, &source[range]) }
+        })
+    }
+
+    fn transfer(
+        &self,
+        offset: u64,
+        bytes: usize,
+        mut copy: impl FnMut(u64, Range<usize>) -> Result<(), PublicationFault>,
+    ) -> Result<(), PublicationFault> {
+        let end = offset
+            .checked_add(bytes as u64)
+            .filter(|end| *end <= self.bytes)
+            .ok_or(PublicationFault {
+                status: MemoryStatus::Translation,
+                completed: 0,
+            })?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let first = self
+            .spans
+            .partition_point(|span| span.logical + span.bytes <= offset);
+        for span in self.spans[first..]
+            .iter()
+            .take_while(|span| span.logical < end)
+        {
+            let start = offset.max(span.logical);
+            let stop = end.min(span.logical + span.bytes);
+            let address = span.physical + (start - span.logical);
+            let done = (start - offset) as usize;
+            copy(address, done..(stop - offset) as usize).map_err(|fault| PublicationFault {
+                status: fault.status,
+                completed: done + fault.completed,
+            })?;
+        }
+        Ok(())
+    }
+}
 
 /// A page-table walk's view of one registered RAM owner.
-/// Keeps only the last immutable extent, never descriptor values.
+/// Caches an extent index in one binding generation, never a descriptor value.
 pub struct DescriptorReader<'a> {
     ram: &'a RegisteredSystemRam,
-    last: Option<&'a Region>,
+    last: Option<(u64, usize)>,
 }
 
 impl RegisteredSystemRam {
@@ -25,6 +147,12 @@ impl RegisteredSystemRam {
         bytes: &[u8],
     ) -> Result<(), PublicationFault> {
         self.preflight(physical, bytes.len())
+            .map_err(|status| PublicationFault {
+                status,
+                completed: 0,
+            })?;
+        let _pin = self
+            .pin_range(physical, bytes.len())
             .map_err(|status| PublicationFault {
                 status,
                 completed: 0,
@@ -76,7 +204,12 @@ impl RegisteredSystemRam {
         if !physical.is_multiple_of(8) {
             return Err(MemoryStatus::InvalidRequest);
         }
-        let (region, offset) = self.region(physical).ok_or(MemoryStatus::Translation)?;
+        let _pin = self.pin_descriptor(physical)?;
+        let binding = self.binding()?;
+        let (region, offset) = binding
+            .ram
+            .region(physical)
+            .ok_or(MemoryStatus::Translation)?;
         region
             .backing
             .host_pointer(offset, 8, AccessKind::Write)
@@ -96,20 +229,17 @@ impl DescriptorReader<'_> {
         if !physical.is_multiple_of(8) {
             return Err(MemoryStatus::InvalidRequest);
         }
-        self.ram.domain.check_execution()?;
-        let last = self.last.and_then(|region| {
-            // Registration rejects extents that wrap, so an address below
-            // the base always gives an offset beyond the extent's end.
-            let offset = usize::try_from(physical.wrapping_sub(region.source_pa)).ok()?;
-            (offset < region.bytes).then_some((region, offset))
-        });
-        let (region, offset) = last
-            .or_else(|| {
-                let (region, offset) = self.ram.region(physical)?;
-                self.last = Some(region);
-                Some((region, offset))
-            })
+        let _pin = self.ram.pin_descriptor(physical)?;
+        let binding = self.ram.binding()?;
+        let hint = self
+            .last
+            .filter(|&(generation, _)| generation == binding.generation)
+            .map(|(_, index)| index);
+        let (index, region, offset) = binding
+            .ram
+            .region_at(physical, hint)
             .ok_or(MemoryStatus::Translation)?;
+        self.last = Some((binding.generation, index));
         let pointer = region
             .backing
             .host_pointer(offset, 8, AccessKind::Read)

@@ -1,8 +1,8 @@
 //! Creating a setup: the plan of what it writes, its description, and
 //! writing it.
 use super::{
-    CHOICES_PATH, CHOOSER_SECONDS, Environment, INSTALL_CHOICE, InstallImage, LOADER_PATH, MARGIN,
-    RECORD, Request, assets,
+    CHOOSER_SECONDS, Environment, INSTALL_CHOICE, InstallImage, LOADER_PATH, MARGIN, Request,
+    assets,
     bundle::{self, Kind},
     ecid::Ecid,
     firmware, format,
@@ -13,8 +13,8 @@ use super::{
         supported,
     },
     read_efi,
-    record::{RECORD_KIND, RECORD_SCHEMA, Record, publish, write_record},
-    translations, update, wifi, wizard,
+    record::{RECORD_KIND, RECORD_SCHEMA, Record, write_record},
+    translations, update, volume_log, volume_swap, wifi, wizard,
 };
 use crate::{efi, restore};
 use anyhow::{Context, Result, bail, ensure};
@@ -25,6 +25,11 @@ use std::{
     path::{Path, PathBuf},
 };
 use stela_formats::builds;
+use stela_loader::mount_interface::{
+    VOLUME_LOG_BYTES, VOLUME_LOG_SLOTS,
+    layout::{self, Layout},
+};
+use stela_runtime::pc::swap::{DEFAULT_VOLUME_MAX_BYTES, MIN_STORE_BYTES};
 
 /// The setup USB's one unmounted partition besides its EFI partition: a
 /// raw partition, which becomes the Mac's internal SSD. `None` when the USB
@@ -142,7 +147,10 @@ pub(super) fn plan_install(
             ipsw_bytes: 0,
             need: MARGIN,
             expected: medium::Expected::default(),
-            created: missing_directories(&record.volume, &medium::directory(&record.volume, build)),
+            created: missing_directories(
+                &record.volume,
+                &medium::directory_in(&record.volume, record.layout, build),
+            ),
         }),
         false => {
             let receipt = restore::receipt(ipsw)?;
@@ -151,8 +159,17 @@ pub(super) fn plan_install(
                 Some(download) => download.bytes,
                 None => fs::metadata(ipsw)?.len(),
             };
-            let need = medium::needed_bytes(&volume, build, ipsw_bytes, environment.piece_bytes);
-            let created = missing_directories(&volume, &medium::directory(&volume, build));
+            let need = medium::needed_bytes_in(
+                &volume,
+                record.layout,
+                build,
+                ipsw_bytes,
+                environment.piece_bytes,
+            );
+            let created = missing_directories(
+                &volume,
+                &medium::directory_in(&volume, record.layout, build),
+            );
             Some(MediumPlan {
                 volume,
                 guid,
@@ -209,8 +226,9 @@ pub(super) fn describe_install(
             text,
             "  {:<14} {} ({})",
             bundle.kind.label(),
-            bundle::directory_of(
+            bundle::directory_of_in(
                 &record.volume,
+                record.layout,
                 bundle::Identity {
                     kind: bundle.kind,
                     build: &bundle.build,
@@ -227,14 +245,14 @@ pub(super) fn describe_install(
             text,
             "  install image  {}: file list only; Install macOS downloads macOS {} from Apple \
              over the PC's network (Ethernet, or the Wi-Fi network setup names)",
-            medium::directory(&medium.volume, &plan.build).display(),
+            medium::directory_in(&medium.volume, record.layout, &plan.build).display(),
             plan.build,
         )?;
     } else if let Some(medium) = &plan.medium {
         writeln!(
             text,
             "  install medium {}: the macOS {} IPSW in pieces on partition {} ({} to write)",
-            medium::directory(&medium.volume, &plan.build).display(),
+            medium::directory_in(&medium.volume, record.layout, &plan.build).display(),
             plan.build,
             medium.guid,
             host::bytes_text(medium.need)
@@ -269,6 +287,7 @@ pub(super) fn apply_install(
     // Recorded before the first piece, so an interrupted copy is undone.
     record.media.retain(|m| m.build != build);
     record.media.push(medium::Medium {
+        layout: record.layout,
         build: build.clone(),
         volume: plan.volume.clone(),
         partition_guid: plan.guid.clone(),
@@ -293,7 +312,7 @@ pub(super) fn apply_install(
             "Apple's servers hold macOS build {}, not {build}",
             inventory.manifest.product_build,
         );
-        let sha256 = medium::write_remote(&plan.volume, inventory)?;
+        let sha256 = medium::write_remote_in(&plan.volume, record.layout, inventory)?;
         if let Some(medium) = record.media.iter_mut().find(|m| m.build == build) {
             medium.manifest_sha256 = sha256;
         }
@@ -301,7 +320,12 @@ pub(super) fn apply_install(
         return remove_replaced(record, &build, previous.as_ref());
     }
     if let Some(download) = environment.download {
-        let written = download.write(&plan.volume, &record.model, environment.piece_bytes)?;
+        let written = download.write_in(
+            &plan.volume,
+            record.layout,
+            &record.model,
+            environment.piece_bytes,
+        )?;
         if let Some(medium) = record.media.iter_mut().find(|m| m.build == build) {
             medium.manifest_sha256 = written.manifest_sha256;
         }
@@ -317,6 +341,7 @@ pub(super) fn apply_install(
         inventory.manifest.product_build,
     );
     let written = medium::write(medium::WriteOptions {
+        layout: record.layout,
         volume: &plan.volume,
         ipsw,
         inventory,
@@ -459,8 +484,11 @@ impl Resume {
             previous
                 .restore_bundle(kind, Some(ecid))
                 .is_some_and(|kept| {
-                    bundle::verify(&kept.directory(&previous.volume), &kept.manifest_sha256)
-                        .is_empty()
+                    bundle::verify(
+                        &kept.directory_in(&previous.volume, previous.layout),
+                        &kept.manifest_sha256,
+                    )
+                    .is_empty()
                 })
         });
         let bundles = match intact {
@@ -535,6 +563,8 @@ pub(super) struct Plan {
     /// The install medium.
     pub(super) install: InstallPlan,
     pub(super) notes: Vec<String>,
+    /// Optional USB swap request that could not fit after installer reservations.
+    swap_note: Option<String>,
     /// The key file's passphrase, for `--wifi`.
     pub(super) wifi_passphrase: Option<String>,
     /// The chips of this computer's NVIDIA GPUs, whose firmware setup adds.
@@ -546,18 +576,19 @@ pub(super) fn plan(
     command: &Request,
     ipsw: PathBuf,
     early: Option<PreparedSetup>,
+    efi_image: Vec<u8>,
 ) -> Result<Plan> {
     let host = environment.host;
     let esp = locate_esp(host, &command.usb)?;
     // An interrupted first setup is resumed; any other is refused.
-    let previous = match esp.join(RECORD).exists() {
-        false => None,
-        true => match super::record::interrupted(host, &esp, &command.usb) {
+    let previous = match super::record::layout_at(&esp)? {
+        None => None,
+        Some(layout) => match super::record::interrupted(host, &esp, &command.usb) {
             Some(previous) => Some(previous),
             None => bail!(
                 "{} is already set up ({}). Update it with {} or {}, or remove it with {} first",
                 esp.display(),
-                esp.join(RECORD).display(),
+                esp.join(layout.esp_path(layout::RECORD)).display(),
                 super::fix(&command.usb, "update stela"),
                 super::fix(&command.usb, "update os"),
                 super::fix(&command.usb, "uninstall")
@@ -598,7 +629,7 @@ pub(super) fn plan(
     let mut notes = Vec::new();
     // The bundles, the install medium and the translation store go on the
     // USB's FAT32 data partition, which the firmware reads.
-    let (volume, _) = medium::locate(host, &esp, command.install_volume.as_deref())?;
+    let (volume, volume_guid) = medium::locate(host, &esp, command.install_volume.as_deref())?;
     let resume = match &previous {
         Some(previous) => Some(Resume::check(
             environment,
@@ -621,12 +652,10 @@ pub(super) fn plan(
         },
         &mut notes,
     )?;
-    let efi_path = match &command.efi {
-        Some(path) => path.clone(),
-        None => assets::resolve()?,
-    };
-    let efi_image = read_efi(environment, &efi_path)?;
-    update::check_firmware_support(&esp, &efi_image)?;
+    let layout = previous
+        .as_ref()
+        .map_or_else(|| layout_for_image(&efi_image), |record| record.layout);
+    update::check_firmware_support(&esp, layout, &efi_image)?;
     // The restore bundles are prepared on this computer before the USB
     // changes, which also measures them for the space check. A resumed
     // setup keeps its intact ones.
@@ -654,17 +683,16 @@ pub(super) fn plan(
         disk: installed.disk.clone(),
     };
     machines::check_name(&install.name)?;
+    let bundle_directory = bundle::build_directory_in(&volume, layout, &build);
     let mut record = Record {
+        layout,
         schema_version: RECORD_SCHEMA,
         kind: RECORD_KIND.into(),
         build: build.clone(),
         model: command.model().into(),
         esp: esp.clone(),
-        bundle_directory: bundle::build_directory(&volume, &build),
-        created_directories: missing_directories(
-            &volume,
-            &bundle::build_directory(&volume, &build),
-        ),
+        created_directories: missing_directories(&volume, &bundle_directory),
+        bundle_directory,
         volume: volume.clone(),
         payload_directory: None,
         options: String::new(),
@@ -686,6 +714,9 @@ pub(super) fn plan(
         profile: command.profile,
         install_image: command.install_image,
         translations: None,
+        volume_swap: previous
+            .as_ref()
+            .and_then(|previous| previous.volume_swap.clone()),
         wifi: command.wifi.clone().map(|ssid| wifi::Network {
             ssid,
             country: command.wifi_country.clone(),
@@ -699,7 +730,7 @@ pub(super) fn plan(
     if let Some(resume) = resume {
         notes.push(format!(
             "resumes the setup interrupted on {}",
-            esp.join(RECORD).display()
+            esp.join(layout.esp_path(layout::RECORD)).display()
         ));
         record.bundles = resume.bundles;
         record.media = resume.media;
@@ -729,14 +760,70 @@ pub(super) fn plan(
     // everything above.
     let medium_bytes = install.medium.as_ref().map_or(0, |m| m.need);
     if record.translations.is_none() {
-        let (store, note) = translations::choose(
+        let (store, note) = translations::choose_in(
             host,
+            layout,
             &[record.volume.as_path()],
             |_| medium_bytes + bundles,
             command.translation_store_bytes,
         )?;
         notes.extend(note);
         record.translations = store;
+    }
+    let mut swap_note = None;
+    if command.volume_swap_bytes.is_some() || record.volume_swap.is_some() {
+        check_volume_swap_efi(&efi_image)?;
+    }
+    if let Some(store) = &record.volume_swap {
+        ensure!(
+            command
+                .volume_swap_bytes
+                .is_none_or(|bytes| bytes == store.requested_bytes),
+            "the interrupted setup already requested {} bytes of USB swap",
+            store.requested_bytes
+        );
+    } else if let Some(requested) = command.volume_swap_bytes {
+        let cache_bytes = record.translations.as_ref().map_or(0, |store| {
+            translations::needed_bytes(store.pack_bytes).saturating_sub(store.used_bytes())
+        });
+        let logs = (VOLUME_LOG_SLOTS.len() - volume_log::owned_slots(&record).len()) as u64
+            * VOLUME_LOG_BYTES as u64;
+        let reserved = medium_bytes + bundles + cache_bytes + logs;
+        let available = host
+            .volume(&record.volume)?
+            .free_bytes
+            .saturating_sub(reserved);
+        let policy = super::nwconfig_publish::status(&record.esp)?
+            .as_ref()
+            .map(super::nwconfig_publish::default_swap_policy)
+            .unwrap_or_default();
+        ensure!(
+            policy.enabled
+                && matches!(
+                    policy.location,
+                    northwood_config::SwapLocation::Auto
+                        | northwood_config::SwapLocation::VolumeFile
+                ),
+            "the default boot entry does not enable USB volume swap"
+        );
+        record.volume_swap = volume_swap::Store::plan(
+            requested,
+            policy.volume_max_bytes,
+            available,
+            super::swap::random_guid()?,
+            volume_guid.parse().map_err(anyhow::Error::msg)?,
+        )?;
+        if record.volume_swap.is_none() {
+            swap_note = Some(format!(
+                "USB swap requested {}. Only {} is available after reserving installer files, the translation store and logs.",
+                host::bytes_text(requested),
+                host::bytes_text(available)
+            ));
+        }
+    }
+    if let Some(store) = &record.volume_swap {
+        store.validate_volume(host, &record)?;
+        store.repair_plan(&record.volume, record.layout)?;
     }
     record.options = record.options_text()?;
     record.choices_text()?;
@@ -752,7 +839,7 @@ pub(super) fn plan(
                 .bundles
                 .iter()
                 .filter(|bundle| bundle.kind == Kind::Restore)
-                .map(|bundle| bundle.directory(&record.volume)),
+                .map(|bundle| bundle.directory_in(&record.volume, layout)),
         )
         .collect();
     let offline =
@@ -786,6 +873,7 @@ pub(super) fn plan(
         installed,
         install,
         notes,
+        swap_note,
         wifi_passphrase: command.wifi_passphrase.clone(),
         gpu_chips,
     })
@@ -815,8 +903,9 @@ pub(super) fn describe(plan: &Plan) -> Result<String> {
             text,
             "  {:<14} {} ({})",
             prepared.kind.label(),
-            bundle::directory_of(
+            bundle::directory_of_in(
                 &record.volume,
+                record.layout,
                 bundle::Identity {
                     kind: prepared.kind,
                     build: &prepared.build,
@@ -831,6 +920,15 @@ pub(super) fn describe(plan: &Plan) -> Result<String> {
     if let Some(store) = &record.translations {
         writeln!(text, "  translations   {}", store.describe())?;
     }
+    if let Some(store) = &record.volume_swap {
+        writeln!(
+            text,
+            "  USB swap       {}",
+            describe_volume_swap(record, store)
+        )?;
+    } else if let Some(note) = &plan.swap_note {
+        writeln!(text, "  {note}")?;
+    }
     writeln!(
         text,
         "  boot loader    {}: stela.efi",
@@ -838,20 +936,40 @@ pub(super) fn describe(plan: &Plan) -> Result<String> {
     )?;
     let checked = &plan.installed;
     let disk = &checked.disk;
+    if record.layout == Layout::Northwood {
+        writeln!(
+            text,
+            "  nwconfig.plist {}",
+            record
+                .esp
+                .join(record.layout.esp_path(layout::CONFIG))
+                .display()
+        )?;
+    }
     writeln!(
         text,
         "  stela.cfg      {}",
-        record.esp.join("EFI/stela/stela.cfg").display()
+        record
+            .esp
+            .join(record.layout.esp_path(layout::OPTIONS))
+            .display()
     )?;
     writeln!(
         text,
         "  choices.cfg    {}: \"{}\", \"{INSTALL_CHOICE}\" ({CHOOSER_SECONDS} s menu)",
-        record.esp.join(CHOICES_PATH).display(),
+        record
+            .esp
+            .join(record.layout.esp_path(layout::CHOICES))
+            .display(),
         install.name
     )?;
     describe_install(record, &plan.install, &mut text)?;
     if let Some(network) = &record.wifi {
-        writeln!(text, "  {}", wifi::describe(network, &record.esp))?;
+        writeln!(
+            text,
+            "  {}",
+            wifi::describe_in(network, &record.esp, record.layout)
+        )?;
     }
     for line in record.addresses.describe() {
         writeln!(text, "  {line}")?;
@@ -890,6 +1008,12 @@ pub(super) fn state_line(disk: &installed::InstalledDisk) -> String {
 pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Result<String> {
     let host = environment.host;
     // Before anything is erased.
+    if let Some(bytes) = command.volume_swap_bytes {
+        ensure!(
+            bytes >= MIN_STORE_BYTES,
+            "USB swap needs at least {MIN_STORE_BYTES} bytes"
+        );
+    }
     command.read_wifi_passphrase()?;
     if command.fetch {
         builds::find_in(environment.builds, &command.build)?;
@@ -915,11 +1039,33 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
             host::size_text(found.bytes)
         );
         if command.dry_run {
-            return Ok(format!(
+            let layout = match &command.efi {
+                Some(path) => {
+                    let image = read_efi(environment, path)?;
+                    if command.volume_swap_bytes.is_some() {
+                        check_volume_swap_efi(&image)?;
+                    }
+                    layout_for_image(&image)
+                }
+                None => Layout::Northwood,
+            };
+            let mut report = format!(
                 "Setup would erase {disk} ({}) into an EFI partition and a FAT32 volume named \
-                 {USB_VOLUME}, then set it up.\nDry run: nothing was changed.\n",
-                found.name
-            ));
+                 {}, then set it up.\n",
+                found.name,
+                layout.volume_label(),
+            );
+            if let Some(bytes) = command.volume_swap_bytes {
+                writeln!(
+                    report,
+                    "  USB swap       {} requested in {}, up to {} after reserving installer files",
+                    host::bytes_text(bytes),
+                    layout.data_path(layout::DATA_SWAP),
+                    host::bytes_text(DEFAULT_VOLUME_MAX_BYTES)
+                )?;
+            }
+            report.push_str("Dry run: nothing was changed.\n");
+            return Ok(report);
         }
         host.check_erase_access(&disk)?;
         let identity = wizard::Usb::from_disk(&found, host);
@@ -931,6 +1077,9 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
             .install_image
             .get_or_insert(super::default_install_image(found.bytes));
         erase = Some((disk, found.name, found.bytes, identity));
+    } else {
+        // Inspect the mounted installer's layout before downloading any files.
+        locate_esp(host, &command.usb)?;
     }
     // Downloaded boot archives are kept in one place until setup finishes,
     // so a setup run again after a stop reuses them, and removed once it
@@ -971,11 +1120,12 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         download: download.as_ref(),
         ..*environment
     };
-    if !command.dry_run {
-        if command.efi.is_none() {
-            command.efi = Some(assets::resolve()?);
-        }
-        read_efi(environment, command.efi.as_ref().unwrap())?;
+    if command.efi.is_none() {
+        command.efi = Some(assets::resolve()?);
+    }
+    let efi_image = read_efi(environment, command.efi.as_ref().unwrap())?;
+    if command.volume_swap_bytes.is_some() {
+        check_volume_swap_efi(&efi_image)?;
     }
     let mut early = None;
     if let Some((disk, _, capacity, _)) = &erase {
@@ -985,9 +1135,6 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
                 "{} is on the USB being erased; move installer inputs to another disk first",
                 path.display()
             );
-        }
-        if let Some(path) = &command.efi {
-            read_efi(environment, path)?;
         }
         let remote = download.is_none() && image_is_remote(&ipsw, command.install_image)?;
         // The portable installer knows its identity before the target PC is
@@ -1021,7 +1168,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
     if let Some((disk, name, _, identity)) = erase {
         identity.verify(host)?;
         eprintln!("Erasing {disk} ({name})");
-        host.erase(&disk, USB_VOLUME)?;
+        host.erase(&disk, layout_for_image(&efi_image).volume_label())?;
         let volume = host
             .disks()?
             .into_iter()
@@ -1030,7 +1177,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
             .with_context(|| format!("{disk} has no mounted volume after it was erased"))?;
         command.usb = volume;
     }
-    let plan = plan(environment, &command, ipsw, early)?;
+    let plan = plan(environment, &command, ipsw, early, efi_image)?;
     let mut report = describe(&plan)?;
     if command.dry_run {
         report.push_str("Dry run: nothing was changed.\n");
@@ -1100,8 +1247,31 @@ fn confirm_erase(host: &dyn Host, disk: &host::Disk) -> Result<()> {
     Ok(())
 }
 
-/// The FAT32 volume setup erases a USB into.
-pub(super) const USB_VOLUME: &str = "STELA";
+/// Explicit upstream loaders still require the legacy layout.
+fn layout_for_image(image: &[u8]) -> Layout {
+    if efi::supports_northwood_layout(image) {
+        Layout::Northwood
+    } else {
+        Layout::Legacy
+    }
+}
+
+fn check_volume_swap_efi(image: &[u8]) -> Result<()> {
+    ensure!(
+        efi::supports_northwood_layout(image),
+        "USB swap needs a current Northwood EFI"
+    );
+    Ok(())
+}
+
+fn describe_volume_swap(record: &Record, store: &volume_swap::Store) -> String {
+    format!(
+        "{} ({} of {} requested)",
+        store.directory(&record.volume, record.layout).display(),
+        host::bytes_text(store.bytes),
+        host::bytes_text(store.requested_bytes)
+    )
+}
 
 /// Directories from `root` down to `path` that do not exist yet, deepest
 /// first.
@@ -1127,6 +1297,17 @@ pub(super) fn apply(environment: &Environment<'_>, plan: Plan) -> Result<()> {
         store.publish()?;
     }
     apply_install(environment, &mut record, &plan.ipsw, plan.install)?;
+    if let Some(store) = &record.volume_swap {
+        store.validate_volume(environment.host, &record)?;
+        volume_log::prepare(&record)?;
+        eprintln!(
+            "Preparing USB swap at {}",
+            describe_volume_swap(&record, store)
+        );
+        store.publish(&record.volume, record.layout)?;
+    } else if let Some(note) = &plan.swap_note {
+        eprintln!("{note}");
+    }
     let checked = &plan.installed;
     if let Some(region) = &checked.foreign {
         installed::erase_foreign(environment.host, region)?;
@@ -1135,22 +1316,28 @@ pub(super) fn apply(environment: &Environment<'_>, plan: Plan) -> Result<()> {
         installed::initialize_nor(environment.host, &checked.disk, nor)?;
     }
     if let Some(passphrase) = &plan.wifi_passphrase {
-        wifi::write_key(&esp, passphrase)?;
+        wifi::write_key_in(&esp, passphrase, record.layout)?;
     }
-    efi::add_mount(&esp, &plan.efi_image, None, Some(&record.options))?;
-    publish(&mut record)?;
+    super::record::publish_with_image(&mut record, &plan.efi_image)?;
     record.complete = true;
     write_record(&esp, &record)?;
     for chip in plan.gpu_chips {
-        firmware::provision(firmware::ProvisionOptions {
-            requirements: None,
-            gpu: Some(chip),
-            wifi: None,
-            destination: &esp.join(stela_loader::host_firmware::DIRECTORY),
-            cache: &super::cache_dir().join("firmware"),
-            dry_run: false,
-            mount_image: &plan.efi_image,
-        })
+        let (destination, installed) =
+            firmware::publication_paths(&esp, record.layout, &plan.efi_image)?;
+        firmware::provision_from(
+            firmware::ProvisionOptions {
+                requirements: None,
+                gpu: Some(chip),
+                wifi: None,
+                profile: None,
+                offline: false,
+                destination: &destination,
+                cache: &super::cache_dir().join("firmware"),
+                dry_run: false,
+                mount_image: &plan.efi_image,
+            },
+            &installed,
+        )
         .with_context(|| {
             format!(
                 "the USB is set up, but without {chip}'s GPU firmware, which macOS needs: add \
@@ -1160,7 +1347,7 @@ pub(super) fn apply(environment: &Environment<'_>, plan: Plan) -> Result<()> {
         })?;
     }
     if record.wifi.is_some() {
-        firmware::provision_wifi(environment.host, &esp, &plan.efi_image)?;
+        firmware::provision_wifi_in(environment.host, &esp, record.layout, &plan.efi_image)?;
     }
     Ok(())
 }

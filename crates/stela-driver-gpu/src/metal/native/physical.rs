@@ -108,7 +108,8 @@ const ENABLED: [&CStr; 33] = [
 
 /// Extensions only probed: no Metal path uses them yet, so the device does
 /// not enable them, but their features name what the driver could offer.
-const PROBED: [&CStr; 3] = [
+const PROBED: [&CStr; 4] = [
+    ext::external_memory_host::NAME,
     khr::acceleration_structure::NAME,
     khr::ray_query::NAME,
     khr::ray_tracing_pipeline::NAME,

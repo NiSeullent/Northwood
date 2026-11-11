@@ -128,6 +128,13 @@ impl Port {
     fn testing(&self) -> bool {
         self.status & bit(PORT_TEST) != 0
     }
+
+    fn disconnect(&mut self) {
+        if self.status & bit(PORT_CONNECTION) != 0 {
+            self.status &= bit(PORT_POWER) | bit(PORT_TEST);
+            self.change |= bit(PORT_CONNECTION);
+        }
+    }
 }
 
 struct State {
@@ -246,7 +253,7 @@ impl<P: Ports> Hub<P> {
     /// Brings each powered port's connection status in line with its cable
     /// (11.24.2.7.1.1): a change sets C_PORT_CONNECTION, and a
     /// disconnection disables the port.
-    fn detect(&mut self) {
+    pub(crate) fn detect(&mut self) {
         for (n, port) in self.state.ports.iter_mut().enumerate() {
             if port.status & bit(PORT_POWER) == 0 || port.testing() {
                 continue;
@@ -259,11 +266,22 @@ impl<P: Ports> Hub<P> {
                     port.status |= bit(PORT_LOW_SPEED);
                 }
                 port.change |= bit(PORT_CONNECTION);
-            } else if !attached && connected {
-                port.status &= bit(PORT_POWER);
-                port.change |= bit(PORT_CONNECTION);
+            } else if !attached {
+                port.disconnect();
             }
         }
+    }
+
+    /// Publish removal before another function can take this slot.
+    pub(crate) fn disconnect(&mut self, port: usize) {
+        debug_assert!(!self.ports.attached(port));
+        self.state.ports[port].disconnect();
+    }
+
+    /// A vacant port can accept a function once it reports no connection change.
+    pub(crate) fn can_connect(&self, port: usize) -> bool {
+        let state = &self.state.ports[port];
+        !state.testing() && state.change & bit(PORT_CONNECTION) == 0
     }
 
     /// The status change bitmap (11.12.4): bit 0 the hub, bit n port n.
@@ -282,6 +300,9 @@ impl<P: Ports> Hub<P> {
     fn usable(&self, port: u8) -> Option<usize> {
         let n = usize::from(port).checked_sub(1)?;
         let status = self.state.ports.get(n)?.status;
+        if !self.ports.attached(n) {
+            return None;
+        }
         let enabled = bit(PORT_CONNECTION) | bit(PORT_ENABLE) | bit(PORT_POWER);
         let split = self.ports.speed(n) != Speed::High;
         (status & enabled == enabled
@@ -320,7 +341,11 @@ impl<P: Ports> Context<'_, P> {
         let powered = port.status & bit(PORT_POWER) != 0;
         match setup.value {
             PORT_POWER => port.status |= bit(PORT_POWER),
-            PORT_RESET if powered && port.status & bit(PORT_CONNECTION) != 0 => {
+            PORT_RESET
+                if powered
+                    && port.status & bit(PORT_CONNECTION) != 0
+                    && self.functions.attached(n) =>
+            {
                 port.status &= !(bit(PORT_SUSPEND) | bit(PORT_HIGH_SPEED));
                 port.status |= bit(PORT_ENABLE);
                 if self.functions.speed(n) == Speed::High {
@@ -528,7 +553,9 @@ impl<P: Ports> BusPeer for Hub<P> {
 impl<P: Ports> Function for Hub<P> {
     fn set_time(&mut self, now: u64) {
         for n in 0..self.ports.count() {
-            self.ports.function(n).set_time(now);
+            if self.ports.attached(n) {
+                self.ports.function(n).set_time(now);
+            }
         }
         self.detect();
     }

@@ -281,6 +281,17 @@ impl<L: Link, C: Clock> Stack<L, C> {
             self.close_connection(connection);
         }
     }
+    /// Queued bytes and capacity on an established plain HTTP receive socket.
+    pub fn http_receive_queue(&self, transfer: &HttpTransfer) -> Option<(usize, usize)> {
+        let Connection::Plain(tcp) = transfer.connection.as_ref()? else {
+            return None;
+        };
+        let Endpoint::Connected(socket) = &tcp.endpoint else {
+            return None;
+        };
+        let socket = self.sockets.get::<tcp::Socket>(*socket);
+        Some((socket.recv_queue(), socket.recv_capacity()))
+    }
     /// Starts a POST of `body` to `url` without waiting; [`Self::read_post`]
     /// moves it along.
     pub fn open_post(

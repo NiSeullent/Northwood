@@ -335,7 +335,11 @@ impl Controller {
         slot.inventory = Some(fresh.clone());
         Ok(fresh)
     }
-    fn reset_preflight(&self, device: &Device, endpoints: &[Endpoint]) -> Result<(), BlockError> {
+    pub(super) fn reset_preflight(
+        &self,
+        device: &Device,
+        endpoints: &[Endpoint],
+    ) -> Result<(), BlockError> {
         if self.validate_id(device.id)? != device.slot {
             return Err(BlockError::Unsupported(
                 "USB reset descriptor slot identity mismatch",

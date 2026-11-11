@@ -34,6 +34,7 @@ use uefi::{
 use crate::native_smp::resources::{Resources as NativeResources, STACK_BYTES, STACK_STRIDE};
 mod handoff_phase;
 mod memory;
+pub(crate) mod memory_map;
 const MIB: u64 = 1024 * 1024;
 /// The loader heap's free bytes kept past boot services, for what still runs
 /// before the engine does; the rest of it goes to the guest.
@@ -128,48 +129,60 @@ fn allocate(bytes: u64) -> Result<Region> {
     })
 }
 
-/// The host RAM the guest and Stela's parts may take: the free and boot
-/// services ranges in whole 2 MiB pages, as the guest's ranges are found
-/// after boot services end.
-fn free_ram() -> Result<u64> {
+/// The usable RAM in the current firmware map, measured as in the handoff.
+fn memory_map(stage: Option<&str>) -> Result<memory_map::Map> {
     let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| refuse!("no memory map"))?;
-    Ok(map
-        .entries()
-        .filter(|entry| {
-            matches!(
-                entry.ty,
-                MemoryType::CONVENTIONAL
-                    | MemoryType::BOOT_SERVICES_CODE
-                    | MemoryType::BOOT_SERVICES_DATA
-            )
-        })
-        .map(|entry| {
-            let start = entry.phys_start.next_multiple_of(LARGE);
-            let end = (entry.phys_start + entry.page_count * PAGE) & !(LARGE - 1);
-            end.saturating_sub(start)
-        })
-        .sum())
+    Ok(memory_map::summarize(&map, stage))
+}
+
+pub(crate) fn report_initial_map(map: &impl MemoryMap) {
+    memory_map::summarize(map, Some("entry"));
+}
+
+/// Host-check measures the live map before loading any guest bundle. The
+/// profile is an estimate for one worker at that point.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn diagnostic_memory() -> Result<(Option<stela_boot_core::host_memory::Profile>, String)>
+{
+    use stela_boot_core::host_memory;
+    let map = memory_map(Some("diagnostic"))?.ledger;
+    let profile = host_memory::sizes(map.usable, 1, 1);
+    let detail = format!(
+        "usable={} MiB, minimum={} MiB, one-worker estimate={}",
+        map.usable >> 20,
+        host_memory::MIN_PHYSICAL >> 20,
+        profile
+            .as_ref()
+            .map_or("refused", |sizes| sizes.profile.name()),
+    );
+    Ok((profile.ok().map(|sizes| sizes.profile), detail))
 }
 
 /// Return the loader heap's unused end to the firmware, whose free ranges
 /// the guest's are found from: the heap is sized before anything is known of
 /// what the boot will load. A refusal only leaves those pages to Stela.
-fn release_loader_heap() {
+fn release_loader_heap() -> u64 {
     let Some(released) = crate::ALLOCATOR.release_tail(LOADER_HEAP_KEPT) else {
-        return;
+        return 0;
     };
     let pages = released.len() / PAGE as usize;
     let Some(start) = core::ptr::NonNull::new(released.start as *mut u8) else {
-        return;
+        return 0;
     };
     // SAFETY: LOADER_DATA pages of the heap's firmware allocation, which the
     // heap no longer manages and nothing else refers to.
     let result = unsafe { boot::free_pages(start, pages) };
+    let bytes = if result.is_ok() {
+        released.len() as u64
+    } else {
+        0
+    };
     output::arguments(format_args!(
         "BOOT HEAP released {}M: {}\n",
         released.len() >> 20,
         Released(result)
     ));
+    bytes
 }
 
 /// A page release's result in the log: `ok`, or the firmware's status.
@@ -314,8 +327,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         .as_ref()
         .and_then(|_| {
             let path = system.wifi_key.as_deref().unwrap_or(DEFAULT_WIFI_KEY);
-            let path = uefi::CString16::try_from(path).ok()?;
-            volume.read(uefi::fs::PathBuf::from(path)).ok()
+            crate::firmware::esp::wifi_key(&mut volume, path)
         })
         .unwrap_or_default();
     let host_devices = system.storage.is_some()
@@ -324,6 +336,8 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         || system.install_source.is_some()
         || system.nor.is_some()
         || system.network_check.is_some()
+        || system.network_check_get.is_some()
+        || !system.network_check_ranges.is_empty()
         || system.audio_check.is_some()
         || !system.usb_storage.is_empty()
         || system.input
@@ -331,24 +345,35 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         || system.guest_network;
     let storage = if host_devices {
         crate::status::begin("Finding the PCI devices Stela drives itself");
+        let before = memory_map(None).ok();
         let found = storage::discover()?;
+        if let (Some(before), Ok(after)) = (before, memory_map(None)) {
+            output::arguments(format_args!(
+                "HOST STORAGE usable_before={:#x} usable_after={:#x}\n",
+                before.ledger.usable, after.ledger.usable,
+            ));
+        }
         crate::status::done("");
         Some(found)
     } else {
         None
     };
-    let (source, mut files, bundle_pes) = if system.preboot.is_some() {
+    let (source, mut files, bundle_pes, staging) = if system.preboot.is_some() {
         drop(volume);
-        (Vec::new(), Vec::new(), None)
+        (Vec::new(), Vec::new(), None, Default::default())
     } else if let Some(directory) = system.bundle_directory.as_deref() {
         drop(volume);
         let verify_topology = !(system.native_bootstrap_check || system.native_shared_check);
-        let bundle = crate::engine::bundle::read(directory, verify_topology)?;
-        (Vec::new(), bundle.files, bundle.processors)
+        let bundle = crate::engine::bundle::read(
+            directory,
+            verify_topology,
+            verify_topology && !system.dram_explicit,
+        )?;
+        (Vec::new(), bundle.files, bundle.processors, bundle.staging)
     } else {
         let source = firmware::source(&mut volume)?;
         drop(volume);
-        (source, Vec::new(), None)
+        (source, Vec::new(), None, Default::default())
     };
     let inventory = match (
         system.restore_manifest_path.as_deref(),
@@ -365,8 +390,19 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         // its own after boot services end.
         (None, Some(path)) => {
             crate::status::begin("Checking the macOS install files on the USB");
-            let inventory =
-                crate::engine::bundle::with_inventory(path, crate::engine::install::check_pieces)?;
+            let source = system.install_source;
+            let inventory = crate::engine::bundle::with_inventory(
+                path,
+                source,
+                |root, directory, manifest| {
+                    crate::engine::install::check_pieces(
+                        root,
+                        directory,
+                        manifest,
+                        source.is_some(),
+                    )
+                },
+            )?;
             crate::status::done("");
             Some(inventory)
         }
@@ -413,6 +449,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         source,
         files,
         bundle_pes,
+        staging,
         storage,
         wifi_key,
     })
@@ -423,8 +460,46 @@ struct Inputs {
     source: Vec<u8>,
     files: BundleFiles,
     bundle_pes: Option<usize>,
+    staging: crate::engine::bundle::StagedBundle,
     storage: Option<stela_drivers::Handoff>,
     wifi_key: Vec<u8>,
+}
+
+impl Inputs {
+    fn report_staged(&self) -> u64 {
+        let kernel = self.staging.kernel_bytes();
+        let (bundle, files, inventory, pipelines) = self.files.iter().fold(
+            (kernel, usize::from(kernel != 0), 0, 0),
+            |(bundle, files, inventory, pipelines), (name, region)| match name.as_str() {
+                RESTORE_INVENTORY_FILE
+                | RESTORE_BLOCKS_FILE
+                | INSTALL_PIECES_FILE
+                | stela_runtime::restore::fdr::FILE => {
+                    (bundle, files, inventory + region.bytes, pipelines)
+                }
+                #[cfg(feature = "nvk")]
+                crate::engine::pipelines::FILE => (bundle, files, inventory, region.bytes),
+                _ => (bundle + region.bytes, files + 1, inventory, pipelines),
+            },
+        );
+        let (largest_name, largest_bytes) = self
+            .files
+            .iter()
+            .max_by_key(|(_, region)| region.bytes)
+            .map_or(("none", 0), |(name, region)| (name.as_str(), region.bytes));
+        let (largest_name, largest_bytes) = if kernel > largest_bytes {
+            (stela_loader::boot_bundle::KERNEL_FILE, kernel)
+        } else {
+            (largest_name, largest_bytes)
+        };
+        let source = self.source.len() as u64;
+        output::arguments(format_args!(
+            "HOST STAGED bundle={bundle:#x} files={files} largest={largest_name}:{largest_bytes:#x} \
+             inventory={inventory:#x} pipelines={pipelines:#x} source={source:#x} wifi_key={:#x}\n",
+            self.wifi_key.len(),
+        ));
+        bundle + inventory + pipelines + source
+    }
 }
 
 /// `EFI_MEMORY_RUNTIME`: the region stays the firmware's after boot
@@ -578,7 +653,7 @@ pub fn held_at_start(options: &[u8]) -> Option<&'static str> {
 /// `log` is the partition holding the USB's boot log, when the loader keeps
 /// one there (`log_file`).
 pub(crate) fn boot(
-    mut options: Vec<u8>,
+    mut selected: crate::choice::Selection,
     mut volume: FileSystem,
     log: Option<Guid>,
     host_firmware: crate::host_firmware::Resources,
@@ -587,21 +662,28 @@ pub(crate) fn boot(
     // NVRAM chooses macOS or recoveryOS before any input is read. A machine
     // NVRAM holds in recovery mode waits at the startup choices, as LLB
     // waits for a restore host, until one that boots is chosen.
-    let options = loop {
+    let (options, northwood_config) = loop {
+        if let Some(system) = core::str::from_utf8(&selected.options)
+            .ok()
+            .and_then(|text| System::parse(text).ok())
+        {
+            crate::log_file::set_volume_log(!system.no_volume_log);
+        }
         crate::status::begin("Reading the startup request in NVRAM");
-        let routed = crate::selection::route(options);
+        let northwood = crate::firmware::selected_northwood_config(&mut volume, &selected);
+        let routed = crate::selection::route(selected.options);
         crate::status::done("");
         match routed {
-            Ok(routed) => break routed,
+            Ok(routed) => break (routed, northwood.unwrap_or_default()),
             Err(Refusal::Other(error)) => output::fatal(error),
             Err(refusal) => {
-                options = crate::choice::hold(&mut volume, held(refusal)).unwrap_or_else(|| {
+                selected = crate::choice::hold(&mut volume, held(refusal)).unwrap_or_else(|| {
                     output::fatal(
                         "the machine can only be restored and this volume has no startup \
                          choices to restore it from",
                     )
                 });
-                if !options.starts_with(b"--system") {
+                if !selected.options.starts_with(b"--system") {
                     output::fatal("the chosen startup option is not a system-mode boot");
                 }
                 crate::status::take_screen(Framebuffer::from_firmware());
@@ -612,8 +694,10 @@ pub(crate) fn boot(
     // services end.
     let inputs = inputs(&options, volume);
     let result = inputs.and_then(|inputs| {
+        output::boot_stage("firmware-inputs-ready");
         load(
             options,
+            northwood_config,
             inputs,
             log,
             host_firmware,
@@ -641,7 +725,7 @@ fn translation_store(
     crate::status::begin("Opening the translation cache");
     // Without a memory map the pack gets nothing; the parts' sizing
     // reports the map's absence.
-    let free = free_ram().map_or(0, |free| free.saturating_sub(pending));
+    let free = memory_map(None).map_or(0, |map| map.ledger.separate_usable.saturating_sub(pending));
     let budget = stela_boot_core::host_memory::pack_budget(free, cores, cores);
     let Some(store) = crate::engine::translations::read(budget) else {
         crate::status::done("none on this USB");
@@ -687,15 +771,18 @@ fn translation_store(
 
 fn load(
     options: Vec<u8>,
+    northwood_config: Vec<u8>,
     inputs: Inputs,
     log: Option<Guid>,
     host_firmware: crate::host_firmware::Resources,
     snapshot: Snapshot,
 ) -> Result<core::convert::Infallible> {
+    let staged = inputs.report_staged();
     let Inputs {
         source,
         files: bundle,
         bundle_pes,
+        staging,
         storage,
         wifi_key,
     } = inputs;
@@ -709,9 +796,34 @@ fn load(
     // copy comes between.
     let image_bytes = crate::native_image::ResidentImage::allocation_bytes(snapshot.bytes);
     let (bundle, storage) = translation_store(bundle, storage, cores, image_bytes);
+    output::boot_stage("translation-store-ready");
+    let pack = bundle
+        .iter()
+        .find(|(name, _)| name == crate::engine::translations::FILE)
+        .map_or(0, |(_, region)| region.bytes);
+    output::arguments(format_args!("HOST STAGED pack={pack:#x}\n"));
     crate::status::begin("Setting up Stela's memory");
     let image = memory::prepare_image(&snapshot)?;
-    let mut memory = memory::reserve(cores, &image.ram)?;
+    let (cores, sipi) = memory::prepare_sipi(cores);
+    let before_reclaim = memory_map(None)?.ledger.separate_usable;
+    let snapshot_bytes = snapshot.bytes;
+    let before_release = crate::ALLOCATOR.usage();
+    // The relocated image owns its bytes. Return the pristine copy and the
+    // unused heap tail before sizing, so the firmware map is the authority.
+    drop(snapshot);
+    let released = release_loader_heap();
+    output::arguments(format_args!(
+        "HOST LOADER heap_total={:#x} heap_live={:#x} heap_released={released:#x} \
+         snapshot={snapshot_bytes:#x} resident_image={image_bytes:#x}\n",
+        before_release.total, before_release.live,
+    ));
+    let mut memory = memory::reserve(
+        (cores, sipi),
+        &image.ram,
+        staged + pack,
+        released,
+        before_reclaim,
+    )?;
     let tsc_hz = crate::firmware::tsc_hz();
     if !crate::cpu::INVARIANT_TSC.present() {
         output::arguments(format_args!(
@@ -759,6 +871,7 @@ fn load(
         ..
     } = image;
     let memory::EngineMemory {
+        profile: memory_profile,
         heap,
         native_resources,
         native_task_allocations,
@@ -780,6 +893,7 @@ fn load(
         files,
         file_count,
     } = handoff_phase::retain_files(options, source, bundle)?;
+    let northwood_config = handoff_phase::retain_config(northwood_config);
     let handoff = handoff_page.physical as *mut Handoff;
     let engine_entry =
         layout::image() + (crate::engine::entry as *const () as u64 - image.start as u64);
@@ -792,20 +906,22 @@ fn load(
         boot_heap.peak >> 20,
         boot_heap.live >> 20,
     ));
-    release_loader_heap();
-    // Reservations have already been sized and the relocated image owns its
-    // bytes. The final firmware map can now offer the pristine pages to macOS.
-    drop(snapshot);
     // SAFETY: the fresh immutable MP observation is held LOADER_DATA. Identity
     // mappings and the calibrated local APIC remain valid across EBS.
     let capture = unsafe {
         crate::native_smp::firmware::Capture::read(native_processors.physical as *const u8)
     };
     crate::status::begin("Taking control of the other processors");
-    crate::output::leave_boot_services();
+    let boot_esp = (storage.present
+        && memory_profile == stela_boot_core::host_memory::Profile::Paged)
+        .then(firmware::esp::boot_esp)
+        .flatten();
+    let volume_log = crate::output::leave_boot_services().filter(|_| storage.present);
+    let mut bundle_layout = staging.commit();
     // SAFETY: no protocol or pool allocation outlives this call; every page
     // Stela keeps is LOADER_DATA or LOADER_CODE.
     let map = unsafe { boot::exit_boot_services(None) };
+    output::boot_stage("exit-boot-services");
     let mut exit = SuccessfulExit {
         map: core::mem::ManuallyDrop::new(map),
         ownership: Some(EbsOwnership { _private: () }),
@@ -866,8 +982,19 @@ fn load(
     let handoff_phase::GuestMemory {
         ranges: guest,
         count,
-        installed,
-    } = handoff_phase::guest_memory(exit.map());
+        ledger: final_memory_map,
+    } = handoff_phase::guest_memory(exit.map(), &mut bundle_layout);
+    let adopted = bundle_layout
+        .backing()
+        .iter()
+        .map(|part| part.region.bytes)
+        .sum::<u64>();
+    if adopted != 0 {
+        output::arguments(format_args!(
+            "HOST BUNDLE direct={adopted:#x} remaining_staged={:#x}\n",
+            staged.saturating_sub(adopted),
+        ));
+    }
     // SAFETY: fresh LOADER_DATA pages sized for the handoff.
     unsafe {
         handoff.write(Handoff {
@@ -890,6 +1017,8 @@ fn load(
             host,
             host_bytes,
             log_partition: log.map(|guid| guid.0),
+            volume_log,
+            boot_esp,
             tsc_hz,
             tsc_source: crate::firmware::tsc_source(),
             tsc_tolerance_ppm: crate::firmware::tsc_tolerance_ppm(),
@@ -900,7 +1029,9 @@ fn load(
             wall,
             guest,
             guest_count: count,
-            installed,
+            installed: final_memory_map.installed,
+            final_memory_map,
+            memory_profile,
             storage,
             host_firmware,
             power,
@@ -916,6 +1047,8 @@ fn load(
             native_mmio_capture,
             inactive_firmware_units,
             amd_tables,
+            northwood_config,
+            bundle_layout,
         });
     }
     // SAFETY: boot services ended; the completed root maps this code and

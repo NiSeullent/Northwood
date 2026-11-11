@@ -65,7 +65,7 @@ pub struct Handoff {
     /// The firmware's real-time clock at boot; `None` when the firmware has
     /// no valid time.
     pub wall: Option<RtcReading>,
-    /// Free host RAM after boot services, in 2 MiB-aligned ranges.
+    /// Guest backing in placement order, in 2 MiB-aligned ranges.
     pub guest: [Region; MAX_GUEST_RANGES],
     pub guest_count: usize,
     /// The host's RAM in the firmware's memory map, every RAM type
@@ -100,6 +100,47 @@ pub struct Handoff {
     pub(crate) inactive_firmware_units: crate::native_dma::InactiveFirmwareUnits,
     /// Exclusive firmware RAM below 4 GiB for AMD-Vi device tables.
     pub(crate) amd_tables: Region,
+    /// The prepared data-volume slot the engine can extend through native I/O.
+    pub(crate) volume_log: Option<crate::log_file::VolumeLog>,
+    pub(crate) final_memory_map: crate::system::memory_map::Ledger,
+    pub(crate) memory_profile: stela_boot_core::host_memory::Profile,
+    /// Validated ESP configuration and boot entry. Kept outside the guest bundle.
+    pub(crate) northwood_config: Region,
+    /// The split BootKC source and aligned bundle extents included in `guest`.
+    pub(crate) bundle_layout: BundleLayout,
+    /// GPT identity of the image's boot ESP, independent of other DATA users.
+    pub(crate) boot_esp: Option<pc::swap::volume::BootEsp>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BundlePart {
+    pub(crate) offset: u64,
+    pub(crate) contents: Region,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BundleBacking {
+    pub(crate) guest_offset: u64,
+    pub(crate) region: Region,
+    pub(crate) kernel_collection: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct BundleLayout {
+    pub(crate) kernel_parts: [BundlePart; MAX_FILES],
+    pub(crate) kernel_count: usize,
+    pub(crate) backing: [BundleBacking; MAX_FILES],
+    pub(crate) backing_count: usize,
+}
+
+impl BundleLayout {
+    pub(crate) fn kernel_parts(&self) -> &[BundlePart] {
+        &self.kernel_parts[..self.kernel_count]
+    }
+
+    pub(crate) fn backing(&self) -> &[BundleBacking] {
+        &self.backing[..self.backing_count]
+    }
 }
 
 /// A read of the firmware's real-time clock: its time as UTC and its

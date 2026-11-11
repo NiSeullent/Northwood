@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@localhost>
+Date: Wed, 11 Nov 2026 16:29:47 +0000
+Subject: [PATCH] llvmpipe: honor compute FP32 denorm modes per dispatch
+
+The compute worker historically selects flush-to-zero for every
+non-kernel job. Respect explicit NIR FP32 preserve and flush modes
+for compute jobs so a Northwood AIR shader can use its requested
+denormal behavior.
+
+Apply the selected mode on both pooled and synchronous dispatches.
+Keep the existing stage defaults and restore the caller's floating
+point state after a synchronous dispatch. Vulkan feature reporting
+remains unchanged.
+
+Northwood downstream patch.
+Mesa base: ddaf85e353442d9d7f192fdcf1823e652e3f2ee3
+---
+ src/gallium/drivers/llvmpipe/lp_cs_tpool.c | 67 +++++++++++++++++-----
+ 1 file changed, 52 insertions(+), 15 deletions(-)
+
+diff --git a/src/gallium/drivers/llvmpipe/lp_cs_tpool.c b/src/gallium/drivers/llvmpipe/lp_cs_tpool.c
+index b81019238dbecc030bbfe13d33ab695e32710f76..c150e5108eedd68fc2956229d9144a78d645b784 100644
+--- a/src/gallium/drivers/llvmpipe/lp_cs_tpool.c
++++ b/src/gallium/drivers/llvmpipe/lp_cs_tpool.c
+@@ -33,6 +33,49 @@
+ #include "util/u_math.h"
+ #include "lp_cs_tpool.h"
+ #include "compiler/shader_enums.h"
++#include "compiler/nir/nir.h"
++#include "util/detect.h"
++
++enum lp_cs_denorm_mode {
++   LP_CS_DENORM_INHERIT,
++   LP_CS_DENORM_FLUSH,
++   LP_CS_DENORM_PRESERVE,
++};
++
++/* Only Vulkan compute's explicit FP32 mode changes the worker policy. */
++static enum lp_cs_denorm_mode
++lp_cs_job_denorm_mode(const struct lp_cs_job_info *job_info)
++{
++   const struct lp_compute_shader_variant *variant = job_info->current->variant;
++   if (variant->stage == MESA_SHADER_COMPUTE) {
++      const nir_shader *nir = variant->shader->base.ir.nir;
++      const unsigned controls = nir->info.float_controls_execution_mode;
++      if (controls & FLOAT_CONTROLS_DENORM_PRESERVE_FP32)
++         return LP_CS_DENORM_PRESERVE;
++      if (controls & FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32)
++         return LP_CS_DENORM_FLUSH;
++   }
++   return variant->stage == MESA_SHADER_KERNEL ?
++          LP_CS_DENORM_INHERIT : LP_CS_DENORM_FLUSH;
++}
++
++static void
++lp_cs_set_denorm_mode(enum lp_cs_denorm_mode mode, unsigned fpstate)
++{
++   if (mode == LP_CS_DENORM_FLUSH) {
++      util_fpstate_set_denorms_to_zero(fpstate);
++      return;
++   }
++   if (mode == LP_CS_DENORM_PRESERVE) {
++#if DETECT_ARCH_SSE
++      fpstate &= ~0x8040u; /* MXCSR FTZ and DAZ */
++#elif DETECT_ARCH_ARM || DETECT_ARCH_AARCH64
++      fpstate &= ~(1u << 24); /* FPSCR/FPCR FZ */
++#endif
++   }
++   util_fpstate_set(fpstate);
++}
++
+ 
+ static int
+ lp_cs_tpool_worker(void *data)
+@@ -44,7 +87,7 @@ lp_cs_tpool_worker(void *data)
+    mtx_lock(&pool->m);
+ 
+    unsigned fpstate = util_fpstate_get();
+-   bool flush_denorms = false;
++   enum lp_cs_denorm_mode denorm_mode = LP_CS_DENORM_INHERIT;
+ 
+    while (!pool->shutdown) {
+       struct lp_cs_tpool_task *task;
+@@ -77,14 +120,10 @@ lp_cs_tpool_worker(void *data)
+       mtx_unlock(&pool->m);
+ 
+       struct lp_cs_job_info *job_info = task->data;
+-      if ((job_info->current->variant->stage == MESA_SHADER_KERNEL) == flush_denorms) {
+-         if (flush_denorms) {
+-            util_fpstate_set(fpstate);
+-            flush_denorms = false;
+-         } else {
+-            util_fpstate_set_denorms_to_zero(fpstate);
+-            flush_denorms = true;
+-         }
++      enum lp_cs_denorm_mode requested = lp_cs_job_denorm_mode(job_info);
++      if (requested != denorm_mode) {
++         lp_cs_set_denorm_mode(requested, fpstate);
++         denorm_mode = requested;
+       }
+       for (unsigned i = 0; i < iter_per_thread; i++)
+          task->work(task->data, this_iter + i, &lmem);
+@@ -154,11 +193,10 @@ lp_cs_tpool_queue_task(struct lp_cs_tpool *pool,
+       struct lp_cs_job_info *job_info = data;
+       
+       unsigned fpstate = 0;
+-      bool flush_denorms = false;
+-      if (job_info->current->variant->stage != MESA_SHADER_KERNEL) {
++      enum lp_cs_denorm_mode requested = lp_cs_job_denorm_mode(job_info);
++      if (requested != LP_CS_DENORM_INHERIT) {
+          fpstate = util_fpstate_get();
+-         util_fpstate_set_denorms_to_zero(fpstate);
+-         flush_denorms = true;
++         lp_cs_set_denorm_mode(requested, fpstate);
+       }
+ 
+       memset(&lmem, 0, sizeof(lmem));
+@@ -167,9 +205,8 @@ lp_cs_tpool_queue_task(struct lp_cs_tpool *pool,
+       }
+       FREE(lmem.local_mem_ptr);
+ 
+-      if (flush_denorms) {
++      if (requested != LP_CS_DENORM_INHERIT)
+          util_fpstate_set(fpstate);
+-      }
+       return NULL;
+    }
+    task = CALLOC_STRUCT(lp_cs_tpool_task);
+-- 
+2.52.0
+

@@ -169,6 +169,9 @@ pub struct Transfer {
     endpoint: Endpoint,
     request: Vec<u8>,
     sent: usize,
+    /// A read or write observed a socket past the SYN handshake. Another
+    /// transfer can poll the interface and close it before our next call.
+    handshake_observed: bool,
     /// When the transfer fails unless something arrives first.
     idle_at: u64,
 }
@@ -621,6 +624,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             }),
             request,
             sent: 0,
+            handshake_observed: false,
             idle_at: u64::MAX,
         };
         let started = self.now().and_then(|now| {
@@ -695,6 +699,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             return Ok(0);
         };
         let socket = self.sockets.get_mut::<tcp::Socket>(socket);
+        transfer.handshake_observed |= socket.may_send();
         if socket.can_send() {
             let sent = socket.send_slice(bytes).map_err(|_| NetError::Reset)?;
             if sent != 0 {
@@ -732,9 +737,14 @@ impl<L: Link, C: Clock> Stack<L, C> {
         self.poll()?;
         let now = self.now()?;
         let Some(socket) = self.connect(transfer)? else {
-            return self.waiting(transfer, now);
+            return if now >= transfer.idle_at {
+                Err(NetError::Timeout("DNS"))
+            } else {
+                Ok(false)
+            };
         };
         let socket = self.sockets.get_mut::<tcp::Socket>(socket);
+        transfer.handshake_observed |= socket.may_send();
         if socket.can_send() && transfer.sent < transfer.request.len() {
             transfer.sent += socket
                 .send_slice(&transfer.request[transfer.sent..])
@@ -755,23 +765,25 @@ impl<L: Link, C: Clock> Stack<L, C> {
             return Ok(true);
         }
         if now >= transfer.idle_at {
-            return Err(NetError::Timeout("TCP transfer"));
+            let phase = match socket.state() {
+                tcp::State::SynSent | tcp::State::SynReceived => "TCP SYN",
+                tcp::State::Closed if !transfer.handshake_observed => "TCP SYN",
+                // Local enqueue can finish while TCP still has bytes to send or acknowledge.
+                _ if transfer.sent < transfer.request.len() || socket.send_queue() != 0 => {
+                    "TCP request send/ack"
+                }
+                _ => "TCP response bytes",
+            };
+            return Err(NetError::Timeout(phase));
         }
         match socket.state() {
             tcp::State::Closed if !transfer.request.is_empty() && transfer.sent == 0 => {
                 Err(NetError::Reset)
             }
-            tcp::State::SynSent | tcp::State::SynReceived => self.waiting(transfer, now),
+            tcp::State::SynSent | tcp::State::SynReceived => Ok(false),
             _ if !socket.may_recv() && !socket.can_recv() => take(&[], true),
-            _ => self.waiting(transfer, now),
+            _ => Ok(false),
         }
-    }
-
-    fn waiting(&self, transfer: &Transfer, now: u64) -> Result<bool, NetError> {
-        if now >= transfer.idle_at {
-            return Err(NetError::Timeout("TCP transfer"));
-        }
-        Ok(false)
     }
 
     /// Ends `transfer`, gracefully if it completed, and frees its socket or

@@ -230,11 +230,15 @@ impl Service {
         let inputs_due = due(INPUTS, false, next);
         if let Some(usb) = usb.as_mut().filter(|_| inputs_due) {
             let arrived = usb.poll(
+                network.is_some(),
                 #[cfg(feature = "diagnostics")]
                 &mut input_turn.usb_wait,
             );
             if let Some(input) = input.as_mut() {
-                input.add(arrived);
+                input.add(arrived.inputs);
+            }
+            if let Some(network) = network.as_mut() {
+                network.usb_changed(devices, arrived.links, &arrived.removed);
             }
             lap.part(Part::Usb);
         }
@@ -291,7 +295,11 @@ impl Service {
             }
             lap.part(Part::Log);
         }
-        if let Some(network) = network.as_mut().filter(|_| due(NETWORK, true, next)) {
+        if let Some(network) = network
+            .as_mut()
+            .filter(|network| network.has_work() && due(NETWORK, true, next))
+            && network.activate(devices)
+        {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
             let (frames, status, room) = devices.with(|devices| {

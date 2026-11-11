@@ -27,6 +27,7 @@ stela-engine = { path = "../stela-engine", default-features = false }
 stela-contracts = { path = "../stela-contracts", default-features = false }
 stela-crypto = { path = "../stela-crypto" }
 stela-tls = { path = "../stela-tls" }
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
 stela-formats = { path = "../stela-formats", default-features = false }
 serde.workspace = true
 serde_json = { version = "1", default-features = false, features = ["alloc"] }

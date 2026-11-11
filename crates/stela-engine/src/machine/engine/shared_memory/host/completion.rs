@@ -4,7 +4,42 @@ use crate::machine::{
     Stop,
     engine::{RequirementKind, processors::Peer},
 };
-use crate::memory::CanonicalRamService;
+use crate::memory::{
+    CanonicalRamService,
+    system_ram::{ClosedDescriptorFrame, NonresidentRamFrame},
+};
+use publication::RamCpuMappingRevocation;
+use stela_compiler::context::memory::MemoryStatus;
+
+#[cfg(all(feature = "std", feature = "test-support"))]
+mod reference;
+
+/// The exact frame remains closed to registered I/O and the held workers
+/// have revoked their guest-facing CPU mappings for the held interval.
+#[must_use]
+pub struct CpuMappingsRevokedFrame<'a>(ClosedDescriptorFrame<'a>);
+
+impl CpuMappingsRevokedFrame<'_> {
+    pub fn physical(&self) -> u64 {
+        self.0.physical()
+    }
+
+    /// # Safety
+    /// The output must be private and disjoint from live RAM/native frames.
+    pub unsafe fn copy_into(&self, output: &mut [u8; 16 * 1024]) -> Result<(), MemoryStatus> {
+        // SAFETY: forwarded unchanged private-output contract.
+        unsafe { self.0.copy_into(output) }
+    }
+}
+
+impl<'a> CpuMappingsRevokedFrame<'a> {
+    /// Hide this frame while retaining the original backing and worker hold.
+    pub fn mark_nonresident(self) -> Result<NonresidentRamFrame<'a>, MemoryStatus> {
+        // SAFETY: construction required the exact held workers' retirement
+        // receipts. The token still borrows the service and release is gated.
+        unsafe { self.0.mark_nonresident() }
+    }
+}
 
 /// Canonical RAM and the exact all-worker stop remain borrowed through a
 /// controller's own prepared effect and ACK. This does not implement Apple DRAM,
@@ -32,6 +67,45 @@ impl<H: Host, T: NativeTransport> HeldRamService<'_, H, T> {
         self.inventory
             .require_all_held(self.held.as_ref().expect("actual held cohort"))
             .map_err(|_| stela_compiler::context::memory::MemoryStatus::Domain)
+    }
+
+    /// Close admission before issuing any owner-local CPU revocation. A
+    /// busy or wired frame returns `None` without issuing a revocation.
+    /// Finish the held service before waiting for a busy writer to return.
+    /// Once issued, missing completion fails the RAM and keeps the cohort
+    /// stopped. The returned borrow must end before releasing the workers.
+    pub fn try_revoke_frame_cpu_mappings(
+        &mut self,
+        physical: u64,
+    ) -> Result<Option<CpuMappingsRevokedFrame<'_>>, MemoryStatus> {
+        self.validate_current()?;
+        if !self
+            .sessions
+            .iter()
+            .map(WorkerServices::binding)
+            .eq(self.inventory.bindings())
+        {
+            return Err(MemoryStatus::Domain);
+        }
+        let ram = self.ram.as_ref().expect("live canonical service");
+        let Some(frame) = ram.try_close_frame(physical)? else {
+            return Ok(None);
+        };
+
+        for session in self.sessions.iter_mut() {
+            let effect = HostEffect::RevokeRamCpuMappings(RamCpuMappingRevocation::new(&frame));
+            let result = session
+                .command(effect)
+                .map_err(|_| ())
+                .and_then(|command| self.transport.apply(self.local, command).map_err(|_| ()))
+                .and_then(|receipt| session.accept(receipt).map_err(|_| ()));
+            if result.is_err() {
+                ram.fail();
+                self.transport
+                    .fail_stopped("held worker RAM CPU mapping revocation did not complete");
+            }
+        }
+        Ok(Some(CpuMappingsRevokedFrame(frame)))
     }
     /// Complete coherent CPU memory on the BSP helper and every held
     /// source worker. Each owner must apply its real fence and return the exact
@@ -62,10 +136,19 @@ impl<H: Host, T: NativeTransport> HeldRamService<'_, H, T> {
             }
         }
     }
+
+    fn require_resident_for_release(&mut self) {
+        if self.memory().has_nonresident_frames() {
+            self.memory().fail();
+            self.transport
+                .fail_stopped("nonresident RAM frame remains at worker release");
+        }
+    }
     /// End only RAM exclusion, keeping the SAME worker stop and open
     /// owner-local sessions for a synchronous controller/CPU transaction.
     /// Only engine continuation code can consume the returned stop permission.
     pub(in crate::machine::engine) fn finish_memory(mut self) -> publication::StoppedWorkers {
+        self.require_resident_for_release();
         if self.validate_current().is_err() {
             self.transport
                 .fail_stopped("canonical write lost its actual RAM hold");
@@ -80,6 +163,7 @@ impl<H: Host, T: NativeTransport> HeldRamService<'_, H, T> {
     /// instruction's own architectural retirement remains the engine's job.
     /// No RAM/controller effect or ACK is manufactured by this method.
     pub fn finish(mut self) {
+        self.require_resident_for_release();
         if self.validate_current().is_err() {
             self.transport
                 .fail_stopped("canonical RAM service lost its live owner");

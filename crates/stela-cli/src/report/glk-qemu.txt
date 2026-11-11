@@ -1,0 +1,5 @@
+FW GLK ATTACH pci=0000:00:06.0 device=3185 mse=true bme=true bar0_low=0x0 bar0_next=0x0 bar0=raw-bar0-refused
+HOST GLK ATTACH pci=0000:00:06.0 device=3185 mse=true bme=false intx_disabled=true intx_asserted=false pci_controls=Ok(()) gop=other-function firmware_exclusion=unproven irq_drain=unproven attach=refused-no-engine-stop-receipt
+HOST GLK ATTACH pci=0000:00:06.0 pm_state=None msi_enabled=None msix_enabled=None pcie_pending=None
+HOST GLK ATTACH pci=0000:00:06.0 bar0=raw-bar0-refused
+HOST GPU GLK pci=0000:00:06.0 device=3185 ggtt_bytes=4194304 stolen_base=0x9be00000 stolen_bytes=67108864

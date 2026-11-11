@@ -3,8 +3,8 @@ use super::{Payload, binding, count, depth_stencil_state, grid, index_type, prim
 use crate::metal::{
     abi::{
         BarrierScope, CullMode, DepthClipMode, LoadAction, MultisampleDepthResolveFilter,
-        MultisampleStencilResolveFilter, RenderStages, StoreAction, StoreActionOptions,
-        TriangleFillMode, VisibilityResultMode, VisibilityResultType, Winding,
+        MultisampleStencilResolveFilter, PrimitiveType, RenderStages, StoreAction,
+        StoreActionOptions, TriangleFillMode, VisibilityResultMode, VisibilityResultType, Winding,
     },
     command_buffer::{
         CommandBuffer,
@@ -319,9 +319,21 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             }
             RenderCode::DrawPrimitives => {
                 let draw: DrawPrimitives = payload.record()?;
+                let primitive = primitive(draw.primitive)?;
+                if self.device.is_hosted_lavapipe()
+                    && !matches!(
+                        primitive,
+                        PrimitiveType::Triangle | PrimitiveType::TriangleStrip
+                    )
+                {
+                    return Err(Fault::new(
+                        Status::Unsupported,
+                        "primitive on hosted lavapipe",
+                    ));
+                }
                 commands.draw_primitives(
                     &mut self.device.resolver(),
-                    primitive(draw.primitive)?,
+                    primitive,
                     count(draw.vertex_start)?,
                     count(draw.vertex_count)?,
                     count(draw.instance_count)?,

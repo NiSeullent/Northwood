@@ -452,7 +452,7 @@ fn sptm_image_span(regions: &[Region]) -> Result<core::ops::Range<u64>> {
 /// rounds to no pages.
 const ABSENT_SECURE_KERNEL: [&str; 3] = ["CL4-entry", "CL4-rx", "CL4-virt"];
 
-const KERNEL_FILE: &str = "kernelcache.img";
+pub const KERNEL_FILE: &str = "kernelcache.img";
 const AUXILIARY_FILE: &str = "auxkc.img";
 const SPTM_FILE: &str = "sptm.img";
 const TXM_FILE: &str = "txm.img";

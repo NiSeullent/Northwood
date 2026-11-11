@@ -48,9 +48,10 @@ fn diagnostic_options_are_typed() {
 fn host_check_lines_round_trip_and_refuse_bad_values() {
     let line = "--host-check \
                 --nor-file 11111111-2222-3333-4444-555555555555:/stela/nor.bin --deadline 30 \
-                --key-seconds 5";
+                --key-seconds 5 --no-volume-log";
     let options = HostCheck::parse(line).unwrap();
     assert_eq!(options.deadline, Some(30));
+    assert!(options.no_volume_log);
     assert_eq!(HostCheck::parse(&options.to_string()), Ok(options));
     assert_eq!(HostCheck::parse("--host-check"), Ok(HostCheck::default()));
     for text in [
@@ -84,6 +85,12 @@ fn single_user_needs_a_preboot_selection() {
 fn scanout_mirror_round_trips() {
     assert!(!round_trip("--system").scanout_mirror);
     assert!(round_trip(&format!("--system {SCANOUT_MIRROR}")).scanout_mirror);
+}
+
+#[test]
+fn data_volume_log_can_be_disabled() {
+    assert!(!round_trip("--system").no_volume_log);
+    assert!(round_trip(&format!("--system {NO_VOLUME_LOG}")).no_volume_log);
 }
 
 #[test]

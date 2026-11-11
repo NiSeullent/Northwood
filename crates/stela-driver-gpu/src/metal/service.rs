@@ -630,6 +630,43 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             return Err(Error::DeviceLost.into());
         }
         self.admit_quiescing(operation)?;
+        if self.device.is_hosted_lavapipe()
+            && !matches!(
+                operation,
+                Operation::Negotiate
+                    | Operation::Capabilities
+                    | Operation::Release
+                    | Operation::Report
+                    | Operation::NewLibrary
+                    | Operation::LibraryFunctionNames
+                    | Operation::LibraryIdentity
+                    | Operation::NewFunction
+                    | Operation::FunctionReflection
+                    | Operation::FunctionBindings
+                    | Operation::NewBuffer
+                    | Operation::NewImportedBuffer
+                    | Operation::FormatAlignments
+                    | Operation::NewTexture
+                    | Operation::NewBufferTexture
+                    | Operation::NewRenderPipeline
+                    | Operation::NewComputePipeline
+                    | Operation::NewEvent
+                    | Operation::EventSignaledValue
+                    | Operation::SetEventSignaledValue
+                    | Operation::WaitEvent
+                    | Operation::SampleTimestamps
+                    | Operation::AllocatedSize
+                    | Operation::Poll
+                    | Operation::CommandFailure
+                    | Operation::CompletedAfter
+                    | Operation::Commit
+            )
+        {
+            return Err(
+                Fault::new(Status::Unsupported, "operation on hosted lavapipe")
+                    .value(operation.raw()),
+            );
+        }
         let mut call = Call {
             connection,
             request,

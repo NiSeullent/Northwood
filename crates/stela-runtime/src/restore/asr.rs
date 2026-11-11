@@ -68,6 +68,19 @@ pub enum Phase {
     Complete,
     Failed,
 }
+
+/// Cumulative image payload progress. Validation and checksum bytes are excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadProgress {
+    pub image_bytes: u64,
+    /// Payload read from the source, including read-ahead chunks.
+    pub verified_ahead_bytes: u64,
+    /// Payload placed in the sender's output buffer, including previous chunks.
+    pub staged_bytes: u64,
+    /// Payload bytes accepted by the stream.
+    pub accepted_bytes: u64,
+}
+
 pub struct Sender {
     image: String,
     size: u64,
@@ -116,9 +129,23 @@ impl Sender {
     pub fn phase(&self) -> Phase {
         self.phase
     }
-    /// The payload bytes sent and the image's size.
+    /// The current image offset and size, including during OOB reads.
     pub fn progress(&self) -> (u64, u64) {
         (self.offset, self.size)
+    }
+    /// Payload progress from the start of the payload phase through completion.
+    pub fn payload_progress(&self) -> Option<PayloadProgress> {
+        if !matches!(self.phase, Phase::Payload | Phase::Complete) {
+            return None;
+        }
+        let trailer = if self.checksum { SHA1_BYTES } else { 0 };
+        let pending_payload = self.output.remaining().saturating_sub(trailer) as u64;
+        Some(PayloadProgress {
+            image_bytes: self.size,
+            verified_ahead_bytes: self.ahead_at.max(self.offset),
+            staged_bytes: self.offset,
+            accepted_bytes: self.offset - pending_payload,
+        })
     }
     /// Read up to `chunks` payload chunks ahead in one read of the source,
     /// while fewer than [`AHEAD_CHUNKS`] wait: a caller that must not hold
@@ -454,8 +481,112 @@ mod tests {
         assert_eq!(sender.phase(), Phase::Payload);
         assert!(sender.poll(&mut stream, &mut source).is_ready());
         assert_eq!(sender.phase(), Phase::Complete);
+        let bytes = data.len() as u64;
+        assert_eq!(
+            sender.payload_progress(),
+            Some(PayloadProgress {
+                image_bytes: bytes,
+                verified_ahead_bytes: bytes,
+                staged_bytes: bytes,
+                accepted_bytes: bytes,
+            })
+        );
         assert!(stream.output.ends_with(&data));
     }
+
+    #[test]
+    fn payload_progress_excludes_oob_and_a_partially_written_checksum() {
+        struct Budgeted {
+            inner: Ready,
+            budget: usize,
+        }
+        impl ByteStream for Budgeted {
+            fn read(&mut self, bytes: &mut [u8]) -> Poll<Result<usize>> {
+                self.inner.read(bytes)
+            }
+
+            fn write(&mut self, bytes: &[u8]) -> Poll<Result<usize>> {
+                let accepted = self.budget.min(bytes.len());
+                if accepted == 0 {
+                    return Poll::Pending;
+                }
+                self.budget -= accepted;
+                self.inner.write(&bytes[..accepted])
+            }
+        }
+
+        let data: Vec<_> = (0..32).collect();
+        let mut source = fixture(&data, false);
+        let mut stream = Budgeted {
+            inner: Ready {
+                input: xml(Value::dict([
+                    ("Command", Value::from("Initiate")),
+                    ("Checksum Chunks", Value::Boolean(true)),
+                ])),
+                output: Vec::new(),
+            },
+            budget: usize::MAX,
+        };
+        let mut sender = Sender::new("os.dmg".into(), &source).unwrap();
+        sender.prefetch(&mut source, 1).unwrap();
+        for _ in 0..stream.inner.input.len() {
+            assert!(sender.poll(&mut stream, &mut source).is_pending());
+        }
+        assert_eq!(sender.payload_progress(), None);
+        let validation_bytes = stream.inner.output.len();
+
+        stream.inner.input = xml(Value::dict([
+            ("Command", Value::from("OOBData")),
+            ("OOB Offset", Value::Integer(7)),
+            ("OOB Length", Value::Integer(9)),
+        ]));
+        stream.budget = 0;
+        for _ in 0..stream.inner.input.len() {
+            assert!(sender.poll(&mut stream, &mut source).is_pending());
+        }
+        assert_eq!(sender.phase(), Phase::Oob);
+        assert!(sender.poll(&mut stream, &mut source).is_pending());
+        assert_eq!(sender.progress().0, 16);
+        assert_eq!(sender.payload_progress(), None);
+        stream.budget = 9;
+        assert!(sender.poll(&mut stream, &mut source).is_pending());
+        assert_eq!(&stream.inner.output[validation_bytes..], &data[7..16]);
+
+        stream.inner.input = xml(Value::dict([("Command", Value::from("Payload"))]));
+        for _ in 0..stream.inner.input.len() {
+            assert!(sender.poll(&mut stream, &mut source).is_pending());
+        }
+        sender.prefetch(&mut source, 1).unwrap();
+        let mut expected = PayloadProgress {
+            image_bytes: 32,
+            verified_ahead_bytes: 32,
+            staged_bytes: 0,
+            accepted_bytes: 0,
+        };
+        assert_eq!(sender.payload_progress(), Some(expected));
+
+        stream.budget = 7;
+        assert!(sender.poll(&mut stream, &mut source).is_pending());
+        expected.staged_bytes = 32;
+        expected.accepted_bytes = 7;
+        assert_eq!(sender.payload_progress(), Some(expected));
+
+        stream.budget = 25;
+        assert!(sender.poll(&mut stream, &mut source).is_pending());
+        expected.accepted_bytes = 32;
+        assert_eq!(sender.payload_progress(), Some(expected));
+        stream.budget = 5;
+        assert!(sender.poll(&mut stream, &mut source).is_pending());
+        assert_eq!(sender.payload_progress(), Some(expected));
+
+        stream.budget = SHA1_BYTES - 5;
+        assert_eq!(sender.poll(&mut stream, &mut source), Poll::Ready(Ok(())));
+        assert_eq!(sender.payload_progress(), Some(expected));
+        let payload = &stream.inner.output[validation_bytes + 9..];
+        assert_eq!(&payload[..data.len()], data.as_slice());
+        assert_eq!(&payload[data.len()..], Sha1::digest(&data).as_slice());
+    }
+
     /// A sender that reads ahead sends only chunks read ahead, so a poll
     /// never reads the source while it holds the stream.
     #[test]

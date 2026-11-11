@@ -170,6 +170,16 @@ impl Bounce {
         }
     }
 
+    /// Drop both local aliases. The caller flushes this CPU's contexts.
+    pub(super) fn revoke(&mut self) {
+        for entry in self.entries {
+            // SAFETY: these are the worker's own window leaves, through the
+            // physmap. The worker is held outside the translation helper.
+            unsafe { (layout::physical(entry) as *mut u64).write_volatile(0) };
+        }
+        self.mapped = [u64::MAX; 2];
+    }
+
     /// Map host frames `first` and `second` at the slot, which every view
     /// shares and `current` is loaded; its address.
     fn map(&mut self, first: u64, second: u64, contexts: &mut Contexts, current: usize) -> u64 {
@@ -193,12 +203,17 @@ impl Bounce {
 /// registers' call describes, or no return at all.
 extern "sysv64" fn translate(saved: &mut Saved) -> u64 {
     let state = state();
-    state.follow_native();
-    state.follow_pan(flags_pan());
     let address = saved.rcx;
     // SAFETY: the two bytes the stub placed after its CALL, in the arena.
     let [bytes, flags] = unsafe { (saved.ret as *const [u8; 2]).read_unaligned() };
     let write = flags & WRITE != 0;
+    // Even a warm direct or split hit may only use aliases from the
+    // admitted execution generation.
+    if state.native_ram().is_err() {
+        abandon(state, saved, address, write, FaultCause::RamBinding);
+    }
+    state.follow_native();
+    state.follow_pan(flags_pan());
     let view = state.current as u8;
     let current = state.root_of(state.current);
     state.helper_calls += 1;

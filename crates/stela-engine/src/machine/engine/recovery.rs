@@ -132,6 +132,7 @@ pub enum NativeFailureReason {
     CodeExtent,
     InternalSite,
     TrapSiteMismatch,
+    RamBinding,
     Position,
     Qualification(RecoveryQualificationError),
     /// The pack no longer gives a stored block's entry.

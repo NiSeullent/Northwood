@@ -308,6 +308,16 @@ impl Controller {
         block: usize,
         command: Command,
     ) -> Result<u32, BlockError> {
+        self.start_with_retries(namespace, block, command, 0)
+    }
+
+    pub(super) fn start_with_retries(
+        &mut self,
+        namespace: u32,
+        block: usize,
+        command: Command,
+        retries: u8,
+    ) -> Result<u32, BlockError> {
         self.ready()?;
         let tag = self
             .tags
@@ -320,7 +330,7 @@ impl Controller {
             .pool
             .take(command_pages(&command))
             .ok_or(BlockError::Protocol("every NVMe bounce page is in use"))?;
-        self.submit(tag, namespace, block, command, 0);
+        self.submit(tag, namespace, block, command, retries);
         Ok(tag as u32)
     }
 
@@ -332,7 +342,7 @@ impl Controller {
         namespace: u32,
         block: usize,
         command: Command,
-        mut destination: Option<&mut [u8]>,
+        destination: Option<&mut [u8]>,
     ) -> Finished {
         self.ready()?;
         self.settle()?;
@@ -345,6 +355,14 @@ impl Controller {
             _ => {}
         }
         let tag = self.start(namespace, block, command)? as usize;
+        self.wait_for_tag(tag, destination)
+    }
+
+    pub(super) fn wait_for_tag(
+        &mut self,
+        tag: usize,
+        mut destination: Option<&mut [u8]>,
+    ) -> Finished {
         loop {
             if let Some(result) = self.finish_into(tag, destination.as_deref_mut()) {
                 return result;

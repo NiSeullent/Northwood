@@ -90,6 +90,14 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 "only events and textures are shared",
             ));
         }
+        if let Object::Texture(texture) = object
+            && self.device.is_staged_buffer_texture(texture)?
+        {
+            return Err(crate::metal::error::Error::Unsupported(
+                "sharing host buffer render targets",
+            )
+            .into());
+        }
         if let Some(share) = self.shares.objects.get(&object) {
             let token = share.token;
             return call.reply(&ShareToken { token });

@@ -1,3 +1,5 @@
+extern crate std;
+
 use super::*;
 use crate::Result;
 use stela_contracts::refuse;
@@ -15,7 +17,12 @@ fn j473_aes() -> stela_soc_data::aes::Config {
     }
 }
 use alloc::{rc::Rc, vec::Vec};
-use core::cell::RefCell;
+use core::{
+    cell::RefCell,
+    num::NonZeroU64,
+    sync::atomic::{AtomicBool, Ordering},
+};
+use stela_contracts::gate::{CallerFault, CallerMemory};
 use {
     stela_contracts::bus::MmioDevice, stela_contracts::dma::Iommu,
     stela_contracts::dma::test_support::Ram,
@@ -3472,6 +3479,209 @@ fn release_usb_phy(d: &mut AppleDevices, phy: &stela_soc_data::board::TypecPhy) 
 }
 
 #[test]
+fn a_reserved_usb_network_port_reconnects_after_disconnect_acknowledgment() {
+    use crate::usb::{
+        BusPeer, Reply, Token,
+        control::{
+            CLEAR_FEATURE, GET_DESCRIPTOR, GET_STATUS, SET_ADDRESS, SET_CONFIGURATION, SET_FEATURE,
+            SET_INTERFACE,
+            tests::{setup, transfer},
+        },
+    };
+    use stela_drivers::block::RamDisk;
+
+    fn hub(devices: &mut AppleDevices) -> &mut Hub<Attachments> {
+        devices.usb_masters[0].peripheral.as_mut().unwrap()
+    }
+
+    fn port_status(devices: &mut AppleDevices, port: u16) -> (u16, u16) {
+        let bytes = transfer(hub(devices), setup(0xa3, GET_STATUS, 0, port, 4), &[]).unwrap();
+        (
+            u16::from_le_bytes([bytes[0], bytes[1]]),
+            u16::from_le_bytes([bytes[2], bytes[3]]),
+        )
+    }
+
+    const PORT: u16 = 2;
+    const CHANGE_CONNECTION: u16 = 16;
+    let mut devices = AppleDevices::new();
+    let dart = devices
+        .add_dart(
+            Range {
+                physical: 0x382f00000,
+                bytes: 0x4000,
+            },
+            16,
+            None,
+            None,
+        )
+        .unwrap();
+    add_usb_phy(&mut devices);
+    let placement = usb_placement();
+    devices.add_usb(&placement, dart).unwrap();
+    devices
+        .attach_input(
+            placement.port,
+            UsbCables {
+                reserve_network: true,
+                bluetooth: true,
+                disks: vec![Box::new(RamDisk::new("test", 8, 512))],
+                ..UsbCables::default()
+            },
+        )
+        .unwrap();
+    transfer(hub(&mut devices), setup(0, SET_ADDRESS, 3, 0, 0), &[]).unwrap();
+    transfer(hub(&mut devices), setup(0, SET_CONFIGURATION, 1, 0, 0), &[]).unwrap();
+    for port in 1..=4 {
+        transfer(hub(&mut devices), setup(0x23, SET_FEATURE, 8, port, 0), &[]).unwrap();
+        if port != PORT {
+            transfer(hub(&mut devices), setup(0x23, SET_FEATURE, 4, port, 0), &[]).unwrap();
+        }
+    }
+    let descriptors = [1, 3, 4].map(|port| {
+        let function = hub(&mut devices).downstream(port).unwrap();
+        transfer(function, setup(0x80, GET_DESCRIPTOR, 0x100, 0, 18), &[]).unwrap()
+    });
+    let descriptor = transfer(
+        hub(&mut devices),
+        setup(0xa0, GET_DESCRIPTOR, 0x2900, 0, 9),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(descriptor[2], 4);
+    assert_eq!(port_status(&mut devices, PORT), (0x100, 0));
+    assert!(hub(&mut devices).downstream(PORT as u8).is_none());
+    hub(&mut devices).set_time(77);
+
+    let first = Mac([2, 0, 0, 0, 0, 1]);
+    let second = Mac([2, 0, 0, 0, 0, 2]);
+    assert!(devices.attach_network(Mac([0; 6])).is_err());
+    assert!(devices.attach_network(first).unwrap());
+    assert_eq!(port_status(&mut devices, PORT), (0x101, 1));
+    transfer(
+        hub(&mut devices),
+        setup(0x23, CLEAR_FEATURE, CHANGE_CONNECTION, PORT, 0),
+        &[],
+    )
+    .unwrap();
+    transfer(hub(&mut devices), setup(0x23, SET_FEATURE, 4, PORT, 0), &[]).unwrap();
+    assert!(hub(&mut devices).downstream(PORT as u8).is_some());
+    assert!(devices.attach_network(second).is_err());
+
+    devices.detach_network();
+    assert_eq!(port_status(&mut devices, PORT), (0x100, 0x11));
+    assert!(hub(&mut devices).downstream(PORT as u8).is_none());
+    assert!(devices.network_status().is_none());
+    assert!(!devices.attach_network(second).unwrap());
+    assert!(devices.network_status().is_none());
+    let mut bitmap = [0];
+    assert_eq!(
+        hub(&mut devices).packet(0x81, Token::In, &mut bitmap),
+        Ok(Reply::Ack(1))
+    );
+    assert_ne!(bitmap[0] & (1 << PORT), 0);
+    transfer(
+        hub(&mut devices),
+        setup(0x23, CLEAR_FEATURE, CHANGE_CONNECTION, PORT, 0),
+        &[],
+    )
+    .unwrap();
+
+    assert!(devices.attach_network(second).unwrap());
+    assert_eq!(port_status(&mut devices, PORT), (0x101, 0x11));
+    transfer(hub(&mut devices), setup(0x23, SET_FEATURE, 4, PORT, 0), &[]).unwrap();
+    let function = hub(&mut devices).downstream(PORT as u8).unwrap();
+    let address = transfer(
+        function,
+        setup(0x80, GET_DESCRIPTOR, 0x0304, 0x0409, 26),
+        &[],
+    )
+    .unwrap();
+    let address: Vec<_> = address[2..]
+        .chunks_exact(2)
+        .map(|letter| letter[0])
+        .collect();
+    assert_eq!(address, b"020000000002");
+
+    // The replacement's guest data interface must carry frames through the
+    // same queues the boot service uses, under the replacement's own MAC.
+    const BULK_IN: u8 = 0x81;
+    const BULK_OUT: u8 = 0x02;
+    const PACKET_FILTER: u8 = 0x43;
+    transfer(function, setup(0, SET_ADDRESS, 4, 0, 0), &[]).unwrap();
+    transfer(function, setup(0, SET_CONFIGURATION, 1, 0, 0), &[]).unwrap();
+    transfer(function, setup(0x01, SET_INTERFACE, 1, 1, 0), &[]).unwrap();
+    // Directed frames and broadcasts are sufficient for DHCP.
+    transfer(function, setup(0x21, PACKET_FILTER, 0x0c, 0, 0), &[]).unwrap();
+    assert_eq!(devices.network_status(), Some((true, Default::default())));
+    assert!(devices.network_room());
+    assert_eq!(devices.network_take(), None);
+
+    let mut outbound = [0x55; 60];
+    outbound[..6].copy_from_slice(&Mac::BROADCAST.0);
+    outbound[6..12].copy_from_slice(&second.0);
+    assert_eq!(
+        hub(&mut devices).downstream(PORT as u8).unwrap().packet(
+            BULK_OUT,
+            Token::Out,
+            &mut outbound
+        ),
+        Ok(Reply::Ack(outbound.len()))
+    );
+    assert_eq!(devices.network_take().as_deref(), Some(outbound.as_slice()));
+    assert_eq!(devices.network_take(), None);
+
+    let mut inbound = vec![0x6a; 60];
+    inbound[..6].copy_from_slice(&first.0);
+    devices.network_deliver_owned(inbound.clone()).unwrap();
+    inbound[..6].copy_from_slice(&second.0);
+    devices.network_deliver_owned(inbound.clone()).unwrap();
+    let (_, pending) = devices.network_status().unwrap();
+    assert_eq!(
+        (pending.to_host, pending.to_guest, pending.filtered),
+        (1, 0, 1)
+    );
+    let mut packet = [0; 512];
+    let function = hub(&mut devices).downstream(PORT as u8).unwrap();
+    assert_eq!(
+        function.packet(BULK_IN, Token::In, &mut packet),
+        Ok(Reply::Ack(inbound.len()))
+    );
+    assert_eq!(&packet[..inbound.len()], inbound.as_slice());
+    assert_eq!(
+        function.packet(BULK_IN, Token::In, &mut packet),
+        Ok(Reply::Nak)
+    );
+    let (_, delivered) = devices.network_status().unwrap();
+    assert_eq!((delivered.to_host, delivered.to_guest), (1, 1));
+
+    for (port, expected) in [1, 3, 4].into_iter().zip(descriptors) {
+        let function = hub(&mut devices).downstream(port).unwrap();
+        let current = transfer(function, setup(0x80, GET_DESCRIPTOR, 0x100, 0, 18), &[]).unwrap();
+        assert_eq!(current, expected);
+    }
+
+    // Existing explicit cables have priority when there is no room for an
+    // empty network slot.
+    let disks = (0..UsbCables::disk_ports(false, true))
+        .map(|_| Box::new(RamDisk::new("test", 8, 512)) as Box<dyn BlockDevice>)
+        .collect();
+    devices
+        .attach_input(
+            placement.port,
+            UsbCables {
+                reserve_network: true,
+                bluetooth: true,
+                disks,
+                ..UsbCables::default()
+            },
+        )
+        .unwrap();
+    assert!(!hub(&mut devices).ports.network_slot);
+    assert!(devices.attach_network(first).is_err());
+}
+
+#[test]
 fn mounted_usb_dma_service_failure_is_protected_from_survey_substitution() {
     let mut d = AppleDevices::new();
     let dart = d
@@ -3996,48 +4206,49 @@ fn usb_core_aliases_platform_refusals_and_port_driven_polling() {
     assert_eq!(devices.dma_deadline(), None);
 }
 
+#[derive(Default)]
+struct GateTestService {
+    calls: std::sync::Mutex<Vec<(u64, u64)>>,
+    completed: AtomicBool,
+}
+
+impl stela_contracts::gate::GateService for GateTestService {
+    fn connect(&self) -> Result<NonZeroU64, &'static str> {
+        Ok(NonZeroU64::MIN)
+    }
+    fn disconnect(&self, _: NonZeroU64) {}
+    fn serve(
+        &self,
+        connection: NonZeroU64,
+        record: u64,
+        _: &mut dyn CallerMemory,
+    ) -> Result<(), CallerFault> {
+        self.calls.lock().unwrap().push((connection.get(), record));
+        Ok(())
+    }
+    fn import(
+        &self,
+        _: NonZeroU64,
+        _: &[stela_contracts::gate::MemoryRange],
+        _: NonZeroU64,
+    ) -> Result<NonZeroU64, &'static str> {
+        Err("no memory")
+    }
+    fn retired(&self) -> Option<NonZeroU64> {
+        None
+    }
+    fn quiesced(&self) -> bool {
+        false
+    }
+    fn signaled(&self) -> bool {
+        self.completed.swap(false, Ordering::Acquire)
+    }
+    fn bundle(&self, _: stela_contracts::gate::BundleReport) {}
+}
+
 #[test]
 fn a_gate_store_is_served_in_its_own_pes_step() {
-    extern crate std;
-
-    use core::num::NonZeroU64;
-    use stela_contracts::gate::{CallerFault, CallerMemory};
     const GATE: u64 = 0x5_0000_0000;
-    #[derive(Default)]
-    struct Service(std::sync::Mutex<Vec<(u64, u64)>>);
-    impl stela_contracts::gate::GateService for Service {
-        fn connect(&self) -> Result<NonZeroU64, &'static str> {
-            Ok(NonZeroU64::MIN)
-        }
-        fn disconnect(&self, _: NonZeroU64) {}
-        fn serve(
-            &self,
-            connection: NonZeroU64,
-            record: u64,
-            _: &mut dyn CallerMemory,
-        ) -> Result<(), CallerFault> {
-            self.0.lock().unwrap().push((connection.get(), record));
-            Ok(())
-        }
-        fn import(
-            &self,
-            _: NonZeroU64,
-            _: &[stela_contracts::gate::MemoryRange],
-            _: NonZeroU64,
-        ) -> Result<NonZeroU64, &'static str> {
-            Err("no memory")
-        }
-        fn retired(&self) -> Option<NonZeroU64> {
-            None
-        }
-        fn quiesced(&self) -> bool {
-            false
-        }
-        fn signaled(&self) -> bool {
-            false
-        }
-        fn bundle(&self, _: stela_contracts::gate::BundleReport) {}
-    }
     struct Caller;
     impl CallerMemory for Caller {
         fn read(&mut self, address: u64, _: &mut [u8]) -> Result<(), CallerFault> {
@@ -4047,7 +4258,7 @@ fn a_gate_store_is_served_in_its_own_pes_step() {
             Err(CallerFault::Denied { address })
         }
     }
-    let service = alloc::sync::Arc::new(Service::default());
+    let service = Arc::new(GateTestService::default());
     let mut d = AppleDevices::new();
     let irq = AicInput::new(0, 700);
     d.add_gpu_gate(GATE, irq, service.clone()).unwrap();
@@ -4081,7 +4292,52 @@ fn a_gate_store_is_served_in_its_own_pes_step() {
     assert!(d.take_call(1).is_none());
     let outcome = d.take_call(2).unwrap().run(&mut Caller);
     d.finish_call(outcome);
-    assert_eq!(*service.0.lock().unwrap(), [(1, 0x1234)]);
+    assert_eq!(*service.calls.lock().unwrap(), [(1, 0x1234)]);
+}
+
+#[test]
+fn a_late_gpu_gate_routes_external_completion_to_aic_until_guest_ack() {
+    use stela_contracts::gate::window::{ACK, STATUS};
+    use stela_soc_data::aic::{AIC2_IRQ_CFG, AIC2_MAX_IRQ};
+
+    const AIC: u64 = 0x2_3b0c_0000;
+    const EVENT: u64 = AIC + 0x8000;
+    const GATE: u64 = 0x5_0000_0000;
+    const IRQ: u64 = 700;
+    const MAX_IRQ: u64 = AIC2_MAX_IRQ as u64;
+    const MASK_CLR: u64 = AIC + AIC2_IRQ_CFG + 4 * MAX_IRQ + 3 * (MAX_IRQ / 8) + 4 * (IRQ / 32);
+    const UNMASK: u64 = 1 << (IRQ % 32);
+
+    let mut devices = AppleDevices::new();
+    devices
+        .add_aic(AIC, 1152, AicLayout::aic2(0x8000, 0))
+        .unwrap();
+    devices.write(0, AIC + 0x14, 4, 1, 0).unwrap();
+    devices.write(0, MASK_CLR, 4, UNMASK, 0).unwrap();
+    assert!(!devices.lines(0, 0).irq);
+
+    let service = Arc::new(GateTestService::default());
+    devices
+        .add_gpu_gate(GATE, AicInput::new(0, IRQ as u16), service.clone())
+        .unwrap();
+    assert!(!devices.lines(0, 1).irq);
+    assert_eq!(devices.read(0, GATE + STATUS, 8, 1), Ok(0));
+
+    // Host completion is published separately from any board or guest call.
+    service.completed.store(true, Ordering::Release);
+    assert!(devices.lines(0, 2).irq);
+    assert_eq!(devices.read(0, EVENT, 4, 2), Ok(1 << 16 | IRQ));
+    assert_eq!(devices.read(0, GATE + STATUS, 8, 2), Ok(1));
+    devices.write(0, MASK_CLR, 4, UNMASK, 2).unwrap();
+    assert!(
+        devices.lines(0, 2).irq,
+        "the AIC claim alone leaves the gate asserted"
+    );
+
+    devices.write(0, GATE + ACK, 8, 0, 3).unwrap();
+    assert_eq!(devices.read(0, GATE + STATUS, 8, 3), Ok(0));
+    assert!(!devices.lines(0, 3).irq);
+    assert_eq!(devices.read(0, EVENT, 4, 3), Ok(0));
 }
 
 mod data_integration;

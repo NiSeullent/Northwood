@@ -568,6 +568,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         requester: mmu::Requester,
         reported: Option<u64>,
     ) -> Result<TagCheck, Stop> {
+        self.tag_check_with_tables(access, requester, reported, None)
+    }
+
+    pub(super) fn tag_check_with_tables(
+        &mut self,
+        access: &debug::Access,
+        requester: mmu::Requester,
+        reported: Option<u64>,
+        mut registered: Option<&mut super::device_access::SiteTables<'_>>,
+    ) -> Result<TagCheck, Stop> {
         if !self.cpu.tag_checked(access.el, access.address) {
             return Ok(TagCheck::Passed);
         }
@@ -586,13 +596,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
             } else {
                 (access.address & !(GRANULE - 1)).wrapping_add(index * GRANULE)
             };
-            match mmu::translate(
-                &controls,
-                address,
-                kind,
-                requester,
-                &mut RamTables(&mut self.host),
-            ) {
+            let outcome = match registered.as_deref_mut() {
+                Some(tables) => tables
+                    .translate(&controls, address, kind, requester)
+                    .map_err(|reason| self.unsupported(reason))?,
+                None => mmu::translate(
+                    &controls,
+                    address,
+                    kind,
+                    requester,
+                    &mut RamTables(&mut self.host),
+                ),
+            };
+            match outcome {
                 Translated::Mapped(translation)
                     if translation.attributes == TAGGED && {
                         self.host.speculation_barrier();

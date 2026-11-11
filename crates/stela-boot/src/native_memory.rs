@@ -175,5 +175,11 @@ pub fn verify() -> Result<(), MemoryError> {
         MemoryError::InvalidPageList
     })?;
     catalog.try_retire().map_err(|_| MemoryError::Unavailable)?;
-    SOURCE.verify()
+    SOURCE.verify()?;
+    #[cfg(feature = "diagnostics")]
+    frame_reuse::verify()?;
+    Ok(())
 }
+
+#[cfg(feature = "diagnostics")]
+mod frame_reuse;

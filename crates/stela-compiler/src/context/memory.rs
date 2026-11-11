@@ -194,6 +194,8 @@ pub enum MemoryStatus {
     Domain = 7,
     /// Original SP alignment fault, distinct from data-access alignment.
     StackAlignment = 8,
+    /// A registered physical RAM frame is temporarily unavailable.
+    Nonresident = 9,
 }
 
 impl MemoryStatus {
@@ -208,6 +210,7 @@ impl MemoryStatus {
             Self::InvalidRequest,
             Self::Domain,
             Self::StackAlignment,
+            Self::Nonresident,
         ]
         .into_iter()
         .find(|status| *status as u32 == code)
@@ -224,6 +227,7 @@ impl MemoryStatus {
             Self::InvalidRequest => "invalid request",
             Self::Domain => "domain",
             Self::StackAlignment => "stack alignment",
+            Self::Nonresident => "nonresident RAM",
         }
     }
 }
@@ -345,6 +349,7 @@ mod tests {
             MemoryStatus::InvalidRequest,
             MemoryStatus::Domain,
             MemoryStatus::StackAlignment,
+            MemoryStatus::Nonresident,
         ]
         .into_iter()
         .enumerate()
@@ -352,7 +357,7 @@ mod tests {
             assert_eq!(status as u32, code as u32);
             assert_eq!(MemoryStatus::from_code(code as u32), Some(status));
         }
-        assert_eq!(MemoryStatus::from_code(9), None);
+        assert_eq!(MemoryStatus::from_code(10), None);
         for first in [
             SpAlignmentRequirement::Any,
             SpAlignmentRequirement::Enabled,

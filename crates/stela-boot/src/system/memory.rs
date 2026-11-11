@@ -26,6 +26,7 @@ pub(super) struct EngineImage {
 
 /// Firmware-owned allocations kept by the engine and its native workers.
 pub(super) struct EngineMemory {
+    pub profile: stela_boot_core::host_memory::Profile,
     pub heap: Region,
     pub native_resources: NativeResources,
     pub native_task_allocations: crate::native_smp::resources::TaskAllocations,
@@ -99,11 +100,9 @@ pub(super) fn prepare_image(snapshot: &Snapshot) -> Result<EngineImage> {
     })
 }
 
-/// Reserve the engine's working memory and each physical worker's resources.
-/// The other cores start from a page below 1 MiB, taken first; firmware
-/// that left none free boots on one core.
-pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemory> {
-    let (cores, sipi) = match cores {
+/// Reserve the other cores' page below 1 MiB. If none is free, use the BSP.
+pub(super) fn prepare_sipi(cores: usize) -> (usize, u64) {
+    match cores {
         1 => (1, 0),
         _ => match sipi_page() {
             Some(page) => (cores, page),
@@ -115,9 +114,88 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
                 (1, 0)
             }
         },
+    }
+}
+
+/// Reserve the engine's working memory and each physical worker's resources.
+pub(super) fn reserve(
+    (cores, sipi): (usize, u64),
+    ram: &[(usize, usize)],
+    staged: u64,
+    released: u64,
+    before_reclaim: u64,
+) -> Result<EngineMemory> {
+    use stela_boot_core::host_memory::{self, Profile, gigabytes};
+    let map = memory_map(Some("budget"))?.ledger;
+    let free = map.usable;
+    output::arguments(format_args!(
+        "HOST MEMORY free={}M before_reclaim={}M cores={cores} staged={staged:#x} loader_released={released:#x} \
+         align_loss={:#x}\n",
+        free >> 20,
+        before_reclaim >> 20,
+        map.align_loss,
+    ));
+    if free < host_memory::MIN_PHYSICAL {
+        let minimum = host_memory::MIN_PHYSICAL;
+        output::arguments(format_args!(
+            "CHECK memory FAIL usable={free:#x} minimum={:#x} cores={cores}\n",
+            minimum,
+        ));
+        output::boot_diagnostic("Startup memory diagnostics");
+        output::boot_diagnostic(&format!(
+            "Memory check found {} MiB usable. At least {} MiB ({} GiB) is required.",
+            free >> 20,
+            minimum >> 20,
+            minimum >> 30,
+        ));
+        output::boot_diagnostic(&format!(
+            "{} MiB staged, {} MiB reclaimed, {} MiB lost to alignment",
+            staged >> 20,
+            released >> 20,
+            map.align_loss >> 20,
+        ));
+        if cfg!(feature = "diagnostics") {
+            output::boot_diagnostic(
+                "Restart from this USB. Press a key at startup and choose Diagnostics.",
+            );
+        }
+        return Err(host_memory::Shortfall {
+            free,
+            needed: minimum,
+        }
+        .refusal());
+    }
+    let mut sizes = host_memory::sizes(free, cores, cores)?;
+    // Keep the established engine budget when it already admitted this boot.
+    // The released pages then increase the guest's backing directly.
+    if let Ok(mut established) = host_memory::sizes(before_reclaim, cores, cores)
+        && established.profile != Profile::Paged
+        && before_reclaim <= free
+    {
+        established.guest += free - before_reclaim;
+        sizes = established;
+    }
+    let heap = match allocate(sizes.heap) {
+        Ok(heap) => heap,
+        Err(_) => {
+            let fallback = host_memory::fragmented_sizes(free, cores, cores)?;
+            output::arguments(format_args!(
+                "HOST MEMORY heap_contiguous_unavailable={}M fallback={}M\n",
+                sizes.heap >> 20,
+                fallback.heap >> 20,
+            ));
+            if fallback.heap >= sizes.heap {
+                return Err(refuse!(
+                    "no contiguous firmware RAM extent for the engine heap"
+                ));
+            }
+            let heap = allocate(fallback.heap).map_err(|_| {
+                refuse!("no contiguous firmware RAM extent for the reduced engine heap")
+            })?;
+            sizes = fallback;
+            heap
+        }
     };
-    let free = free_ram()?;
-    let sizes = stela_boot_core::host_memory::sizes(free, cores, cores)?;
     output::arguments(format_args!(
         "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M profile={}\n",
         free >> 20,
@@ -127,15 +205,26 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         sizes.guest >> 20,
         sizes.profile.name(),
     ));
-    if sizes.profile == stela_boot_core::host_memory::Profile::Compact {
-        use stela_boot_core::host_memory::gigabytes;
-        crate::status::info(&format!(
+    output::arguments(format_args!(
+        "CHECK memory PASS usable={free:#x} profile={} cores={}\n",
+        sizes.profile.name(),
+        sizes.cores,
+    ));
+    match sizes.profile {
+        Profile::Standard => {}
+        Profile::Compact => crate::status::info(&format!(
             "this PC has {} GB of RAM free, less than a full boot takes: macOS gets {} GB and \
              Stela keeps small caches, so everything runs slower; 8 GB of RAM is recommended",
             gigabytes(free),
             gigabytes(sizes.guest)
-        ));
+        )),
+        Profile::Paged => crate::status::info(&format!(
+            "low-memory boot with about {} GB of backed guest DRAM on {} host cores",
+            gigabytes(sizes.guest),
+            sizes.cores,
+        )),
     }
+    let cores = sizes.cores;
     // Each claimed core owns a full native part. Check both ends before allocation.
     for slot in [0, cores - 1] {
         let part = crate::native_smp::resources::partition(
@@ -147,7 +236,6 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         )?;
         crate::native_smp::resources::code_part_bytes(part.code_bytes, sizes.code.parts)?;
     }
-    let heap = allocate(sizes.heap)?;
     // The engine allocator uses this existing physmap directly. Prove the
     // complete firmware reservation is covered before publishing the handoff.
     if !ram.iter().any(|&(start, end)| {
@@ -195,6 +283,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     let loader_tables = crate::paging::loader::Builder::new()?;
     let root = loader_tables.root();
     Ok(EngineMemory {
+        profile: sizes.profile,
         heap,
         native_resources,
         native_task_allocations,

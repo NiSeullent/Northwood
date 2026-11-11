@@ -104,6 +104,23 @@ impl Drop for SourceWriteGuard<'_> {
 }
 
 impl MemorySystem {
+    #[cfg(test)]
+    pub(in crate::memory) fn seed_source_mutation_for_test(
+        &self,
+        backing: &Arc<MemoryBacking>,
+        generation: u64,
+    ) {
+        let tracker = &backing.source_mutation;
+        let mut state = tracker.state.lock().unwrap();
+        assert!(state.is_none());
+        *state = Some(SourceMutationState {
+            system: Arc::downgrade(&self.identity),
+            generation,
+        });
+        tracker.generation.store(generation, Ordering::Release);
+        tracker.enabled.store(true, Ordering::Release);
+    }
+
     pub(in crate::memory) fn prepare_source_write<'a>(
         &'a self,
         backing: &'a Arc<MemoryBacking>,

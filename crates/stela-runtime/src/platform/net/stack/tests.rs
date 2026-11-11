@@ -1,4 +1,5 @@
 mod clock;
+mod ecm;
 mod http_flow;
 #[cfg(all(not(target_os = "uefi"), feature = "native-reference-peer"))]
 mod tls;
@@ -459,11 +460,21 @@ fn a_silent_or_absent_peer_times_out() {
     let clock = TestClock::default();
     let mut lan = Lan::new(100, clock.clone());
     lan.drop_every = 1;
-    let mut s = stack(lan, clock);
+    let mut s = stack(lan, clock.clone());
+    let mut transfer = s.open("10.0.2.2", vec![1], 64).unwrap();
+    s.poll().unwrap();
+    clock.0.set(transfer.idle_at + 1_000_000);
+    // Another caller can drive the shared interface before this transfer reads.
+    s.poll().unwrap();
     assert_eq!(
-        s.get_range("10.0.2.2", "/", 0, 9, |_| ()),
-        Err(NetError::Timeout("TCP transfer"))
+        s.sockets.get::<tcp::Socket>(transfer.socket()).state(),
+        tcp::State::Closed
     );
+    assert_eq!(
+        s.read(&mut transfer, |_, _| panic!("unexpected reply")),
+        Err(NetError::Timeout("TCP SYN"))
+    );
+    s.close(transfer);
     let clock = TestClock::default();
     let mut s = stack(Lan::new(100, clock.clone()), clock);
     // Port 81 has no listener: smoltcp answers with a reset.
@@ -471,6 +482,90 @@ fn a_silent_or_absent_peer_times_out() {
         s.get_range("10.0.2.2:81", "/", 0, 9, |_| ()),
         Err(NetError::Reset)
     );
+}
+
+#[test]
+fn an_expired_lookup_without_a_tcp_socket_reports_dns() {
+    let clock = TestClock::default();
+    let mut stack = Stack::new(Lan::ipv6(0, clock.clone()), clock.clone(), 7).unwrap();
+    stack.automatic().unwrap();
+    stack
+        .set_config(Config {
+            address: Ipv4Cidr::new(CLIENT_IP, 24),
+            router: None,
+            dns: vec![SERVER_IP],
+        })
+        .unwrap();
+    stack.link_mut().drop_every = 1;
+    let mut transfer = stack.open("silent.test", vec![1], 64).unwrap();
+    assert!(matches!(
+        transfer.endpoint,
+        Endpoint::Resolving(Lookup {
+            query: Some((_, DnsQueryType::Aaaa)),
+            ..
+        })
+    ));
+    assert!(
+        !stack
+            .read(&mut transfer, |_, _| panic!("unexpected reply"))
+            .unwrap()
+    );
+    clock.0.set(transfer.idle_at);
+    // The expired AAAA lookup hands back an unresolved endpoint when IPv4 is available.
+    assert_eq!(
+        stack.read(&mut transfer, |_, _| panic!("unexpected reply")),
+        Err(NetError::Timeout("DNS"))
+    );
+    stack.close(transfer);
+}
+
+#[test]
+fn tcp_timeout_distinguishes_pending_request_bytes_from_response_wait() {
+    for (drop_ack, phase) in [
+        (true, "TCP request send/ack"),
+        (false, "TCP response bytes"),
+    ] {
+        let clock = TestClock::default();
+        let mut stack = stack(Lan::new(0, clock.clone()), clock.clone());
+        // Lan only sends a response once it sees a complete HTTP request head.
+        let request = b"opaque request bytes";
+        let mut transfer = stack.open("10.0.2.2", request.to_vec(), 64).unwrap();
+        let no_response = |_: &[u8], _| panic!("unexpected response");
+        for _ in 0..32 {
+            assert!(!stack.read(&mut transfer, no_response).unwrap());
+            if transfer.sent == request.len() {
+                break;
+            }
+        }
+        assert_eq!(transfer.sent, request.len());
+        if drop_ack {
+            stack.link_mut().drop_every = 1;
+        }
+        for _ in 0..8 {
+            assert!(!stack.read(&mut transfer, no_response).unwrap());
+            clock.0.set(clock.0.get() + 10_000);
+        }
+        assert_eq!(stack.link_mut().request, request);
+        let socket = stack.sockets.get::<tcp::Socket>(transfer.socket());
+        assert_eq!(
+            socket.send_queue(),
+            if drop_ack { request.len() } else { 0 }
+        );
+        clock
+            .0
+            .set(transfer.idle_at + if drop_ack { 1_000_000 } else { 0 });
+        if drop_ack {
+            stack.poll().unwrap();
+            let socket = stack.sockets.get::<tcp::Socket>(transfer.socket());
+            assert_eq!(socket.state(), tcp::State::Closed);
+            assert_eq!(socket.send_queue(), request.len());
+        }
+        assert_eq!(
+            stack.read(&mut transfer, no_response),
+            Err(NetError::Timeout(phase))
+        );
+        stack.close(transfer);
+    }
 }
 
 #[test]

@@ -95,6 +95,32 @@ impl Fixture {
 }
 
 #[test]
+fn legacy_namespace_refuses_exclusive_claim_before_any_command() {
+    let Fixture {
+        disk,
+        _registers,
+        _memory,
+    } = Fixture::new();
+    let expected = disk.identity().clone();
+    let Err((disk, error)) = disk.into_exclusive() else {
+        panic!("the legacy controller has no owned DMA domain");
+    };
+    assert_eq!(
+        error,
+        BlockError::Unsupported("NVMe controller has no DMA owner")
+    );
+    assert_eq!(disk.identity(), &expected);
+    {
+        let controller = disk.controller.borrow();
+        assert_eq!(controller.admin.tail, 0);
+        assert_eq!(controller.io.tail, 0);
+        assert!(controller.held.iter().all(Vec::is_empty));
+    }
+    assert!(_registers.iter().all(|&register| register == 0));
+    drop(disk);
+}
+
+#[test]
 fn a_timeout_aborts_then_a_controller_that_stays_down_poisons_its_siblings() {
     let _clock = crate::test_clock::virtualize();
     let mut fixture = Fixture::new();

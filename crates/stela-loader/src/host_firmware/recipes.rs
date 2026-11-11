@@ -266,6 +266,16 @@ const fn mediatek_wifi(member: &'static str, length: usize, sha256: &'static str
 /// names a bare file, as `iwlwifi` does.
 pub const INTEL_WIFI: &[Recipe] = &[
     intel_wifi(
+        "intel/iwlwifi/iwlwifi-9000-pu-b0-jf-b0-46.ucode",
+        1519568,
+        "9a0c5d938646942f9798e6212579c25771e4bb44301cd409b82abe361ca2c3e0",
+    ),
+    intel_wifi(
+        "intel/iwlwifi/iwlwifi-9260-th-b0-jf-b0-46.ucode",
+        1490508,
+        "05f4c12514fddfd56fea660b3d2eb6b6e6f4a87a324d5d40464050312ddca911",
+    ),
+    intel_wifi(
         "intel/iwlwifi/iwlwifi-cc-a0-77.ucode",
         1368100,
         "1866a58a1daee56b120362122d5f7548b443b53d33f2558a7e4407d58fd27dab",
@@ -770,6 +780,43 @@ pub fn require_wifi(inventory: &mut Inventory, vendor: u16, device: u16) -> Resu
     Ok(true)
 }
 
+// Mirrors the legacy Intel driver's PCI candidates. Keep this separate from
+// the automatic Wi-Fi provisioning table until gen1 transport is available.
+fn legacy_intel_wifi_image(device: u16) -> Option<&'static str> {
+    match device {
+        0x30dc | 0x31dc | 0x9df0 | 0xa370 => Some("iwlwifi-9000-pu-b0-jf-b0-46.ucode"),
+        0x2526 | 0x271b | 0x271c => Some("iwlwifi-9260-th-b0-jf-b0-46.ucode"),
+        _ => None,
+    }
+}
+
+/// Prefetch the Lenovo IdeaPad 1 15IGL7's pinned Wi-Fi candidate and the
+/// regulatory database. The boot driver still has to confirm live hardware.
+pub fn require_15igl7_wifi(inventory: &mut Inventory) -> Result<(), Error> {
+    const DEVICE: u16 = 0x31dc;
+    require_regulatory(inventory)?;
+    inventory.observe(Requirement {
+        name: "regulatory.db.p7s",
+        target: Target {
+            driver: "wifi-regulatory",
+            hardware: "wireless-regdb",
+            revision: "v20",
+            board: None,
+        },
+        minimum_bytes: 1,
+    })?;
+    inventory.observe(Requirement {
+        name: legacy_intel_wifi_image(DEVICE).expect("15IGL7 device has a pinned recipe"),
+        target: Target {
+            driver: "wifi-intel",
+            hardware: "pci:8086:31dc",
+            revision: "linux-firmware",
+            board: None,
+        },
+        minimum_bytes: 1,
+    })
+}
+
 /// What the Intel driver can name for the PCI device `device`
 /// (`stela_drivers::net::wifi::intel::identity::device_images`), by the
 /// family its `iwl_hw_card_ids` entry names. `iwlwifi-ma-b0-hr-b0-89.ucode`
@@ -831,8 +878,20 @@ fn select_regulatory(request: &Request) -> Option<&'static Recipe> {
 }
 
 fn select_intel_wifi(request: &Request) -> Option<&'static Recipe> {
-    if !request.target.hardware.starts_with("pci:8086:") {
-        return None;
+    let device = request.target.hardware.strip_prefix("pci:8086:")?;
+    if matches!(
+        request.name.as_str(),
+        "iwlwifi-9000-pu-b0-jf-b0-46.ucode" | "iwlwifi-9260-th-b0-jf-b0-46.ucode"
+    ) {
+        let device = u16::from_str_radix(device, 16)
+            .ok()
+            .filter(|_| hex_field(device, 4))?;
+        if legacy_intel_wifi_image(device) != Some(request.name.as_str())
+            || request.target.revision != "linux-firmware"
+            || request.target.board.is_some()
+        {
+            return None;
+        }
     }
     INTEL_WIFI.iter().find(|recipe| {
         recipe.image.member.strip_prefix("intel/iwlwifi/") == Some(request.name.as_str())

@@ -30,6 +30,7 @@ use stela_soc_data::board::assigned::{
 };
 use stela_soc_data::pmgr::coverage::DomainId;
 mod cpu_ids;
+mod pmgr_clusters;
 pub use cpu_ids::{CpuIdMapping, CpuIdRecipe, WatchdogProjection};
 
 const CPUS: &str = "/cpus";
@@ -548,6 +549,9 @@ impl<'p, 's> Projection<'p, 's> {
         }
         consumers(&tree.root, "/", &locations)?;
         let (cpu_ids, watchdog) = cpu_ids.apply(&mut projected)?;
+        if let CpuIdRecipe::DenseWithWatchdog { original, .. } = source.cpu_ids {
+            pmgr_clusters::apply(plan.profile(), original, tree, &cpu_ids, &mut projected)?;
+        }
         let removed = cpus
             .children
             .iter()

@@ -59,6 +59,15 @@ pub enum RequirementKind {
         detail: &'static str,
     },
     Translation(mmu::Unsupported),
+    NonresidentRam {
+        frame: u64,
+    },
+    RamTransfer {
+        physical: u64,
+        write: bool,
+        completed: usize,
+        status: stela_compiler::context::memory::MemoryStatus,
+    },
     Fetch {
         physical: u64,
     },
@@ -77,8 +86,10 @@ pub enum RequirementKind {
     ParallelAdmission(ParallelAdmissionError),
     /// Register residency cannot be recovered from the host capture.
     FaultRecovery(stela_compiler::block::FaultRecoveryError),
-    /// Detailed refusal before a checked native frame was executed.
+    /// Detailed native admission refusal before the source instruction executes.
     NativePreparation(String),
+    /// A registered RAM service excluded entry before native code executed.
+    NativeRamServiceBusy,
 }
 
 impl fmt::Display for Requirement {
@@ -120,6 +131,19 @@ impl fmt::Display for Requirement {
             RequirementKind::Translation(unsupported) => {
                 write!(f, "translation configuration {unsupported:?}")?
             }
+            RequirementKind::NonresidentRam { frame } => {
+                write!(f, "RAM frame at PA {frame:#x} is nonresident")?
+            }
+            RequirementKind::RamTransfer {
+                physical,
+                write,
+                completed,
+                status,
+            } => write!(
+                f,
+                "registered RAM {} at PA {physical:#x} stopped after {completed} bytes: {status:?}",
+                if *write { "write" } else { "read" }
+            )?,
             RequirementKind::Fetch { physical } => {
                 write!(f, "instruction fetch from non-RAM PA {physical:#x}")?
             }
@@ -149,6 +173,11 @@ impl fmt::Display for Requirement {
             RequirementKind::NativePreparation(detail) => {
                 write!(f, "native preparation: {detail}")?
             }
+            RequirementKind::NativeRamServiceBusy => write!(
+                f,
+                "native preparation: {}",
+                super::NativeEntryError::RamServiceBusy
+            )?,
         }
         if let Some(syndrome) = self.syndrome {
             write!(f, " esr={syndrome:#x}")?;

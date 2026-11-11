@@ -8,7 +8,10 @@ pub use stela_boot_core::host_resources::Resources;
 use stela_boot_core::host_resources::report;
 use stela_contracts::refuse;
 use stela_drivers::firmware::Catalog;
-use stela_loader::host_firmware::{self as manifest, MAX_MANIFEST_BYTES, Manifest};
+use stela_loader::{
+    host_firmware::{self as manifest, MAX_MANIFEST_BYTES, Manifest},
+    mount_interface::layout::{FIRMWARE, FIRMWARE_MANIFEST, Layout},
+};
 use uefi::{
     CString16,
     proto::media::file::{Directory, File as _, FileAttribute, FileInfo, FileMode, RegularFile},
@@ -149,8 +152,18 @@ fn read_file(mut file: RegularFile, expected: Option<usize>, limit: usize) -> Re
     })
 }
 
+fn open_manifest(root: &mut Directory) -> Result<Option<(Layout, RegularFile)>> {
+    for layout in Layout::PREFERRED {
+        if let Some(file) = open(root, &layout.esp_path(FIRMWARE_MANIFEST))? {
+            return Ok(Some((layout, file)));
+        }
+    }
+    Ok(None)
+}
+
 /// Absence alone is optional. Any unreadable/malformed present manifest or
-/// missing/corrupt resource is a boot refusal, with no alternate-volume search.
+/// missing/corrupt resource is a boot refusal. Images belong to the same
+/// selected firmware directory and volume as their manifest.
 pub fn read(root: &mut Directory) -> Result<Resources> {
     let smbios = smbios::capture();
     let mut wifi =
@@ -158,7 +171,7 @@ pub fn read(root: &mut Directory) -> Result<Resources> {
     for (slot, descriptor) in wifi.iter_mut().zip(&VARIABLE_DESCRIPTORS) {
         *slot = wifi::capture(descriptor.variable)?;
     }
-    let Some(file) = open(root, manifest::MANIFEST_PATH)? else {
+    let Some((layout, file)) = open_manifest(root)? else {
         output::arguments(format_args!("HOST FIRMWARE manifest=absent\n"));
         let resources = Resources {
             wifi,
@@ -187,7 +200,7 @@ pub fn read(root: &mut Directory) -> Result<Resources> {
     // Parse/identity checks and the total budget precede every image allocation.
     let started = output::now();
     for (slot, image) in resources.images.iter_mut().zip(&parsed.images) {
-        let path = format!("{}/{}", manifest::DIRECTORY, image.path);
+        let path = layout.esp_path(&format!("{FIRMWARE}/{}", image.path));
         let file =
             open(root, &path)?.ok_or(refuse!("host firmware manifest names a missing resource"))?;
         *slot = read_file(file, Some(image.length), manifest::MAX_IMAGE_BYTES)?;

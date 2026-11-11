@@ -35,8 +35,8 @@ pub(super) struct Outcome {
     pub(super) status: Option<ExitStatus>,
 }
 
-/// Write and print `run.json`, then fail on any check that did not pass.
-pub(super) fn finish(arguments: &Run, outcome: Outcome) -> Result<ExitCode> {
+/// Write `run.json`, optionally print it, then fail on a check that did not pass.
+pub(super) fn finish(arguments: &Run, outcome: Outcome, print: bool) -> Result<ExitCode> {
     let Outcome {
         paths,
         preboot,
@@ -179,7 +179,9 @@ pub(super) fn finish(arguments: &Run, outcome: Outcome) -> Result<ExitCode> {
     });
     report["hpet"] = json!(arguments.hpet_enabled());
     fs::write(output.join("run.json"), format!("{report:#}\n"))?;
-    println!("{report:#}");
+    if print {
+        println!("{report:#}");
+    }
     if let Some(Err(error)) = storage {
         return Err(error.context("host storage check failed"));
     }

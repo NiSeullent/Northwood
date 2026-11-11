@@ -14,7 +14,11 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-use stela_loader::{aux_kc::TRUSTED_CODE_FILE, trust_cache::CodeHash};
+use stela_loader::{
+    aux_kc::TRUSTED_CODE_FILE,
+    plugin::{self, BundleSeal, CODE_RESOURCES_PATH},
+    trust_cache::CodeHash,
+};
 
 pub mod app;
 pub mod sdk;
@@ -30,6 +34,23 @@ const PLUGIN_PATH: &str = "/System/Volumes/Data/Library/GPUBundles/StelaGPU.bund
 const BUNDLE_IDENTIFIER: &str = "com.stela.StelaGPU.Metal";
 /// The Metal plugin's executable in its bundle.
 const BUNDLE_EXECUTABLE: &str = "Contents/MacOS/StelaGPU";
+const BUNDLE_INFO: &str = "Contents/Info.plist";
+/// The plugin has no resources beyond its executable and Info.plist, which
+/// the signature seals separately. Keep the empty resource envelope portable.
+const BUNDLE_RESOURCES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>files</key><dict/>
+  <key>files2</key><dict/>
+  <key>rules</key><dict><key>^Resources/</key><true/></dict>
+  <key>rules2</key><dict>
+    <key>^.*</key><true/>
+    <key>^Info\.plist$</key><dict><key>omit</key><true/><key>weight</key><integer>20</integer></dict>
+  </dict>
+</dict>
+</plist>
+"#;
 /// The Metal plugin's slices: Metal loads it into processes of either.
 const BUNDLE_TARGETS: [(&str, &str); 2] = [("arm64", "arm64-apple-macos27.0"), ("arm64e", TARGET)];
 
@@ -47,7 +68,11 @@ pub fn run() -> Result<()> {
     fs::write(include.join("stela/bundle.h"), bundle_header(&bundle)?)?;
     fs::write(include.join("stela/app.h"), app_header(root)?)?;
     let kext = build_kext(&component, &output, &xnu, &include)?;
-    let code = stela_loader::plugin::code_hashes(&fs::read(bundle.join(BUNDLE_EXECUTABLE))?)?;
+    let seal = BundleSeal::new(
+        &fs::read(bundle.join(BUNDLE_INFO))?,
+        &fs::read(bundle.join(CODE_RESOURCES_PATH))?,
+    );
+    let code = plugin::bundle_code_hashes(&fs::read(bundle.join(BUNDLE_EXECUTABLE))?, seal)?;
     fs::write(kext.join(TRUSTED_CODE_FILE), code.concat())?;
     embed_kext(&kext, &code, &output.join("StelaGPU.kext.rs"))?;
     stela_cli::gpu::Payload::write(&output)?;
@@ -134,10 +159,14 @@ fn build_bundle(component: &Path, output: &Path, include: &Path) -> Result<PathB
         .iter()
         .map(|slice| slice.iter().map(Vec::as_slice).collect())
         .collect();
-    let executable = stela_loader::plugin::link(BUNDLE_IDENTIFIER, &slices)?;
+    let info = fs::read(source.join("Info.plist"))?;
+    let seal = BundleSeal::new(&info, BUNDLE_RESOURCES);
+    let executable = plugin::link_bundle(BUNDLE_IDENTIFIER, &slices, seal)?;
     let contents = bundle.join("Contents");
     fs::create_dir_all(contents.join("MacOS"))?;
-    fs::copy(source.join("Info.plist"), contents.join("Info.plist"))?;
+    fs::create_dir_all(contents.join("_CodeSignature"))?;
+    fs::write(bundle.join(BUNDLE_INFO), info)?;
+    fs::write(bundle.join(CODE_RESOURCES_PATH), BUNDLE_RESOURCES)?;
     fs::write(bundle.join(BUNDLE_EXECUTABLE), executable)?;
     Ok(bundle)
 }
@@ -198,7 +227,8 @@ fn build_kext(component: &Path, output: &Path, xnu: &Path, include: &Path) -> Re
 }
 
 /// `stela/bundle.h`: the Metal plugin `bundle` as the kext installs it, each
-/// regular file's path in the bundle, mode, SHA-256 and bytes, in path order.
+/// regular file's path in the bundle, mode, SHA-256 and bytes. The executable
+/// follows the files it seals so a failed seal write leaves it untouched.
 /// Its executable is the code the boot's trust cache lists, so the kext and
 /// the trust cache always name the same plugin.
 fn bundle_header(bundle: &Path) -> Result<String> {
@@ -242,7 +272,9 @@ fn bundle_header(bundle: &Path) -> Result<String> {
             Ok((name.to_owned(), bytes))
         })
         .collect::<Result<_>>()?;
-    files.sort();
+    files.sort_by(|(left, _), (right, _)| {
+        (left == BUNDLE_EXECUTABLE, left).cmp(&(right == BUNDLE_EXECUTABLE, right))
+    });
     let mut header = String::from(
         "/* StelaGPU.bundle as `cargo xtask guest` built it, which the kext installs:\n \
          * each file's path in the bundle, mode, SHA-256 and bytes. */\n\

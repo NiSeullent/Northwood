@@ -14,6 +14,7 @@ use reports::*;
 use run::*;
 use stela_contracts::refuse;
 mod start;
+mod swap;
 pub(crate) use start::entry;
 mod aml;
 mod bluetooth;
@@ -32,6 +33,7 @@ mod kernel_work;
 pub(crate) use kernel_work::FirmwareContext;
 mod network;
 pub(crate) mod nor;
+pub(crate) mod northwood;
 mod parallel;
 #[cfg(feature = "nvk")]
 pub(crate) mod pipelines;
@@ -118,6 +120,7 @@ const EC_LOWER_ABORTS: [u64; 2] = [0x20, 0x24];
 /// RAM the engine sizes from the host.
 struct Options {
     system: System,
+    northwood: Option<northwood_config::NwConfig>,
     /// Guest DRAM backed by host RAM: all the host has free
     /// ([`guest_ram`]).
     ram_bytes: u64,
@@ -254,6 +257,7 @@ impl Options {
         Ok(Self {
             system: System::parse_resolved(text)
                 .map_err(stela_boot_core::options::Error::message)?,
+            northwood: None,
             ram_bytes: 0,
             dram_bytes: 0,
         })
@@ -362,6 +366,7 @@ unsafe fn enable_doit() -> bool {
 /// size themselves from memory that exists
 /// (`stela_boot_core::host_memory::guest_dram`).
 fn guest_ram(handoff: &Handoff, options: &mut Options) -> Result<Vec<RamRange>> {
+    handoff.final_memory_map.report("handoff");
     let mut ranges = Vec::new();
     let mut assigned = 0;
     for region in &handoff.guest[..handoff.guest_count] {
@@ -379,8 +384,11 @@ fn guest_ram(handoff: &Handoff, options: &mut Options) -> Result<Vec<RamRange>> 
     let dram = stela_boot_core::host_memory::guest_dram(handoff.installed, assigned);
     options.dram_bytes = dram.reported;
     output::arguments(format_args!(
-        "GUEST DRAM backed={assigned:#x} reported={:#x} kept={:#x}\n",
-        dram.reported, dram.kept
+        "GUEST DRAM backed={assigned:#x} reported={:#x} kept={:#x} ranges={} largest={:#x}\n",
+        dram.reported,
+        dram.kept,
+        ranges.len(),
+        ranges.iter().map(|range| range.bytes).max().unwrap_or(0),
     ));
     Ok(ranges)
 }

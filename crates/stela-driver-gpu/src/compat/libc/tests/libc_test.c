@@ -211,6 +211,26 @@ static void test_unmap_refusal(void)
 	CHECK(!munmap(mapping, 4096) && live_blocks == before);
 }
 
+static void test_unavailable_mapping_protection(void)
+{
+	const int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+	CHECK(mmap(NULL, 4096, PROT_READ | PROT_EXEC, flags, -1, 0) == MAP_FAILED &&
+	      errno == ENOTSUP);
+	unsigned char *mapping = mmap(NULL, 4096, PROT_READ | PROT_WRITE, flags, -1, 0);
+	CHECK(mapping != MAP_FAILED);
+	if (mapping == MAP_FAILED)
+		return;
+
+	const int protections[] = { PROT_READ | PROT_EXEC, PROT_READ, PROT_NONE };
+	for (size_t index = 0; index < sizeof(protections) / sizeof(protections[0]); index++) {
+		errno = 0;
+		CHECK(mprotect(mapping, 4096, protections[index]) == -1 && errno == ENOTSUP);
+	}
+	mapping[0] = 0x5a;
+	CHECK(mapping[0] == 0x5a);
+	CHECK(!munmap(mapping, 4096));
+}
+
 static void test_anonymous_files(void)
 {
 	extern int file_mapped_fd;
@@ -655,6 +675,7 @@ int main(void)
 	test_strings();
 	test_allocation();
 	test_unmap_refusal();
+	test_unavailable_mapping_protection();
 	test_anonymous_files();
 	test_meminfo();
 	test_refusals();

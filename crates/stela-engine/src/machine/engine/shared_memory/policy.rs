@@ -97,22 +97,19 @@ impl Policy {
         });
         MemoryStatus::Unsupported
     }
-    fn check_physical(
+    fn check_physical_result(
         &mut self,
         request: DataRequest,
-        part: DataPart,
-        physical: u64,
+        address: u64,
+        result: Result<(), MemoryStatus>,
     ) -> Result<(), (MemoryStatus, u64)> {
-        self.ram
-            .check_physical(physical, part.bytes)
-            .map_err(|status| {
-                let status = if status == MemoryStatus::Domain {
-                    status
-                } else {
-                    self.unsupported(request, part.address, Refusal::PhysicalGeometry)
-                };
-                (status, part.address)
-            })
+        result.map_err(|status| {
+            let status = match status {
+                MemoryStatus::Domain | MemoryStatus::Nonresident => status,
+                _ => self.unsupported(request, address, Refusal::PhysicalGeometry),
+            };
+            (status, address)
+        })
     }
 
     fn fault(
@@ -276,7 +273,8 @@ impl DataPolicy for Policy {
         if let Some(physical) = self.tlb.lookup(part, eligible) {
             // The cache admits only contained Normal, untagged parts from a
             // checked walk. RAM ownership still needs a check on every hit.
-            self.check_physical(request, part, physical)?;
+            let ram = self.ram.check_physical(physical, part.bytes);
+            self.check_physical_result(request, part.address, ram)?;
             return Ok(physical);
         }
         let access = match part.kind {
@@ -334,10 +332,13 @@ impl DataPolicy for Policy {
                 part.address,
             ));
         }
+        let ram = self.ram.check_physical(translated.physical, part.bytes);
+        if ram == Err(MemoryStatus::Nonresident) {
+            return Err((MemoryStatus::Nonresident, part.address));
+        }
         if translated.memory == mmu::MemoryType::Device
             && request.operation == DataOperation::Ordinary
-            && self.ram.check_physical(translated.physical, part.bytes)
-                == Err(MemoryStatus::Translation)
+            && ram == Err(MemoryStatus::Translation)
         {
             let reached = if request.flags & flags::WRITE == 0 {
                 Failure::DeviceRead {
@@ -393,7 +394,7 @@ impl DataPolicy for Policy {
         // Normal Non-cacheable is not Device memory and needs no Device lock.
         // Mapping the data quantity to an unowned device/aperture cannot acquire
         // canonical-RAM permission just because its ARM descriptor was Normal.
-        self.check_physical(request, part, translated.physical)?;
+        self.check_physical_result(request, part.address, ram)?;
         if eligible {
             self.tlb.fill(part, translated);
         }

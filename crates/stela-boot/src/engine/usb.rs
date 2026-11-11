@@ -4,9 +4,9 @@
 //! as Linux's `hub_event` services them. A controller that signals its
 //! events wakes the engine and is polled once it has work
 //! ([`xhci::Host::due`]); another is polled on a timer. A keyboard or
-//! pointer that arrives joins the host input; another new device is
-//! reported and its owners kept until every device they came with is
-//! removed. The USB storage interfaces probe configured stay owned here
+//! pointer that arrives joins the host input. Network adapters can be handed
+//! to the guest network service. Other class owners are kept until their
+//! devices are removed. The USB storage interfaces probe configured stay owned here
 //! for the boot, with the disks the guest reaches through them.
 //!
 //! A USB4 host whose firmware runs the connection manager is looked at on the
@@ -32,7 +32,7 @@ use stela_drivers::{
         },
     },
     input::InputDevice,
-    probe::native::usb4,
+    probe::{Adapter, native::usb4},
     usb::{
         storage::UsbStorage,
         xhci::{self, Found},
@@ -117,6 +117,13 @@ struct Kept {
     _found: Found,
 }
 
+#[derive(Default)]
+pub(super) struct Arrivals {
+    pub(super) inputs: Vec<InputDevice>,
+    pub(super) links: Vec<Adapter>,
+    pub(super) removed: Vec<xhci::SlotId>,
+}
+
 /// A USB4 host and what the polls last saw of it.
 struct Usb4 {
     host: usb4::Host,
@@ -185,10 +192,14 @@ impl HostUsb {
     }
 
     /// Poll controllers with work or a due attachment timer, and check
-    /// non-signalling controllers on the fallback interval. Return the
-    /// keyboards and pointers that arrived.
-    pub fn poll(&mut self, #[cfg(feature = "diagnostics")] wait: &mut u64) -> Vec<InputDevice> {
-        let mut inputs = Vec::new();
+    /// non-signalling controllers on the fallback interval. Hand off network
+    /// owners and their exact removal IDs when the guest reserved a port.
+    pub(super) fn poll(
+        &mut self,
+        guest_network: bool,
+        #[cfg(feature = "diagnostics")] wait: &mut u64,
+    ) -> Arrivals {
+        let mut arrived = Arrivals::default();
         let now = super::host::rdtsc();
         let timed = now.wrapping_sub(self.last) >= self.interval;
         if timed {
@@ -241,6 +252,9 @@ impl HostUsb {
             };
             for device in &changes.removed {
                 output::arguments(format_args!("USB removed {}\n", device.location));
+                if guest_network {
+                    arrived.removed.push(device.id);
+                }
                 for kept in &mut self.kept {
                     kept.attached
                         .retain(|location| *location != device.location);
@@ -262,7 +276,7 @@ impl HostUsb {
             for (location, why) in &added.unused {
                 output::arguments(format_args!("USB UNUSED {location}: {why}\n"));
             }
-            inputs.extend(
+            arrived.inputs.extend(
                 added
                     .inputs
                     .drain(..)
@@ -271,9 +285,25 @@ impl HostUsb {
             for device in &added.devices {
                 output::arguments(format_args!("USB added {}\n", device.location));
             }
-            if !added.disks.is_empty() || !added.storage.is_empty() || !added.links.is_empty() {
+            if guest_network {
+                for (location, error) in &added.vendor_failures {
+                    output::arguments(format_args!("USB VENDOR FAILED {location}: {error}\n"));
+                }
+                arrived
+                    .links
+                    .extend(added.links.drain(..).map(Adapter::Usb));
+                arrived
+                    .links
+                    .extend(added.vendor_links.drain(..).map(Adapter::UsbVendor));
+            }
+            if !added.disks.is_empty() || !added.storage.is_empty() {
                 output::arguments(format_args!(
-                    "USB a disk or network adapter added after boot is kept unused until the next boot\n"
+                    "USB a disk added after boot is kept unused until the next boot\n"
+                ));
+            }
+            if !added.links.is_empty() || !added.vendor_links.is_empty() {
+                output::arguments(format_args!(
+                    "USB a network adapter added after boot is kept unused until the next boot\n"
                 ));
             }
             if !changes.added.devices.is_empty() {
@@ -288,7 +318,7 @@ impl HostUsb {
                 });
             }
         }
-        inputs
+        arrived
     }
 
     /// Run each running USB4 host's software connection manager for up to a

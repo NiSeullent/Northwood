@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- The profile supplies device defaults; setup adds the target and install paths. -->
+  <key>Northwood</key>
+  <dict>
+    <key>SchemaVersion</key><integer>1</integer>
+    <key>HardwareProfile</key><string>lenovo-ideapad-1-15igl7</string>
+  </dict>
+  <key>Memory</key>
+  <dict>
+    <key>Profile</key><string>Auto</string>
+    <key>Swap</key>
+    <dict>
+      <key>Location</key><string>Auto</string>
+      <key>SizeGiB</key><integer>32</integer>
+    </dict>
+  </dict>
+</dict>
+</plist>

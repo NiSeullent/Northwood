@@ -4,10 +4,10 @@ use alloc::{boxed::Box, rc::Rc};
 use stela_contracts::refuse;
 use stela_drivers::bus::pci::power::Timer;
 
-pub(super) struct Prepared(config::Prepared);
+pub(crate) struct Prepared(config::Prepared);
 
 impl Prepared {
-    pub(super) fn capture() -> crate::Result<Self> {
+    pub(crate) fn capture() -> crate::Result<Self> {
         let mut source = config::Prepared::capture()
             .map_err(|error| refuse!("USB clock resource capture: {error}", %error))?;
         source
@@ -16,7 +16,7 @@ impl Prepared {
         Ok(Self(source))
     }
 
-    pub(super) fn map(&mut self, tables: &mut Tables) -> crate::Result<()> {
+    pub(crate) fn map(&mut self, tables: &mut Tables) -> crate::Result<()> {
         self.0
             .map(tables)
             .map_err(|error| refuse!("USB clock aperture: {error}", %error))
@@ -26,7 +26,7 @@ impl Prepared {
     /// Same exclusive standalone BSP/root and complete USB/HPET handoff
     /// through shutdown. Firmware, SMM, and other actors cannot access or
     /// change those resources after EBS.
-    pub(super) unsafe fn attach(self, root: &ActivatedTables) -> crate::Result<Rc<dyn Timer>> {
+    pub(crate) unsafe fn attach(self, root: &ActivatedTables) -> crate::Result<Rc<dyn Timer>> {
         // SAFETY: caller keeps the original standalone root and firmware handoff.
         let source = unsafe { config::Source::activate(root, self.0) }
             .map_err(|error| refuse!("USB clock root: {error}", %error))?;

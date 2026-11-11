@@ -25,6 +25,7 @@ use crate::{
 use alloc::{format, rc::Rc, vec::Vec};
 
 mod admin;
+mod exclusive;
 mod features;
 mod io;
 pub mod owned;
@@ -736,10 +737,20 @@ impl Controller {
     }
 
     fn wait_status(&self, timeout: u64, condition: impl Fn(u32) -> bool) -> Result<(), BlockError> {
+        self.registers.wait_status(self.clock, timeout, condition)
+    }
+}
+
+impl RegisterIo {
+    fn wait_status(
+        &self,
+        clock: Clock,
+        timeout: u64,
+        condition: impl Fn(u32) -> bool,
+    ) -> Result<(), BlockError> {
         let mut failure = None;
-        let done = self
-            .clock
-            .wait(timeout, || match self.registers.read32(STATUS) {
+        let done = clock
+            .try_wait(timeout, || match self.read32(STATUS) {
                 Ok(REMOVED) => {
                     failure = Some(removed());
                     true
@@ -749,7 +760,8 @@ impl Controller {
                     failure = Some(error);
                     true
                 }
-            });
+            })
+            .map_err(|_| BlockError::Unsupported("NVMe requires a representable deadline"))?;
         if let Some(error) = failure {
             return Err(error);
         }
@@ -757,6 +769,31 @@ impl Controller {
             Ok(())
         } else {
             Err(BlockError::Timeout)
+        }
+    }
+
+    /// Stop an engine whose original register and submission owners are
+    /// already excluded. This observes only NVMe engine state. It does not
+    /// close firmware users, contain PCI DMA or drain the original root.
+    fn stop_controller(&self, clock: Clock, timeout: u64) -> Result<(), BlockError> {
+        clock
+            .check_duration(timeout)
+            .map_err(|_| BlockError::Unsupported("NVMe requires a representable deadline"))?;
+        if self.read32(STATUS)? == REMOVED {
+            return Err(removed());
+        }
+        self.write32(CONFIGURATION, 0)?;
+        self.wait_status(clock, timeout, |status| status & READY == 0)?;
+        self.confirm_disabled()
+    }
+
+    fn confirm_disabled(&self) -> Result<(), BlockError> {
+        match self.read32(CONFIGURATION)? {
+            REMOVED => Err(removed()),
+            config if config & ENABLE != 0 => {
+                Err(BlockError::Protocol("NVMe disable did not clear CC.EN"))
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -775,6 +812,15 @@ pub struct Namespace {
     scanned: u64,
     /// Set once a rescan removed the namespace.
     removed: Option<BlockError>,
+}
+
+/// The only software route to an owned controller and its namespace.
+/// Use synchronous block requests, with no automatic replay across a
+/// namespace notice or controller reset. This type does not publish a
+/// device through discovery.
+pub struct ExclusiveNamespace {
+    namespace: Namespace,
+    refused: Option<BlockError>,
 }
 
 /// Reset `function`'s controller, bring up its queues and return its usable
@@ -1153,8 +1199,21 @@ impl Namespace {
         if self.scanned == controller.scans {
             return Ok(());
         }
+        self.refresh_namespace(controller, false)
+    }
+
+    fn refresh_namespace(
+        &mut self,
+        controller: &mut Controller,
+        required: bool,
+    ) -> Result<(), BlockError> {
         let scans = controller.scans;
         let Some((mut ids, independent)) = controller.namespace_ids(self.namespace)? else {
+            if required {
+                return Err(BlockError::Unsupported(
+                    "NVMe namespace Identify unavailable",
+                ));
+            }
             self.scanned = scans;
             return Ok(());
         };
@@ -1166,7 +1225,7 @@ impl Namespace {
         let (commands, limits) = (controller.commands, controller.limits);
         let data = match controller.identify(IDENTIFY_NAMESPACE, self.namespace) {
             Ok(data) => data,
-            Err(BlockError::Device { .. }) => {
+            Err(BlockError::Device { .. }) if !required => {
                 self.scanned = scans;
                 return Ok(());
             }

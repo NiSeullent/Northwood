@@ -37,6 +37,7 @@ use stela_engine::translations::pack;
 use stela_engine::translations::pack::{DecodedRecord, Pack, StagedOffer, Store};
 #[cfg(feature = "nvk")]
 use stela_formats::payload::pieces::Extent;
+use stela_loader::mount_interface::layout::{DATA_STORE, Layout};
 use stela_runtime::pc::fat32::Fat32;
 use stela_runtime::pc::gpt::Guid;
 use stela_runtime::translation_store;
@@ -53,8 +54,6 @@ use uefi::{
 
 /// The handoff file holding the store's placement and its pack.
 pub const FILE: &str = "translations";
-/// The store's directory on its volume, and `stela setup`'s bound there.
-pub(super) const DIRECTORY: &str = "stela\\store";
 const CONFIG: &str = "store.cfg";
 const BYTES_KEY: &str = "bytes";
 const CONFIG_LIMIT: usize = 256;
@@ -75,14 +74,22 @@ const PLACEMENT_BYTES: usize = 64;
 /// The pack file holds the bound's bytes and its volume's partition is
 /// known: the engine may rewrite it.
 const WRITABLE: u32 = 1;
+const NORTHWOOD_LAYOUT: u32 = 2;
 /// The words of the buffer a renamed file's `FileInfo` is built in: its
 /// fixed fields and an 8.3 name.
 const FILE_INFO_WORDS: usize = 64;
 
-/// The pack file's path, with `separator` between components.
-fn pack_path(translator: &Digest, separator: &str) -> String {
-    let name = format!("{}.{PACK_EXTENSION}", hex(&translator.0[..NAME_BYTES]));
-    format!("{}{separator}{name}", DIRECTORY.replace('\\', separator))
+/// The pack's 8.3 name, independent of its store directory.
+fn pack_name(translator: &Digest) -> String {
+    format!("{}.{PACK_EXTENSION}", hex(&translator.0[..NAME_BYTES]))
+}
+
+pub(super) fn store_path(layout: Layout, name: &str) -> String {
+    layout.data_path(&format!("{DATA_STORE}/{name}"))
+}
+
+pub(super) fn uefi_store_path(layout: Layout, name: &str) -> String {
+    store_path(layout, name).replace('/', "\\")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -110,8 +117,8 @@ pub(super) fn read_exact(file: &mut RegularFile, buffer: &mut [u8]) -> Option<()
 }
 
 /// `store.cfg`'s bound.
-pub(super) fn bound(root: &mut Directory) -> Option<u64> {
-    let mut file = open(root, &format!("{DIRECTORY}\\{CONFIG}"), FileMode::Read)?;
+fn bound(root: &mut Directory, layout: Layout) -> Option<u64> {
+    let mut file = open(root, &uefi_store_path(layout, CONFIG), FileMode::Read)?;
     let mut text = vec![0; CONFIG_LIMIT];
     let mut done = 0;
     while done < text.len() {
@@ -181,27 +188,17 @@ pub struct Opened {
 /// this PC can read. `None` when no volume has a store.
 pub fn read(budget: u64) -> Option<Opened> {
     let translator = translations::translator_id();
-    for handle in boot::find_handles::<SimpleFileSystem>().ok()? {
-        let Ok(mut volume) = boot::open_protocol_exclusive::<SimpleFileSystem>(handle) else {
-            continue;
-        };
-        let Ok(mut root) = volume.open_volume() else {
-            continue;
-        };
-        // The file's size, which `stela setup` allocated.
-        let Some(bound) = bound(&mut root) else {
-            continue;
-        };
+    with_configured(|handle, root, layout, bound| {
         let limit = bound.min(budget);
-        let path = pack_path(&translator, "\\");
-        if open(&mut root, &path, FileMode::Read).is_none() {
-            claim_spare(&mut root, &translator);
+        let path = uefi_store_path(layout, &pack_name(&translator));
+        if open(root, &path, FileMode::Read).is_none() {
+            claim_spare(root, layout, &translator);
         }
         // A read-only volume's pack is read and never written; a missing
         // one leaves the boot's translations in memory.
-        let opened = open(&mut root, &path, FileMode::ReadWrite)
+        let opened = open(root, &path, FileMode::ReadWrite)
             .map(|file| (file, true))
-            .or_else(|| open(&mut root, &path, FileMode::Read).map(|file| (file, false)));
+            .or_else(|| open(root, &path, FileMode::Read).map(|file| (file, false)));
         let partition = partition(handle);
         let reading = output::now();
         let (region, pack, allocated) = match opened {
@@ -236,7 +233,7 @@ pub fn read(budget: u64) -> Option<Opened> {
         };
         // Below the floor, or with its pack left for a larger PC, the boot
         // keeps its translations in memory.
-        let flags =
+        let writable =
             if allocated && partition.is_some() && limit >= PACK_FLOOR && pack != PackRead::Skipped
             {
                 WRITABLE
@@ -254,29 +251,55 @@ pub fn read(budget: u64) -> Option<Opened> {
         // The engine lays out the next pack within this boot's limit.
         placement[8..16].copy_from_slice(&limit.to_le_bytes());
         placement[16..32].copy_from_slice(&partition.unwrap_or_default());
-        placement[32..36].copy_from_slice(&flags.to_le_bytes());
         let pack_bytes = region.bytes - PLACEMENT_BYTES as u64;
         placement[40..48].copy_from_slice(&pack_bytes.to_le_bytes());
-        return Some(Opened {
+        let flags = writable
+            | if layout == Layout::Northwood {
+                NORTHWOOD_LAYOUT
+            } else {
+                0
+            };
+        placement[32..36].copy_from_slice(&flags.to_le_bytes());
+        Some(Opened {
             region,
             writable: flags & WRITABLE != 0,
             pack,
-        });
+        })
+    })
+}
+
+/// Use the first configured store, searching Northwood on all volumes first.
+/// Keep the volume and the selected layout together for the callback.
+pub(super) fn with_configured<T>(
+    read: impl FnOnce(uefi::Handle, &mut Directory, Layout, u64) -> Option<T>,
+) -> Option<T> {
+    let handles = boot::find_handles::<SimpleFileSystem>().ok()?;
+    for layout in Layout::PREFERRED {
+        for &handle in &handles {
+            let Ok(mut volume) = boot::open_protocol_exclusive::<SimpleFileSystem>(handle) else {
+                continue;
+            };
+            let Ok(mut root) = volume.open_volume() else {
+                continue;
+            };
+            if let Some(bound) = bound(&mut root, layout) {
+                return read(handle, &mut root, layout, bound);
+            }
+        }
     }
     None
 }
 
 /// Give `translator` the spare pack file by renaming it, when the store
 /// has one: the file keeps its preallocated clusters.
-fn claim_spare(root: &mut Directory, translator: &Digest) {
-    let Some(mut file) = open(root, &format!("{DIRECTORY}\\{SPARE}"), FileMode::ReadWrite) else {
+fn claim_spare(root: &mut Directory, layout: Layout, translator: &Digest) {
+    let Some(mut file) = open(root, &uefi_store_path(layout, SPARE), FileMode::ReadWrite) else {
         return;
     };
     let Ok(info) = file.get_boxed_info::<FileInfo>() else {
         return;
     };
-    let Ok(name) = CString16::try_from(pack_path(translator, "/").rsplit('/').next().unwrap_or(""))
-    else {
+    let Ok(name) = CString16::try_from(pack_name(translator).as_str()) else {
         return;
     };
     let mut storage = vec![0u64; FILE_INFO_WORDS];
@@ -327,10 +350,7 @@ fn read_pack(
     if read_exact(file, &mut prefix[header.len()..]).is_none() {
         return (None, PackRead::None);
     }
-    let (Ok(held), Ok(within)) = (
-        Pack::length(&prefix, translator),
-        translation_store::within(&prefix, translator, limit),
-    ) else {
+    let Ok(within) = translation_store::within(&prefix, translator, limit) else {
         return (None, PackRead::None);
     };
     if within.records == 0 && within.omitted != 0 {
@@ -369,7 +389,7 @@ fn read_pack(
         translation_store::trim(pack);
         PackRead::Part {
             read: length as u64,
-            held,
+            held: within.pack_length,
         }
     };
     let region = Region {
@@ -766,6 +786,11 @@ pub fn install(contents: &'static [u8]) -> Option<Guid> {
     let field = |at: usize| u64::from_le_bytes(contents[at..at + 8].try_into().expect("a field"));
     let bound = field(8);
     let flags = u32::from_le_bytes(contents[32..36].try_into().expect("a word"));
+    let layout = if flags & NORTHWOOD_LAYOUT == 0 {
+        Layout::Legacy
+    } else {
+        Layout::Northwood
+    };
     let pack_bytes = usize::try_from(field(40)).ok()?;
     let pack = contents.get(PLACEMENT_BYTES..PLACEMENT_BYTES + pack_bytes)?;
     let translator = translations::translator_id();
@@ -797,7 +822,7 @@ pub fn install(contents: &'static [u8]) -> Option<Guid> {
         *boot = Some(Boot {
             translator,
             bound,
-            path: pack_path(&translator, "/"),
+            path: store_path(layout, &pack_name(&translator)),
             partition: None,
         });
         let readable = if pack.is_some() { READ_PACK } else { 0 };
@@ -835,7 +860,11 @@ pub fn with_store_file<R>(
             .take()
             .ok_or("the store's partition is not open")?;
         let mut volume = Fat32::open(Bytes::new(partition)).map_err(|error| format!("{error}"))?;
-        let file = volume.file(&format!("{}/{name}", DIRECTORY.replace('\\', "/")));
+        let directory = boot
+            .path
+            .rsplit_once('/')
+            .map_or("", |(directory, _)| directory);
+        let file = volume.file(&format!("{directory}/{name}"));
         let mut device = volume.into_inner().into_inner();
         let result = file
             .map(|file| f(&mut *device, &file.extents))

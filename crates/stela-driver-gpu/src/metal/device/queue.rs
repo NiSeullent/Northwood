@@ -61,7 +61,7 @@ use crate::metal::{
     upload::{Chunk, ChunkSource},
     vulkan::{
         BufferCreate, BufferUsage, MemoryProperties, PipelineStages, PipelineStatistics,
-        backend::{Backend, BufferAllocation, Object, Requirements},
+        backend::{Backend, BufferAllocation, GUEST_COPY_WAIT_NS, Object, Requirements},
         command::Command,
         object::{
             BufferInfo, ExecutionSet, ImageView, IndirectCommandsLayout, Memory, MemoryRequest,
@@ -578,6 +578,29 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             let (Some(color), Some(Some(attached))) = (color, plan.color.get(index)) else {
                 continue;
             };
+            if let Some((_, resolve)) = attached.resolve {
+                require(
+                    !self.is_staged_buffer_texture(resolve.texture)?,
+                    "resolving to a host buffer render target",
+                )?;
+            }
+            if let Some(staged) = self.staged_color(attached.view.texture)? {
+                let [width, height, _] = staged.region.extent;
+                require(
+                    attached.resolve.is_none()
+                        && plan.extent == [width, height]
+                        && plan.color.iter().flatten().count() == 1,
+                    "a host buffer render target needs one full-size color attachment and no resolve",
+                )?;
+                require(
+                    matches!(
+                        attached.store_action,
+                        StoreAction::Store | StoreAction::DontCare | StoreAction::Unknown
+                    ) && color.store_action_options.is_empty(),
+                    "store action and options of a host buffer render target",
+                )?;
+                plan.inputs.staged_colors[index] = Some(staged);
+            }
             if let Some((_, resolve)) = attached.resolve
                 && self
                     .texture_descriptor(resolve.texture)?
@@ -618,6 +641,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         if self.capabilities.framebuffer_reads {
             for (index, color) in plan.color.iter().enumerate() {
                 let Some(color) = color else { continue };
+                if plan.inputs.staged_colors[index].is_some() {
+                    continue;
+                }
                 let texture = self.texture_descriptor(color.view.texture)?;
                 if !texture
                     .usage
@@ -717,7 +743,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         }
         let visibility = request
             .visibility_result_buffer
-            .map(|buffer| Ok((self.buffer(buffer)?, request.visibility_result_type)))
+            .map(|buffer| {
+                require(
+                    !self.is_guest_copy_buffer(buffer)?,
+                    "visibility results in a copied guest buffer",
+                )?;
+                Ok((self.buffer(buffer)?, request.visibility_result_type))
+            })
             .transpose()?;
         let samples = request
             .counter_samples
@@ -1297,6 +1329,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let order = [held.key, held.queue];
         !self.lost
             && held.step == 0
+            && !held.segments[0].copies_guest_rows()
             && !self
                 .queue
                 .held
@@ -1322,7 +1355,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let held = &self.queue.held[index];
         // Only submitted work and the CPU's signals raise an event, and both
         // promise their values here: a held wait needs no driver query.
-        Ok(held
+        let ready = held
             .segments
             .iter()
             .position(|segment| {
@@ -1331,7 +1364,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     .iter()
                     .any(|&(semaphore, value)| self.promised(semaphore) < value)
             })
-            .unwrap_or(held.segments.len()))
+            .unwrap_or(held.segments.len());
+        let cut = held.segments[..ready]
+            .iter()
+            .position(Segment::copies_guest_rows);
+        // Host copies delimit submissions even when every event is ready.
+        // In particular, only the native work before a Load may precede its
+        // private checkpoint, and public signals after a Store follow publication.
+        Ok(cut.map_or(ready, |index| index.max(1)))
     }
 
     /// The highest value submitted work or the CPU signals on `semaphore`.
@@ -1494,6 +1534,30 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 held.segments[segment].binds.extend(binds);
             }
         }
+        if let [segment] = &mut held.segments[..]
+            && segment.copies_guest_rows()
+        {
+            let submitted_store = self.prepare_guest_copy(segment).map_err(|_| {
+                self.mark_lost();
+                Error::DeviceLost
+            })?;
+            if submitted_store {
+                if let Some(flight) = self
+                    .queue
+                    .in_flight
+                    .iter_mut()
+                    .find(|flight| flight.serial == held.serial)
+                {
+                    flight.submits += 1;
+                    flight.segments += 1;
+                }
+                if segment.signals.is_empty() {
+                    // This phase is already complete. The continuation
+                    // carries the normal guest-visible signals.
+                    return Ok(());
+                }
+            }
+        }
         self.track(&mut held)?;
         if let Some(flight) = self
             .queue
@@ -1514,6 +1578,40 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             "a submission ends with a signal"
         );
         self.backend.submit(&held.segments)
+    }
+
+    /// Executes host transfer boundaries under the same service turn. A
+    /// promised wait has a submitted producer, but the CPU cannot read
+    /// guest RAM until the actual value is reached.
+    fn prepare_guest_copy(&mut self, segment: &mut Segment) -> Result<bool> {
+        for &(event, value) in &segment.waits {
+            if self.event_value(event)? < value
+                && !self
+                    .backend
+                    .wait_semaphore(event, value, GUEST_COPY_WAIT_NS)?
+            {
+                return Err(Error::DeviceLost);
+            }
+        }
+        if let Some(rows) = segment.guest_load.take() {
+            // A previous GPU operation may still read the private buffer.
+            self.backend.finish_guest_copy_segment(Segment::default())?;
+            // SAFETY: the checkpoint drained prior GPU work. This turn
+            // owns the lease through the held command buffer.
+            unsafe { self.backend.read_guest_rows(rows) }?;
+        }
+        let Some(rows) = segment.guest_store.take() else {
+            return Ok(false);
+        };
+        // The private GPU checkpoint can succeed while canonical publication
+        // fails. Keep all guest signals out of that submission.
+        let mut work = core::mem::take(segment);
+        segment.signals = core::mem::take(&mut work.signals);
+        self.backend.finish_guest_copy_segment(work)?;
+        // SAFETY: the copy and its host visibility barrier have reached
+        // the private checkpoint; later work has not been submitted.
+        unsafe { self.backend.publish_guest_rows(rows) }?;
+        Ok(true)
     }
 
     /// Waits for the held work through `serial` whose arguments are being
