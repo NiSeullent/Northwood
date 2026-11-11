@@ -21,6 +21,7 @@ fn every_host_size_keeps_the_parts_in_bounds_and_the_guest_above_its_floor() {
     ] {
         let free = free(installed);
         let sizes = sizes(free, runners, runners).unwrap();
+        assert_eq!(sizes.profile, Profile::Standard, "{installed} GiB");
         let floor = HEAP_FLOOR + sizes.code.window - FLOOR_WINDOW;
         assert!((floor..=HEAP_CEILING.max(floor)).contains(&sizes.heap));
         assert!(sizes.guest >= GUEST_FLOOR);
@@ -120,16 +121,19 @@ fn a_128_gib_host_grows_the_heap_with_its_share_window_and_pes() {
 }
 
 /// Heap, code, pool and guest MiB for `runners` PEs at `free` GiB, or None
-/// when the guest's floor does not fit.
+/// when not even the compact profile's floors fit. At 4 GiB the compact
+/// profile boots 2 and 8 runners (and 64 runners at 8 GiB), where the
+/// standard one's floors do not fit; 24 and 64 runners' pools and heap
+/// shares alone pass 4 GiB.
 #[test]
 fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
     for (runners, free, expected) in [
-        (2, 4, None),
+        (2, 4, Some([1518, 68, 76, 2434])),
         (2, 8, Some([2560, 260, 162, 5210])),
         (2, 16, Some([2560, 260, 292, 13272])),
         (2, 30, Some([2848, 260, 466, 27146])),
         (2, 128, Some([11210, 260, 1602, 118000])),
-        (8, 4, None),
+        (8, 4, Some([1528, 144, 268, 2156])),
         (8, 8, Some([2816, 528, 538, 4310])),
         (8, 16, Some([3328, 1040, 1058, 10958])),
         (8, 30, Some([3712, 1040, 1724, 24244])),
@@ -140,7 +144,7 @@ fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
         (24, 30, Some([4864, 1968, 1624, 22264])),
         (24, 128, Some([13354, 2096, 5992, 109630])),
         (64, 4, None),
-        (64, 8, None),
+        (64, 8, Some([3520, 640, 1024, 3008])),
         (64, 16, Some([3412, 1152, 2048, 9772])),
         (64, 30, Some([5504, 2048, 2048, 21120])),
         (64, 128, Some([13994, 2176, 5958, 108944])),
@@ -230,21 +234,129 @@ fn the_heap_grows_with_the_host_between_its_bounds() {
     assert!(HEAP_FLOOR < small && small < large && large < HEAP_CEILING);
 }
 
+/// Under the compact floors the refusal names what they need: eight
+/// runners' 3600 MiB (a 128 MiB window and its records, 128 MiB of pools,
+/// the 1 GiB heap, 16 MiB per PE and the guest's 2 GiB) round up to 4 GB,
+/// as do two runners' 3300 MiB.
 #[test]
 fn too_little_ram_says_how_much_is_needed() {
-    let refusal = sizes(4 * GIB, 8, 8).unwrap_err();
+    let refusal = sizes(3 * GIB, 8, 8).unwrap_err();
     assert_eq!(
         refusal.to_string(),
-        "this PC has 4.0 GB of RAM free; Stela needs at least 7 GB free: \
-         3 GB for macOS and the rest for its own memory"
+        "this PC has 3.0 GB of RAM free; Stela needs at least 4 GB free: \
+         2 GB for macOS and the rest for its own memory"
     );
-    let two_cores = sizes(5 * GIB, 2, 2).unwrap_err();
+    assert!(sizes(3599 * MIB, 8, 8).is_err());
+    assert!(sizes(3600 * MIB, 8, 8).is_ok());
+    let two_cores = sizes(3 * GIB, 2, 2).unwrap_err();
     assert!(
-        two_cores.to_string().contains("at least 6 GB"),
+        two_cores.to_string().contains("at least 4 GB"),
         "{two_cores}"
     );
-    assert!(sizes(6 * GIB, 2, 2).is_ok());
-    assert!(sizes(free(8), 2, 2).is_ok());
+    assert!(sizes(3299 * MIB, 2, 2).is_err());
+    assert_eq!(sizes(3300 * MIB, 2, 2).unwrap().profile, Profile::Compact);
+    // Where the standard profile does not fit yet, the compact one boots;
+    // from there up the standard one.
+    assert_eq!(sizes(5 * GIB, 2, 2).unwrap().profile, Profile::Compact);
+    assert_eq!(sizes(6 * GIB, 2, 2).unwrap().profile, Profile::Standard);
+    assert_eq!(sizes(free(8), 2, 2).unwrap().profile, Profile::Standard);
+}
+
+/// A 4 GB PC (3968 MiB free, the firmware keeping 3 %) boots in the compact
+/// profile on any core count it has, every part at or above its floor and
+/// the guest above its 2 GiB.
+#[test]
+fn a_4_gb_pc_boots_compact() {
+    for cores in [1, 2, 4, 6, 8] {
+        let sizes = sizes(free(4), cores, cores).unwrap();
+        assert_eq!(sizes.profile, Profile::Compact, "{cores} cores");
+        assert!(
+            sizes.guest >= GUEST_COMPACT_FLOOR,
+            "{cores} cores: {sizes:?}"
+        );
+        assert!(
+            sizes.heap >= HEAP_COMPACT_FLOOR + sizes.code.window + cores as u64 * PE_HEAP,
+            "{cores} cores: {sizes:?}"
+        );
+        assert!(sizes.pool >= POOL_FLOOR.max(cores as u64 * POOL_COMPACT_RUNNER_FLOOR));
+        assert!(sizes.code.window <= 128 * MIB);
+        assert!(sizes.heap.is_multiple_of(ALIGNMENT));
+        assert!(sizes.pool.is_multiple_of(ALIGNMENT));
+        assert_eq!(
+            sizes.heap + sizes.code.bytes + sizes.pool + sizes.guest,
+            free(4),
+            "{cores} cores"
+        );
+    }
+    // Four cores: the 64 MiB window and 8 MiB of private code, the pool's
+    // 64 MiB floor, the heap's 1152 MiB floor (1 GiB, the window's records
+    // and 16 MiB per PE) and the guest's 2 GiB leave 632 MiB, split between
+    // the heap and the guest's side; the pool takes its sixty-fourths of
+    // that side.
+    let sizes = sizes(free(4), 4, 4).unwrap();
+    assert_eq!(
+        [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB),
+        [1468, 72, 142, 2286]
+    );
+}
+
+/// A 4 GB PC whose firmware keeps more (3.5 GiB free) still boots on four
+/// cores, the guest at its floor and a little more.
+#[test]
+fn a_tight_4_gb_pc_keeps_the_guest_its_floor() {
+    let tight = sizes(3584 * MIB, 4, 4).unwrap();
+    assert_eq!(tight.profile, Profile::Compact);
+    assert_eq!(
+        [tight.heap, tight.code.bytes, tight.pool, tight.guest].map(|b| b / MIB),
+        [1276, 72, 130, 2106]
+    );
+    // Right at the floors everything is a floor: the guest exactly 2 GiB.
+    let least = sizes_at(3336 * MIB);
+    assert_eq!(least.guest, GUEST_COMPACT_FLOOR);
+    assert_eq!(least.heap, 1152 * MIB);
+    assert_eq!(least.pool, 64 * MIB);
+    assert!(sizes(3335 * MIB, 4, 4).is_err());
+}
+
+fn sizes_at(free: u64) -> Sizes {
+    sizes(free, 4, 4).unwrap()
+}
+
+/// The pack's budget requires the standard profile, so a compact host
+/// reads none: its RAM is the guest's and the heap's.
+#[test]
+fn compact_hosts_read_no_pack() {
+    assert_eq!(pack_budget(free(4), 4, 4), 0);
+    assert_eq!(pack_budget(free(4), 8, 8), 0);
+    assert_eq!(pack_budget(6 * GIB, 8, 8), 0);
+}
+
+/// Where the standard profile begins to fit, the compact one hands over
+/// without a large step in the heap or the guest.
+#[test]
+fn the_compact_profile_hands_over_to_the_standard_one() {
+    let threshold = (4 * GIB / MIB..8 * GIB / MIB)
+        .map(|mib| mib * MIB)
+        .find(|&free| estimate_guest(free, 8, 8).is_ok_and(|guest| guest >= GUEST_FLOOR))
+        .expect("a host the standard profile fits");
+    let below = sizes(threshold - MIB, 8, 8).unwrap();
+    let at = sizes(threshold, 8, 8).unwrap();
+    assert_eq!(below.profile, Profile::Compact);
+    assert_eq!(at.profile, Profile::Standard);
+    assert!(below.guest >= GUEST_COMPACT_FLOOR && at.guest >= GUEST_FLOOR);
+    assert!(below.heap.abs_diff(at.heap) < GIB, "{below:?} {at:?}");
+    assert!(below.guest.abs_diff(at.guest) < GIB, "{below:?} {at:?}");
+    // Between the compact floors and that threshold every host boots, and
+    // every part keeps within the RAM.
+    for free in (3600 * MIB..threshold).step_by(7 * MIB as usize) {
+        let sizes = sizes(free, 8, 8).unwrap();
+        assert_eq!(sizes.profile, Profile::Compact, "{free}");
+        assert!(sizes.guest >= GUEST_COMPACT_FLOOR, "{free}");
+        assert_eq!(
+            sizes.heap + sizes.code.bytes + sizes.pool + sizes.guest,
+            free
+        );
+    }
 }
 
 #[test]
@@ -288,19 +400,22 @@ fn a_128_gb_pc_keeps_more_for_the_pack() {
 
 #[test]
 fn the_pack_gets_only_what_the_parts_and_the_guest_leave() {
-    // Just above what eight cores need, the pack gets the rest, not its
-    // share; below it, nothing, and the boot goes on without a pack.
+    // Just above what eight cores need for the standard profile, the pack
+    // gets the rest, not its share; below it, nothing, and the boot goes on
+    // without a pack (in the compact profile, nearer the floors).
     let needed = (6000..7200)
         .map(|mib| mib * MIB)
-        .find(|&free| sizes(free, 8, 8).is_ok())
+        .find(|&free| estimate_guest(free, 8, 8).is_ok_and(|guest| guest >= GUEST_FLOOR))
         .unwrap();
     assert_eq!(pack_budget(needed, 8, 8), 0);
     // 100 MiB more leaves the pack about that much, less the margin: the
     // most that still fits.
     let budget = pack_budget(needed + 100 * MIB, 8, 8);
     assert!((PACK_FLOOR..=100 * MIB).contains(&budget), "{budget}");
-    assert!(sizes(needed + 100 * MIB - budget - PACK_MARGIN, 8, 8).is_ok());
-    assert!(sizes(needed + 100 * MIB - budget - ALIGNMENT - PACK_MARGIN, 8, 8).is_err());
+    let fits = sizes(needed + 100 * MIB - budget - PACK_MARGIN, 8, 8).unwrap();
+    assert_eq!(fits.profile, Profile::Standard);
+    let short = sizes(needed + 100 * MIB - budget - ALIGNMENT - PACK_MARGIN, 8, 8).unwrap();
+    assert_eq!(short.profile, Profile::Compact);
     assert_eq!(pack_budget(4 * GIB, 8, 8), 0);
     for cores in [1, 2, 4, 8, 16, 64] {
         for free in (2 * GIB..40 * GIB).step_by(37 * MIB as usize) {

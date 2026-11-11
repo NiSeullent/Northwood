@@ -119,13 +119,23 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     let free = free_ram()?;
     let sizes = stela_boot_core::host_memory::sizes(free, cores, cores)?;
     output::arguments(format_args!(
-        "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M\n",
+        "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M profile={}\n",
         free >> 20,
         sizes.heap >> 20,
         sizes.code.bytes >> 20,
         sizes.pool >> 20,
         sizes.guest >> 20,
+        sizes.profile.name(),
     ));
+    if sizes.profile == stela_boot_core::host_memory::Profile::Compact {
+        use stela_boot_core::host_memory::gigabytes;
+        crate::status::info(&format!(
+            "this PC has {} GB of RAM free, less than a full boot takes: macOS gets {} GB and \
+             Stela keeps small caches, so everything runs slower; 8 GB of RAM is recommended",
+            gigabytes(free),
+            gigabytes(sizes.guest)
+        ));
+    }
     // Each claimed core owns a full native part. Check both ends before allocation.
     for slot in [0, cores - 1] {
         let part = crate::native_smp::resources::partition(

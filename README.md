@@ -26,8 +26,10 @@ and Apple7 GPU families.
 
 ## Requirements
 
-- An x86-64-v2 CPU (about 2011 or newer), UEFI with Secure Boot off, 8 GB of
-  RAM.
+- An x86-64-v2 CPU (about 2011 or newer), UEFI with Secure Boot off, 4 GB of
+  RAM. 8 GB or more is recommended: with less than about 7 GB free, Stela
+  boots in a compact profile that gives macOS 2 GB or a little more and runs
+  slower.
 - An NVIDIA GTX 16 or RTX 20 series GPU or newer.
 - A USB stick of 8 GB or more.
 - An empty GPT partition of at least 60 GB.
