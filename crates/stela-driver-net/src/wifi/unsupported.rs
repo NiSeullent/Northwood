@@ -7,9 +7,17 @@
 /// when a driver here takes it or no Linux driver lists it.
 pub fn reason(vendor: u16, device: u16) -> Option<&'static str> {
     Some(match (vendor, device) {
-        // iwlwifi, MVM op mode, pre-AX generations.
-        (0x8086, 0x2526 | 0x271b | 0x271c | 0x30dc | 0x31dc | 0x9df0 | 0xa370) => {
-            "Intel Wireless-AC 9000 series (Linux iwlwifi): this generation has no driver here"
+        // iwlwifi, MVM op mode, pre-AX generations. The 9000 series is the
+        // integrated Wi-Fi of Gemini Lake (31dc), Cannon Lake (9df0) and
+        // Coffee Lake (a370) laptops, whose only network is then a USB
+        // Ethernet adapter.
+        (0x8086, 0x30dc | 0x31dc | 0x9df0 | 0xa370) => {
+            "Intel Wireless-AC 9560 or 9462 CNVi (Linux iwlwifi, 9000 series): this generation \
+             has no driver here; a USB Ethernet adapter gives the install its network"
+        }
+        (0x8086, 0x2526 | 0x271b | 0x271c) => {
+            "Intel Wireless-AC 9260 (Linux iwlwifi, 9000 series): this generation has no \
+             driver here; a USB Ethernet adapter gives the install its network"
         }
         (0x8086, 0x24f3 | 0x24f4 | 0x24f5 | 0x24f6 | 0x24fb | 0x24fd) => {
             "Intel Wireless 8000 series or 3168 (Linux iwlwifi): this generation has no driver here"

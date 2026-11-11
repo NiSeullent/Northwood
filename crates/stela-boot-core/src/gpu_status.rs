@@ -35,9 +35,14 @@ pub fn refused(address: &str, device: u16, reason: Reason) -> String {
     }
 }
 
-/// The screen line for a PC without an NVIDIA GPU.
+/// The screen line for a PC without an NVIDIA GPU: the boot goes on with
+/// the firmware's framebuffer, so an Intel or AMD iGPU laptop installs and
+/// runs macOS without GPU acceleration.
 pub fn none() -> String {
-    format!("this PC has no NVIDIA GPU: Stela needs {SUPPORTED}")
+    format!(
+        "this PC has no NVIDIA GPU, so macOS runs without GPU acceleration on the firmware \
+         framebuffer: Stela's Metal driver needs {SUPPORTED}"
+    )
 }
 
 #[cfg(test)]
@@ -68,6 +73,8 @@ mod tests {
             "the NVIDIA GPU at 01:00.0 (device 1b80) is not supported: Stela needs an NVIDIA \
              GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU"
         );
-        assert!(none().starts_with("this PC has no NVIDIA GPU: Stela needs"));
+        assert!(
+            none().starts_with("this PC has no NVIDIA GPU, so macOS runs without GPU acceleration")
+        );
     }
 }
