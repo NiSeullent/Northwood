@@ -149,6 +149,12 @@ pub const WINDOW_PER_RUNNER: u64 = 128 * MIB;
 /// The window per runner when [`WINDOW_PER_RUNNER`] would leave the guest
 /// under its floor ([`crate::host_memory::sizes`] falls back to it).
 pub const SMALL_WINDOW_PER_RUNNER: u64 = 64 * MIB;
+/// The window per runner on a compact host (a 4 GB PC;
+/// `host_memory::Profile::Compact`), where the RAM is the guest's and the
+/// heap's: eight runners share 128 MiB, and fewer the 64 MiB minimum. The
+/// ring turns more often and recompiles more; the boot is slower, not
+/// smaller.
+pub const COMPACT_WINDOW_PER_RUNNER: u64 = 16 * MIB;
 const MIN_WINDOW: u64 = 64 * MIB;
 const MAX_WINDOW: u64 = 2048 * MIB;
 const CODE_ALIGNMENT: u64 = 16 * MIB;

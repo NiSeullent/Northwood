@@ -1,11 +1,21 @@
 //! The parts of Stela's memory sized from the host RAM free at boot (the
 //! engine heap, native code arena and shadow page-table pool), the share
 //! left for the guest, and what is left of it for the translation pack.
+//!
+//! Two profiles split the RAM. The standard one gives the heap its measured
+//! desktop floor ([`HEAP_FLOOR`]) and the guest at least [`GUEST_FLOOR`]; a
+//! PC of about 7 GiB free and up boots with it. The compact one is for
+//! smaller PCs, a 4 GB one above all: the guest gets at least
+//! [`GUEST_COMPACT_FLOOR`], the heap at least [`HEAP_COMPACT_FLOOR`] beside
+//! its block records, and what is left is split evenly between them. A
+//! compact boot runs slower: its code window and shadow pools are small, it
+//! reads no translation pack, and macOS pages more with less DRAM.
 use crate::Result;
 use crate::native_resources::{
-    CodeReservation, SMALL_WINDOW_PER_RUNNER, WINDOW_PER_RUNNER, code_reservation_per_runner,
-    parked_reserve,
+    COMPACT_WINDOW_PER_RUNNER, CodeReservation, SMALL_WINDOW_PER_RUNNER, WINDOW_PER_RUNNER,
+    code_reservation_per_runner, parked_reserve,
 };
+use alloc::string::String;
 use stela_contracts::refuse;
 
 const MIB: u64 = 1024 * 1024;
@@ -74,9 +84,24 @@ const POOL_PER_RUNNER: u64 = GIB;
 /// the sixty-fourth is less.
 const POOL_BASE: u64 = 64 * MIB;
 const POOL_GROWTH: u64 = 160;
-/// The least guest DRAM Stela boots macOS with. Below it macOS spends its
-/// time paging; 26A434 reaches the desktop with 3.1 GiB.
+/// The least guest DRAM the standard profile boots macOS with. Below it
+/// macOS spends its time paging; 26A434 reaches the desktop with 3.1 GiB.
 pub const GUEST_FLOOR: u64 = 3 * GIB;
+/// The least guest DRAM a compact boot gives macOS: what the restore and a
+/// desktop need to run at all, paging as they go. A Mac mini (M2) ships
+/// with no less than 8 GiB, so macOS sizes nothing for less than this;
+/// Apple's own virtual Macs run from 2 GiB.
+pub const GUEST_COMPACT_FLOOR: u64 = 2 * GIB;
+/// The least engine heap a compact boot keeps beside its block records and
+/// each PE's own [`PE_HEAP`]: the drivers, the pipelines a restore and a
+/// desktop boot create, and one shader compile at a time. It is under half
+/// the measured desktop peak, so a compact boot may run out of heap where a
+/// standard one does not, at the largest shader compiles above all.
+pub const HEAP_COMPACT_FLOOR: u64 = 1024 * MIB;
+/// The least pool a running executor gets on a compact host: two 8 MiB
+/// halves, which a 26A434 restore's userland filled 20 to 80 times a beat
+/// and ran with.
+const POOL_COMPACT_RUNNER_FLOOR: u64 = 16 * MIB;
 /// The step [`Shortfall::needed`] is found in.
 const NEEDED_STEP: u64 = 256 * MIB;
 /// Free host RAM bytes per byte of the persistent translation pack the
@@ -91,6 +116,27 @@ pub const PACK_FLOOR: u64 = 64 * MIB;
 /// the storage drivers' rings and the firmware ranges' rounding to 2 MiB.
 const PACK_MARGIN: u64 = 16 * MIB;
 
+/// Which split of the host RAM [`sizes`] made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// The heap at its measured desktop floor or more, the guest at
+    /// [`GUEST_FLOOR`] or more.
+    Standard,
+    /// A small host: the guest at [`GUEST_COMPACT_FLOOR`] or more, the heap
+    /// at [`HEAP_COMPACT_FLOOR`] or more, the rest split between them.
+    Compact,
+}
+
+impl Profile {
+    /// The profile's name, as the boot log prints it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Compact => "compact",
+        }
+    }
+}
+
 /// The parts' sizes and the guest DRAM left after them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizes {
@@ -100,6 +146,7 @@ pub struct Sizes {
     /// Free RAM after the three parts; Stela's stacks, tables and image
     /// take a few more MiB of it.
     pub guest: u64,
+    pub profile: Profile,
 }
 
 /// The DRAM the guest Mac reports and the host RAM it does not see.
@@ -131,6 +178,11 @@ pub fn guest_dram(installed: u64, backed: u64) -> GuestDram {
     }
 }
 
+/// `bytes` in GB to a tenth, as the boot's messages print RAM: "4.0".
+pub fn gigabytes(bytes: u64) -> String {
+    alloc::format!("{}.{}", bytes / GIB, bytes % GIB * 10 / GIB)
+}
+
 /// Too little RAM for the guest's floor: `free` bytes, of `needed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shortfall {
@@ -143,8 +195,8 @@ impl Shortfall {
     /// sold, and the free RAM to a tenth.
     pub fn refusal(self) -> crate::Refusal {
         let needed = self.needed.div_ceil(GIB);
-        let free = alloc::format!("{}.{}", self.free / GIB, self.free % GIB * 10 / GIB);
-        let floor = GUEST_FLOOR / GIB;
+        let free = gigabytes(self.free);
+        let floor = GUEST_COMPACT_FLOOR / GIB;
         refuse!(
             "this PC has {free} GB of RAM free; Stela needs at least {needed} GB free: \
              {floor} GB for macOS and the rest for its own memory",
@@ -158,7 +210,8 @@ impl Shortfall {
 /// The sizes for `free` host bytes and `runners` of the `cores` executors
 /// running PEs; the others add only their parked reserves.
 ///
-/// Each part takes a share of `free`, between its bounds:
+/// In the standard profile each part takes a share of `free`, between its
+/// bounds:
 /// - the heap a twelfth, [`HEAP_PER_WINDOW`] byte per byte of the board's
 ///   code window and [`PE_HEAP`] per runner, within
 ///   [`HEAP_FLOOR`]..=[`HEAP_CEILING`], the floor moved by the window's
@@ -172,14 +225,19 @@ impl Shortfall {
 ///   sharers * (free - heap - code - pool) / 64`, solved for `pool`; at least
 ///   [`POOL_RUNNER_FLOOR`] per runner, at most [`POOL_PER_RUNNER`] per sharer.
 ///
-/// A guest share under [`GUEST_FLOOR`] is a [`Shortfall`].
+/// A guest share under [`GUEST_FLOOR`] falls back to the [compact
+/// profile](Profile::Compact), and a host too small for that is a
+/// [`Shortfall`].
 pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
     let estimate = estimate(free, cores, runners)?;
     if estimate.guest >= GUEST_FLOOR {
         return Ok(estimate);
     }
+    if let Some(compact) = compact(free, cores, runners)? {
+        return Ok(compact);
+    }
     let mut needed = free.next_multiple_of(NEEDED_STEP);
-    while estimate_guest(needed, cores, runners)? < GUEST_FLOOR {
+    while compact(needed, cores, runners)?.is_none() {
         needed += NEEDED_STEP;
     }
     Err(Shortfall { free, needed }.refusal())
@@ -188,10 +246,12 @@ pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
 /// The bytes of persistent translation pack the loader may read for
 /// `free` host bytes, measured just before it reads the pack, with
 /// `runners` of `cores` executors running PEs: at most a
-/// 1/[`PACK_SHARE`] of `free`, and only as much as still leaves [`sizes`]
-/// the guest's floor, after the pack and a margin for the loader's other
-/// allocations. Zero, below [`PACK_FLOOR`]: the parts and the guest come
-/// first, and the pack never makes a boot fail.
+/// 1/[`PACK_SHARE`] of `free`, and only as much as still leaves the
+/// standard profile the guest's floor, after the pack and a margin for the
+/// loader's other allocations. Zero, below [`PACK_FLOOR`]: the parts and
+/// the guest come first, and the pack never makes a boot fail. A compact
+/// host, where the standard profile never fits, reads no pack: its RAM is
+/// the guest's and the heap's.
 pub fn pack_budget(free: u64, cores: usize, runners: usize) -> u64 {
     let mut budget = free / PACK_SHARE / ALIGNMENT * ALIGNMENT;
     while budget >= PACK_FLOOR {
@@ -208,8 +268,9 @@ fn estimate_guest(free: u64, cores: usize, runners: usize) -> Result<u64> {
     estimate(free, cores, runners).map(|sizes| sizes.guest)
 }
 
-/// The sizes with the larger code window per runner, or with the smaller
-/// one where the larger would leave the guest under its floor.
+/// The standard profile's sizes with the larger code window per runner, or
+/// with the smaller one where the larger would leave the guest under its
+/// floor.
 fn estimate(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
     let large = estimate_with(free, cores, runners, WINDOW_PER_RUNNER)?;
     if large.guest >= GUEST_FLOOR {
@@ -228,15 +289,8 @@ fn estimate_with(free: u64, cores: usize, runners: usize, per_runner: u64) -> Re
         * ALIGNMENT;
     let heap = (heap / ALIGNMENT * ALIGNMENT).clamp(floor, HEAP_CEILING.max(floor));
     let rest = free.saturating_sub(heap).saturating_sub(code.bytes);
-    let sharers = u128::from(running.min(POOL_SHARERS));
-    let rest = u128::from(rest);
-    // A sixty-fourth of the guest each, or the base and a 160th if less.
-    let share = sharers * rest / (u128::from(POOL_SHARE) + sharers);
-    let growth = u128::from(POOL_GROWTH);
-    let grown = sharers * (growth * u128::from(POOL_BASE) + rest) / (growth + sharers);
-    let pool = share.min(grown) as u64;
-    let (rest, sharers) = (rest as u64, sharers as u64);
-    let pool = (pool / ALIGNMENT * ALIGNMENT).clamp(
+    let sharers = running.min(POOL_SHARERS);
+    let pool = (pool_share(rest, running) / ALIGNMENT * ALIGNMENT).clamp(
         POOL_FLOOR.max(running * POOL_RUNNER_FLOOR),
         sharers * POOL_PER_RUNNER,
     );
@@ -247,7 +301,56 @@ fn estimate_with(free: u64, cores: usize, runners: usize, per_runner: u64) -> Re
         code,
         pool,
         guest: rest.saturating_sub(pool),
+        profile: Profile::Standard,
     })
+}
+
+/// The compact profile's sizes, or `None` when `free` does not hold its
+/// floors: the code arena at [`COMPACT_WINDOW_PER_RUNNER`] per runner, the
+/// pool's and the heap's floors ([`POOL_COMPACT_RUNNER_FLOOR`] per runner;
+/// [`HEAP_COMPACT_FLOOR`] with the window's block records and [`PE_HEAP`]
+/// per runner) and the guest's [`GUEST_COMPACT_FLOOR`]. What is left above
+/// them goes half to the heap and half to the guest's side, where the pool
+/// takes its usual share of the guest, never more than that half, so the
+/// guest keeps its floor.
+fn compact(free: u64, cores: usize, runners: usize) -> Result<Option<Sizes>> {
+    let code = code_reservation_per_runner(free, cores, runners, COMPACT_WINDOW_PER_RUNNER)?;
+    let running = runners as u64;
+    let (_, parked) = parked_reserve(cores, runners);
+    let pool_floor = POOL_FLOOR.max(running * POOL_COMPACT_RUNNER_FLOOR);
+    let heap_floor = (HEAP_COMPACT_FLOOR + HEAP_PER_WINDOW * code.window + running * PE_HEAP)
+        .next_multiple_of(ALIGNMENT);
+    let floors = code.bytes + pool_floor + parked + heap_floor + GUEST_COMPACT_FLOOR;
+    let Some(surplus) = free.checked_sub(floors) else {
+        return Ok(None);
+    };
+    let half = surplus / 2 / ALIGNMENT * ALIGNMENT;
+    let heap = heap_floor + half;
+    let rest = free - heap - code.bytes;
+    let sharers = running.min(POOL_SHARERS);
+    let cap = (sharers * POOL_PER_RUNNER)
+        .min(pool_floor + half)
+        .max(pool_floor);
+    let pool = (pool_share(rest, running) / ALIGNMENT * ALIGNMENT).clamp(pool_floor, cap) + parked;
+    Ok(Some(Sizes {
+        heap,
+        code,
+        pool,
+        guest: rest - pool,
+        profile: Profile::Compact,
+    }))
+}
+
+/// The running executors' pool for `rest` bytes of guest and pool together:
+/// a sixty-fourth of the guest for each of up to [`POOL_SHARERS`] sharers,
+/// or [`POOL_BASE`] and a [`POOL_GROWTH`]th of it if that is less.
+fn pool_share(rest: u64, running: u64) -> u64 {
+    let sharers = u128::from(running.min(POOL_SHARERS));
+    let rest = u128::from(rest);
+    let share = sharers * rest / (u128::from(POOL_SHARE) + sharers);
+    let growth = u128::from(POOL_GROWTH);
+    let grown = sharers * (growth * u128::from(POOL_BASE) + rest) / (growth + sharers);
+    share.min(grown) as u64
 }
 
 #[cfg(test)]
