@@ -9,33 +9,32 @@ use crate::{
         pci::{Address, EcamWindow, Function},
     },
     gpu,
-    input::{self, InputDevice, virtio::VirtioInput},
-    net::{
-        self, Link, LinkError, Mac,
-        alx::Alx,
-        e1000e::{E1000e, pch::cold::attach as pch},
-        igb::Igb,
-        igc::Igc,
-        realtek::{self, Realtek},
-        virtio::VirtioNet,
-    },
-    storage::{ahci, nvme, rtsx, sdhci, virtio},
-    usb::{self, bluetooth::UsbHci, cdc::UsbNet, ethernet::UsbEthernet, xhci},
+    input::{self, InputDevice},
+    net::{self, e1000e::pch::cold::attach as pch, realtek},
+    storage::{ahci, rtsx, sdhci},
+    usb::{self, bluetooth::UsbHci, xhci},
 };
 use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
 use core::fmt;
+
+mod adapter;
+pub use adapter::Adapter;
 
 #[cfg(feature = "native-acpi")]
 mod companion;
 #[cfg(feature = "native-acpi")]
 mod i2c;
 #[cfg(feature = "native-acpi")]
+pub use i2c::{HidMatch, HidQuirk, HidSetting};
+#[cfg(feature = "native-acpi")]
 mod power;
 #[cfg(feature = "native-acpi")]
 pub use power::{EmbeddedControllerInstallation, Power, install_embedded_controller};
+mod legacy;
 pub mod native;
 #[cfg(any(test, feature = "native-acpi"))]
 mod platform;
+pub mod registry;
 pub mod services;
 #[cfg(feature = "native-acpi")]
 pub mod smbus;
@@ -148,6 +147,8 @@ pub enum PlatformError {
     Ps2(input::ps2::Error),
     Native(ServiceError),
     I2c(crate::bus::i2c::Error),
+    I2cPciMismatch(crate::bus::pci::Identity),
+    I2cPciStop(crate::bus::pci::Identity, ServiceError),
     Lpss(crate::bus::lpss::Error),
     LpssAttach(crate::bus::lpss::AttachError),
     HidI2c(input::hid_i2c::Error),
@@ -184,6 +185,16 @@ impl fmt::Display for PlatformError {
             Self::Ps2(error) => error.fmt(f),
             Self::Native(error) => error.fmt(f),
             Self::I2c(error) => write!(f, "I2C controller: {error:?}"),
+            Self::I2cPciMismatch(id) => write!(
+                f,
+                "I2C ACPI controller {} {:04x}:{:04x} is not a supported LPSS I2C function",
+                id.address, id.vendor, id.device,
+            ),
+            Self::I2cPciStop(id, error) => write!(
+                f,
+                "LPSS I2C {} {:04x}:{:04x} handoff: {error}",
+                id.address, id.vendor, id.device,
+            ),
             Self::Lpss(error) => write!(f, "LPSS: {error:?}"),
             Self::LpssAttach(error) => write!(f, "LPSS I2C attach: {error:?}"),
             Self::HidI2c(error) => error.fmt(f),
@@ -229,195 +240,6 @@ impl fmt::Display for Warning {
     }
 }
 
-/// A host network adapter, as a raw Ethernet link.
-pub enum Adapter {
-    Virtio(VirtioNet),
-    Igc(Igc),
-    E1000e(E1000e),
-    /// An Intel 82579, I217/I218 or I219 integrated MAC.
-    Pch(Box<pch::Pch>),
-    Igb(Igb),
-    Alx(Alx),
-    Realtek(Realtek),
-    Usb(UsbNet),
-    UsbVendor(UsbEthernet),
-    Tg3(Box<native::Located<native::Tg3>>),
-    Aqtion(Box<native::Located<net::aqtion::native::Attached>>),
-    #[cfg(feature = "native-acpi")]
-    IntelWifi(Box<native::Located<native::IntelWifi>>),
-    MediatekWifi(Box<native::Located<native::MediatekWifi>>),
-    RealtekWifi(Box<native::Located<native::RealtekWifi>>),
-}
-
-impl Adapter {
-    /// Stable implementation name for diagnostics and driver verification.
-    pub fn driver(&self) -> &'static str {
-        match self {
-            Self::Virtio(_) => "virtio-net",
-            Self::Igc(_) => "igc",
-            Self::E1000e(_) | Self::Pch(_) => "e1000e",
-            Self::Igb(_) => "igb",
-            Self::Alx(_) => "alx",
-            Self::Realtek(_) => "realtek",
-            Self::Usb(_) => "usb-cdc",
-            Self::Tg3(_) => "tg3",
-            Self::Aqtion(_) => "atlantic",
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(_) => "iwlwifi",
-            Self::MediatekWifi(_) => "mt7925e",
-            Self::RealtekWifi(_) => "rtw88_8822ce",
-            Self::UsbVendor(device) => device.driver(),
-        }
-    }
-
-    /// Where the adapter is, for logs.
-    pub fn location(&self) -> &str {
-        match self {
-            Self::Virtio(device) => &device.location,
-            Self::Igc(device) => &device.location,
-            Self::E1000e(device) => &device.location,
-            Self::Pch(device) => &device.location,
-            Self::Igb(device) => &device.location,
-            Self::Alx(device) => &device.location,
-            Self::Realtek(device) => &device.location,
-            Self::Usb(device) => &device.location,
-            Self::UsbVendor(device) => &device.location,
-            Self::Tg3(device) => &device.location,
-            Self::Aqtion(device) => &device.location,
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(device) => &device.location,
-            Self::MediatekWifi(device) => &device.location,
-            Self::RealtekWifi(device) => &device.location,
-        }
-    }
-}
-
-impl Link for Adapter {
-    fn mac(&self) -> Mac {
-        match self {
-            Self::Virtio(device) => device.mac(),
-            Self::Igc(device) => device.mac(),
-            Self::E1000e(device) => device.mac(),
-            Self::Pch(device) => device.mac(),
-            Self::Igb(device) => device.mac(),
-            Self::Alx(device) => device.mac(),
-            Self::Realtek(device) => device.mac(),
-            Self::Usb(device) => device.mac(),
-            Self::UsbVendor(device) => device.mac(),
-            Self::Tg3(device) => device.mac(),
-            Self::Aqtion(device) => device.mac(),
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(device) => device.mac(),
-            Self::MediatekWifi(device) => device.mac(),
-            Self::RealtekWifi(device) => device.mac(),
-        }
-    }
-    fn carrier(&mut self) -> bool {
-        match self {
-            Self::Virtio(device) => device.carrier(),
-            Self::Igc(device) => device.carrier(),
-            Self::E1000e(device) => device.carrier(),
-            Self::Pch(device) => device.carrier(),
-            Self::Igb(device) => device.carrier(),
-            Self::Alx(device) => device.carrier(),
-            Self::Realtek(device) => device.carrier(),
-            Self::Usb(device) => device.carrier(),
-            Self::UsbVendor(device) => device.carrier(),
-            Self::Tg3(device) => device.carrier(),
-            Self::Aqtion(device) => device.carrier(),
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(device) => device.carrier(),
-            Self::MediatekWifi(device) => device.carrier(),
-            Self::RealtekWifi(device) => device.carrier(),
-        }
-    }
-    fn signals(&self) -> bool {
-        match self {
-            Self::Virtio(device) => device.signals(),
-            Self::Igc(device) => device.signals(),
-            Self::E1000e(device) => device.signals(),
-            Self::Pch(device) => device.signals(),
-            Self::Igb(device) => device.signals(),
-            Self::Alx(device) => device.signals(),
-            Self::Realtek(device) => device.signals(),
-            Self::Usb(device) => device.signals(),
-            Self::UsbVendor(device) => device.signals(),
-            Self::Tg3(device) => device.signals(),
-            Self::Aqtion(device) => device.signals(),
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(device) => device.signals(),
-            Self::MediatekWifi(device) => device.signals(),
-            Self::RealtekWifi(device) => device.signals(),
-        }
-    }
-    fn due_us(&self) -> Option<u64> {
-        match self {
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(device) => device.due_us(),
-            Self::MediatekWifi(device) => device.due_us(),
-            Self::RealtekWifi(device) => device.due_us(),
-            _ => None,
-        }
-    }
-    fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
-        match self {
-            Self::Virtio(device) => device.transmit(frame),
-            Self::Igc(device) => device.transmit(frame),
-            Self::E1000e(device) => device.transmit(frame),
-            Self::Pch(device) => device.transmit(frame),
-            Self::Igb(device) => device.transmit(frame),
-            Self::Alx(device) => device.transmit(frame),
-            Self::Realtek(device) => device.transmit(frame),
-            Self::Usb(device) => device.transmit(frame),
-            Self::UsbVendor(device) => device.transmit(frame),
-            Self::Tg3(device) => device.transmit(frame),
-            Self::Aqtion(device) => device.transmit(frame),
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(device) => device.transmit(frame),
-            Self::MediatekWifi(device) => device.transmit(frame),
-            Self::RealtekWifi(device) => device.transmit(frame),
-        }
-    }
-    fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
-        match self {
-            Self::Virtio(device) => device.receive(),
-            Self::Igc(device) => device.receive(),
-            Self::E1000e(device) => device.receive(),
-            Self::Pch(device) => device.receive(),
-            Self::Igb(device) => device.receive(),
-            Self::Alx(device) => device.receive(),
-            Self::Realtek(device) => device.receive(),
-            Self::Usb(device) => device.receive(),
-            Self::UsbVendor(device) => device.receive(),
-            Self::Tg3(device) => device.receive(),
-            Self::Aqtion(device) => device.receive(),
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(device) => device.receive(),
-            Self::MediatekWifi(device) => device.receive(),
-            Self::RealtekWifi(device) => device.receive(),
-        }
-    }
-    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
-        match self {
-            Self::Virtio(device) => device.receive_reusing(frame),
-            Self::Igc(device) => device.receive_reusing(frame),
-            Self::E1000e(device) => device.receive_reusing(frame),
-            Self::Pch(device) => device.receive_reusing(frame),
-            Self::Igb(device) => device.receive_reusing(frame),
-            Self::Alx(device) => device.receive_reusing(frame),
-            Self::Realtek(device) => device.receive_reusing(frame),
-            Self::Usb(device) => device.receive_reusing(frame),
-            Self::UsbVendor(device) => device.receive_reusing(frame),
-            Self::Tg3(device) => device.receive_reusing(frame),
-            Self::Aqtion(device) => device.receive_reusing(frame),
-            #[cfg(feature = "native-acpi")]
-            Self::IntelWifi(device) => device.receive_reusing(frame),
-            Self::MediatekWifi(device) => device.receive_reusing(frame),
-            Self::RealtekWifi(device) => device.receive_reusing(frame),
-        }
-    }
-}
-
 /// Whether a driver here may attach `function`, or probe hands it over from
 /// firmware (every USB host controller), including the HD Audio check: its
 /// memory BARs must be mapped uncached before ExitBootServices.
@@ -428,22 +250,7 @@ pub fn claims(function: &Function) -> bool {
 /// Candidate selection from copied firmware/native header DATA only. This
 /// grants neither resource ownership nor permission to size or attach BARs.
 pub fn claims_identity(function: &crate::bus::pci::Identity) -> bool {
-    virtio::matches_identity(function)
-        || input::virtio::matches_identity(function)
-        || net::virtio::matches_identity(function)
-        || net::igc::matches_identity(function)
-        || net::e1000e::matches_identity(function)
-        || pch::matches_identity(function)
-        || net::igb::matches_identity(function)
-        || net::alx::matches_identity(function)
-        || realtek::matches_identity(function)
-        || crate::audio::hda::pci::identify_identity(function).is_ok()
-        || function.class == nvme::CLASS
-        || ahci::matches_identity(function)
-        || sdhci::matches_identity(function)
-        || rtsx::matches_identity(function)
-        || function.class == xhci::CLASS
-        || usb::handoff::Kind::of(function.class).is_some()
+    registry::pre_exit_claim(function)
 }
 
 /// An HD Audio function beside a display controller's function 0 is that
@@ -641,6 +448,32 @@ pub unsafe fn probe(
     let firmware = handoff_provider(handoff);
     // SAFETY: the caller granted the complete machine/controller contract.
     unsafe { probe_with_provider(handoff, captures, dma, firmware, None, None) }
+}
+
+/// Attach legacy drivers with a standalone mount's owned minimum-delay clock.
+/// Attachments that need a native resource broker still report unavailable.
+///
+/// # Safety
+/// The requirements of [`probe`] apply. `minimum` must cover the actual
+/// physical minimum delays of the mounted machine and outlive its users.
+pub unsafe fn probe_with_minimum(
+    handoff: &Handoff,
+    captures: PlatformCaptures,
+    dma: &mut dyn DmaAllocator,
+    minimum: Rc<dyn crate::bus::pci::power::Timer>,
+) -> Devices {
+    // SAFETY: the caller owns the same handoff, mappings and DMA as probe().
+    unsafe {
+        probe_with_resources(
+            handoff,
+            captures,
+            dma,
+            handoff_provider(handoff),
+            ProbeResources::Standalone(minimum),
+            None,
+            &registry::DriverPolicy::default(),
+        )
+    }
 }
 
 /// The handoff's firmware catalog as the provider [`probe_with_provider`]
@@ -932,6 +765,68 @@ pub unsafe fn probe_with_provider(
     services: Option<&dyn NativeServices>,
     wifi: Option<&Network>,
 ) -> Devices {
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        probe_with_policy(
+            handoff,
+            captures,
+            dma,
+            firmware,
+            services,
+            wifi,
+            &registry::DriverPolicy::default(),
+        )
+    }
+}
+
+/// Apply the selected policy to PCI attachment. USB firmware handoff and
+/// downstream USB class admission still use the mount's existing rules.
+/// Display inventory remains available. The post-scan NVIDIA consumer
+/// applies the same policy through [`registry::DriverPolicy::allows_nvmodern`].
+///
+/// # Safety
+/// The requirements of [`probe_with_provider`] apply.
+pub unsafe fn probe_with_policy(
+    handoff: &Handoff,
+    captures: PlatformCaptures,
+    dma: &mut dyn DmaAllocator,
+    firmware: &'static dyn crate::firmware::Provider,
+    services: Option<&dyn NativeServices>,
+    wifi: Option<&Network>,
+    policy: &registry::DriverPolicy<'_>,
+) -> Devices {
+    // SAFETY: forwarded from the caller's native probe contract.
+    unsafe {
+        probe_with_resources(
+            handoff,
+            captures,
+            dma,
+            firmware,
+            ProbeResources::Services(services),
+            wifi,
+            policy,
+        )
+    }
+}
+
+enum ProbeResources<'a> {
+    Services(Option<&'a dyn NativeServices>),
+    Standalone(Rc<dyn crate::bus::pci::power::Timer>),
+}
+
+unsafe fn probe_with_resources(
+    handoff: &Handoff,
+    captures: PlatformCaptures,
+    dma: &mut dyn DmaAllocator,
+    firmware: &'static dyn crate::firmware::Provider,
+    resources: ProbeResources<'_>,
+    wifi: Option<&Network>,
+    policy: &registry::DriverPolicy<'_>,
+) -> Devices {
+    let (services, standalone_minimum) = match resources {
+        ProbeResources::Services(services) => (services, None),
+        ProbeResources::Standalone(minimum) => (None, Some(minimum)),
+    };
     let mut devices = Devices {
         bluetooth_platform: captures.bluetooth,
         native_services: services.is_some(),
@@ -948,12 +843,15 @@ pub unsafe fn probe_with_provider(
     let mut broadcom_bluetooth = Vec::new();
     let legacy_pci_writes = services.is_none_or(NativeServices::legacy_pci_writes);
     let mut ehci_hosts = Vec::new();
-    let mut usb_handoff_failures = Vec::new();
+    let mut usb_handoffs = UsbHandoffStatus {
+        companions_released: true,
+        legacy_released: true,
+    };
     // USB4 hosts with a software connection manager come up first: the scan
     // below then finds what they tunnel, as it finds any other function.
     let software_usb4 = services.map_or_else(Vec::new, |services| {
         // SAFETY: the caller owns the machine, and no driver has started.
-        unsafe { native::usb4::bring_up(services, handoff, &mut devices) }
+        unsafe { native::usb4::bring_up(services, handoff, policy, &mut devices) }
     });
     let mut usb4_hosts = Vec::new();
     // Each PCI bridge and its secondary bus, for ACPI companion lookups.
@@ -962,14 +860,21 @@ pub unsafe fn probe_with_provider(
     // controller is.
     #[cfg(feature = "native-acpi")]
     let mut smbus_functions = Vec::new();
-    let minimum_result = match services {
-        Some(services) => services.minimum_delay(),
-        None => Err(ServiceError::Unavailable),
+    let minimum_result = match (services, standalone_minimum) {
+        (Some(services), _) => services.minimum_delay(),
+        (None, Some(minimum)) => Ok(minimum),
+        (None, None) => Err(ServiceError::Unavailable),
     };
     // Every window is enumerated before any driver runs, as Linux finds
     // every device before its fixups: the Intel xHCI port switch asks
     // whether an Intel EHCI exists anywhere.
     let (scanned, pci_scan_complete) = scan(handoff, &mut devices);
+    #[cfg(feature = "native-acpi")]
+    let pci_identities = if services.is_some() {
+        scanned.iter().flatten().map(Function::identity).collect()
+    } else {
+        Vec::new()
+    };
     let intel_ehci = scanned.iter().flatten().any(|function| {
         function.vendor == 0x8086
             && usb::handoff::Kind::of(function.class) == Some(usb::handoff::Kind::Ehci)
@@ -983,28 +888,7 @@ pub unsafe fn probe_with_provider(
     for found in scanned {
         for mut function in found {
             let address = function.address;
-            // A network adapter joins the links, or its failure is recorded.
-            macro_rules! attach_link {
-                ($attached:expr, $variant:path) => {{
-                    match $attached {
-                        Ok(device) => devices.nics.push($variant(device)),
-                        Err(error) => devices.failures.push((address, error.into())),
-                    }
-                    continue;
-                }};
-            }
-            macro_rules! minimum_for_function {
-                () => {
-                    match &minimum_result {
-                        Ok(minimum) => minimum,
-                        Err(error) => {
-                            devices.failures.push((address, Error::Native(*error)));
-                            devices.owners.push(Box::new(function));
-                            continue;
-                        }
-                    }
-                };
-            }
+            let identity = function.identity();
             if function.class[..2] == [6, 4] {
                 use crate::bus::pci::ConfigSpace;
                 let checked = (|| -> Result<_, BlockError> {
@@ -1023,23 +907,29 @@ pub unsafe fn probe_with_provider(
                     }
                 }
             }
-            if function.class[..2] == [2, 0x80] {
-                // A chip Linux drives and no driver here does is named once,
-                // with its Linux driver, and left untouched.
-                if let Some(why) =
-                    crate::net::wifi::unsupported::reason(function.vendor, function.device)
-                {
-                    devices.unsupported.push((address, function.class, why));
+            let early = registry::early(&identity);
+            let selection = registry::select_pci(&identity, policy);
+            let refusal = selection.refusal();
+            if let Some(why) = refusal {
+                devices.unsupported.push((address, function.class, why));
+                if !matches!(
+                    early,
+                    Some(registry::Early::Display | registry::Early::Usb(_))
+                ) {
                     continue;
                 }
+            }
+            let driver = selection.driver();
+            if function.class[..2] == [2, 0x80] {
                 if wifi.is_none()
                     && matches!(
-                        native::Kind::of(&function),
-                        None | Some(
-                            native::Kind::IntelWifi
-                                | native::Kind::MediatekWifi
-                                | native::Kind::RealtekWifi
-                        )
+                        driver,
+                        None | Some(registry::Driver::Legacy(_))
+                            | Some(registry::Driver::Native(
+                                native::Kind::IntelWifi
+                                    | native::Kind::MediatekWifi
+                                    | native::Kind::RealtekWifi
+                            ))
                     )
                 {
                     // No Wi-Fi hardware is touched without a network. Other
@@ -1057,36 +947,41 @@ pub unsafe fn probe_with_provider(
                         Some(crate::net::wifi::regulatory::database::load(firmware));
                 }
             }
-            if let Some(adapter) = gpu::Adapter::discover(&function) {
-                devices.gpus.push(adapter);
+            if let Some(registry::Early::Display) = early {
+                devices.gpus.extend(gpu::Adapter::inspect(&mut function));
                 continue;
             }
             crate::working(&alloc::format!("PCI {address}"));
             #[cfg(feature = "native-acpi")]
-            if smbus::matches(&function) {
+            if let Some(registry::Early::Smbus) = early {
                 smbus_functions.push(address);
                 continue;
             }
-            if let Some(kind) = usb::handoff::Kind::of(function.class) {
+            if let Some(registry::Early::Usb(kind)) = early {
                 let inputs = UsbHandoff {
                     handoff,
                     minimum: &minimum_result,
                     legacy_pci_writes,
                     intel_ehci,
+                    attach_ehci: selection.attaches_ehci(),
+                    route_ports: refusal.is_none(),
                 };
                 let Some(handed) = usb_handoff(
                     function,
                     kind,
                     &inputs,
                     &mut ehci_hosts,
-                    &mut usb_handoff_failures,
+                    &mut usb_handoffs,
                     &mut devices,
                 ) else {
                     continue;
                 };
                 function = handed;
+                if refusal.is_some() {
+                    continue;
+                }
             }
-            let result = if let Some(kind) = native::Kind::of(&function) {
+            if let Some(registry::Driver::Native(kind)) = driver {
                 let Some(services) = services else {
                     devices
                         .failures
@@ -1121,7 +1016,8 @@ pub unsafe fn probe_with_provider(
                     },
                 }
                 continue;
-            } else if !legacy_pci_writes {
+            }
+            if !legacy_pci_writes {
                 if function.class[..2] != [6, 4] {
                     devices.unsupported.push((
                         address,
@@ -1130,257 +1026,38 @@ pub unsafe fn probe_with_provider(
                     ));
                 }
                 continue;
-            } else if virtio::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                virtio::VirtioBlk::new(&mut function, handoff, dma, minimum.as_ref())
-                    .map(|device| vec![Box::new(device) as Box<dyn BlockDevice>])
-            } else if function.class == nvme::CLASS {
-                let minimum = minimum_for_function!().clone();
-                nvme::attach(&mut function, handoff, dma, minimum.as_ref()).map(|attached| {
-                    devices
-                        .device_failures
-                        .extend(attached.failures.into_iter().map(|(namespace, error)| {
-                            (alloc::format!("{address} namespace {namespace}"), error)
-                        }));
-                    attached
-                        .namespaces
-                        .into_iter()
-                        .map(|device| Box::new(device) as Box<dyn BlockDevice>)
-                        .collect()
-                })
-            } else if function.class == xhci::CLASS {
-                let minimum = minimum_for_function!().clone();
-                match xhci::attach_with_provider(
-                    &mut function,
-                    handoff,
-                    dma,
-                    firmware,
-                    minimum.clone(),
-                ) {
-                    Ok(found) => {
-                        devices.disks.extend(
-                            found
-                                .disks
-                                .into_iter()
-                                .map(|d| Box::new(d) as Box<dyn BlockDevice>),
-                        );
-                        devices.inputs.extend(
-                            found
-                                .inputs
-                                .into_iter()
-                                .map(|input| InputDevice::Usb(Box::new(input))),
-                        );
-                        devices.usb_devices.extend(found.devices);
-                        devices.usb_hosts.extend(found.hosts);
-                        devices.usb_storage.extend(found.storage);
-                        devices.audio.extend(found.audio);
-                        devices.bluetooth_bootloaders.extend(found.bootloaders);
-                        for mut device in found.bluetooth {
-                            // The kept result owns its evidence/errors;
-                            // no catalog borrow or firmware bytes escape.
-                            let _ = device.initialize_with_provider(
-                                firmware,
-                                devices.bluetooth_platform.platform_inputs(),
-                            );
-                            devices.bluetooth.push(device);
-                        }
-                        devices
-                            .nics
-                            .extend(found.links.into_iter().map(Adapter::Usb));
-                        devices
-                            .nics
-                            .extend(found.vendor_links.into_iter().map(Adapter::UsbVendor));
-                        devices.usb_failures.extend(found.failures);
-                        devices.usb_vendor_failures.extend(found.vendor_failures);
-                        devices.usb_unused.extend(found.unused);
-                        devices
-                            .usb_port_probes
-                            .extend(found.probes.into_iter().map(|probe| (address, probe)));
-                    }
-                    Err(error) => devices.failures.push((address, error.into())),
-                }
-                continue;
-            } else if net::virtio::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                attach_link!(
-                    VirtioNet::new(&mut function, handoff, dma, minimum.as_ref()),
-                    Adapter::Virtio
-                );
-            } else if net::igc::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                // SAFETY: the caller grants exclusive post-EBS controller,
-                // segment configuration and firmware/ASPM policy ownership.
-                let attached = unsafe { Igc::new(&mut function, handoff, dma, minimum.clone()) };
-                attach_link!(attached, Adapter::Igc);
-            } else if net::e1000e::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                // SAFETY: the caller granted exclusive ownership of all mapped PCI
-                // functions and controllers after ExitBootServices.
-                let attached = unsafe { E1000e::new(&mut function, handoff, dma, minimum.clone()) };
-                attach_link!(attached, Adapter::E1000e);
-            } else if pch::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                // The MTP/PTP cohorts read Linux's K1 board quirk from the
-                // SMBIOS system fields; without them those cohorts refuse.
-                let snapshot = crate::firmware::smbios::load(firmware).ok();
-                let host = snapshot
-                    .as_ref()
-                    .map(|snapshot| pch::host_identity(&snapshot.identity))
-                    .unwrap_or_default();
-                // SAFETY: as for e1000e; the adapter keeps the function, its
-                // configuration and both register windows to the end of boot.
-                let attached =
-                    unsafe { pch::Pch::attach(function, handoff, dma, minimum.clone(), host) };
-                attach_link!(attached.map(Box::new), Adapter::Pch);
-            } else if net::igb::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                // SAFETY: as for e1000e, the caller granted exclusive ownership
-                // of the mapped PCI functions and their controllers.
-                let attached = unsafe { Igb::new(&mut function, handoff, dma, minimum.clone()) };
-                if let Ok(device) = &attached {
-                    if device.warnings.nvm_autoload_timeout {
-                        devices.warnings.push((
-                            address,
-                            Warning::Message(
-                                "igb NVM autoload completion timed out; NVM contents validated",
-                            ),
-                        ));
-                    }
-                    if device.warnings.phy_configuration_timeout {
-                        devices.warnings.push((
-                            address,
-                            Warning::Message("igb PHY configuration completion timed out; PHY transactions validated"),
-                        ));
-                    }
-                }
-                attach_link!(attached, Adapter::Igb);
-            } else if net::alx::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                // SAFETY: as for e1000e, the caller granted exclusive ownership
-                // of the mapped PCI functions and their controllers.
-                let attached = unsafe { Alx::new(&mut function, handoff, dma, minimum.clone()) };
-                attach_link!(attached, Adapter::Alx);
-            } else if realtek::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                // SAFETY: the caller granted exclusive post-EBS ownership of
-                // mapped PCI/MMIO and DMA, including upstream ASPM configuration.
-                let attached =
-                    unsafe { Realtek::new(&mut function, handoff, dma, firmware, minimum.clone()) };
-                if let Ok(Some(warning)) = attached.as_ref().map(Realtek::warning) {
-                    devices.warnings.push((address, Warning::Realtek(warning)));
-                }
-                attach_link!(attached, Adapter::Realtek);
-            } else if input::virtio::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                match VirtioInput::new(&mut function, handoff, dma, minimum.as_ref()) {
-                    Ok(device) => devices.inputs.push(InputDevice::Virtio(Box::new(device))),
-                    Err(error) => devices.failures.push((address, error.into())),
-                }
-                continue;
-            } else if rtsx::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                let attached = match rtsx::attach(function, handoff, minimum.clone()) {
-                    Ok(attached) => attached,
-                    Err(failure) => {
-                        devices
-                            .failures
-                            .push((address, Error::Device(failure.error.clone())));
-                        devices.owners.push(Box::new(failure));
+            }
+            if let Some(registry::Driver::Legacy(attach)) = driver {
+                let minimum = match &minimum_result {
+                    Ok(minimum) => minimum,
+                    Err(error) => {
+                        devices.failures.push((address, Error::Native(*error)));
+                        devices.owners.push(Box::new(function));
                         continue;
                     }
                 };
-                Ok({
-                    devices.rtsx_hosts.push(attached.host);
-                    if let Some(error) = attached.failure {
-                        devices
-                            .device_failures
-                            .push((alloc::format!("{address} RTSX SD slot"), error));
-                    }
-                    attached
-                        .card
-                        .into_iter()
-                        .map(|card| Box::new(card) as Box<dyn BlockDevice>)
-                        .collect()
-                })
-            } else if sdhci::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                let attached = match sdhci::attach(function, handoff, dma, minimum.clone()) {
-                    Ok(attached) => attached,
-                    Err(failure) => {
-                        devices
-                            .failures
-                            .push((address, Error::Device(failure.error.clone())));
-                        devices.owners.push(Box::new(failure));
-                        continue;
-                    }
-                };
-                Ok({
-                    for host in attached.failed_hosts {
-                        devices.owners.push(Box::new(host));
-                    }
-                    for slot in attached.failed_slots {
-                        devices.owners.push(Box::new(slot));
-                    }
-                    devices.sd_hosts.extend(attached.hosts);
-                    devices.device_failures.extend(
-                        attached.failures.into_iter().map(|(slot, error)| {
-                            (alloc::format!("{address} SD slot {slot}"), error)
-                        }),
+                // SAFETY: the caller owns the mapped functions, and the
+                // mount allows legacy PCI writes.
+                unsafe {
+                    attach(
+                        function,
+                        &mut legacy::Context {
+                            handoff,
+                            dma,
+                            firmware,
+                            minimum,
+                            devices: &mut devices,
+                        },
                     );
-                    attached
-                        .cards
-                        .into_iter()
-                        .map(|card| Box::new(card) as Box<dyn BlockDevice>)
-                        .collect()
-                })
-            } else if ahci::matches(&function) {
-                let minimum = minimum_for_function!().clone();
-                let attached = match ahci::attach(function, handoff, dma, minimum.clone()) {
-                    Ok(attached) => attached,
-                    Err(failure) => {
-                        devices
-                            .failures
-                            .push((address, Error::Device(failure.error.clone())));
-                        devices.owners.push(Box::new(failure));
-                        continue;
-                    }
-                };
-                Ok({
-                    if attached.remapped_nvme != 0 {
-                        devices
-                            .warnings
-                            .push((address, Warning::Message(ahci::REMAPPED_NVME)));
-                    }
-                    devices.ahci_hosts.push(attached.host);
-                    devices.device_failures.extend(
-                        attached
-                            .failures
-                            .into_iter()
-                            .map(|(port, error)| (alloc::format!("{address} port {port}"), error)),
-                    );
-                    attached
-                        .disks
-                        .into_iter()
-                        .map(|device| Box::new(device) as Box<dyn BlockDevice>)
-                        .collect()
-                })
-            } else {
-                if let Some(why) = unclaimed(function.class, address, &displays) {
-                    devices.unsupported.push((address, function.class, why));
                 }
-                continue;
-            };
-            match result {
-                Ok(found) => devices.disks.extend(found),
-                Err(error) => devices.failures.push((address, error.into())),
+            } else if let Some(why) = unclaimed(function.class, address, &displays) {
+                devices.unsupported.push((address, function.class, why));
             }
         }
     }
-    let companions_released = pci_scan_complete
-        && !usb_handoff_failures
-            .iter()
-            .any(|kind| matches!(kind, usb::handoff::Kind::Uhci | usb::handoff::Kind::Ohci));
-    attach_ehci_hosts(
+    let companions_released = pci_scan_complete && usb_handoffs.companions_released;
+    #[cfg_attr(not(feature = "native-acpi"), allow(unused_variables))]
+    let ehci_legacy_released = attach_ehci_hosts(
         ehci_hosts,
         companions_released,
         services,
@@ -1396,10 +1073,19 @@ pub unsafe fn probe_with_provider(
         handoff,
         &mut devices,
     );
-    // After every USB host left firmware, as Linux's i8042 probe runs after
-    // its PCI fixups.
     #[cfg(feature = "native-acpi")]
-    attach_platform(services, smbus_functions, &bridges, handoff, &mut devices);
+    attach_platform(
+        services,
+        smbus_functions,
+        &bridges,
+        &pci_identities,
+        handoff,
+        usb_handoffs.permits_i8042(
+            pci_scan_complete && !handoff.ecam.is_empty(),
+            ehci_legacy_released,
+        ),
+        &mut devices,
+    );
     devices
 }
 
@@ -1411,6 +1097,34 @@ struct UsbHandoff<'a> {
     legacy_pci_writes: bool,
     /// Whether the scan found an Intel EHCI anywhere.
     intel_ehci: bool,
+    /// Whether policy allows the separate native EHCI attach.
+    attach_ehci: bool,
+    /// Whether policy allows the xHCI driver that uses the routed ports.
+    route_ports: bool,
+}
+
+struct PendingEhci {
+    address: Address,
+    legacy_released: bool,
+}
+
+struct UsbHandoffStatus {
+    companions_released: bool,
+    legacy_released: bool,
+}
+
+impl UsbHandoffStatus {
+    fn failed(&mut self, kind: usb::handoff::Kind) {
+        if matches!(kind, usb::handoff::Kind::Uhci | usb::handoff::Kind::Ohci) {
+            self.companions_released = false;
+        }
+        self.legacy_released = false;
+    }
+
+    #[cfg(any(feature = "native-acpi", test))]
+    fn permits_i8042(&self, pci_enumerated: bool, ehci_legacy_released: bool) -> bool {
+        pci_enumerated && self.legacy_released && ehci_legacy_released
+    }
 }
 
 /// Take a USB host of `kind` from firmware before any driver binds, as
@@ -1421,19 +1135,26 @@ fn usb_handoff(
     mut function: Function,
     kind: usb::handoff::Kind,
     inputs: &UsbHandoff<'_>,
-    ehci_hosts: &mut Vec<Address>,
-    usb_handoff_failures: &mut Vec<usb::handoff::Kind>,
+    ehci_hosts: &mut Vec<PendingEhci>,
+    status: &mut UsbHandoffStatus,
     devices: &mut Devices,
 ) -> Option<Function> {
     let address = function.address;
     // EHCI's native attach takes the controller through its own
     // owners when legacy writes are excluded.
     if kind == usb::handoff::Kind::Ehci && !inputs.legacy_pci_writes {
-        ehci_hosts.push(address);
+        if inputs.attach_ehci {
+            ehci_hosts.push(PendingEhci {
+                address,
+                legacy_released: false,
+            });
+        } else {
+            status.failed(kind);
+        }
         return None;
     }
     if !inputs.legacy_pci_writes {
-        usb_handoff_failures.push(kind);
+        status.failed(kind);
         devices.failures.push((
             address,
             Error::Native(ServiceError::Refused("legacy USB PCI handoff unavailable")),
@@ -1443,43 +1164,59 @@ fn usb_handoff(
     let minimum = match inputs.minimum {
         Ok(minimum) => minimum,
         Err(error) => {
-            usb_handoff_failures.push(kind);
+            status.failed(kind);
             devices.failures.push((address, Error::Native(*error)));
             devices.owners.push(Box::new(function));
             return None;
         }
     };
     // SAFETY: the caller owns the machine and no driver has bound
-    // this controller yet, as Linux's early PCI fixup runs. Every
-    // host, EHCI included, leaves firmware here, so its SMIs are
-    // off even when its driver later fails to attach.
-    match unsafe { usb::handoff::early(&mut function, inputs.handoff, minimum.as_ref()) } {
-        Some(Ok(handed)) if handed.forced => devices.warnings.push((
-            address,
-            Warning::Message(
-                "USB host firmware handoff timed out; ownership taken with its SMIs off",
-            ),
-        )),
-        Some(Err(error)) => {
-            devices.platform_failures.push((
-                alloc::format!("{address} {} handoff", kind.name()),
-                PlatformError::Handoff(error),
-            ));
-            // EHCI's native attach retries the handoff through
-            // its own requester and BAR mapping.
-            if kind == usb::handoff::Kind::Ehci {
-                ehci_hosts.push(address);
-                return None;
+    // this controller yet, as Linux's early PCI fixup runs.
+    let legacy_released =
+        match unsafe { usb::handoff::early(&mut function, inputs.handoff, minimum.as_ref()) } {
+            Some(Ok(handed)) => {
+                let warning = if !handed.legacy_released {
+                    Some("USB host firmware handoff did not verify that legacy SMIs are off")
+                } else if handed.forced {
+                    Some("USB host firmware handoff timed out; ownership taken with its SMIs off")
+                } else {
+                    None
+                };
+                if let Some(warning) = warning {
+                    devices.warnings.push((address, Warning::Message(warning)));
+                }
+                handed.legacy_released
             }
-            usb_handoff_failures.push(kind);
-            devices.owners.push(Box::new(function));
-            return None;
-        }
-        _ => {}
-    }
+            Some(Err(error)) => {
+                devices.platform_failures.push((
+                    alloc::format!("{address} {} handoff", kind.name()),
+                    PlatformError::Handoff(error),
+                ));
+                if kind != usb::handoff::Kind::Ehci {
+                    status.failed(kind);
+                    devices.owners.push(Box::new(function));
+                    return None;
+                }
+                false
+            }
+            None => false,
+        };
     if kind == usb::handoff::Kind::Ehci {
-        ehci_hosts.push(address);
+        if inputs.attach_ehci {
+            // The native attach retries through its own requester and BAR.
+            ehci_hosts.push(PendingEhci {
+                address,
+                legacy_released,
+            });
+        } else if !legacy_released {
+            status.failed(kind);
+            devices.owners.push(Box::new(function));
+        }
         return None;
+    }
+    status.legacy_released &= legacy_released;
+    if !inputs.route_ports {
+        return Some(function);
     }
     // `quirk_usb_handoff_xhci` ends with the Intel port switch,
     // before the xHCI driver binds.
@@ -1775,19 +1512,24 @@ fn scan(handoff: &Handoff, devices: &mut Devices) -> (Vec<Vec<Function>>, bool) 
 /// Attach each EHCI host the scan found, once every UHCI/OHCI companion
 /// has left firmware, with the USB devices on it.
 fn attach_ehci_hosts(
-    ehci_hosts: Vec<Address>,
+    ehci_hosts: Vec<PendingEhci>,
     companions_released: bool,
     services: Option<&dyn NativeServices>,
     handoff: &Handoff,
     devices: &mut Devices,
-) {
-    for address in ehci_hosts {
+) -> bool {
+    let mut all_legacy_released = true;
+    for PendingEhci {
+        address,
+        mut legacy_released,
+    } in ehci_hosts
+    {
         let attached = match services {
             Some(services) if companions_released => {
                 // SAFETY: the completed scan has run the UHCI/OHCI handoff
                 // for every discovered companion. The native attach owns
                 // EHCI's BIOS handoff through its original requester and BAR.
-                unsafe { native::ehci(services, address, handoff.clock) }
+                unsafe { native::ehci(services, address, handoff.clock, &mut legacy_released) }
             }
             Some(_) => Err((
                 Error::Native(ServiceError::Refused("EHCI companion handoff incomplete")),
@@ -1795,6 +1537,7 @@ fn attach_ehci_hosts(
             )),
             None => Err((Error::Native(ServiceError::Unavailable), None)),
         };
+        all_legacy_released &= legacy_released;
         let controller = match attached {
             Ok(attached) => attached,
             Err((error, kept)) => {
@@ -1825,6 +1568,7 @@ fn attach_ehci_hosts(
         );
         devices.ehci_hosts.push(controller);
     }
+    all_legacy_released
 }
 
 /// Attach each USB4 host left to the firmware connection manager, once the
@@ -1900,7 +1644,9 @@ fn attach_platform(
     services: Option<&dyn NativeServices>,
     mut smbus_functions: Vec<Address>,
     bridges: &[native::Bridge],
+    pci_identities: &[crate::bus::pci::Identity],
     handoff: &Handoff,
+    usb_legacy_released: bool,
     devices: &mut Devices,
 ) {
     if let Some((services, session)) =
@@ -1945,12 +1691,15 @@ fn attach_platform(
                     .push((alloc::format!("{address} SMBus"), error)),
             }
         }
-        // Linux never ties the i8042 to the USB handoffs: a host that
-        // firmware kept is reported on its own, and the controller's
-        // self-test finds ports that USB legacy emulation still traps.
         let smbus_hosts = devices.smbus_hosts.clone();
-        platform::attach_i8042(session, handoff.clock, &smbus_hosts, devices);
-        i2c::attach(services, session, handoff.clock, devices);
+        platform::attach_i8042(
+            session,
+            handoff.clock,
+            &smbus_hosts,
+            usb_legacy_released,
+            devices,
+        );
+        i2c::attach(services, session, handoff.clock, devices, pci_identities);
         power::attach_power(session, devices);
         typec::attach(services, session, ec.as_ref(), handoff.clock, devices);
     }
@@ -1970,6 +1719,88 @@ mod tests {
     };
     use alloc::format;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn i8042_requires_the_usb_legacy_result_of_a_complete_scan() {
+        let mut status = UsbHandoffStatus {
+            companions_released: true,
+            legacy_released: true,
+        };
+        assert!(status.permits_i8042(true, true));
+        assert!(!status.permits_i8042(false, true));
+        assert!(!status.permits_i8042(true, false));
+        status.failed(usb::handoff::Kind::Xhci);
+        assert!(status.companions_released);
+        assert!(!status.permits_i8042(true, true));
+        status.failed(usb::handoff::Kind::Ohci);
+        assert!(!status.companions_released);
+    }
+
+    #[test]
+    fn display_probe_observes_glk_memory_without_changing_ecam() {
+        let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
+        for (slot, identity) in [(2, 0x3185_8086), (3, 0x46a6_8086), (4, 0x2684_10de)] {
+            let start = slot * (1 << 15) / 4;
+            let config = &mut ecam[start..start + 4096 / 4];
+            config.fill(0);
+            config[0] = identity;
+            config[0x08 / 4] = 0x0300_0000;
+            config[0x50 / 4] = 0x0140;
+            config[0x5c / 4] = 0x9be0_0001;
+        }
+        let original = ecam.clone();
+        let window = EcamWindow {
+            base: ecam.as_mut_ptr() as u64,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 0,
+        };
+        let handoff = Handoff {
+            ecam: alloc::vec![window],
+            mapped: alloc::vec![window.range()],
+            dma: 0..0,
+            clock: Clock {
+                ticks_per_microsecond: 1,
+            },
+            firmware: None,
+            completion: None,
+        };
+        let services = services::tests::Refusing::minimum_only();
+        // SAFETY: an empty DMA region cannot allocate physical pages.
+        let mut dma = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
+        // SAFETY: only the live synthetic ECAM buffer is mapped. The services
+        // refuse native access, and none of the display BARs is assigned.
+        let devices = unsafe {
+            probe_with_provider(
+                &handoff,
+                PlatformCaptures::default(),
+                &mut dma,
+                handoff_provider(&handoff),
+                Some(&services),
+                None,
+            )
+        };
+        assert_eq!(ecam, original);
+        assert!(services.preparations.borrow().is_empty());
+        let [glk, other_intel, nvidia] = devices.gpus.as_slice() else {
+            panic!("expected all three display functions in the inventory");
+        };
+        assert_eq!(glk.device, 0x3185);
+        assert_eq!(
+            glk.glk_memory,
+            Some(Ok(gpu::intel::glk::MemoryLayout {
+                ggtt_bytes: 2 << 20,
+                stolen: Some(gpu::intel::glk::StolenMemory {
+                    base: 0x9be0_0000,
+                    bytes: 32 << 20,
+                }),
+            }))
+        );
+        assert_eq!(other_intel.device, 0x46a6);
+        assert_eq!(other_intel.glk_memory, None);
+        assert_eq!(nvidia.device, 0x2684);
+        assert_eq!(nvidia.glk_memory, None);
+    }
 
     #[test]
     fn ehci_uses_native_preparation_only_after_companion_handoff() {

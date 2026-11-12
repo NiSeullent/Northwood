@@ -429,6 +429,8 @@ pub struct Usage {
     pub total: usize,
     pub live: usize,
     pub carved: usize,
+    /// The most bytes carved at any point, including allocator metadata
+    /// and blocks still in small-object caches.
     pub peak: usize,
     /// The largest free block: the most one allocation can get.
     pub largest: usize,

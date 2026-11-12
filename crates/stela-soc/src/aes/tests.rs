@@ -329,6 +329,69 @@ fn software_keys_encrypt_cbc_store_the_chain_and_flag_completion() {
 }
 
 #[test]
+fn idle_nonretained_power_gate_clears_context_and_preserves_hardware_disables() {
+    let mut bench = Bench::new(Some([0x69; 32]));
+    let active = bench.aes.lifecycle;
+    let key = hex("2b7e151628aed2a6abf7158809cf4f3c");
+    let iv = hex("000102030405060708090a0b0c0d0e0f");
+    bench
+        .push(core::iter::once(OPCODE_KEY << 28 | KEY_ENCRYPT).chain(words(&key)))
+        .unwrap();
+    bench
+        .push(core::iter::once(OPCODE_IV << 28).chain(words(&iv)))
+        .unwrap();
+    bench
+        .push([OPCODE_FLAG << 28 | FLAG_INTERRUPT | 0x2a])
+        .unwrap();
+    assert!(bench.aes.keys[0].is_some());
+    assert_ne!(bench.aes.ivs[0], [0; BLOCK]);
+    let irq = Wire::Aic(AicInput::new(0, 0x2f7));
+    assert!(bench.latch.is_asserted(irq));
+
+    let off = LifecycleState {
+        powered: false,
+        clocked: false,
+        ..active
+    };
+    bench.aes.check_lifecycle(off).unwrap();
+    bench
+        .aes
+        .set_lifecycle(off, &mut Access::new(0, 0, &mut bench.latch));
+    assert!(bench.access(STATUS, None).is_err());
+    assert!(!bench.latch.is_asserted(irq));
+    assert_eq!(bench.read(DISABLE_WORD), DISABLE_ALL_BUT_UID1);
+    bench.write(DISABLE_WORD, u64::from(DISABLE_UID1));
+    assert!(bench.access(DISABLE_WORD + 4, Some(0)).is_err());
+    assert!(
+        bench
+            .access(CONTROL, Some(u64::from(CONTROL_START)))
+            .is_err()
+    );
+
+    bench.aes.check_lifecycle(active).unwrap();
+    bench
+        .aes
+        .set_lifecycle(active, &mut Access::new(0, 0, &mut bench.latch));
+    assert_eq!(bench.read(DISABLE_WORD), DISABLE_KNOWN);
+    assert_eq!(bench.read(STATUS), STATUS_SEEDED);
+    assert_eq!(bench.read(INT_ENABLE), 0);
+    assert_eq!(bench.read(INT_STATUS), 0);
+    assert_eq!(bench.read(WATERMARKS), 0);
+    assert_eq!(bench.read(FLAG_COMMAND), 0);
+    assert!(bench.aes.keys.iter().all(Option::is_none));
+    assert_eq!(bench.aes.ivs, [[0; BLOCK]; 4]);
+    assert!(
+        bench
+            .aes
+            .check_lifecycle(LifecycleState {
+                reset: true,
+                ..active
+            })
+            .is_err()
+    );
+}
+
+#[test]
 fn kept_gates_preserve_keys_chaining_queued_dma_and_completed_interrupts() {
     let mut bench = Bench::new(Some([0x69; 32]));
     let key = hex("2b7e151628aed2a6abf7158809cf4f3c");

@@ -212,6 +212,56 @@ fn tree(records: &[(u16, Option<u8>, [u16; 2])], children: &[Vec<u8>]) -> Vec<u8
 }
 
 #[test]
+fn spi_nor_firmware_partition_inherits_controller_power_owner() {
+    use crate::board::{BOOT_FIRMWARE, NOR, SPI};
+
+    let spi_address = 0x3500_0000u64;
+    let spi_reg = [spi_address, 0x1000]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect::<Vec<_>>();
+    let flash_reg = words(&[0, 0x20000, 0x20000, 0x2c0000, 0x2e0000, 0x2c0000]);
+    let firmware = encode(
+        &[
+            ("name", b"firmware"),
+            ("compatible", BOOT_FIRMWARE.as_bytes()),
+            ("reg", &flash_reg),
+        ],
+        &[],
+    );
+    let nor = encode(
+        &[("name", b"spinor"), ("compatible", NOR.as_bytes())],
+        &[firmware],
+    );
+    let spi = encode(
+        &[
+            ("name", b"spi1"),
+            ("compatible", SPI.as_bytes()),
+            ("reg", &spi_reg),
+            ("clock-gates", &words(&[0x36])),
+        ],
+        &[nor],
+    );
+    let bytes = tree(&[(0x36, Some(0), [0, 0])], &[spi]);
+    let resources = inventory(&Node::root(&bytes).unwrap()).unwrap();
+
+    for path in [
+        "/arm-io/spi1",
+        "/arm-io/spi1/spinor",
+        "/arm-io/spi1/spinor/firmware",
+    ] {
+        let resource = resources.iter().find(|entry| entry.name == path).unwrap();
+        assert_eq!(
+            resource.owner,
+            Some(PowerOwner::Mmio(spi_address)),
+            "{path}"
+        );
+        assert_eq!(resource.clocks, [domain_id(0x36)], "{path}");
+        assert_eq!(resource.admission, Admission::Required, "{path}");
+    }
+}
+
+#[test]
 fn mmio_ownership_follows_supported_parent_aliases() {
     use crate::board::UART;
     let reg = |address: u64| {

@@ -1,0 +1,3 @@
+STELA UEFI MOUNT version=0.1.0
+HOST MEMORY free=3672M heap=1298M code=66M pool=64M guest=2244M profile=compact
+HOST SERVICE boundaries=33 maximum_gap_us=31591 gap=host_us/slice_us/kind:962/30628/guest maximum_service_us=3327 gpu_interrupts=0 linux_irqs=0 irq_quarantined=0 irq_fault=None longest_us reports=1274 service=1119 beat=962 pump=190 display=96 disk=67 total_us sliced=200292 reports=2610 service=1715 beat=2216 pump=312 display=145 disk=98 services waiting=0 boot=4 host_drivers_waited_us=0/0 host_drivers_held_us=88221@src/engine/kernel_work.rs:384 undelivered_doorbells=0 longest_us read=0 restore=0 usb=0 input=0 network=0 bluetooth=0 nor=175 log=187 total_us read=0 restore=0 usb=0 input=0 network=0 bluetooth=0 nor=191 log=204

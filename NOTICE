@@ -1,6 +1,10 @@
 Stela
 =====
 
+Northwood is a fork of Stela by tylertms and the Stela contributors.
+See LICENSING.md for the fork's third-party contribution policy and
+CREDITS.md for project and design attributions.
+
 Stela's own code is licensed under the GNU General Public License, version 2
 or (at your option) any later version (SPDX: GPL-2.0-or-later). The license
 text is in LICENSE. Files that say otherwise in their SPDX line or copyright
@@ -377,6 +381,15 @@ crates/stela-driver-gpu/src/: GPU sources and patch series
     WITH LLVM-exception ; BSD-3-Clause OR GPL-2.0 ; GPL-2.0-only ;
     GPL-2.0-or-later ; MIT
     lib/Makefile, lib/find_bit.c, lib/find_random_bit.c, lib/scatterlist*.c
+crates/stela-driver-gpu/src/intel/glk.rs: Gemini Lake PCI graphics memory
+  and Gen9 LP forcewake register references
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0-only ; MIT
+    arch/x86/kernel/early-quirks.c, drivers/gpu/drm/i915/gt/intel_ggtt.c,
+    drivers/gpu/drm/i915/gt/intel_gt_regs.h, drivers/gpu/drm/i915/i915_pci.c,
+    drivers/gpu/drm/i915/intel_uncore.c, include/drm/intel/i915_drm.h,
+    include/drm/intel/pciids.h
+    Intel Gemini Lake Datasheet Volume 2, document 336561, §§2.10 and 2.22
+    https://cdrdv2-public.intel.com/336561/336561-glk-datasheet-volume2.pdf
 crates/stela-driver-gpu/src/intel/wopcm/storage/: GuC firmware backing
   reference
     Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; MIT
@@ -553,6 +566,162 @@ crates/stela-driver-net/src/wifi/intel/: Intel standalone Wi-Fi firmware and
   AX200 ROM context
     Linux 59f9fc2ef8d1e312d2a613d4e1ffad2ff31a0a01; GPL-2.0 OR BSD-3-Clause
     drivers/net/wireless/intel/iwlwifi
+crates/stela-driver-net/src/wifi/intel/firmware/legacy.rs: Intel 9000-series
+  PCI candidate IDs, legacy firmware section ordering and INIT load status
+    Linux 347246472df854673f5f743e6895ab07302fbbb1; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/cfg/9000.c,
+    drivers/net/wireless/intel/iwlwifi/iwl-fh.h,
+    drivers/net/wireless/intel/iwlwifi/pcie/drv.c,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/trans.c,
+    drivers/net/wireless/intel/iwlwifi/fw/paging.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/service.rs: FH firmware
+  service-channel completion, SRAM addressing and NIC access
+    Linux 347246472df854673f5f743e6895ab07302fbbb1; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/iwl-csr.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-prph.h,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/internal.h,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/rx.c,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/trans.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/alive.rs: Intel API 46
+  v3 INIT and REGULAR ALIVE notification layout and wait behavior
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/fw/api/alive.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/cmdhdr.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/commands.h,
+    drivers/net/wireless/intel/iwlwifi/fw/notif-wait.c,
+    drivers/net/wireless/intel/iwlwifi/mvm/fw.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/rx.rs: Intel 9000
+  default RFH queue layout, DMA status and receive-buffer completion
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/cfg/9000.c,
+    drivers/net/wireless/intel/iwlwifi/cfg/rf-jf.c,
+    drivers/net/wireless/intel/iwlwifi/iwl-fh.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-trans.h,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/internal.h,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/rx.c,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/trans.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/rfh.rs: Intel 9000
+  RFH queue-zero MMIO, polled interrupt causes and requester stop
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/iwl-csr.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-fh.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-io.c,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/rx.c,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/trans.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/adapter.rs: Intel 9000
+  secure INIT CPU release, FH section status, RFH handoff and NVM ordering
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/iwl-csr.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-prph.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-io.c,
+    drivers/net/wireless/intel/iwlwifi/mvm/fw.c,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/internal.h,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/trans.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/adapter/regular.rs:
+  Intel 9000 stopped INIT handoff, dual-CPU REGULAR load, ALIVE sequencing,
+  and post-paging TX antenna, PHY DB, PHY configuration, Bluetooth
+  coexistence and SoC latency command order
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/mvm/fw.c,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/trans.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/hcmd.rs: Intel 9000
+  Gen1 command DMA layout, TFD publication and FH/SCD stop
+    Linux 347246472df854673f5f743e6895ab07302fbbb1; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/cfg/9000.c,
+    drivers/net/wireless/intel/iwlwifi/iwl-fh.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-prph.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-scd.h,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/internal.h,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/tx.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/hcmd/hardware.rs:
+  Intel 9000 FH queue registration and command-only SCD activation
+    Linux 347246472df854673f5f743e6895ab07302fbbb1; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/cfg/9000.c,
+    drivers/net/wireless/intel/iwlwifi/fw/api/txq.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-csr.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-fh.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-prph.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-scd.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-trans.h,
+    drivers/net/wireless/intel/iwlwifi/mvm/ops.c,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/trans.c,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/tx.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/nvm.rs: Intel 9000
+  read-only NVM access and extended identity fields
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/cfg/9000.c,
+    drivers/net/wireless/intel/iwlwifi/fw/api/commands.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/nvm-reg.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-csr.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-drv.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-nvm-parse.c,
+    drivers/net/wireless/intel/iwlwifi/iwl-trans.c,
+    drivers/net/wireless/intel/iwlwifi/mvm/nvm.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/paging.rs: Intel 9000
+  REGULAR firmware paging geometry, DMA blocks and FW_PAGING_BLOCK_CMD
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/fw/api/cmdhdr.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/commands.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/paging.h,
+    drivers/net/wireless/intel/iwlwifi/fw/img.h,
+    drivers/net/wireless/intel/iwlwifi/fw/paging.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/phy.rs: Intel 9000
+  INIT and REGULAR calibration TLVs, antenna masks, shared-clock profile,
+  and PHY configuration commands
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/cfg/9000.c,
+    drivers/net/wireless/intel/iwlwifi/fw/api/commands.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/config.h,
+    drivers/net/wireless/intel/iwlwifi/fw/file.h,
+    drivers/net/wireless/intel/iwlwifi/fw/img.c,
+    drivers/net/wireless/intel/iwlwifi/fw/img.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-drv.c,
+    drivers/net/wireless/intel/iwlwifi/mvm/fw.c,
+    drivers/net/wireless/intel/iwlwifi/mvm/mvm.h,
+    drivers/net/wireless/intel/iwlwifi/pcie/drv.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/phy_db.rs: Intel 9000
+  PHY DB notification records, replay order and PHY_DB_CMD serialization
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/fw/api/cmdhdr.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/commands.h,
+    drivers/net/wireless/intel/iwlwifi/iwl-phy-db.c,
+    drivers/net/wireless/intel/iwlwifi/iwl-trans.c
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/aux.rs: Intel 9000
+  first AUX queue and internal station command and status formats
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/fw/api/commands.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/mac.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/sta.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/tx.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/txq.h,
+    drivers/net/wireless/intel/iwlwifi/fw/file.h,
+    drivers/net/wireless/intel/iwlwifi/mvm/sta.c,
+    drivers/net/wireless/intel/iwlwifi/mvm/utils.c,
+    drivers/net/wireless/intel/iwlwifi/pcie/gen1_2/tx.c
+crates/stela-driver-net/src/wifi/intel/radio.rs:
+  MVM normal Bluetooth coexistence and SoC latency payloads, capability
+  gates, and Intel 9000 PCI profiles
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/cfg/9000.c,
+    drivers/net/wireless/intel/iwlwifi/fw/api/coex.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/commands.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/system.h,
+    drivers/net/wireless/intel/iwlwifi/fw/file.h,
+    drivers/net/wireless/intel/iwlwifi/fw/init.c,
+    drivers/net/wireless/intel/iwlwifi/iwl-trans.c,
+    drivers/net/wireless/intel/iwlwifi/mvm/coex.c,
+    drivers/net/wireless/intel/iwlwifi/mvm/constants.h,
+    drivers/net/wireless/intel/iwlwifi/mvm/mvm.h,
+    drivers/net/wireless/intel/iwlwifi/pcie/drv.c
+crates/stela-driver-net/src/wifi/intel/radio/control.rs:
+  MVM DQA capability gate and fixed command-queue payload
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
+    drivers/net/wireless/intel/iwlwifi/fw/api/commands.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/config.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/datapath.h,
+    drivers/net/wireless/intel/iwlwifi/fw/api/txq.h,
+    drivers/net/wireless/intel/iwlwifi/fw/file.h,
+    drivers/net/wireless/intel/iwlwifi/mvm/fw.c
 crates/stela-driver-net/src/wifi/intel/: Selected MLD link and station
   continuations
     Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause ;
@@ -720,6 +889,11 @@ crates/stela-driver-storage/src/nvme.rs, nvme/: NVMe error handling,
   namespace discovery, host memory buffer, shutdown and recovery
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-only
     drivers/nvme/host/core.c, drivers/nvme/host/pci.c
+    The Northwood ownership wrapper in
+    crates/stela-driver-storage/src/nvme/exclusive.rs and its model tests in
+    crates/stela-driver-storage/src/nvme/owned/tests/exclusive.rs are original
+    project code under GPL-2.0-or-later. They exercise the existing NVMe port
+    and its in-tree model.
 crates/stela-driver-storage/src/ahci.rs, ahci/: AHCI controller setup and
   libata error handling
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-or-later

@@ -72,6 +72,7 @@ pub(crate) static ALLOCATOR: heap::Heap = heap::Heap::new().reporting_failures(|
 fn initial_heap_bytes() -> Result<usize, EarlyText> {
     let map = uefi::boot::memory_map(MemoryType::LOADER_DATA)
         .map_err(|_| EarlyText::from("firmware memory map unavailable for the boot heap"))?;
+    system::report_initial_map(&map);
     let free = map
         .entries()
         .filter(|entry| entry.ty == MemoryType::CONVENTIONAL)
@@ -262,16 +263,22 @@ fn main() -> Status {
     let options = choice::resolve(&mut volume, options);
     status::done("");
     let held = system::held_at_start(&options);
-    let options = choice::choose(&mut volume, options, held);
+    let selected = choice::choose(&mut volume, options, held);
     status::take_screen(console::Framebuffer::from_firmware());
-    if options.starts_with(b"--system") {
-        system::boot(options, volume, log, host_firmware, snapshot);
+    if selected.options.starts_with(b"--system") {
+        system::boot(selected, volume, log, host_firmware, snapshot);
     }
+    let options = selected.options;
     drop(snapshot);
     if options.starts_with(stela_boot_core::options::HOST_CHECK.as_bytes()) {
-        drop(volume);
         #[cfg(feature = "diagnostics")]
-        host_check::boot(options);
+        {
+            let settings =
+                firmware::diagnostic_northwood_config(&mut volume, selected.entry.as_deref());
+            let install_target = choice::diagnostic_disk(&mut volume);
+            drop(volume);
+            host_check::boot(options, host_firmware, settings, install_target);
+        }
         #[cfg(not(feature = "diagnostics"))]
         output::fatal("host checks require a diagnostics build");
     }

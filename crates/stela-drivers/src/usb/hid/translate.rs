@@ -91,6 +91,12 @@ impl Translator {
         self.reports.keys.is_some() || self.reports.pointer.is_some()
     }
 
+    /// The input report feeding the native relative pointer, if any.
+    pub(crate) fn relative_pointer_report(&self) -> Option<u8> {
+        let pointer = self.reports.pointer.as_ref()?;
+        pointer.x?.relative.then_some(pointer.report.unwrap_or(0))
+    }
+
     /// Keyboard reports holding usages the native keyboard cannot report.
     pub fn dropped(&self) -> u64 {
         self.dropped

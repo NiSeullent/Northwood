@@ -871,13 +871,14 @@ attachment_accesses(const struct stela_metal_specialization *specialization,
    return true;
 }
 
-nir_shader *
-stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
-                              const struct stela_metal_target *target,
-                              const struct stela_metal_specialization *specialization,
-                              const struct stela_metal_reflection *reflection,
-                              struct stela_air_error *error)
+static nir_shader *
+compile_reflected(const void *air, size_t size, const char *entry,
+                  const struct stela_metal_target *target,
+                  const struct stela_metal_specialization *specialization,
+                  const struct stela_metal_reflection *reflection,
+                  struct stela_air_error *error, enum stela_air_backend_profile profile)
 {
+   const bool software_half = profile != STELA_AIR_BACKEND_NATIVE;
    struct stela_air_error local = {0};
    if (!error)
       error = &local;
@@ -908,6 +909,11 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
       reflection = owned_reflection;
    }
    enum stela_metal_function_stage stage = reflection->stage;
+   if (software_half && (specialization->tile ||
+       (stage != STELA_METAL_KERNEL && stage != STELA_METAL_VERTEX && stage != STELA_METAL_FRAGMENT))) {
+      fail(error, STELA_AIR_TARGET, "software binary16 supports kernels and ordinary vertex/fragment stages");
+      goto done;
+   }
    if (stage == STELA_METAL_VISIBLE) {
       fail(error, STELA_AIR_ARGUMENT, "visible functions compile into the functions that link them");
       goto done;
@@ -918,6 +924,10 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
     * stage, which no vertex stage can take the place of. */
    const struct stela_metal_tessellation *tessellation = specialization->tessellation;
    bool patch = reflection->patch != STELA_AIR_PATCH_NONE;
+   if (software_half && (tessellation || patch)) {
+      fail(error, STELA_AIR_TARGET, "software binary16 does not support tessellation");
+      goto done;
+   }
    if (patch && !tessellation) {
       fail(error, STELA_AIR_ARGUMENT, "post-tessellation vertex functions need tessellation stages");
       goto done;
@@ -1030,7 +1040,9 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
       resources.tile = &tile;
    }
    if (stage == STELA_METAL_KERNEL) {
-      shader = stela_air_to_nir(air, size, entry, target->nir, &resources, error);
+      shader = software_half ?
+         stela_air_software_to_nir(air, size, entry, target->nir, &resources, profile, error) :
+         stela_air_to_nir(air, size, entry, target->nir, &resources, error);
       goto done;
    }
    struct stela_air_varying_slot rows[STELA_METAL_VARYINGS];
@@ -1067,10 +1079,45 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
       .vertex_input_words = fetches_words ? words : NULL,
       .decode_vertex_input = decode_vertex_input,
    };
-   shader = stela_air_metal_stage_to_nir(air, size, entry, target->nir, &options, error);
+   shader = software_half ?
+      stela_air_metal_software_stage_to_nir(air, size, entry, target->nir, &options, profile, error) :
+      stela_air_metal_stage_to_nir(air, size, entry, target->nir, &options, error);
 done:
    free(owned_reflection);
    return shader;
+}
+
+nir_shader *
+stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
+                             const struct stela_metal_target *target,
+                             const struct stela_metal_specialization *specialization,
+                             const struct stela_metal_reflection *reflection,
+                             struct stela_air_error *error)
+{
+   return compile_reflected(air, size, entry, target, specialization, reflection, error,
+                            STELA_AIR_BACKEND_NATIVE);
+}
+
+nir_shader *
+stela_metal_compile_software_reflected(const void *air, size_t size, const char *entry,
+                                      const struct stela_metal_target *target,
+                                      const struct stela_metal_specialization *specialization,
+                                      const struct stela_metal_reflection *reflection,
+                                      struct stela_air_error *error)
+{
+   return compile_reflected(air, size, entry, target, specialization, reflection, error,
+                            STELA_AIR_BACKEND_SOFTWARE);
+}
+
+nir_shader *
+stela_metal_compile_lavapipe_reflected(const void *air, size_t size, const char *entry,
+                                      const struct stela_metal_target *target,
+                                      const struct stela_metal_specialization *specialization,
+                                      const struct stela_metal_reflection *reflection,
+                                      struct stela_air_error *error)
+{
+   return compile_reflected(air, size, entry, target, specialization, reflection, error,
+                            STELA_AIR_BACKEND_PATCHED_LAVAPIPE);
 }
 
 nir_shader *

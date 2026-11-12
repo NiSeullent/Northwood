@@ -73,6 +73,23 @@ impl Host for BareHost<'_> {
         })
     }
 
+    fn device_site_ram(
+        &self,
+    ) -> Result<Option<stela_engine::machine::engine::DeviceSiteRam>, MemoryStatus> {
+        let state = state();
+        Ok(state
+            .registered_ram
+            .as_ref()
+            .map(|ram| stela_engine::machine::engine::DeviceSiteRam {
+                ram: Arc::clone(ram),
+                expected_generation: state.native_ram_generation,
+            }))
+    }
+
+    fn device_site_has_retained_ram(&self, page: u64) -> bool {
+        ram::contains(&state().ram, page)
+    }
+
     fn read_ram_descriptor(&mut self, physical: u64) -> Option<u64> {
         super::super::speculation::fence();
         if let Some(ram) = &state().registered_ram {
@@ -355,7 +372,17 @@ impl Host for BareHost<'_> {
     }
 
     unsafe fn execute(&mut self, code: NativeCode, guest: &mut GuestState) -> NativeExit {
-        assert!(!state().native, "nested native block entry");
+        // SAFETY: forwarded under the installed system block contract.
+        unsafe { self.try_execute(code, guest) }
+            .unwrap_or_else(|reason| crate::output::fatal(reason))
+    }
+
+    unsafe fn try_execute(
+        &mut self,
+        code: NativeCode,
+        guest: &mut GuestState,
+    ) -> Result<NativeExit, NativeEntryError> {
+        state().begin_native_ram()?;
         state().native = true;
         state().load_pan();
         let entered = rdtsc();
@@ -363,7 +390,7 @@ impl Host for BareHost<'_> {
         let exit = unsafe { stela_enter_block(guest, code.0) };
         state().follow_native();
         state().follow_pan(guest.pan != 0);
-        native_return(code, exit, entered)
+        Ok(native_return(code, exit, entered))
     }
 
     unsafe fn execute_context(
@@ -372,7 +399,13 @@ impl Host for BareHost<'_> {
         guest: &mut GuestState,
         context: &mut stela_compiler::context::ExecutionContext,
     ) -> Option<NativeExit> {
-        assert!(!state().native, "nested native context entry");
+        let host_state = state();
+        assert!(
+            !host_state.native && host_state.native_ram_execution.is_none(),
+            "nested native context entry"
+        );
+        // The checked engine context owns its own execution session. It
+        // accesses RAM through callbacks and receives no raw shadow lease.
         #[cfg(feature = "native-profile")]
         let measured = state().native_profile.work_start(
             stela_engine::machine::engine::NativeTimingWork::NativeCall,
@@ -569,6 +602,31 @@ impl Host for BareHost<'_> {
 
     fn invalidate_translations(&mut self) {
         state().reset_shadow(Cause::Invalidated);
+    }
+
+    fn revoke_ram_cpu_mappings(
+        &mut self,
+        request: &stela_engine::machine::engine::publication::RamCpuMappingRevocation,
+    ) -> bool {
+        let state = state();
+        if state.native
+            || !state
+                .registered_ram
+                .as_ref()
+                .is_some_and(|ram| request.belongs_to(ram))
+        {
+            return false;
+        }
+
+        state.clear_shadow(Cause::Invalidated);
+        state.tlb.clear();
+        if let Some(bounce) = &mut state.bounce {
+            bounce.revoke();
+        }
+        // These guest-facing leaves are non-global. Flush every PCID here,
+        // including one a loader-root guard could restore without flushing.
+        crate::native_mmio::shootdown::flush();
+        true
     }
 
     fn invalidate_reach(&mut self, reach: Reach, everywhere: Everywhere) {

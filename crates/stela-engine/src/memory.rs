@@ -19,7 +19,7 @@ pub mod system_ram;
 use stela_contracts::{refuse, require};
 pub use system_ram::{
     CanonicalRamService, RegisteredSystemRam, RegistrationError as SystemRamRegistrationError,
-    ReservedSystemRamRange,
+    ReservedSystemRamRange, WiredRam,
 };
 pub mod stage1;
 mod storage;

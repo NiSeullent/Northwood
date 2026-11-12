@@ -132,6 +132,7 @@ pub enum Role {
     Staging,
     MachineState,
     Cache,
+    NorthwoodSwap,
 }
 
 impl Role {
@@ -141,6 +142,12 @@ impl Role {
         Self::Cache,
         Self::AppleRegion,
     ];
+    /// E9AFCDBE-E70E-40C5-8A5F-AF97B70BD75D in GPT byte order.
+    pub const NORTHWOOD_SWAP_TYPE: Guid = Guid([
+        0xbe, 0xcd, 0xaf, 0xe9, 0x0e, 0xe7, 0xc5, 0x40, 0x8a, 0x5f, 0xaf, 0x97, 0xb7, 0x0b, 0xd7,
+        0x5d,
+    ]);
+    pub const NORTHWOOD_SWAP_NAME: &str = "Northwood Swap";
 
     pub fn type_guid(self) -> Guid {
         Guid::parse(match self {
@@ -149,6 +156,7 @@ impl Role {
             Self::Staging => "99D6A603-EC02-4167-A0AB-653442B4A265",
             Self::MachineState => "EC61F267-6C83-493C-9BBE-DD26518023BD",
             Self::Cache => "F4F9CDCC-7F4D-4331-A060-8FB3D87B54B8",
+            Self::NorthwoodSwap => return Self::NORTHWOOD_SWAP_TYPE,
         })
         .expect("constant GUID")
     }
@@ -160,11 +168,12 @@ impl Role {
             Self::Staging => "Stela staging",
             Self::MachineState => "Stela machine state",
             Self::Cache => "Stela translation cache",
+            Self::NorthwoodSwap => Self::NORTHWOOD_SWAP_NAME,
         }
     }
 
     fn of(type_guid: Guid) -> Option<Self> {
-        [Self::Esp]
+        [Self::Esp, Self::NorthwoodSwap]
             .into_iter()
             .chain(Self::STELA)
             .find(|role| role.type_guid() == type_guid)
@@ -239,6 +248,8 @@ fn guid_at(bytes: &[u8], at: usize) -> Guid {
 /// partitions may use.
 pub struct HeaderInfo {
     pub disk_guid: Guid,
+    alternate_lba: u64,
+    supported_header: bool,
     pub first_usable: u64,
     /// Inclusive, as in the header.
     pub last_usable: u64,
@@ -270,13 +281,18 @@ pub fn parse_header(
     if !(HEADER_BYTES..=disk.block_bytes as u32).contains(&size) {
         return Err(PayloadError::Disk("GPT header size"));
     }
-    let mut copy = block[..size as usize].to_vec();
+    let mut copy = block
+        .get(..size as usize)
+        .ok_or(PayloadError::Disk("truncated GPT header"))?
+        .to_vec();
     copy[16..20].fill(0);
     if crc32(&copy) != le32(block, 16) {
         return Err(PayloadError::Disk("GPT header CRC mismatch"));
     }
     let info = HeaderInfo {
         disk_guid: guid_at(block, 56),
+        alternate_lba: le64(block, 32),
+        supported_header: le32(block, 8) == REVISION && le32(block, 20) == 0,
         first_usable: le64(block, 40),
         last_usable: le64(block, 48),
         entries_lba: le64(block, 72),
@@ -378,23 +394,53 @@ pub fn plan(
     disk: Disk,
     existing: Option<&Table>,
     request: Request,
+    entropy: impl FnMut() -> [u8; 16],
+) -> Result<Plan, PayloadError> {
+    plan_with_swap(disk, existing, request, None, entropy)
+}
+
+/// Plan the same install layout, reserving an optional swap partition when
+/// building a fresh Apple region. An existing Apple region is never shrunk.
+/// The setup caller is responsible for formatting the swap store itself.
+pub fn plan_with_swap(
+    disk: Disk,
+    existing: Option<&Table>,
+    request: Request,
+    swap_bytes: Option<core::num::NonZeroU64>,
     mut entropy: impl FnMut() -> [u8; 16],
 ) -> Result<Plan, PayloadError> {
     disk.validate()?;
     let bytes = |blocks: u64| blocks * disk.block_bytes;
     let blocks = |bytes: u64| bytes / disk.block_bytes;
+    let mut has_swap = false;
     if let Some(table) = existing {
         if table.partitions.iter().any(|p| p.role().is_none()) {
             return Err(PayloadError::Disk(
                 "target disk has a partition that is neither an ESP nor Stela's",
             ));
         }
-        let present: Vec<&Partition> = table
+        let mut swap = table
             .partitions
             .iter()
-            .filter(|p| p.role().is_some_and(|r| r != Role::Esp))
-            .collect();
-        if !present.is_empty() {
+            .filter(|p| p.role() == Some(Role::NorthwoodSwap));
+        if let Some(partition) = swap.next() {
+            if swap.next().is_some() {
+                return Err(PayloadError::Disk("several Northwood Swap partitions"));
+            }
+            if swap_bytes
+                .is_some_and(|size| partition.blocks() < size.get().div_ceil(disk.block_bytes))
+            {
+                return Err(PayloadError::Disk(
+                    "existing Northwood Swap partition is too small",
+                ));
+            }
+            has_swap = true;
+        }
+        if table
+            .partitions
+            .iter()
+            .any(|p| p.role().is_some_and(|role| Role::STELA.contains(&role)))
+        {
             let complete = Role::STELA.iter().all(|role| {
                 table
                     .partitions
@@ -408,6 +454,9 @@ pub fn plan(
                 .iter()
                 .find(|p| p.role() == Some(Role::Staging));
             return match (complete, staging) {
+                (true, Some(_)) if swap_bytes.is_some() && !has_swap => Err(PayloadError::Disk(
+                    "existing Apple region must be kept; place swap in an unused GPT gap",
+                )),
                 (true, Some(staging)) if bytes(staging.blocks()) >= request.staging_bytes => {
                     Ok(Plan {
                         table: table.clone(),
@@ -456,6 +505,26 @@ pub fn plan(
             .partitions
             .push(new_partition(role, first, count, &mut entropy));
         next = first + count;
+    }
+    if let Some(size) = swap_bytes.filter(|_| !has_swap) {
+        let first = align_up(next, alignment);
+        let count = size
+            .get()
+            .div_ceil(ALIGNMENT)
+            .checked_mul(alignment)
+            .ok_or(PayloadError::Disk("Northwood Swap size overflows"))?;
+        next = first
+            .checked_add(count)
+            .filter(|&after| after <= end)
+            .ok_or(PayloadError::Disk(
+                "target disk has no room for Northwood Swap",
+            ))?;
+        table.partitions.push(new_partition(
+            Role::NorthwoodSwap,
+            first,
+            count,
+            &mut entropy,
+        ));
     }
     let first = align_up(next, alignment);
     let last = (end / alignment) * alignment;
@@ -619,7 +688,7 @@ pub enum Found {
 enum Side {
     Absent,
     Damaged(PayloadError),
-    Valid(Table),
+    Valid(Table, HeaderInfo),
 }
 
 fn copy_at(
@@ -634,19 +703,29 @@ fn copy_at(
         Err(error) => return Ok(Side::Damaged(error)),
     };
     let blocks = info.entry_array_bytes().div_ceil(disk.block_bytes);
-    if info.entries_lba + blocks > disk.blocks {
+    let Some(entries_end) = info.entries_lba.checked_add(blocks) else {
+        return Ok(Side::Damaged(PayloadError::Disk(
+            "GPT entry array outside the disk",
+        )));
+    };
+    if entries_end > disk.blocks {
         return Ok(Side::Damaged(PayloadError::Disk(
             "GPT entry array outside the disk",
         )));
     }
-    if info.last_usable >= disk.blocks {
+    let usable = info.first_usable..=info.last_usable;
+    if info.first_usable <= 1
+        || info.last_usable >= disk.blocks - 1
+        || usable.contains(&lba)
+        || (info.entries_lba <= info.last_usable && entries_end > info.first_usable)
+    {
         return Ok(Side::Damaged(PayloadError::Disk(
-            "GPT usable range outside the disk",
+            "GPT usable range overlaps disk metadata",
         )));
     }
     let entries = read(info.entries_lba, blocks)?;
     Ok(match parse_entries(&info, &entries) {
-        Ok(table) => Side::Valid(table),
+        Ok(table) => Side::Valid(table, info),
         Err(error) => Side::Damaged(error),
     })
 }
@@ -656,6 +735,66 @@ fn protective(block: &[u8]) -> bool {
     block.len() >= 512
         && block[510..512] == [0x55, 0xaa]
         && (0..4).any(|n| block[446 + 16 * n + 4] == 0xee)
+}
+
+/// Admit writes within an existing partition only when the primary and
+/// backup agree and keep their entry arrays on opposite sides of the
+/// usable range. A protective MBR must cover the disk without any
+/// additional partition entries.
+pub fn read_for_write(
+    disk: Disk,
+    mut read: impl FnMut(u64, u64) -> Result<Vec<u8>, PayloadError>,
+) -> Result<Table, PayloadError> {
+    disk.validate()?;
+    let last = disk.blocks - 1;
+    let Side::Valid(table, primary) = copy_at(disk, 1, &mut read)? else {
+        return Err(PayloadError::Disk("invalid primary GPT"));
+    };
+    let Side::Valid(copy, backup) = copy_at(disk, last, &mut read)? else {
+        return Err(PayloadError::Disk("invalid backup GPT"));
+    };
+    if !primary.supported_header
+        || !backup.supported_header
+        || primary.first_usable < disk.first_usable()
+        || primary.last_usable > disk.last_usable()
+    {
+        return Err(PayloadError::Disk(
+            "unsupported GPT header fields for writing",
+        ));
+    }
+    if table != copy
+        || primary.alternate_lba != last
+        || backup.alternate_lba != 1
+        || primary.first_usable != backup.first_usable
+        || primary.last_usable != backup.last_usable
+        || primary.entry_count != backup.entry_count
+        || primary.entry_bytes != backup.entry_bytes
+        || primary.entries_crc != backup.entries_crc
+        || primary.entries_lba + primary.entry_array_bytes().div_ceil(disk.block_bytes)
+            > primary.first_usable
+        || backup.entries_lba <= backup.last_usable
+        || backup.entries_lba + backup.entry_array_bytes().div_ceil(disk.block_bytes) > last
+    {
+        return Err(PayloadError::Disk("the primary and backup GPTs disagree"));
+    }
+    let mbr = read(0, 1)?;
+    if !protective(&mbr) {
+        return Err(PayloadError::Disk("the protective MBR is missing"));
+    }
+    let protected = last.min(u64::from(u32::MAX)) as u32;
+    let mut entries = mbr[446..510]
+        .chunks_exact(16)
+        .filter(|entry| entry.iter().any(|&byte| byte != 0));
+    let protection = entries.next().is_some_and(|entry| {
+        entry[0] == 0
+            && entry[4] == 0xee
+            && entry[8..12] == 1u32.to_le_bytes()
+            && entry[12..16] == protected.to_le_bytes()
+    });
+    if !protection || entries.next().is_some() {
+        return Err(PayloadError::Disk("hybrid or incomplete protective MBR"));
+    }
+    Ok(table)
 }
 
 /// Every 128-byte entry is zero or names an ESP or Stela role, and one is
@@ -696,10 +835,10 @@ pub fn read(
     let primary = copy_at(disk, 1, &mut read)?;
     let backup = copy_at(disk, last, &mut read)?;
     match (primary, backup) {
-        (Side::Valid(table), backup) => {
+        (Side::Valid(table, _), backup) => {
             let repair = match backup {
-                Side::Valid(copy) if copy == table => None,
-                Side::Valid(_) => Some("the backup GPT differs from the primary"),
+                Side::Valid(copy, _) if copy == table => None,
+                Side::Valid(..) => Some("the backup GPT differs from the primary"),
                 Side::Absent => Some("the backup GPT is missing"),
                 Side::Damaged(_) => Some("the backup GPT is damaged"),
             };
@@ -709,7 +848,7 @@ pub fn read(
             };
             Ok(Found::Table { table, repair })
         }
-        (primary, Side::Valid(table)) => Ok(Found::Table {
+        (primary, Side::Valid(table, _)) => Ok(Found::Table {
             table,
             repair: Some(match primary {
                 Side::Absent => "the primary GPT is missing",

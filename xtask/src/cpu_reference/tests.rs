@@ -16,7 +16,7 @@ fn every_case_is_recorded() {
 fn stela_matches_the_recorded_mac() {
     let table = recorded().unwrap();
     let cases = corpus::all();
-    let endings = stela::run(&cases).unwrap();
+    let endings = stela::run(&cases, TargetCpu::detect()).unwrap();
     let mut unexpected = Vec::new();
     for (case, ending) in cases.iter().zip(&endings) {
         let stela = record::outcome(case, ending);

@@ -16,6 +16,7 @@ name = "stela"
 path = "src/main.rs"
 
 [dependencies]
+northwood-config = { path = "../northwood-config", features = ["std"] }
 stela-gpu-maintenance.workspace = true
 stela-soc-data = { path = "../stela-soc-data", default-features = false }
 stela-engine = { path = "../stela-engine" }
@@ -29,7 +30,7 @@ sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
 stela-drivers.workspace = true
-stela-boot-core.workspace = true
+stela-boot-core = { workspace = true, features = ["config-validation"] }
 stela-soc.workspace = true
 stela-runtime.workspace = true
 stela-loader.workspace = true

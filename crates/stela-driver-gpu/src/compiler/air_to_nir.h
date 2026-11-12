@@ -4,6 +4,7 @@
 
 #include "compiler/nir/nir_builder.h"
 #include "air_metadata.h"
+#include "air_soft_half.h"
 #include <stddef.h>
 
 /* User-space compiler boundary. LLVM and Mesa must be built for this process's
@@ -715,6 +716,14 @@ nir_shader *stela_air_metal_stage_to_nir(const void *, size_t, const char *entry
                                         const struct stela_air_stage_options *,
                                         struct stela_air_error *);
 
+/* Ordinary vertex/fragment stages with software binary16 ALU lowering. The
+ * backend profile controls which FP32 arithmetic the shader may request. */
+nir_shader *stela_air_metal_software_stage_to_nir(const void *, size_t, const char *entry,
+                                                 const nir_shader_compiler_options *,
+                                                 const struct stela_air_stage_options *,
+                                                 enum stela_air_backend_profile,
+                                                 struct stela_air_error *);
+
 /* Input is the hash-checked raw AIR bitcode selected by the archive reader.
  * Success transfers ownership of a real NIR shader to the caller (ralloc_free).
  * Failure returns NULL, destroys partial NIR, and reports an explicit error.
@@ -753,4 +762,16 @@ nir_shader *stela_air_to_nir(const void *bitcode, size_t size, const char *entry
                             const nir_shader_compiler_options *nir_options,
                             const struct stela_air_options *options,
                             struct stela_air_error *error);
+
+/* Compute frontend for a software target with 16-bit integer SSA and no
+ * native FP16. Supports register-only half add, subtract, multiply, fused
+ * multiply-add and round-to-nearest-even FP32 conversions. Other half
+ * arithmetic and 16-bit memory/texture interfaces refuse explicitly. An
+ * input that requires preserving FP32 subnormals cannot use arbitrary FP32
+ * arithmetic on this target. */
+nir_shader *stela_air_software_to_nir(const void *bitcode, size_t size, const char *entry,
+                                     const nir_shader_compiler_options *nir_options,
+                                     const struct stela_air_options *options,
+                                     enum stela_air_backend_profile profile,
+                                     struct stela_air_error *error);
 #endif

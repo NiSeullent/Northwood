@@ -35,18 +35,18 @@ use crate::efi;
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{fmt::Write as _, fs, path::Path};
+use stela_loader::mount_interface::layout::Layout;
 
 pub(super) fn version_id(image: &[u8]) -> String {
     let digest = hex::encode(Sha256::digest(image));
     digest[..16].into()
 }
 
-pub(super) fn check_firmware_support(esp: &Path, image: &[u8]) -> Result<()> {
-    stela_loader::host_firmware::check_installed_mount(
-        &esp.join(stela_loader::host_firmware::DIRECTORY),
-        image,
-    )
-    .context("stela.efi cannot load installed host firmware")?;
+pub(super) fn check_firmware_support(esp: &Path, layout: Layout, image: &[u8]) -> Result<()> {
+    super::check_layout_efi(layout, image)?;
+    let catalog = super::firmware::catalog_directory(esp, layout, image)?;
+    stela_loader::host_firmware::check_installed_mount(&catalog, image)
+        .context("stela.efi cannot load installed host firmware")?;
     Ok(())
 }
 
@@ -54,7 +54,7 @@ pub(super) fn check_firmware_support(esp: &Path, image: &[u8]) -> Result<()> {
 /// restore bundles and medium are the startup choices' from now on.
 fn activate_build(record: &mut Record, build: &str) -> Result<()> {
     record.build = build.into();
-    record.bundle_directory = bundle::build_directory(&record.volume, build);
+    record.bundle_directory = bundle::build_directory_in(&record.volume, record.layout, build);
     publish(record)
 }
 
@@ -69,7 +69,7 @@ pub(super) fn prune(record: &mut Record) -> Result<()> {
     record.bundles = active;
     super::remove_bundles(record, &stale)?;
     for build in stale.iter().map(|b| &b.build) {
-        let directory = bundle::build_directory(&record.volume, build);
+        let directory = bundle::build_directory_in(&record.volume, record.layout, build);
         if *build != record.build && directory.is_dir() {
             fs::remove_dir_all(directory)?;
         }
@@ -122,7 +122,7 @@ pub(super) fn update_stela(
         dry_run,
     } = options;
     let image = read_efi(environment, image_path)?;
-    check_firmware_support(&record.esp, &image)?;
+    check_firmware_support(&record.esp, record.layout, &image)?;
     let to = version_id(&image);
     let to_generation = environment.generation();
     ready(&record, usb)?;
@@ -135,7 +135,7 @@ pub(super) fn update_stela(
     text.push_str(&super::fdr::prepare(&record, true)?);
     // The firmware the last boot asked for and the USB lacks, which every
     // update that changes something adds.
-    let requested = super::firmware::requested(&esp, &image)?;
+    let requested = super::firmware::requested_in(&esp, record.layout, &image)?;
     for line in requested.lines() {
         writeln!(text, "  firmware       {line}")?;
     }
@@ -244,8 +244,9 @@ pub(super) fn update_stela(
             text,
             "  {:<14} {} ({to_generation}, {}), replaces {from_generation}",
             bundle.kind.label(),
-            bundle::directory_of(
+            bundle::directory_of_in(
                 &record.volume,
+                record.layout,
                 bundle::Identity {
                     kind: bundle.kind,
                     build: &bundle.build,
@@ -288,11 +289,11 @@ pub(super) fn update_stela(
         store.publish()?;
     }
     super::fdr::prepare(&record, false)?;
-    efi::add_mount(&esp, &image, None, None)?;
+    efi::add_mount_in(&esp, &image, None, None, record.layout)?;
     activate(&mut record, to)?;
     // A USB whose setup left its Wi-Fi network without firmware gets it now.
     if record.wifi.is_some() {
-        super::firmware::provision_wifi(environment.host, &esp, &image)?;
+        super::firmware::provision_wifi_in(environment.host, &esp, record.layout, &image)?;
     }
     requested.provision(&esp, &image)?;
     text.push_str("Done.\n");

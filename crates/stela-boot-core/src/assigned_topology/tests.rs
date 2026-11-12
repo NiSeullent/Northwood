@@ -561,24 +561,30 @@ fn original_t8112_adapter_joins_dense_driver_ids_to_physical_first_p_resources()
     let source = Source::t8112(&original, &live, identity, 0x100).unwrap();
     let capture = capture();
     let roster = BspRoster::observed(&capture, 0, 42).unwrap();
-    let prepared = source.prepare(&roster, profile.clone()).unwrap();
-    assert_eq!(prepared.plan.pes().len(), 1);
-    assert_eq!(prepared.profile.processors.len(), 1);
-    let join = prepared.join(0x100).unwrap();
-    assert_eq!((join.logical, join.worker, join.apic), (0, 0, 42));
-    assert_eq!(
-        (join.enable_core.argument, join.error_interrupt),
-        (0x10, 0x66)
-    );
-    assert_eq!((join.core_power.device, join.cluster_power.device), (5, 10));
-    assert_eq!(word(&prepared.tree, "/cpus/cpu4", "cpu-id"), Ok(0));
-    assert_eq!(word(&prepared.tree, "/cpus/cpu4", "reg"), Ok(0x100));
-    assert_eq!(word(&prepared.tree, "/cpus", "max_cpus"), Ok(1));
-    assert_eq!(prepared.receipt.cpu_ids[0].original_id, 4);
-    assert_eq!(
-        prepared.tree.node("/arm-io/pmgr"),
-        tree.node("/arm-io/pmgr")
-    );
+    let has_legacy_clusters = tree.property("/arm-io/pmgr", "clusters").is_some();
+    let prepared = source.prepare(&roster, profile.clone());
+    if has_legacy_clusters {
+        assert!(prepared.err().unwrap().to_string().contains("J473 PMGR"));
+    } else {
+        let prepared = prepared.unwrap();
+        assert_eq!(prepared.plan.pes().len(), 1);
+        assert_eq!(prepared.profile.processors.len(), 1);
+        let join = prepared.join(0x100).unwrap();
+        assert_eq!((join.logical, join.worker, join.apic), (0, 0, 42));
+        assert_eq!(
+            (join.enable_core.argument, join.error_interrupt),
+            (0x10, 0x66)
+        );
+        assert_eq!((join.core_power.device, join.cluster_power.device), (5, 10));
+        assert_eq!(word(&prepared.tree, "/cpus/cpu4", "cpu-id"), Ok(0));
+        assert_eq!(word(&prepared.tree, "/cpus/cpu4", "reg"), Ok(0x100));
+        assert_eq!(word(&prepared.tree, "/cpus", "max_cpus"), Ok(1));
+        assert_eq!(prepared.receipt.cpu_ids[0].original_id, 4);
+        assert_eq!(
+            prepared.tree.node("/arm-io/pmgr"),
+            tree.node("/arm-io/pmgr")
+        );
+    }
     assert_eq!(source.resources.source(), original);
     // Construction fixture only: exercise the selected-source to
     // loader cache-interval/watchdog/profile projection boundary at every
@@ -604,7 +610,12 @@ fn original_t8112_adapter_joins_dense_driver_ids_to_physical_first_p_resources()
                 })
                 .collect(),
         );
-        let selected = Source::t8112_assigned(&original, &live, identity, 0x100, count).unwrap();
+        let selected = Source::t8112_assigned(&original, &live, identity, 0x100, count);
+        if has_legacy_clusters && count < 8 {
+            assert!(selected.err().unwrap().to_string().contains("J473 PMGR"));
+            continue;
+        }
+        let selected = selected.unwrap();
         let prepared = selected.prepare(&roster, profile.clone()).unwrap();
         let board = board::board(&prepared.tree.serialize()).unwrap();
         assert_eq!(board.boot_processor.unwrap().cpu, 0);
@@ -622,6 +633,10 @@ fn original_t8112_adapter_joins_dense_driver_ids_to_physical_first_p_resources()
             [0x100, 0x101, 0x102, 0x103, 0, 1, 2, 3][..count]
         );
         assert_eq!(prepared.receipt.cpu_ids.len(), count);
+        assert_eq!(
+            prepared.tree.node("/arm-io/pmgr"),
+            tree.node("/arm-io/pmgr")
+        );
     }
     let override_live = captured_live_tree(tree, "-v acc-harvesting=0");
     assert!(

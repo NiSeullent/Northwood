@@ -54,6 +54,10 @@ impl Output {
     pub fn written(&self) -> u64 {
         self.written
     }
+    /// Bytes in the current buffer the stream has yet to accept.
+    pub(super) fn remaining(&self) -> usize {
+        self.bytes.len() - self.at
+    }
     /// Take the emptied buffer after a successful send.
     pub(super) fn take_completed_buffer(&mut self) -> Vec<u8> {
         debug_assert!(!self.is_pending());

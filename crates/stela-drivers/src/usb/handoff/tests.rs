@@ -153,7 +153,8 @@ fn ehci_firmware_releases_its_semaphore_and_its_smis_go_off() {
         handed,
         Handed {
             from_firmware: true,
-            forced: false
+            forced: false,
+            legacy_released: true,
         }
     );
     assert_eq!(config.words[usize::from(EECP / 4)], EHCI_LEGSUP | 1 << 24);
@@ -224,7 +225,8 @@ fn ohci_routing_returns_on_ownership_change_or_is_cleared() {
             handed,
             Handed {
                 from_firmware: true,
-                forced: !releases
+                forced: !releases,
+                legacy_released: true,
             }
         );
         assert_eq!(registers.word(OHCI_CONTROL), OHCI_CTRL_RWC);
@@ -246,6 +248,7 @@ fn uhci_set_up_by_firmware_is_reset_with_legacy_support_cleared() {
     )
     .unwrap();
     assert!(handed.from_firmware);
+    assert!(handed.legacy_released);
     assert_eq!(config.read16(UHCI_LEGSUP).unwrap(), UHCI_LEGSUP_RWC);
     assert_eq!(
         ports.writes,
@@ -304,13 +307,38 @@ fn xhci_legacy_support_is_taken_and_the_controller_halted() {
         handed,
         Handed {
             from_firmware: true,
-            forced: false
+            forced: false,
+            legacy_released: true,
         }
     );
     assert_eq!(registers.word(0x110), XHCI_LEGACY | XHCI_OS_OWNED);
     // The SMI enables are clear and the RW1C events written back.
     assert_eq!(registers.word(0x114), XHCI_LEGACY_SMI_EVENTS);
     assert_eq!(registers.word(0x20 + XHCI_USBCMD), 0);
+}
+
+#[test]
+fn xhci_legacy_readback_can_withhold_i8042_without_refusing_usb() {
+    let _time = crate::test_clock::virtualize();
+    let minimum = crate::minimum_model::owned(clock());
+    let mut registers = Model::with(&[(0x110, XHCI_LEGACY)]);
+    registers.react = Some(|words, offset, _| {
+        if offset == 0x114 {
+            *words.get_mut(&offset).unwrap() |= 1;
+        }
+    });
+    let handed = xhci_legacy(&mut registers, 0x110, clock(), minimum.as_ref()).unwrap();
+    assert_eq!(registers.word(0x110), XHCI_LEGACY | XHCI_OS_OWNED);
+    assert!(!handed.legacy_released);
+
+    registers.react = Some(|words, offset, _| {
+        if offset == 0x110 {
+            *words.get_mut(&offset).unwrap() &= !XHCI_OS_OWNED;
+        }
+    });
+    let handed = xhci_legacy(&mut registers, 0x110, clock(), minimum.as_ref()).unwrap();
+    assert_eq!(registers.word(0x114) & XHCI_LEGACY_SMI_ENABLES, 0);
+    assert!(!handed.legacy_released);
 }
 
 #[test]
@@ -460,7 +488,8 @@ fn early_ehci_handoff_takes_the_semaphore_and_clears_the_smis() {
         handed,
         Some(Ok(Handed {
             from_firmware: true,
-            forced: false
+            forced: false,
+            legacy_released: true,
         }))
     );
     let words = &function.config().words;

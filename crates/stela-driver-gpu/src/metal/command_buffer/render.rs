@@ -450,6 +450,32 @@ impl CommandBuffer {
             }
         }
         let plane_decodes = self.extended_planes(resolver, &pass, true, None, false)?;
+        for (color, staged) in pass.color.iter().zip(&pass.inputs.staged_colors) {
+            if let Some(staged) = staged
+                && color
+                    .as_ref()
+                    .is_some_and(|color| color.load_op == AttachmentLoadOp::Load)
+            {
+                if let Some(rows) = staged.guest_rows {
+                    let segment = self.recorder.segment();
+                    if segment.commands.len() != 1
+                        || !segment.signals.is_empty()
+                        || segment.copies_guest_rows()
+                    {
+                        self.recorder.pause_statistics();
+                        self.recorder.start_segment(Vec::new());
+                        self.recorder.resume_statistics(resolver, false)?;
+                    }
+                    self.recorder.segment().guest_load = Some(rows);
+                }
+                self.recorder.access(super::blit::TRANSFER);
+                self.recorder.push(Command::CopyBufferToImage {
+                    src: staged.buffer,
+                    dst: staged.image,
+                    region: staged.region,
+                });
+            }
+        }
         self.recorder.access(RENDER_PASS);
         self.recorder.pause_statistics();
         let begin = self.recorder.commands().len();
@@ -602,8 +628,46 @@ impl CommandBuffer {
         self.average_samples(resolver, &state.pass)?;
         self.narrow_plane_decodes(resolver, &state, DrawnArea::bounds(&drawn))?;
         self.extended_planes(resolver, &state.pass, false, Some(&drawn), draws_only)?;
+        let mut guest_store = None;
+        for (color, staged) in state
+            .pass
+            .color
+            .iter()
+            .zip(&state.pass.inputs.staged_colors)
+        {
+            if let Some(staged) = staged
+                && color
+                    .as_ref()
+                    .is_some_and(|color| color.store_action == StoreAction::Store)
+            {
+                guest_store = staged.guest_rows;
+                self.recorder.access(super::blit::TRANSFER);
+                self.recorder.push(Command::CopyImageToBuffer {
+                    src: staged.image,
+                    dst: staged.buffer,
+                    region: staged.region,
+                });
+                // A CPU may read after the next event signal, before the
+                // command buffer completes. Keep the transfer write in
+                // the hazard tracker for later GPU work, too.
+                self.recorder.push(Command::Barrier(Barrier {
+                    src_stages: PipelineStages::ALL_TRANSFER,
+                    src_access: Access::TRANSFER_WRITE,
+                    dst_stages: PipelineStages::HOST,
+                    dst_access: Access::HOST_READ,
+                }));
+            }
+        }
         self.follow_depth(resolver, &state.pass)?;
-        self.resolve_visibility(resolver, state.visibility)
+        self.resolve_visibility(resolver, state.visibility)?;
+        if let Some(rows) = guest_store {
+            self.recorder.pause_statistics();
+            self.recorder.segment().guest_store = Some(rows);
+            // Guest events and completion belong to the continuation.
+            self.recorder.start_segment(Vec::new());
+            self.recorder.resume_statistics(resolver, false)?;
+        }
+        Ok(())
     }
 
     /// Converts each two-plane extended-range attachment's half floats

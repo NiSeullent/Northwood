@@ -25,6 +25,7 @@
  */
 static const char kPlugins[] = "/System/Volumes/Data/Library/GPUBundles";
 static const char kPlugin[] = "/System/Volumes/Data/Library/GPUBundles/StelaGPU.bundle/";
+static const char kSignature[] = "/System/Volumes/Data/Library/GPUBundles/StelaGPU.bundle/Contents/_CodeSignature";
 /* How often the installer looks for the Data volume, in milliseconds. */
 static const unsigned kMountPoll = 50;
 
@@ -32,6 +33,24 @@ static const unsigned kMountPoll = 50;
 static uint64_t
 install(vfs_context_t context, char *buffer)
 {
+	// An older install needs maintenance to provision this directory. Check
+	// before replacing its executable, which requires the matching seal.
+	vnode_t signature = NULLVP;
+	int signatureError = vnode_lookup(kSignature, VNODE_LOOKUP_NOFOLLOW, &signature, context);
+	if (signatureError == ENOENT) {
+		IOLog("StelaGPU: the plugin signature directory is absent; run stela-gpu-maintenance install\n");
+		return STELA_GATE_BUNDLE_MISSING;
+	}
+	if (signatureError) {
+		IOLog("StelaGPU: looking up the plugin signature directory failed: %d\n", signatureError);
+		return STELA_GATE_BUNDLE_FAILED;
+	}
+	bool directory = vnode_isdir(signature);
+	vnode_put(signature);
+	if (!directory) {
+		IOLog("StelaGPU: the plugin signature path is not a directory\n");
+		return STELA_GATE_BUNDLE_FAILED;
+	}
 	uint64_t report = STELA_GATE_BUNDLE_CURRENT;
 	for (const stela_bundle_file &file : stela_bundle_files) {
 		char path[256];

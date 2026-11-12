@@ -75,6 +75,26 @@ fn a_blank_disk_gets_aligned_stela_partitions_after_a_reserved_esp_gap() {
 }
 
 #[test]
+fn a_fresh_swap_reservation_preserves_the_apple_minimum_and_resumes() {
+    let bytes = core::num::NonZeroU64::new(32 << 30);
+    let original = plan(DISK, None, request(), counter()).unwrap();
+    let planned = plan_with_swap(DISK, None, request(), bytes, counter()).unwrap();
+    let swap = planned.partition(Role::NorthwoodSwap).unwrap();
+    assert_eq!(swap.blocks() * DISK.block_bytes, bytes.unwrap().get());
+    let apple = planned.partition(Role::AppleRegion).unwrap();
+    assert!(apple.first_lba > swap.last_lba);
+    assert!(apple.blocks() * DISK.block_bytes >= DEFAULT_MIN_APPLE_BYTES);
+    assert!(plan_with_swap(DISK, Some(&original.table), request(), bytes, counter()).is_err());
+    let decoded = read_back(DISK, &encode(DISK, &planned.table).unwrap());
+    assert_eq!(decoded, planned.table);
+    assert!(
+        !plan(DISK, Some(&decoded), request(), counter())
+            .unwrap()
+            .write
+    );
+}
+
+#[test]
 fn encoded_tables_parse_back_with_valid_crcs_at_both_block_sizes() {
     for block_bytes in [512, 4096] {
         let disk = Disk {

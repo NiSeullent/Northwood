@@ -275,9 +275,19 @@ impl Drop for InternalKernelCode {
 /// Loaded libraries by id: ids that share bytes hold one copy.
 type Libraries = BTreeMap<u64, Arc<LoadedLibrary>>;
 
+#[derive(Clone, Copy)]
+enum Lowering {
+    Native,
+    #[cfg(any(feature = "metal-linked", test))]
+    SoftwareHalf,
+    #[cfg(any(feature = "metal-linked", test))]
+    Lavapipe,
+}
+
 pub struct AirCompiler {
     service: Service,
     target: ffi::Target,
+    lowering: Lowering,
     project_reflection: bool,
     reuse_sampler_states: bool,
     /// MTLB libraries by id; ids are never reused.
@@ -389,6 +399,7 @@ impl AirCompiler {
         Self {
             service,
             target,
+            lowering: Lowering::Native,
             project_reflection,
             reuse_sampler_states,
             libraries: BTreeMap::new(),
@@ -755,6 +766,10 @@ impl Compiler for AirCompiler {
     }
 
     fn features(&self) -> ShaderFeatures {
+        #[cfg(any(feature = "metal-linked", test))]
+        if matches!(self.lowering, Lowering::Lavapipe) {
+            return ShaderFeatures::COMPUTE | ShaderFeatures::VERTEX_FRAGMENT;
+        }
         FEATURES
     }
 
@@ -1499,6 +1514,13 @@ impl AirCompiler {
             };
             let mut hasher = stela_crypto::Sha256::new();
             use stela_crypto::digest::Digest;
+            match self.lowering {
+                Lowering::Native => (),
+                #[cfg(any(feature = "metal-linked", test))]
+                Lowering::SoftwareHalf => hasher.update(b"Stela software half NIR v1\0"),
+                #[cfg(any(feature = "metal-linked", test))]
+                Lowering::Lavapipe => hasher.update(b"Stela lavapipe NIR v1\0"),
+            }
             hasher.update(selected.module.slice_hash);
             hasher.update(entry.as_bytes());
             hasher.update([0]);

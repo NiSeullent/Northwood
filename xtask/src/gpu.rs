@@ -5,6 +5,7 @@ use clap::{Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 pub mod fetch;
+mod lavapipe;
 mod llvm;
 mod mesa;
 mod metal_suite;
@@ -99,6 +100,16 @@ pub enum Command {
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
         jobs: u16,
     },
+    /// Build a hosted x86-64 Linux lavapipe ICD from Stela's Mesa pin and patches.
+    /// Requires Meson, Ninja, LLVM development files and a native C/C++ toolchain.
+    Lavapipe {
+        /// Maximum parallel native compiler processes.
+        #[arg(long, default_value_t = default_jobs(), value_parser = clap::value_parser!(u16).range(1..))]
+        jobs: u16,
+        /// Print the object inputs of an existing NVK and lavapipe Meson plan as JSON.
+        #[arg(long, value_name = "MESON_BUILD")]
+        combined_plan: Option<PathBuf>,
+    },
     /// Differential testing of the Metal stack: plan the suite's assertions,
     /// prove them on a Mac, carry them to a guest and check its results.
     #[command(subcommand)]
@@ -141,6 +152,11 @@ pub fn run(command: Command) -> Result<()> {
         }),
         // `stela.efi` carries the kext it links against each boot's kernel.
         Command::Nvk { jobs } => build_nvk(jobs),
+        Command::Lavapipe {
+            combined_plan: Some(build),
+            ..
+        } => lavapipe::combined_plan(&build),
+        Command::Lavapipe { jobs, .. } => lavapipe::build(jobs),
         Command::MetalSuite(command) => metal_suite::run(command),
         Command::Llvm { jobs, test } => llvm::build(&toolchain::Toolchain::discover()?, jobs, test),
     }

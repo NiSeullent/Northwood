@@ -10,7 +10,8 @@
 //! ([`pump_due`]), so other PEs do not spin on a lock while Linux runs and
 //! GPU completions are not starved. Nothing reserves a core, and a Linux
 //! environment with nothing to do costs the boot PE one comparison a slice.
-#[cfg(feature = "nvk")]
+#[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
 pub(super) mod client;
 #[cfg(feature = "nvk")]
 pub(super) mod display;
@@ -19,14 +20,14 @@ mod file;
 #[cfg(feature = "nvk")]
 pub(super) mod gate;
 /// `xtask guest`'s objects of the StelaGPU kext.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "guest-stelagpu")]
 mod kext {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/guest/StelaGPU.kext.rs"
     ));
 }
-#[cfg(feature = "nvk")]
+#[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
 mod stack;
 #[cfg(feature = "nvk")]
 mod waiter;
@@ -127,7 +128,7 @@ const PUMP_NS: u64 = 2_000_000;
 static HUB: AtomicPtr<Hub> = AtomicPtr::new(ptr::null_mut());
 static BOOT_PE: AtomicUsize = AtomicUsize::new(0);
 /// The processor the environment runs on.
-#[cfg(feature = "nvk")]
+#[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
 static BOOT_CPU: AtomicU32 = AtomicU32::new(0);
 
 /// End the boot PE's slices for Linux, through `hub`.
@@ -1206,6 +1207,17 @@ struct Started {
     result: Result<(), Errno>,
 }
 
+impl Started {
+    fn empty() -> Self {
+        Self {
+            _attached: Vec::new(),
+            #[cfg(feature = "nvk")]
+            bound: Vec::new(),
+            result: Ok(()),
+        }
+    }
+}
+
 // SAFETY: the original managed runtime enters the canonical owner on the
 // child before run. The job retains the actual devices until it publishes
 // the result, whose attachments remain owned for the boot.
@@ -1220,12 +1232,7 @@ unsafe impl ManagedJob for Start {
 fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
     #[cfg(feature = "nvk")]
     stela_boot_core::heap::set_peak_hook(gate::peak_passed);
-    let mut job = Started {
-        _attached: Vec::new(),
-        #[cfg(feature = "nvk")]
-        bound: Vec::new(),
-        result: Ok(()),
-    };
+    let mut job = Started::empty();
     // SAFETY: entered, on a task.
     job.result = unsafe { gpu::nouveau::start() };
     if job.result.is_err() {
@@ -1307,20 +1314,20 @@ struct Installed {
     /// When the service is next due, as a TSC value: the clock reads only
     /// in the Linux environment's root, and the boot loop asks outside it.
     next: AtomicU64,
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
     window: &'static Window,
     tsc_hz: u64,
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
     libc_clock: client::LibcClock,
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
     heap_bytes: u64,
     /// Clients' mappings with their sizes in pages, by address. For tasks.
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
     mappings: RefCell<BTreeMap<u64, (stela_linux::client::Mapping, usize)>>,
     /// Mesa's running threads, by the bottom of their stacks. On the boot CPU.
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
     mesa_threads: RefCell<BTreeMap<u64, client::Running>>,
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
     service: client::Service,
     owner: &'static Arc<LinuxKernel>,
     threads: &'static LinuxThreads,
@@ -1354,7 +1361,7 @@ pub(super) struct Machine {
     pub tsc_hz: u64,
     pub wall: Option<RtcReading>,
     /// The host heap capacity reported to the linked graphics runtime.
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
     pub heap_bytes: u64,
 }
 
@@ -1383,16 +1390,16 @@ pub(super) fn single_user(single_user: bool) {
     let _ = single_user;
 }
 
-/// The kexts a boot that gives the GPUs to nouveau links into its system.
+/// The StelaGPU kext and plugin CDHashes for an installed guest.
 pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "guest-stelagpu")]
     return alloc::vec![stela_loader::aux_kc::Kext {
         info: kext::INFO,
         objects: kext::OBJECTS.to_vec(),
         bundle_path: "/Library/Extensions/StelaGPU.kext".into(),
         trusted_code: kext::TRUSTED_CODE.to_vec(),
     }];
-    #[cfg(not(feature = "nvk"))]
+    #[cfg(not(feature = "guest-stelagpu"))]
     Vec::new()
 }
 
@@ -1411,6 +1418,16 @@ pub(super) fn serve(
 /// Bring Linux up over `claimed`, and return once nouveau has bound them or
 /// failed, as the guest should not start with a half-started GPU beneath it.
 pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error> {
+    open_linux(machine, claimed, false)
+}
+
+#[cfg(feature = "pthread-runtime-probe")]
+pub(super) fn probe_pthread(machine: Machine) -> Result<(), Error> {
+    open_linux(machine, Vec::new(), true)?;
+    client::probe_pthread().map_err(Error::PthreadProbe)
+}
+
+fn open_linux(machine: Machine, claimed: Vec<Claimed>, runtime_only: bool) -> Result<(), Error> {
     // Keep the exact original claims on every partial startup refusal.
     let claimed = ManuallyDrop::new(claimed);
     let Machine {
@@ -1419,7 +1436,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         random,
         tsc_hz,
         wall,
-        #[cfg(feature = "nvk")]
+        #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
         heap_bytes,
     } = machine;
     let image = work.image()?;
@@ -1442,7 +1459,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         .collect();
     let clock = work.service_clock().map_err(environment_error)?;
     let epoch = clock.epoch().map_err(environment_error)?;
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
     let libc_clock = client::LibcClock::anchor(|| epoch.now_ns()).map_err(environment_error)?;
     let time = clock.clock();
     let events = Arc::new(Events {
@@ -1499,7 +1516,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         stela_linux::image::register(image).map_err(|_| kernel_work::Error::Inventory)?;
         stela_linux::heap::register(allocate_zeroed).map_err(|_| kernel_work::Error::Inventory)?;
     }
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
     BOOT_CPU.store(host::processor(), Ordering::Relaxed);
     let (owner, threads, job) = work.dispatch_linux(|runtime| {
         Ok(mount_and_start(
@@ -1509,6 +1526,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
             domain.clone(),
             claimed,
             time.as_ref(),
+            runtime_only,
         ))
     })??;
     let result = job.result.map_err(Error::Init);
@@ -1527,18 +1545,18 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         domain,
         // Due at once: the first pump finds Linux's own deadline.
         next: AtomicU64::new(0),
-        #[cfg(feature = "nvk")]
+        #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
         window,
         tsc_hz,
-        #[cfg(feature = "nvk")]
+        #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
         libc_clock,
-        #[cfg(feature = "nvk")]
+        #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
         heap_bytes,
-        #[cfg(feature = "nvk")]
+        #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
         mappings: RefCell::new(BTreeMap::new()),
-        #[cfg(feature = "nvk")]
+        #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
         mesa_threads: RefCell::new(BTreeMap::new()),
-        #[cfg(feature = "nvk")]
+        #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
         service: client::Service::default(),
         owner,
         threads,
@@ -1572,6 +1590,7 @@ fn mount_and_start(
     domain: Arc<Domain<SLOTS>>,
     claimed: ManuallyDrop<Vec<Claimed>>,
     time: &dyn Clock,
+    runtime_only: bool,
 ) -> Result<MountedStartup, Error> {
     let deadline = time
         .now_ns()
@@ -1627,6 +1646,10 @@ fn mount_and_start(
     let ready = unsafe { srcu.join() }.map_err(|failure| Error::Srcu(failure.error))?;
     let probing = host::rdtsc();
     START_TICKS[0].store(probing.wrapping_sub(started), Ordering::Relaxed);
+    if runtime_only {
+        debug_assert!(claimed.is_empty());
+        return Ok((owner, threads, ManuallyDrop::new(Started::empty())));
+    }
     let completed = Rc::new(Cell::new(None));
     let job = Box::pin(Start {
         kernel: owner.as_ref(),
@@ -1685,6 +1708,8 @@ pub(super) enum Error {
     Child(Outcome),
     Init(Errno),
     Timeout,
+    #[cfg(feature = "pthread-runtime-probe")]
+    PthreadProbe(i32),
     #[cfg(feature = "nvk")]
     NoDevices,
 }
@@ -1707,6 +1732,8 @@ impl core::fmt::Display for Error {
             Self::Submit(error) => write!(f, "GPU startup job refused: {error:?}"),
             Self::Child(outcome) => write!(f, "GPU startup child ended: {outcome:?}"),
             Self::Init(error) => write!(f, "Linux initialization failed: errno {}", -error),
+            #[cfg(feature = "pthread-runtime-probe")]
+            Self::PthreadProbe(stage) => write!(f, "native pthread probe failed at stage {stage}"),
             Self::Timeout => {
                 f.write_str("GPU startup exceeded its deadline; native owners remain held")
             }
@@ -1997,12 +2024,12 @@ pub(super) fn pump() {
             }
             // Tasks retire and calls arrive only through steps and posts:
             // a pump's first pass looks only if something may have.
-            #[cfg(feature = "nvk")]
+            #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
             if !first || client::start_due() {
                 gpu.advance_children();
                 client::start(gpu)?;
             }
-            #[cfg(not(feature = "nvk"))]
+            #[cfg(not(any(feature = "nvk", feature = "pthread-runtime-probe")))]
             gpu.advance_children();
             first = false;
             lap(PumpPart::Children);
@@ -2079,7 +2106,7 @@ pub(super) fn pump_posted() {
 
 /// A pump from a wait for the service's turn on the boot CPU, which runs no
 /// guest code meanwhile.
-#[cfg(feature = "nvk")]
+#[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
 fn pump_waiting() {
     if installed().is_some_and(|gpu| ready_since(gpu, host::rdtsc()).is_some()) {
         PUMPS.relaxed.fetch_add(1, Ordering::Relaxed);

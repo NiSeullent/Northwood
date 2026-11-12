@@ -82,6 +82,18 @@ impl Transaction {
 
 pub(crate) struct Checkpoint(Option<Transaction>);
 
+#[cfg(feature = "native-profile")]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct NorProfile {
+    pub(crate) reads: u64,
+    pub(crate) read_bytes: u64,
+    pub(crate) programs: u64,
+    pub(crate) program_bytes: u64,
+    pub(crate) erases: u64,
+    pub(crate) erase_bytes: u64,
+    pub(crate) status_bytes: u64,
+}
+
 pub struct Nor {
     image: Image,
     enabled: bool,
@@ -90,6 +102,8 @@ pub struct Nor {
     /// Sectors committed programs and erases changed since the host last
     /// took them.
     dirty: BTreeSet<usize>,
+    #[cfg(feature = "native-profile")]
+    profile: NorProfile,
 }
 impl Nor {
     pub fn new(image: Image) -> Self {
@@ -99,7 +113,13 @@ impl Nor {
             selected: false,
             transaction: None,
             dirty: BTreeSet::new(),
+            #[cfg(feature = "native-profile")]
+            profile: NorProfile::default(),
         }
+    }
+    #[cfg(feature = "native-profile")]
+    pub(crate) fn take_profile(&mut self) -> NorProfile {
+        core::mem::take(&mut self.profile)
     }
     /// The changed sectors, each as (offset, its current bytes).
     pub fn take_dirty(&mut self) -> Vec<(usize, Vec<u8>)> {
@@ -159,14 +179,40 @@ impl Nor {
             match t.command {
                 WRITE_ENABLE => self.enabled = true,
                 WRITE_DISABLE => self.enabled = false,
+                #[cfg(feature = "native-profile")]
+                READ | FAST_READ => {
+                    let prefix = if t.command == READ { 3 } else { 4 };
+                    self.profile.reads = self.profile.reads.saturating_add(1);
+                    self.profile.read_bytes = self
+                        .profile
+                        .read_bytes
+                        .saturating_add((t.position - prefix) as u64);
+                }
+                #[cfg(feature = "native-profile")]
+                READ_STATUS => {
+                    self.profile.status_bytes =
+                        self.profile.status_bytes.saturating_add(t.position as u64);
+                }
                 PROGRAM if self.enabled => {
-                    let base = t.address & !(PAGE_SIZE - 1);
+                    let base = (t.address % CAPACITY) & !(PAGE_SIZE - 1);
+                    let page = &mut self.image.bytes_mut()[base..base + PAGE_SIZE];
+                    let mut changed = false;
                     for (i, &byte) in t.data().iter().enumerate() {
-                        let offset = (base | ((t.address + i) & (PAGE_SIZE - 1))) % CAPACITY;
-                        self.image.bytes_mut()[offset] &= byte;
-                        self.dirty.insert(offset / SECTOR_SIZE);
+                        let stored = &mut page[(t.address + i) & (PAGE_SIZE - 1)];
+                        let programmed = *stored & byte;
+                        changed |= programmed != *stored;
+                        *stored = programmed;
+                    }
+                    if changed {
+                        self.dirty.insert(base / SECTOR_SIZE);
                     }
                     self.enabled = false;
+                    #[cfg(feature = "native-profile")]
+                    {
+                        self.profile.programs = self.profile.programs.saturating_add(1);
+                        self.profile.program_bytes =
+                            self.profile.program_bytes.saturating_add(t.length as u64);
+                    }
                 }
                 ERASE_SECTOR | ERASE_BLOCK if self.enabled => {
                     let size = if t.command == ERASE_SECTOR {
@@ -175,10 +221,21 @@ impl Nor {
                         BLOCK_SIZE
                     };
                     let base = (t.address % CAPACITY) & !(size - 1);
-                    self.image.bytes_mut()[base..base + size].fill(ERASED);
-                    self.dirty
-                        .extend(base / SECTOR_SIZE..(base + size) / SECTOR_SIZE);
+                    let sectors =
+                        self.image.bytes_mut()[base..base + size].chunks_exact_mut(SECTOR_SIZE);
+                    for (index, sector) in sectors.enumerate() {
+                        if sector.iter().any(|&byte| byte != ERASED) {
+                            sector.fill(ERASED);
+                            self.dirty.insert(base / SECTOR_SIZE + index);
+                        }
+                    }
                     self.enabled = false;
+                    #[cfg(feature = "native-profile")]
+                    {
+                        self.profile.erases = self.profile.erases.saturating_add(1);
+                        self.profile.erase_bytes =
+                            self.profile.erase_bytes.saturating_add(size as u64);
+                    }
                 }
                 WRITE_STATUS if self.enabled => self.enabled = false,
                 _ => (), // JEDEC ignores mutations when WEL is clear.
@@ -327,6 +384,25 @@ mod tests {
                 .iter()
                 .all(|&b| b == ERASED)
         );
+        #[cfg(feature = "native-profile")]
+        {
+            // A fast read's dummy byte does not count as payload. The
+            // write attempted with WEL clear did not commit a program.
+            command(&mut nor, &[FAST_READ, 0, 0, 0, 0, 0xff]);
+            assert_eq!(
+                nor.take_profile(),
+                NorProfile {
+                    reads: 2,
+                    read_bytes: 3,
+                    programs: 2,
+                    program_bytes: 3,
+                    erases: 1,
+                    erase_bytes: SECTOR_SIZE as u64,
+                    status_bytes: 3,
+                }
+            );
+            assert_eq!(nor.take_profile(), NorProfile::default());
+        }
     }
     #[test]
     fn committed_programs_and_erases_report_their_sectors_once() {
@@ -339,13 +415,56 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!((dirty[0].0, dirty[0].1[0]), (0x1000, 0x5a));
         assert!(nor.take_dirty().is_empty());
+        for address in [0x00, 0xa0] {
+            command(&mut nor, &[WRITE_ENABLE]);
+            command(&mut nor, &[PROGRAM, 0x01, address, 0, 0x5a]);
+        }
+        command(&mut nor, &[WRITE_ENABLE]);
+        command(&mut nor, &[PROGRAM, 0x01, 0, 0, ERASED]);
+        assert_eq!(command(&mut nor, &[READ_STATUS, 0]), [ERASED, 0]);
+        for _ in 0..2 {
+            command(&mut nor, &[WRITE_ENABLE]);
+            command(&mut nor, &[ERASE_BLOCK, 0x01, 0, 0]);
+            assert_eq!(command(&mut nor, &[READ_STATUS, 0]), [ERASED, 0]);
+        }
+        let erased = nor.take_dirty();
+        assert_eq!(erased.len(), 2);
+        assert_eq!((erased[0].0, erased[1].0), (0x10000, 0x1a000));
+        assert!(
+            erased
+                .iter()
+                .all(|(_, bytes)| bytes.iter().all(|&byte| byte == ERASED))
+        );
+        assert!(nor.take_dirty().is_empty());
+    }
+
+    #[test]
+    fn suppressing_no_op_stores_preserves_the_reloaded_image() {
+        use stela_drivers::block::RamDisk;
+
+        let mut disk = RamDisk::new("nor", CAPACITY as u64 / 512, 512);
+        let (image, _) = persist::load(&mut disk).unwrap();
+        let mut nor = Nor::new(image);
         command(&mut nor, &[WRITE_ENABLE]);
         command(&mut nor, &[ERASE_BLOCK, 0x01, 0, 0]);
-        let erased: Vec<usize> = nor.take_dirty().into_iter().map(|(o, _)| o).collect();
-        assert_eq!(
-            erased,
-            (0x10000..0x20000).step_by(SECTOR_SIZE).collect::<Vec<_>>()
-        );
+        assert!(nor.take_dirty().is_empty());
+        let program = [PROGRAM, 0x01, 0, 255, 0x12, 0x34];
+        command(&mut nor, &[WRITE_ENABLE]);
+        command(&mut nor, &program);
+        let writes = nor.take_dirty();
+        assert_eq!(writes.len(), 1);
+        for (offset, bytes) in writes {
+            persist::store(&mut disk, offset, &bytes).unwrap();
+        }
+        command(&mut nor, &[WRITE_ENABLE]);
+        command(&mut nor, &program);
+        assert!(nor.take_dirty().is_empty());
+        assert_eq!(command(&mut nor, &[READ_STATUS, 0]), [ERASED, 0]);
+        let (loaded, fresh) = persist::load(&mut disk).unwrap();
+        assert!(!fresh);
+        assert_eq!(loaded.bytes(), nor.image().bytes());
+        assert_eq!(loaded.bytes()[0x100ff], 0x12);
+        assert_eq!(loaded.bytes()[0x10000], 0x34);
     }
 
     #[test]

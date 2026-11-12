@@ -251,25 +251,45 @@ fn first_checkout(submodule: &Submodule) -> Result<()> {
     exec(git(tools::root()).args(["submodule", "absorbgitdirs", "--", &submodule.path]))
 }
 
+fn apply_patches(directory: &Path, name: &str, patches: &[PathBuf]) -> Result<()> {
+    if patches.is_empty() {
+        return Ok(());
+    }
+    let applied = exec(
+        git(directory)
+            .args(["-c", "user.name=Stela", "-c"])
+            .arg(format!("user.email={COMMITTER_EMAIL}"))
+            .args(["am", "-q", "--3way", "--committer-date-is-author-date"])
+            .args(patches),
+    );
+    if applied.is_err() {
+        // Leave the checkout at its pin, with no `am` left to block the next.
+        exec(git(directory).args(["am", "--abort"]))?;
+    }
+    applied.with_context(|| format!("third_party/patches/{name} no longer applies"))
+}
+
+fn set_sparse_checkout(directory: &Path, patterns: &str) -> Result<()> {
+    let mut sparse = git(directory)
+        .args(["sparse-checkout", "set", "--no-cone", "--stdin"])
+        .stdin(Stdio::piped())
+        .spawn()?;
+    sparse
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(patterns.as_bytes())?;
+    ensure!(sparse.wait()?.success(), "git sparse-checkout failed");
+    Ok(())
+}
+
 /// Checks out the pin with its sparse scope and applies the series, fetching
 /// from the URL `.gitmodules` names now.
 fn checkout(submodule: &Submodule) -> Result<()> {
     println!("GPU source {}: {}", submodule.name, submodule.pin);
     exec(git(tools::root()).args(["submodule", "sync", "-q", "--", &submodule.path]))?;
     match submodule.sparse()? {
-        Some(patterns) => {
-            let mut sparse = submodule
-                .git()
-                .args(["sparse-checkout", "set", "--no-cone", "--stdin"])
-                .stdin(Stdio::piped())
-                .spawn()?;
-            sparse
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(patterns.as_bytes())?;
-            ensure!(sparse.wait()?.success(), "git sparse-checkout failed");
-        }
+        Some(patterns) => set_sparse_checkout(&submodule.directory(), &patterns)?,
         None => exec(submodule.git().args(["sparse-checkout", "disable"]))?,
     }
     if !submodule.has_pin()? {
@@ -287,24 +307,59 @@ fn checkout(submodule: &Submodule) -> Result<()> {
             .git()
             .args(["checkout", "-q", "-f", "-B", "stela", &submodule.pin]),
     )?;
-    let patches = submodule.patches()?;
-    if !patches.is_empty() {
-        let applied = exec(
-            submodule
-                .git()
-                .args(["-c", "user.name=Stela", "-c"])
-                .arg(format!("user.email={COMMITTER_EMAIL}"))
-                .args(["am", "-q", "--3way", "--committer-date-is-author-date"])
-                .args(&patches),
-        );
-        if applied.is_err() {
-            // Leave the checkout at its pin, with no `am` left to block the next.
-            exec(submodule.git().args(["am", "--abort"]))?;
-        }
-        applied
-            .with_context(|| format!("third_party/patches/{} no longer applies", submodule.name))?;
-    }
+    apply_patches(
+        &submodule.directory(),
+        &submodule.name,
+        &submodule.patches()?,
+    )?;
     submodule.record(&submodule.series()?)
+}
+
+/// Prepares a private pinned Mesa checkout with the lavapipe ICD target.
+pub(super) fn checkout_lavapipe_mesa(directory: &Path) -> Result<Value> {
+    let mesa = submodules()?
+        .into_iter()
+        .find(|submodule| submodule.name == "mesa")
+        .context("no Mesa submodule in .gitmodules")?;
+    println!("GPU source {}: {}", mesa.name, mesa.pin);
+    fs::create_dir(directory)?;
+    exec(git(directory).args(["init", "-q"]))?;
+    exec(git(directory).args(["config", "core.autocrlf", "false"]))?;
+    let mut sparse = mesa.sparse()?;
+    if let Some(patterns) = &mut sparse {
+        patterns.push_str("/src/gallium/targets/lavapipe/\n");
+        set_sparse_checkout(directory, patterns)?;
+    }
+    exec(git(directory).args([
+        "fetch",
+        "-q",
+        "--depth=1",
+        "--no-tags",
+        &mesa.url,
+        &mesa.pin,
+    ]))?;
+    exec(git(directory).args(["checkout", "-q", "--detach", &mesa.pin]))?;
+
+    let patches = mesa.patches()?;
+    let inputs = patches
+        .iter()
+        .map(|patch| tools::binding(patch))
+        .collect::<Result<Vec<_>>>()?;
+    apply_patches(directory, &mesa.name, &patches)?;
+    for (patch, expected) in patches.iter().zip(&inputs) {
+        ensure!(
+            tools::binding(patch)? == *expected,
+            "{} changed during checkout",
+            patch.display()
+        );
+    }
+    let head = capture(git(directory).args(["rev-parse", "HEAD"]))?;
+    Ok(json!({
+        "pin": mesa.pin,
+        "patched_commit": head.trim(),
+        "sparse_patterns": sparse.as_deref().map(|patterns| patterns.lines().collect::<Vec<_>>()),
+        "patches": inputs,
+    }))
 }
 
 /// Installs the pinned tools, then checks out every submodule at its pin with

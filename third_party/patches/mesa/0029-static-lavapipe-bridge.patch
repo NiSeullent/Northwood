@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@localhost>
+Date: Wed, 11 Nov 2026 17:18:49 +0000
+Subject: [PATCH] lavapipe: expose a private static dispatch boundary
+
+A statically linked lavapipe consumer calls lvp_GetInstanceProcAddr
+directly. With STELA_MESA_STATIC_LAVAPIPE enabled, omit the Vulkan
+loader aliases from the lavapipe frontend and its private copy of the
+common Vulkan instance runtime.
+
+Give that consumer the compiler options selected for a directly owned
+physical device and a vertex, fragment or compute shader. The borrowed
+options follow the physical device lifetime. Keep the hosted ICD
+entry points and the Vulkan feature tables in the default build.
+
+Northwood downstream patch.
+Mesa base: ddaf85e353442d9d7f192fdcf1823e652e3f2ee3
+---
+ src/gallium/frontends/lavapipe/lvp_device.c  | 22 ++++++++++++++++++++
+ src/gallium/frontends/lavapipe/lvp_private.h |  9 ++++++++
+ src/vulkan/runtime/vk_instance.c             |  6 ++++++
+ 3 files changed, 37 insertions(+)
+
+diff --git a/src/gallium/frontends/lavapipe/lvp_device.c b/src/gallium/frontends/lavapipe/lvp_device.c
+index 5dc1ace07e9a10a73b17fdf30718b62063cd61c8..d805c1bcbe32f45f850afe5b9c59e18e11060ae9 100644
+--- a/src/gallium/frontends/lavapipe/lvp_device.c
++++ b/src/gallium/frontends/lavapipe/lvp_device.c
+@@ -1829,6 +1829,27 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL lvp_GetInstanceProcAddr(
+                                     pName);
+ }
+ 
++#ifdef STELA_MESA_STATIC_LAVAPIPE
++const struct nir_shader_compiler_options *
++stela_lvp_nir_options(VkPhysicalDevice physical_device,
++                     VkShaderStageFlagBits stage)
++{
++   if (physical_device == VK_NULL_HANDLE)
++      return NULL;
++
++   VK_FROM_HANDLE(lvp_physical_device, device, physical_device);
++   switch (stage) {
++   case VK_SHADER_STAGE_VERTEX_BIT:
++      return device->drv_options[MESA_SHADER_VERTEX];
++   case VK_SHADER_STAGE_FRAGMENT_BIT:
++      return device->drv_options[MESA_SHADER_FRAGMENT];
++   case VK_SHADER_STAGE_COMPUTE_BIT:
++      return device->drv_options[MESA_SHADER_COMPUTE];
++   default:
++      return NULL;
++   }
++}
++#else
+ /* The loader wants us to expose a second GetInstanceProcAddr function
+  * to work around certain LD_PRELOAD issues seen in apps.
+  */
+@@ -1839,6 +1860,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(
+ {
+    return lvp_GetInstanceProcAddr(instance, pName);
+ }
++#endif
+ 
+ static void
+ destroy_pipelines(struct lvp_queue *queue)
+diff --git a/src/gallium/frontends/lavapipe/lvp_private.h b/src/gallium/frontends/lavapipe/lvp_private.h
+index bdb61144beff0759021a4b71cfa9e9423cab57b9..54deea02040060ee8f55b70248fe96307b14a540 100644
+--- a/src/gallium/frontends/lavapipe/lvp_private.h
++++ b/src/gallium/frontends/lavapipe/lvp_private.h
+@@ -698,6 +698,15 @@ VK_DEFINE_HANDLE_CASTS(lvp_physical_device, vk.base, VkPhysicalDevice,
+                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
+ VK_DEFINE_HANDLE_CASTS(lvp_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)
+ 
++#ifdef STELA_MESA_STATIC_LAVAPIPE
++/* Borrowed options for a live, directly owned lavapipe physical device.
++ * Null handles and stages outside vertex, fragment and compute return NULL.
++ */
++const struct nir_shader_compiler_options *
++stela_lvp_nir_options(VkPhysicalDevice physical_device,
++                     VkShaderStageFlagBits stage);
++#endif
++
+ VK_DEFINE_NONDISP_HANDLE_CASTS(lvp_buffer, vk.base, VkBuffer,
+                                VK_OBJECT_TYPE_BUFFER)
+ VK_DEFINE_NONDISP_HANDLE_CASTS(lvp_buffer_view, vk.base, VkBufferView,
+diff --git a/src/vulkan/runtime/vk_instance.c b/src/vulkan/runtime/vk_instance.c
+index 420ab21cd0b92a57d8b2d642b3245f6f867221bb..a38e5cdfc999b9a5b7867b6d459052805ece1bc1 100644
+--- a/src/vulkan/runtime/vk_instance.c
++++ b/src/vulkan/runtime/vk_instance.c
+@@ -324,6 +324,7 @@ vk_instance_get_proc_addr(const struct vk_instance *instance,
+ 
+ #undef LOOKUP_VK_ENTRYPOINT
+ 
++#ifndef STELA_MESA_STATIC_LAVAPIPE
+    /* Beginning with ICD interface v7, the following functions can also be
+     * retrieved via vk_icdGetInstanceProcAddr.
+     */
+@@ -335,6 +336,7 @@ vk_instance_get_proc_addr(const struct vk_instance *instance,
+ #ifdef _WIN32
+    if (strcmp(name, "vk_icdEnumerateAdapterPhysicalDevices") == 0)
+       return (PFN_vkVoidFunction)vk_icdEnumerateAdapterPhysicalDevices;
++#endif
+ #endif
+ 
+    if (instance == NULL)
+@@ -559,6 +561,7 @@ vk_common_EnumeratePhysicalDeviceGroups(VkInstance _instance, uint32_t *pGroupCo
+    return vk_outarray_status(&out);
+ }
+ 
++#ifndef STELA_MESA_STATIC_LAVAPIPE
+ /* With version 4+ of the loader interface the ICD should expose
+  * vk_icdGetPhysicalDeviceProcAddr()
+  */
+@@ -569,6 +572,7 @@ vk_icdGetPhysicalDeviceProcAddr(VkInstance  _instance,
+    VK_FROM_HANDLE(vk_instance, instance, _instance);
+    return vk_instance_get_physical_device_proc_addr(instance, pName);
+ }
++#endif
+ 
+ static uint32_t vk_icd_version = 7;
+ 
+@@ -578,6 +582,7 @@ vk_get_negotiated_icd_version(void)
+    return vk_icd_version;
+ }
+ 
++#ifndef STELA_MESA_STATIC_LAVAPIPE
+ PUBLIC VKAPI_ATTR VkResult VKAPI_CALL
+ vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pSupportedVersion)
+ {
+@@ -647,6 +652,7 @@ vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pSupportedVersion)
+    *pSupportedVersion = vk_icd_version;
+    return VK_SUCCESS;
+ }
++#endif
+ 
+ void
+ vk_instance_start_renderdoc_capture(struct vk_instance *instance)
+-- 
+2.52.0
+

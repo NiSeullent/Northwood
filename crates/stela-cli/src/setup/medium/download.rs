@@ -17,6 +17,20 @@ impl Download {
         model: &str,
         boot: &Path,
     ) -> Result<Self> {
+        let (download, source) = Self::open_source(image)?;
+        restore::payload::trim(source, model, boot)?;
+        ensure!(
+            restore::payload::identity(boot, model)?.1 == download.image.build,
+            "the catalog download contains a different macOS build"
+        );
+        Ok(download)
+    }
+
+    pub(in super::super) fn open(image: restore::Image) -> Result<Self> {
+        Self::open_source(image).map(|(download, _)| download)
+    }
+
+    fn open_source(image: restore::Image) -> Result<(Self, restore::remote::Remote)> {
         ensure!(
             image.sha1.is_some(),
             "the catalog provides no checksum for this full installer"
@@ -27,17 +41,13 @@ impl Download {
             etag: source.etag().into(),
             image,
         };
-        restore::payload::trim(source, model, boot)?;
-        ensure!(
-            restore::payload::identity(boot, model)?.1 == download.image.build,
-            "the catalog download contains a different macOS build"
-        );
-        Ok(download)
+        Ok((download, source))
     }
 
-    pub(in super::super) fn write(
+    pub(in super::super) fn write_in(
         &self,
         volume: &Path,
+        layout: VolumeLayout,
         model: &str,
         piece_bytes: u64,
     ) -> Result<Written> {
@@ -46,13 +56,64 @@ impl Download {
             source.size() == self.bytes && source.etag() == self.etag,
             "the download changed after boot-file preparation; run setup again"
         );
-        write_from(source, volume, model, &self.image, self.bytes, piece_bytes)
+        write_from(
+            source,
+            volume,
+            layout,
+            model,
+            &self.image,
+            self.bytes,
+            piece_bytes,
+        )
     }
+
+    pub(in super::super) fn write_fresh_in(
+        &self,
+        volume: &Path,
+        model: &str,
+        piece_bytes: u64,
+    ) -> Result<Written> {
+        publish_fresh(volume, &self.image.build, |scratch| {
+            self.write_in(scratch, VolumeLayout::Legacy, model, piece_bytes)
+        })
+    }
+}
+
+/// The standalone download never occupies the active install path until
+/// both the catalog digest and FAT32 readback have passed.
+fn publish_fresh(
+    volume: &Path,
+    build: &str,
+    write: impl FnOnce(&Path) -> Result<Written>,
+) -> Result<Written> {
+    let destination = directory(volume, build);
+    ensure!(
+        !destination.try_exists()?,
+        "{} already exists",
+        destination.display()
+    );
+    let scratch = tempfile::Builder::new()
+        .prefix(".stela-install-")
+        .tempdir_in(volume)?;
+    let written = write(scratch.path())?;
+    fs::create_dir_all(
+        destination
+            .parent()
+            .context("install directory has no parent")?,
+    )?;
+    ensure!(
+        !destination.try_exists()?,
+        "{} already exists",
+        destination.display()
+    );
+    fs::rename(directory(scratch.path(), build), destination)?;
+    Ok(written)
 }
 
 fn write_from(
     mut source: impl Read,
     volume: &Path,
+    layout: VolumeLayout,
     model: &str,
     image: &restore::Image,
     total: u64,
@@ -69,7 +130,7 @@ fn write_from(
         !sizes.is_empty() && sizes.len() <= MAX_PIECES,
         "invalid download size or piece size"
     );
-    let directory = directory(volume, &image.build);
+    let directory = directory_in(volume, layout, &image.build);
     fs::create_dir_all(&directory)?;
     let manifest_path = directory.join(MANIFEST_FILE);
     if manifest_path.exists() {
@@ -350,6 +411,68 @@ impl Seek for Joined<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn interrupted_or_unverified_download_leaves_the_install_path_free_for_retry() -> Result<()> {
+        let work = tempfile::tempdir()?;
+        let volume = work.path().join("staged-volume");
+        fs::create_dir(&volume)?;
+        let ipsw = work.path().join("source.ipsw");
+        crate::efi::synthetic_ipsw(&ipsw)?;
+        let bytes = fs::read(ipsw)?;
+        let model = restore::payload::SYNTHETIC_MODEL;
+        let image = restore::Image {
+            version: "test".into(),
+            build: restore::payload::SYNTHETIC_BUILD.into(),
+            models: vec![model.into()],
+            url: "https://updates.cdn-apple.com/source.ipsw".into(),
+            sha1: Some(hex::encode(Sha1::digest(&bytes))),
+        };
+        let attempt = |source: &[u8]| {
+            publish_fresh(&volume, &image.build, |scratch| {
+                write_from(
+                    source,
+                    scratch,
+                    VolumeLayout::Legacy,
+                    model,
+                    &image,
+                    bytes.len() as u64,
+                    HASH_BLOCK_BYTES,
+                )
+            })
+        };
+        assert!(attempt(&bytes[..bytes.len() / 2]).is_err());
+        assert!(fs::read_dir(&volume)?.next().is_none());
+        let mut damaged = bytes.clone();
+        damaged[0] ^= 1;
+        assert!(
+            attempt(&damaged)
+                .unwrap_err()
+                .to_string()
+                .contains("catalog digest")
+        );
+        assert!(fs::read_dir(&volume)?.next().is_none());
+
+        let written = attempt(&bytes)?;
+        assert!(written.wrote > 1);
+        let destination = directory(&volume, &image.build);
+        let manifest_path = destination.join(MANIFEST_FILE);
+        let manifest = fs::read(&manifest_path)?;
+        assert_eq!(written.manifest_sha256, stela_formats::sha256(&manifest));
+        let joined: Vec<u8> = (0..written.wrote)
+            .map(|index| fs::read(destination.join(piece_name(index))))
+            .collect::<io::Result<Vec<_>>>()?
+            .concat();
+        assert_eq!(joined, bytes);
+        assert!(
+            attempt(&bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
+        assert_eq!(manifest, fs::read(manifest_path)?);
+        Ok(())
+    }
+
     fn partials(
         directory: &Path,
         data: &[u8],
@@ -489,6 +612,7 @@ mod tests {
             write_from(
                 &data[..],
                 volume,
+                VolumeLayout::Legacy,
                 restore::payload::SYNTHETIC_MODEL,
                 &image,
                 data.len() as u64,
@@ -512,6 +636,7 @@ mod tests {
                 partial: partial.clone(),
             },
             &volume,
+            VolumeLayout::Legacy,
             restore::payload::SYNTHETIC_MODEL,
             &image,
             data.len() as u64,
@@ -543,6 +668,7 @@ mod tests {
         let written = write_from(
             &bytes[..],
             &volume,
+            VolumeLayout::Northwood,
             restore::payload::SYNTHETIC_MODEL,
             &image,
             bytes.len() as u64,
@@ -553,7 +679,8 @@ mod tests {
             written.wrote > 1,
             "the fixture must exercise joined-piece reads"
         );
-        let written_dir = directory(&volume, &image.build);
+        let written_dir = directory_in(&volume, VolumeLayout::Northwood, &image.build);
+        assert!(!directory(&volume, &image.build).exists());
         let manifest = fs::read(written_dir.join(MANIFEST_FILE))?;
         assert_eq!(written.manifest_sha256, stela_formats::sha256(&manifest));
         let manifest = stela_formats::payload::PayloadManifest::parse(&manifest)
@@ -600,6 +727,7 @@ mod tests {
                 write_from(
                     &bad_bytes[..],
                     &bad,
+                    VolumeLayout::Legacy,
                     restore::payload::SYNTHETIC_MODEL,
                     &image,
                     bytes.len() as u64,

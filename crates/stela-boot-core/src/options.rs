@@ -1,8 +1,8 @@
 //! `stela.cfg`'s system-mode options: one typed record, the one parser
 //! `stela.efi`'s loader and engine read it with, and the one serializer
 //! `stela setup` writes it with. The option line is whitespace-separated
-//! words starting with `--system`; each option is a flag or a flag and one
-//! value. The spellings are part of the setup/mount contract
+//! words starting with `--system`. Each flag defines how many value words
+//! follow it. The spellings are part of the setup/mount contract
 //! (`stela_loader::mount_interface::OPTIONS_REVISION`).
 use crate::Result;
 use alloc::{string::String, vec::Vec};
@@ -30,6 +30,7 @@ pub const SYSTEM: &str = "--system";
 pub const INSTALL: &str = mount_interface::INSTALL_OPTION;
 pub const INSTALL_SOURCE: &str = "--install-source";
 pub const VERIFY_ON_READ: &str = "--verify-on-read";
+pub const NO_VOLUME_LOG: &str = "--no-volume-log";
 pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
 pub const NATIVE_CORES: &str = "--native-cores";
@@ -186,6 +187,43 @@ fn parse_url(url: &str) -> Result<stela_runtime::net::http::Url<'_>, Error> {
     })
 }
 
+const NETWORK_CHECK_RANGE: &str = "--network-check-range";
+const NETWORK_CHECK_REOPEN: &str = "--network-check-reopen";
+const MAX_NETWORK_CHECK_RANGES: usize = 2;
+
+/// One HTTP(S) range diagnostic pinned to an object length and strong ETag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkCheckRange {
+    pub url: String,
+    pub first: u64,
+    pub last: u64,
+    pub total: u64,
+    /// The HTTP entity tag, including its literal double quotes.
+    pub etag: String,
+}
+
+impl NetworkCheckRange {
+    fn check(&self) -> Result<(), Error> {
+        parse_url(&self.url)?;
+        if self.first > self.last || self.last >= self.total {
+            return Err(Error::NetworkCheckRangeExtent);
+        }
+        let opaque = self
+            .etag
+            .strip_prefix('"')
+            .and_then(|tag| tag.strip_suffix('"'));
+        if !opaque.is_some_and(|tag| {
+            !tag.is_empty()
+                && tag
+                    .bytes()
+                    .all(|byte| byte == b'!' || (b'#'..=b'~').contains(&byte))
+        }) {
+            return Err(Error::NetworkCheckRangeEtag);
+        }
+        Ok(())
+    }
+}
+
 /// The system-mode options of one `stela.cfg` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct System {
@@ -247,6 +285,8 @@ pub struct System {
     /// Refuse a payload without recorded block hashes, which would be read
     /// whole before StartRestore (`--verify-on-read`).
     pub verify_on_read: bool,
+    /// Disable readable snapshots on the STELA data partition.
+    pub no_volume_log: bool,
     /// Restore with the inventory's Update identity (`--update-restore`).
     pub update_restore: bool,
     /// Use restored's development-board policy to keep and report FDR
@@ -289,9 +329,16 @@ pub struct System {
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
-    /// POST once to this `http://` URL at start and report the reply
+    /// POST once to this HTTP(S) URL at start and report the reply
     /// (`--network-check URL`).
     pub network_check: Option<String>,
+    /// Fetch up to the first 4 KiB by HTTPS Range GET and report its digest
+    /// (`--network-check-get URL`).
+    pub network_check_get: Option<String>,
+    /// Up to two pinned HTTP(S) ranges to probe together.
+    pub network_check_ranges: Vec<NetworkCheckRange>,
+    /// Fill and abort the first exact-range socket before opening the second.
+    pub network_check_reopen: bool,
     /// Check exclusively owned conventional HDA after ExitBootServices.
     pub audio_check: Option<AudioCheck>,
     /// Explicit whole-controller handoff for the audio check's physical clock.
@@ -376,6 +423,7 @@ impl Default for System {
             install: None,
             install_source: None,
             verify_on_read: false,
+            no_volume_log: false,
             update_restore: false,
             development_restore: false,
             development_board: false,
@@ -392,6 +440,9 @@ impl Default for System {
             profile: false,
             ecid: None,
             network_check: None,
+            network_check_get: None,
+            network_check_ranges: Vec::new(),
+            network_check_reopen: false,
             audio_check: None,
             audio_own_hpet: false,
             native_pci_own_ioapic: false,
@@ -636,6 +687,8 @@ impl System {
             (self.audio_check.is_some(), "--audio-check"),
             (self.audio_own_hpet, "--audio-own-hpet"),
             (self.network_check.is_some(), "--network-check"),
+            (self.network_check_get.is_some(), "--network-check-get"),
+            (!self.network_check_ranges.is_empty(), NETWORK_CHECK_RANGE),
         ]
         .into_iter()
         .find_map(|(enabled, flag)| enabled.then_some(flag))
@@ -771,6 +824,7 @@ impl fmt::Display for System {
         line.value(INSTALL, self.install.as_deref())?;
         line.value(INSTALL_SOURCE, self.install_source)?;
         line.flag(VERIFY_ON_READ, self.verify_on_read)?;
+        line.flag(NO_VOLUME_LOG, self.no_volume_log)?;
         line.flag(UPDATE_RESTORE, self.update_restore)?;
         line.flag("--development-restore", self.development_restore)?;
         for serial in &self.usb_storage {
@@ -809,6 +863,17 @@ impl fmt::Display for System {
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;
+        line.value("--network-check-get", self.network_check_get.as_deref())?;
+        for range in &self.network_check_ranges {
+            line.value(
+                NETWORK_CHECK_RANGE,
+                Some(format_args!(
+                    "{} {} {} {} {}",
+                    range.url, range.first, range.last, range.total, range.etag
+                )),
+            )?;
+        }
+        line.flag(NETWORK_CHECK_REOPEN, self.network_check_reopen)?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;
         line.flag("--native-pci-own-ioapic", self.native_pci_own_ioapic)?;
@@ -855,6 +920,8 @@ pub struct HostCheck {
     pub deadline: Option<u64>,
     /// How long a prompt waits for a key (`--key-seconds`).
     pub key_seconds: u64,
+    /// Disable readable snapshots on the STELA data partition.
+    pub no_volume_log: bool,
 }
 
 impl Default for HostCheck {
@@ -863,6 +930,7 @@ impl Default for HostCheck {
             nor_file: None,
             deadline: None,
             key_seconds: DEFAULT_KEY_SECONDS,
+            no_volume_log: false,
         }
     }
 }
@@ -898,6 +966,7 @@ impl HostCheck {
                 }
                 "--deadline" => options.deadline = Some(seconds(words.next())?),
                 "--key-seconds" => options.key_seconds = seconds(words.next())?,
+                NO_VOLUME_LOG => options.no_volume_log = true,
                 _ => return Err(Error::UnknownHostOption),
             }
         }
@@ -913,6 +982,7 @@ impl fmt::Display for HostCheck {
             write!(line.0, " --nor-file {guid}:{path}")?;
         }
         line.value("--deadline", self.deadline)?;
+        line.flag(NO_VOLUME_LOG, self.no_volume_log)?;
         if self.key_seconds != DEFAULT_KEY_SECONDS {
             line.value("--key-seconds", Some(self.key_seconds))?;
         }

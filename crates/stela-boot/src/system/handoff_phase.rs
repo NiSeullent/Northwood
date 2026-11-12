@@ -10,6 +10,19 @@ pub(super) struct RetainedFiles {
     pub file_count: usize,
 }
 
+pub(super) fn retain_config(config: Vec<u8>) -> Region {
+    if config.is_empty() {
+        return Region::default();
+    }
+    let region = Region {
+        physical: config.as_ptr() as u64,
+        bytes: config.len() as u64,
+    };
+    // The engine reads this immutable allocation through the shared physmap.
+    core::mem::forget(config);
+    region
+}
+
 /// Keep loader input allocations for engine reads through the physmap.
 pub(super) fn retain_files(
     options: Vec<u8>,
@@ -49,62 +62,59 @@ pub(super) fn retain_files(
 pub(super) struct GuestMemory {
     pub ranges: [Region; MAX_GUEST_RANGES],
     pub count: usize,
-    pub installed: u64,
+    pub ledger: memory_map::Ledger,
 }
 
-/// Collect guest candidates from the final firmware map. UEFI does not
-/// sort the map, so the candidates are sorted and touching ones joined
-/// ([`stela_boot_core::ram::merge_ranges`]); RAM past [`MAX_GUEST_RANGES`]
-/// ranges, or past [`CANDIDATES`] firmware entries, is reported once.
-pub(super) fn guest_memory(map: &impl MemoryMap) -> GuestMemory {
-    /// Firmware entries considered; a map has a few dozen to a few hundred.
-    const CANDIDATES: usize = 1024;
-    let mut candidates = [(0, 0); CANDIDATES];
-    let (mut found, mut past) = (0, 0);
-    let mut installed = 0;
-    for entry in map.entries() {
-        if is_ram(entry.ty) {
-            installed += entry.page_count * PAGE;
-        }
-        if !matches!(
-            entry.ty,
-            MemoryType::CONVENTIONAL
-                | MemoryType::BOOT_SERVICES_CODE
-                | MemoryType::BOOT_SERVICES_DATA
-        ) {
+/// Collect guest candidates from the final firmware map, by the same rules
+/// as the loader's earlier budget.
+pub(super) fn guest_memory(
+    map: &impl MemoryMap,
+    bundle_layout: &mut crate::handoff::BundleLayout,
+) -> GuestMemory {
+    let memory_map::Map {
+        mut ranges,
+        mut count,
+        ledger,
+    } = memory_map::summarize(map, None);
+    // Inserting at increasing guest offsets keeps each earlier placement.
+    let backing = &mut bundle_layout.backing[..bundle_layout.backing_count];
+    backing.sort_unstable_by_key(|part| part.guest_offset);
+    let mut adopted = 0;
+    for index in 0..backing.len() {
+        let part = backing[index];
+        let name = if part.kernel_collection {
+            "bootkc"
+        } else {
+            "ramdisk"
+        };
+        let Region { physical, bytes } = part.region;
+        let Some(admitted) = stela_boot_core::ram::insert_backing(
+            &mut ranges,
+            count,
+            part.guest_offset,
+            (physical, bytes),
+            LARGE,
+        ) else {
+            output::arguments(format_args!("HOST BUNDLE {name} backing kept as staging\n"));
             continue;
-        }
-        let start = entry.phys_start.next_multiple_of(LARGE);
-        let end = (entry.phys_start + entry.page_count * PAGE) & !(LARGE - 1);
-        if end <= start {
-            continue;
-        }
-        match candidates.get_mut(found) {
-            Some(slot) => {
-                *slot = (start, end);
-                found += 1;
-            }
-            None => past += end - start,
-        }
-    }
-    let mut merged = [(0, 0); MAX_GUEST_RANGES];
-    let (count, dropped) =
-        stela_boot_core::ram::merge_ranges(&mut candidates[..found], &mut merged);
-    if dropped + past != 0 {
+        };
+        count = admitted;
+        backing[adopted] = part;
+        adopted += 1;
         output::arguments(format_args!(
-            "GUEST DRAM left out bytes={:#x}: the firmware map has more RAM ranges than the \
-             {MAX_GUEST_RANGES} the handoff keeps\n",
-            dropped + past
+            "HOST BUNDLE {name} adopted={bytes:#x} offset={:#x} physical={physical:#x}\n",
+            part.guest_offset,
         ));
     }
+    bundle_layout.backing_count = adopted;
     let mut guest = [Region::default(); MAX_GUEST_RANGES];
-    for (region, &(physical, bytes)) in guest.iter_mut().zip(&merged[..count]) {
+    for (region, &(physical, bytes)) in guest.iter_mut().zip(&ranges[..count]) {
         *region = Region { physical, bytes };
     }
     GuestMemory {
         ranges: guest,
         count,
-        installed,
+        ledger,
     }
 }
 

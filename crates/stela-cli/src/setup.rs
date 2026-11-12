@@ -21,12 +21,11 @@
 //! One command checks the USB and the restore image without writing
 //! anything, prepares the restore bundle on this computer, then copies it
 //! to the USB's FAT32 data partition, which the PC's firmware can read and
-//! which also holds the install medium and the translation store
-//! (`stela/boot`, `stela/install` and `stela/store`), installs `stela.efi`
-//! as the USB's boot loader (`efi`) with a `stela.cfg` that boots the
-//! installed macOS, and records what it wrote in `EFI/stela/setup.json` on
-//! the EFI partition. `--dry-run` stops after the checks; `uninstall`
-//! removes everything the record names.
+//! which also holds the install medium and the translation store. Setup
+//! installs the loader as `EFI/BOOT/BOOTX64.EFI` and records its files
+//! beside the boot settings in `EFI/northwood/setup.json` on new Northwood
+//! media. Existing Stela media keep their layout. `--dry-run` stops after
+//! the checks. `uninstall` removes the files the record names.
 //!
 //! Each Stela machine has its own ECID (`setup::ecid`), drawn once, kept in
 //! the record and given to every bundle prepared for it. Without `--target`,
@@ -66,12 +65,17 @@ pub(crate) mod host;
 mod installed;
 mod machines;
 mod medium;
+mod northwood_config;
+mod nwconfig_publish;
 mod prepare;
 mod record;
 mod state;
+mod swap;
 mod translations;
 mod uninstall;
 mod update;
+mod volume_log;
+mod volume_swap;
 mod wifi;
 mod wizard;
 
@@ -99,7 +103,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use stela_formats::builds;
-use stela_loader::mount_interface::{self, Interface};
+use stela_loader::mount_interface::{self, Interface, layout::Layout};
 use uninstall::uninstall;
 
 /// The Mac models setup presents, with their names: the M2 Mac mini, the
@@ -130,12 +134,14 @@ fn check_model(models: &[(&str, &str)], model: &str) -> Result<()> {
         supported.join(", ")
     )
 }
+#[cfg(test)]
 const RECORD: &str = "EFI/stela/setup.json";
 /// A margin so no volume is filled to its last byte.
 pub(super) const MARGIN: u64 = 64 * 1024 * 1024;
 /// The boot loader `stela setup` installs: `stela.efi` itself.
 pub(super) const LOADER_PATH: &str = efi::LOADER;
 /// The startup choices beside `stela.cfg`.
+#[cfg(test)]
 const CHOICES_PATH: &str = "EFI/stela/choices.cfg";
 /// The startup choices' timeout with several installs; with one, the list
 /// opens only when a key is held.
@@ -335,7 +341,14 @@ enum Action {
     HostFirmwareFetch {
         requirements: Option<PathBuf>,
         gpu: Option<String>,
+        profile: Option<firmware::Profile>,
+        offline: bool,
     },
+    InspectSwap(swap::Inspect),
+    CreateSwapImage(swap::CreateImage),
+    PlanSwapImage(swap::PlanImage),
+    ApplySwapImage(swap::ApplyImage),
+    PrepareSwapVolumeImage(swap::PrepareVolumeImage),
 }
 
 /// One `stela setup` command: its action and the options it was given
@@ -368,6 +381,7 @@ struct Request {
     remove_install: Option<String>,
     chooser_timeout: Option<command::Wait>,
     translation_store_bytes: Option<u64>,
+    pub(super) volume_swap_bytes: Option<u64>,
     host_firmware_cache: Option<PathBuf>,
     confirm_disk: Option<String>,
     /// The person running setup confirmed erasing the USB, as the wizard
@@ -392,8 +406,18 @@ struct Request {
 pub struct InstallMedium {
     /// The macOS 27 restore image (IPSW); a download receipt beside it is
     /// checked.
-    #[arg(long)]
-    ipsw: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "fetch_build",
+        conflicts_with = "fetch_build"
+    )]
+    ipsw: Option<PathBuf>,
+    /// Download this catalog build straight into verified FAT32 pieces.
+    #[arg(long, value_name = "BUILD")]
+    fetch_build: Option<String>,
+    /// Check the download identity, destination and capacity without writing.
+    #[arg(long, requires = "fetch_build")]
+    dry_run: bool,
     /// The Mac model whose identities the inventory lists.
     #[arg(long, default_value = PINNED_MODEL)]
     model: String,
@@ -412,21 +436,29 @@ impl InstallMedium {
             self.volume.display(),
             info.filesystem
         );
-        let (_, build) = restore::payload::identity(&self.ipsw, &self.model)?;
-        let bytes = fs::metadata(&self.ipsw)?.len();
+        if let Some(build) = self.fetch_build.as_deref() {
+            return self.fetch(&host, build);
+        }
+        let ipsw = self
+            .ipsw
+            .as_deref()
+            .context("supply --ipsw or --fetch-build")?;
+        let (_, build) = restore::payload::identity(ipsw, &self.model)?;
+        let bytes = fs::metadata(ipsw)?.len();
         let piece_bytes = stela_formats::payload::PIECE_BYTES;
         medium::check_space(
             &host,
             medium::SpaceOptions {
+                layout: Layout::Legacy,
                 volume: &self.volume,
                 build: &build,
                 ipsw_bytes: bytes,
                 piece_bytes,
             },
         )?;
-        let expected = medium::Expected::of(restore::receipt(&self.ipsw)?.as_ref());
+        let expected = medium::Expected::of(restore::receipt(ipsw)?.as_ref());
         let inventory = restore::payload::inventory(
-            &self.ipsw,
+            ipsw,
             &self.model,
             restore::payload::KeyOptions {
                 fetch: true,
@@ -435,13 +467,59 @@ impl InstallMedium {
             },
         )?;
         let written = medium::write(medium::WriteOptions {
+            layout: Layout::Legacy,
             volume: &self.volume,
-            ipsw: &self.ipsw,
+            ipsw,
             inventory,
             expected: &expected,
             piece_bytes,
         })?;
-        let directory = medium::directory(&self.volume, &build);
+        self.report(&build, &written);
+        if expected.sha1.is_none() {
+            println!("warning: no download receipt; IPSW checked against its BuildManifest only");
+        }
+        Ok(())
+    }
+
+    fn fetch(&self, host: &host::System, build: &str) -> Result<()> {
+        ensure!(
+            !build.is_empty() && build.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+            "unexpected build identifier"
+        );
+        let directory = medium::directory(&self.volume, build);
+        ensure!(
+            !directory.try_exists()?,
+            "{} already exists",
+            directory.display()
+        );
+        let image = restore::select(&restore::catalog()?, Some(build), Some(&self.model))?;
+        let download = medium::download::Download::open(image)?;
+        let piece_bytes = stela_formats::payload::PIECE_BYTES;
+        medium::check_space(
+            host,
+            medium::SpaceOptions {
+                layout: Layout::Legacy,
+                volume: &self.volume,
+                build,
+                ipsw_bytes: download.bytes,
+                piece_bytes,
+            },
+        )?;
+        if self.dry_run {
+            println!(
+                "Dry run: {} catalog bytes for macOS {build}, FAT32 destination {}",
+                download.bytes,
+                directory.display()
+            );
+            return Ok(());
+        }
+        let written = download.write_fresh_in(&self.volume, &self.model, piece_bytes)?;
+        self.report(build, &written);
+        Ok(())
+    }
+
+    fn report(&self, build: &str, written: &medium::Written) {
+        let directory = medium::directory(&self.volume, build);
         println!(
             "Install medium {}: {} pieces kept, {} written; payload.json SHA-256 {}",
             directory.display(),
@@ -452,13 +530,9 @@ impl InstallMedium {
         println!(
             "Engine options: --install \\{}\\{} --install-source <the partition's GPT unique \
              GUID>",
-            stela_formats::payload::install_directory(&build).replace('/', "\\"),
+            stela_formats::payload::install_directory(build).replace('/', "\\"),
             stela_formats::payload::MANIFEST_FILE
         );
-        if expected.sha1.is_none() {
-            println!("warning: no download receipt; IPSW checked against its BuildManifest only");
-        }
-        Ok(())
     }
 }
 
@@ -530,6 +604,14 @@ fn read_efi(environment: &Environment<'_>, path: &Path) -> Result<Vec<u8>> {
     Ok(image)
 }
 
+fn check_layout_efi(layout: Layout, image: &[u8]) -> Result<()> {
+    ensure!(
+        layout == Layout::Legacy || efi::supports_northwood_layout(image),
+        "this EFI image cannot boot a Northwood setup; use a current Northwood EFI image"
+    );
+    Ok(())
+}
+
 /// Refuse to change a setup whose installed `stela.efi` reads another
 /// interface than this `stela` writes; `update stela` replaces it first.
 fn check_installed_efi(environment: &Environment<'_>, record: &Record) -> Result<()> {
@@ -545,7 +627,7 @@ fn check_installed_efi(environment: &Environment<'_>, record: &Record) -> Result
             fix(&record.esp, "update stela")
         );
     }
-    Ok(())
+    check_layout_efi(record.layout, &image)
 }
 
 /// Refuse to prepare bundles for `record` when its active ones are of
@@ -582,7 +664,16 @@ fn revision_mismatch(environment: &Environment<'_>, record: &Record) -> Option<S
 impl Request {
     fn run(mut self) -> Result<()> {
         // A Windows relaunch opens its own window, which only the wizard wants.
-        let elevate = cfg!(unix) || self.usb.as_os_str().is_empty();
+        let swap_image = matches!(
+            self.action,
+            Action::InspectSwap(_)
+                | Action::CreateSwapImage(_)
+                | Action::PlanSwapImage(_)
+                | Action::ApplySwapImage(_)
+                | Action::PrepareSwapVolumeImage(_)
+        );
+        let interactive = !swap_image && self.usb.as_os_str().is_empty();
+        let elevate = !swap_image && (cfg!(unix) || interactive);
         if elevate && !self.dry_run && elevation::relaunch()? {
             return Ok(());
         }
@@ -617,7 +708,6 @@ impl Request {
             builds: builds::SUPPORTED,
             models: SUPPORTED_MODELS,
         };
-        let interactive = self.usb.as_os_str().is_empty();
         // A stela without its stela.efi says so before the wizard asks
         // anything.
         if interactive && self.efi.is_none() {
@@ -638,7 +728,7 @@ impl Request {
         }
         if interactive && !dry_run {
             let profile = if profile {
-                "\nProfiling is on. Keep EFI/stela/boot.log after your run."
+                "\nProfiling is on. Save your boot log with stela setup boot-log."
             } else {
                 ""
             };
@@ -647,7 +737,7 @@ impl Request {
                     "\nBefore that, {}.",
                     firmware::missing(
                         "`stela setup host-firmware fetch --gpu CHIP --usb USB` (USB: the \
-                         installer's STELA volume)"
+                         installer's data volume)"
                     )
                 ),
                 _ => String::new(),
@@ -675,7 +765,13 @@ impl Request {
         match action {
             Action::Create => return self.create(environment),
             Action::Status => return doctor::status(environment, &self.usb),
+            Action::BootLog => return state::boot_log(environment, &self),
             Action::Uninstall => return uninstall(environment, &self.usb, self.dry_run),
+            Action::InspectSwap(ref inspect) => return inspect.run(),
+            Action::CreateSwapImage(ref create) => return create.run(),
+            Action::PlanSwapImage(ref plan) => return plan.run(),
+            Action::ApplySwapImage(ref apply) => return apply.run(),
+            Action::PrepareSwapVolumeImage(ref prepare) => return prepare.run(),
             _ => {}
         }
         let mut record = read_record(environment, &self.usb)?;
@@ -703,7 +799,6 @@ impl Request {
             Action::ResetNvram => state::reset_nvram(environment, &record, &self),
             Action::BackupState(path) => state::backup(environment, &record, &self, &path),
             Action::RestoreState(path) => state::restore(environment, &record, &self, &path),
-            Action::BootLog => state::boot_log(environment, &record, &self),
             Action::UpdateStela => {
                 let image = match &self.efi {
                     Some(path) => path.clone(),
@@ -737,7 +832,8 @@ impl Request {
                 let package =
                     stela_loader::host_firmware::Package::read_for_mount(&source, &mount_image)?;
                 let (images, bytes) = package.inventory();
-                let destination = record.esp.join(stela_loader::host_firmware::DIRECTORY);
+                let (destination, _) =
+                    firmware::publication_paths(&record.esp, record.layout, &mount_image)?;
                 let mut report = format!(
                     "Host firmware: {images} verified resources, {bytes} bytes to {}\n",
                     destination.display()
@@ -752,23 +848,43 @@ impl Request {
                 }
                 Ok(report)
             }
-            Action::HostFirmwareFetch { requirements, gpu } => {
+            Action::HostFirmwareFetch {
+                requirements,
+                gpu,
+                profile,
+                offline,
+            } => {
                 let mount_image = host_firmware_mount(environment, &record)?;
                 let cache = self
                     .host_firmware_cache
                     .clone()
                     .unwrap_or_else(|| cache_dir().join("firmware"));
-                firmware::provision(firmware::ProvisionOptions {
-                    requirements: requirements.as_deref(),
-                    gpu: gpu.as_deref(),
-                    wifi: None,
-                    destination: &record.esp.join(stela_loader::host_firmware::DIRECTORY),
-                    cache: &cache,
-                    dry_run: self.dry_run,
-                    mount_image: &mount_image,
-                })
+                let (destination, installed) =
+                    firmware::publication_paths(&record.esp, record.layout, &mount_image)?;
+                firmware::provision_from(
+                    firmware::ProvisionOptions {
+                        requirements: requirements.as_deref(),
+                        gpu: gpu.as_deref(),
+                        wifi: None,
+                        profile,
+                        offline,
+                        destination: &destination,
+                        cache: &cache,
+                        dry_run: self.dry_run,
+                        mount_image: &mount_image,
+                    },
+                    &installed,
+                )
             }
-            Action::Create | Action::Status | Action::Uninstall => {
+            Action::Create
+            | Action::Status
+            | Action::BootLog
+            | Action::Uninstall
+            | Action::InspectSwap(_)
+            | Action::CreateSwapImage(_)
+            | Action::PlanSwapImage(_)
+            | Action::ApplySwapImage(_)
+            | Action::PrepareSwapVolumeImage(_) => {
                 unreachable!("these run without the setup record")
             }
         }
@@ -782,10 +898,14 @@ impl Request {
         // A first setup that was interrupted is resumed by `setup`, not
         // added to.
         let configured = locate_esp(environment.host, &self.usb).is_ok_and(|esp| {
-            esp.join(RECORD).is_file()
+            record::layout_at(&esp).is_ok_and(|layout| layout.is_some())
                 && record::interrupted(environment.host, &esp, &self.usb).is_none()
         });
         if configured && self.target.is_some() {
+            ensure!(
+                self.volume_swap_bytes.is_none(),
+                "--volume-swap-bytes goes with a new setup"
+            );
             ensure!(
                 self.wifi.is_none(),
                 "--wifi goes with a new setup; {} changes an existing one's",
@@ -889,6 +1009,14 @@ fn host_firmware_mount(environment: &Environment<'_>, record: &Record) -> Result
 /// The ESP to change: the EFI partition of `usb`'s disk, which must be
 /// mounted, sit on a removable disk and boot no loader but Stela's.
 fn locate_esp(host: &dyn Host, usb: &Path) -> Result<PathBuf> {
+    locate_esp_with_record(host, usb, |esp| Ok(record::mutation_layout(esp)?.is_some()))
+}
+
+fn locate_esp_with_record(
+    host: &dyn Host,
+    usb: &Path,
+    has_record: impl FnOnce(&Path) -> Result<bool>,
+) -> Result<PathBuf> {
     ensure!(usb.is_dir(), "{} is not a mounted volume", usb.display());
     let volume = host.volume(usb)?;
     let disks = host.disks()?;
@@ -919,7 +1047,7 @@ fn locate_esp(host: &dyn Host, usb: &Path) -> Result<PathBuf> {
         ),
     };
     // A USB setup prepared owns its loader, damaged or old as it may be.
-    if !esp.join(RECORD).is_file() {
+    if !has_record(&esp)? {
         efi::check_loader(&esp)?;
     }
     if let Some(disk) = host

@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@localhost>
+Date: Wed, 11 Nov 2026 17:24:00 +0000
+Subject: [PATCH] llvmpipe: scope FP32 denorm preserve to vertex and raster work
+
+Use the explicit NIR FP32 preserve mode on the draw frontend when
+only the vertex stage runs. On raster workers, apply the fragment
+mode around each shader path, including full tiles, all-covered
+quads, edge-masked quads and the linear rectangle fallback. Restore the previous worker mode before
+the next shader and retain the ordinary flush-to-zero default.
+
+Keep fragment variants requesting preservation on the ordinary
+raster path. Share the platform floating point state helper with
+the compute path. Vulkan float-controls properties stay unchanged.
+
+Northwood downstream patch.
+Mesa base: ddaf85e353442d9d7f192fdcf1823e652e3f2ee3
+---
+ src/gallium/auxiliary/draw/draw_pt.c               | 17 ++++++++++++++---
+ src/gallium/drivers/llvmpipe/lp_cs_tpool.c         |  7 ++-----
+ src/gallium/drivers/llvmpipe/lp_rast.c             |  4 ++++
+ .../drivers/llvmpipe/lp_rast_linear_fallback.c     |  2 ++
+ src/gallium/drivers/llvmpipe/lp_rast_priv.h        | 22 ++++++++++++++++++++++
+ src/gallium/drivers/llvmpipe/lp_state_fs.c         |  8 ++++++--
+ src/gallium/drivers/llvmpipe/lp_state_fs.h         |  1 +
+ src/util/u_math.c                                  | 11 +++++++++++
+ src/util/u_math.h                                  |  2 ++
+ 9 files changed, 64 insertions(+), 10 deletions(-)
+
+diff --git a/src/gallium/auxiliary/draw/draw_pt.c b/src/gallium/auxiliary/draw/draw_pt.c
+index d127366..3c0dba2 100644
+--- a/src/gallium/auxiliary/draw/draw_pt.c
++++ b/src/gallium/auxiliary/draw/draw_pt.c
+@@ -30,6 +30,7 @@
+   *   Keith Whitwell <keithw@vmware.com>
+   */
+ 
++#include "compiler/nir/nir.h"
+ #include "draw/draw_context.h"
+ #include "draw/draw_gs.h"
+ #include "draw/draw_tess.h"
+@@ -520,11 +521,21 @@ draw_vbo(struct draw_context *draw,
+    if (info->instance_count == 0)
+       return;
+ 
+-   /* Make sure that denorms are treated like zeros. This is
+-    * the behavior required by D3D10. OpenGL doesn't care.
++   /* Keep the usual D3D10/GL default. An explicit preserve request is
++    * handled here for a vertex-only frontend; mixed stages share this
++    * draw entry and can require different modes.
+     */
++   const struct draw_vertex_shader *vs = draw->vs.vertex_shader;
+    draw->fpstate = util_fpstate_get();
+-   util_fpstate_set_denorms_to_zero(draw->fpstate);
++   if (vs && vs->state.type == PIPE_SHADER_IR_NIR &&
++       !draw->gs.geometry_shader && !draw->tcs.tess_ctrl_shader &&
++       !draw->tes.tess_eval_shader &&
++       (vs->state.ir.nir->info.float_controls_execution_mode &
++        FLOAT_CONTROLS_DENORM_PRESERVE_FP32)) {
++      util_fpstate_set_denorms_preserve(draw->fpstate);
++   } else {
++      util_fpstate_set_denorms_to_zero(draw->fpstate);
++   }
+ 
+    if (indirect && indirect->count_from_stream_output) {
+       resolve_draw_info(info, indirect, &draws[0], &resolved_info,
+diff --git a/src/gallium/drivers/llvmpipe/lp_cs_tpool.c b/src/gallium/drivers/llvmpipe/lp_cs_tpool.c
+index c150e51..ebeafd1 100644
+--- a/src/gallium/drivers/llvmpipe/lp_cs_tpool.c
++++ b/src/gallium/drivers/llvmpipe/lp_cs_tpool.c
+@@ -67,11 +67,8 @@ lp_cs_set_denorm_mode(enum lp_cs_denorm_mode mode, unsigned fpstate)
+       return;
+    }
+    if (mode == LP_CS_DENORM_PRESERVE) {
+-#if DETECT_ARCH_SSE
+-      fpstate &= ~0x8040u; /* MXCSR FTZ and DAZ */
+-#elif DETECT_ARCH_ARM || DETECT_ARCH_AARCH64
+-      fpstate &= ~(1u << 24); /* FPSCR/FPCR FZ */
+-#endif
++      util_fpstate_set_denorms_preserve(fpstate);
++      return;
+    }
+    util_fpstate_set(fpstate);
+ }
+diff --git a/src/gallium/drivers/llvmpipe/lp_rast.c b/src/gallium/drivers/llvmpipe/lp_rast.c
+index 64de2ce..b4ca4d5 100644
+--- a/src/gallium/drivers/llvmpipe/lp_rast.c
++++ b/src/gallium/drivers/llvmpipe/lp_rast.c
+@@ -325,6 +325,7 @@ lp_rast_shade_tile(struct lp_rasterizer_task *task,
+    }
+ 
+    const struct lp_fragment_shader_variant *variant = state->variant;
++   const unsigned fpstate = lp_rast_begin_fp32(variant);
+ 
+    unsigned view_index = inputs->view_index;
+    /* render the whole 64x64 tile in 4x4 chunks */
+@@ -388,6 +389,7 @@ lp_rast_shade_tile(struct lp_rasterizer_task *task,
+          END_JIT_CALL();
+       }
+    }
++   lp_rast_end_fp32(variant, fpstate);
+ }
+ 
+ 
+@@ -477,6 +479,7 @@ lp_rast_shade_quads_mask_sample(struct lp_rasterizer_task *task,
+       lp_rast_task_init_thread_data(&task->thread_data, inputs);
+ 
+       /* run shader on 4x4 block */
++      const unsigned fpstate = lp_rast_begin_fp32(variant);
+       BEGIN_JIT_CALL(state, task);
+       variant->jit_function[RAST_EDGE_TEST](&state->jit_context,
+                                             &state->jit_resources,
+@@ -494,6 +497,7 @@ lp_rast_shade_quads_mask_sample(struct lp_rasterizer_task *task,
+                                             sample_stride,
+                                             depth_sample_stride);
+       END_JIT_CALL();
++      lp_rast_end_fp32(variant, fpstate);
+    }
+ }
+ 
+diff --git a/src/gallium/drivers/llvmpipe/lp_rast_linear_fallback.c b/src/gallium/drivers/llvmpipe/lp_rast_linear_fallback.c
+index 8ab1130..6939c82 100644
+--- a/src/gallium/drivers/llvmpipe/lp_rast_linear_fallback.c
++++ b/src/gallium/drivers/llvmpipe/lp_rast_linear_fallback.c
+@@ -107,6 +107,7 @@ shade_quads(struct lp_rasterizer_task *task,
+    lp_rast_task_init_thread_data(&task->thread_data, inputs);
+ 
+    /* run shader on 4x4 block */
++   const unsigned fpstate = lp_rast_begin_fp32(variant);
+    BEGIN_JIT_CALL(state, task);
+    const unsigned fn_index = mask == 0xffff ? RAST_WHOLE : RAST_EDGE_TEST;
+    variant->jit_function[fn_index](&state->jit_context,
+@@ -122,6 +123,7 @@ shade_quads(struct lp_rasterizer_task *task,
+                                    &task->thread_data,
+                                    strides, 0, 0, 0);
+    END_JIT_CALL();
++   lp_rast_end_fp32(variant, fpstate);
+ }
+ 
+ 
+diff --git a/src/gallium/drivers/llvmpipe/lp_rast_priv.h b/src/gallium/drivers/llvmpipe/lp_rast_priv.h
+index 84612f5..7a2dd97 100644
+--- a/src/gallium/drivers/llvmpipe/lp_rast_priv.h
++++ b/src/gallium/drivers/llvmpipe/lp_rast_priv.h
+@@ -30,6 +30,7 @@
+ 
+ #include "util/format/u_format.h"
+ #include "util/u_thread.h"
++#include "util/u_math.h"
+ #include "gallivm/lp_bld_debug.h"
+ #include "lp_memory.h"
+ #include "lp_rast.h"
+@@ -218,6 +219,25 @@ lp_rast_get_depth_block_pointer(struct lp_rasterizer_task *task,
+ }
+ 
+ 
++/* Raster workers normally flush. Scope an explicit preserve request to
++ * the selected shader so that subsequent draws inherit the worker mode. */
++static inline unsigned
++lp_rast_begin_fp32(const struct lp_fragment_shader_variant *variant)
++{
++   if (!variant->preserve_fp32_denorms)
++      return 0;
++   unsigned fpstate = util_fpstate_get();
++   util_fpstate_set_denorms_preserve(fpstate);
++   return fpstate;
++}
++
++static inline void
++lp_rast_end_fp32(const struct lp_fragment_shader_variant *variant, unsigned fpstate)
++{
++   if (variant->preserve_fp32_denorms)
++      util_fpstate_set(fpstate);
++}
++
+ /**
+  * Shade all pixels in a 4x4 block.  The fragment code omits the
+  * triangle in/out tests.
+@@ -274,6 +294,7 @@ lp_rast_shade_quads_all(struct lp_rasterizer_task *task,
+       task->thread_data.raster_state.view_index = inputs->view_index;
+ 
+       /* run shader on 4x4 block */
++      const unsigned fpstate = lp_rast_begin_fp32(variant);
+       BEGIN_JIT_CALL(state, task);
+       variant->jit_function[RAST_WHOLE](&state->jit_context,
+                                         &state->jit_resources,
+@@ -291,6 +312,7 @@ lp_rast_shade_quads_all(struct lp_rasterizer_task *task,
+                                         sample_stride,
+                                         depth_sample_stride);
+       END_JIT_CALL();
++      lp_rast_end_fp32(variant, fpstate);
+    }
+ }
+ 
+diff --git a/src/gallium/drivers/llvmpipe/lp_state_fs.c b/src/gallium/drivers/llvmpipe/lp_state_fs.c
+index 64a6175..b818ece 100644
+--- a/src/gallium/drivers/llvmpipe/lp_state_fs.c
++++ b/src/gallium/drivers/llvmpipe/lp_state_fs.c
+@@ -3854,6 +3854,8 @@ generate_variant(struct llvmpipe_context *lp,
+    memset(variant, 0, sizeof(*variant));
+ 
+    lp_fs_reference(lp, &variant->shader, shader);
++   variant->preserve_fp32_denorms = (nir->info.float_controls_execution_mode &
++                                   FLOAT_CONTROLS_DENORM_PRESERVE_FP32) != 0;
+ 
+    memcpy(&variant->key, key, shader->variant_key_size);
+ 
+@@ -3933,7 +3935,7 @@ generate_variant(struct llvmpipe_context *lp,
+          ? true : false;
+ 
+    /* We only care about opaque blits for now */
+-   if (variant->opaque &&
++   if (variant->opaque && !variant->preserve_fp32_denorms &&
+        (shader->kind == LP_FS_KIND_BLIT_RGBA ||
+         shader->kind == LP_FS_KIND_BLIT_RGB1)) {
+       const struct lp_sampler_static_state *samp0 =
+@@ -3972,6 +3974,7 @@ generate_variant(struct llvmpipe_context *lp,
+     * the linear path.
+     */
+    const bool linear_pipeline =
++         !variant->preserve_fp32_denorms &&
+          !key->stencil[0].enabled &&
+          !key->depth.enabled &&
+          !key->depth.depth_bounds_test &&
+@@ -3988,7 +3991,8 @@ generate_variant(struct llvmpipe_context *lp,
+       lp_debug_fs_variant(variant);
+    }
+ 
+-   llvmpipe_fs_variant_fastpath(variant);
++   if (!variant->preserve_fp32_denorms)
++      llvmpipe_fs_variant_fastpath(variant);
+ 
+    lp_jit_init_types(variant->gallivm, &jit);
+ 
+diff --git a/src/gallium/drivers/llvmpipe/lp_state_fs.h b/src/gallium/drivers/llvmpipe/lp_state_fs.h
+index b021896..0125d87 100644
+--- a/src/gallium/drivers/llvmpipe/lp_state_fs.h
++++ b/src/gallium/drivers/llvmpipe/lp_state_fs.h
+@@ -148,6 +148,7 @@ struct lp_fragment_shader_variant
+ 
+    unsigned opaque:1;
+    unsigned blit:1;
++   unsigned preserve_fp32_denorms:1;
+    unsigned linear_input_mask:16;
+ 
+    struct gallivm_state *gallivm;
+diff --git a/src/util/u_math.c b/src/util/u_math.c
+index 722eac7..aa27598 100644
+--- a/src/util/u_math.c
++++ b/src/util/u_math.c
+@@ -140,6 +140,17 @@ util_fpstate_set_denorms_to_zero(unsigned current_fpstate)
+    return current_fpstate;
+ }
+ 
++void
++util_fpstate_set_denorms_preserve(unsigned current_fpstate)
++{
++#if DETECT_ARCH_SSE
++   current_fpstate &= ~(_MM_FLUSH_ZERO_MASK | _MM_DENORMALS_ZERO_MASK);
++#elif DETECT_ARCH_ARM || DETECT_ARCH_AARCH64
++   current_fpstate &= ~(1u << 24); /* FPSCR/FPCR FZ */
++#endif
++   util_fpstate_set(current_fpstate);
++}
++
+ /**
+  * Set the state of the fpstate (mxcsr on x86, fpscr/fpcr on arm) register.
+  *
+diff --git a/src/util/u_math.h b/src/util/u_math.h
+index fbcf263..6cd45dc 100644
+--- a/src/util/u_math.h
++++ b/src/util/u_math.h
+@@ -811,6 +811,8 @@ util_fpstate_get(void);
+ unsigned
+ util_fpstate_set_denorms_to_zero(unsigned current_fpstate);
+ void
++util_fpstate_set_denorms_preserve(unsigned current_fpstate);
++void
+ util_fpstate_set(unsigned fpstate);
+ 
+ /**

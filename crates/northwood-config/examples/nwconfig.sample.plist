@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Northwood</key>
+  <dict>
+    <key>SchemaVersion</key><integer>1</integer>
+    <key>HardwareProfile</key><string/>
+    <key>AutoProfile</key><true/>
+  </dict>
+  <!-- Quirks describe the host. An item takes Match, Kind, Value and Comment. -->
+  <key>ACPI</key>
+  <dict><key>Quirks</key><array/></dict>
+  <key>Boot</key>
+  <dict>
+    <key>Timeout</key><string>auto</string>
+    <!-- Each startup entry has Name and a dictionary of Overrides. -->
+    <key>Entries</key><array/>
+    <key>DefaultInstall</key><string/>
+    <key>Install</key><string/>
+    <key>InstallSource</key><string/>
+    <key>VerifyOnRead</key><false/>
+    <key>UpdateRestore</key><false/>
+    <key>SingleUser</key><false/>
+    <key>MaintenanceWrite</key><false/>
+    <key>Bundle</key><string/>
+    <key>Preboot</key><string/>
+  </dict>
+  <key>Drivers</key>
+  <dict>
+    <!-- Auto uses the built-in registry. Safe limits it to storage, input and USB. -->
+    <key>Mode</key><string>Auto</string>
+    <key>Enable</key><array/>
+    <key>Disable</key><array/>
+    <key>Arguments</key><dict/>
+    <!-- Block takes Match and Comment. Force takes Module and Match. -->
+    <key>Block</key><array/>
+    <key>Force</key><array/>
+    <key>Input</key><false/>
+    <key>GuestNetwork</key><false/>
+    <key>ExternalDisks</key><false/>
+    <key>UsbStorage</key><array/>
+    <key>Usb4Approve</key><array/>
+    <key>Network</key>
+    <dict>
+      <key>WiFi</key>
+      <dict>
+        <key>SSID</key><string/>
+        <!-- Store the passphrase in this separate file on the ESP. -->
+        <key>KeyFile</key><string>\EFI\northwood\wifi.key</string>
+        <key>Country</key><string/>
+      </dict>
+      <!-- Empty address and gateway select DHCP. -->
+      <key>IPv4</key><string/>
+      <key>Gateway</key><string/>
+      <key>DNS</key><array/>
+    </dict>
+  </dict>
+  <key>Graphics</key>
+  <dict>
+    <key>Backend</key><string>Auto</string>
+    <key>ScanoutMirror</key><false/>
+  </dict>
+  <key>Memory</key>
+  <dict>
+    <key>Profile</key><string>Auto</string>
+    <key>Paged</key>
+    <dict>
+      <key>ReportedBytes</key><integer>2147483648</integer>
+      <key>HeapFloorBytes</key><integer>536870912</integer>
+    </dict>
+    <key>Swap</key>
+    <dict>
+      <key>Enabled</key><true/>
+      <key>SizeGiB</key><integer>32</integer>
+      <key>Location</key><string>Auto</string>
+      <key>Partition</key><string/>
+      <key>VolumeMaxGiB</key><integer>8</integer>
+      <key>Encrypt</key><true/>
+      <key>GuestSwap</key><true/>
+    </dict>
+    <key>TranslationStoreBytes</key><integer>0</integer>
+    <key>StorageRamBytes</key><integer>0</integer>
+  </dict>
+  <key>Guest</key>
+  <dict>
+    <key>Storage</key><string/>
+    <key>Nor</key><string/>
+    <key>Cores</key><integer>0</integer>
+    <key>PEs</key><integer>0</integer>
+    <key>Parallel</key><true/>
+    <key>IdleSkip</key><false/>
+    <key>NativeRounds</key><false/>
+    <key>BootArgs</key><string/>
+  </dict>
+  <key>Misc</key>
+  <dict>
+    <!-- Active debug options require a diagnostics build. -->
+    <key>Debug</key>
+    <dict>
+      <key>HostCheck</key><false/>
+      <key>Profile</key><false/>
+      <key>Survey</key><false/>
+      <key>SepObserve</key><false/>
+      <key>MonitorTrace</key><false/>
+      <key>DisplayTrace</key><false/>
+      <key>Break</key><array/>
+      <key>Trace</key><array/>
+      <key>Watch</key><array/>
+      <key>Dump</key><array/>
+      <key>NetworkCheck</key><string/>
+      <key>AudioCheck</key><string/>
+      <key>AudioOwnHpet</key><false/>
+      <key>OwnIoapic</key><false/>
+      <key>NativeBootstrapCheck</key><false/>
+      <key>NativeSharedCheck</key><false/>
+      <key>NativeArtifacts</key><false/>
+      <key>DevelopmentRestore</key><false/>
+      <key>Raw</key><string/>
+    </dict>
+    <key>BootLog</key>
+    <dict><key>Esp</key><true/><key>Volume</key><true/></dict>
+  </dict>
+  <key>NVRAM</key>
+  <dict><key>Add</key><dict/></dict>
+  <key>PlatformInfo</key>
+  <dict><key>Model</key><string>Mac14,3</string></dict>
+  <key>UEFI</key>
+  <dict>
+    <key>ConnectAll</key><true/>
+    <key>Quirks</key>
+    <dict><key>ReclaimBootServices</key><true/></dict>
+    <key>FirmwarePath</key><string>EFI/northwood/firmware</string>
+  </dict>
+</dict>
+</plist>

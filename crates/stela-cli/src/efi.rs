@@ -27,18 +27,22 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
-use stela_loader::mount_interface;
+use stela_loader::mount_interface::{
+    self,
+    layout::{self, Layout},
+};
 use stela_runtime::pc::boot_log;
 
 use stela_formats::payload::MAX_SLICE_BYTES;
 
 /// The removable-media boot loader path for x64 (UEFI 2.10, Removable Media
 /// Boot Behavior).
-pub const LOADER: &str = "EFI/BOOT/BOOTX64.EFI";
+pub const LOADER: &str = stela_loader::mount_interface::layout::LOADER;
 const LOADER_DIRECTORY: &str = "EFI/BOOT";
-const MOUNT: &str = "EFI/stela";
+#[cfg(test)]
 pub(crate) const OPTIONS: &str = "EFI/stela/stela.cfg";
 /// `mount_interface::BOOT_LOG_FILE`.
+#[cfg(test)]
 pub(crate) const BOOT_LOG: &str = "EFI/stela/boot.log";
 const SOURCE: &str = "EFI/stela/source.bin";
 
@@ -141,9 +145,21 @@ pub(crate) fn check_loader(esp: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The standalone legacy EFI command cannot maintain a Northwood setup.
+fn check_legacy_command(esp: &Path) -> Result<()> {
+    let record = esp.join(Layout::Northwood.esp_path(layout::RECORD));
+    ensure!(
+        !record.try_exists()?,
+        "{} belongs to a Northwood setup; use the setup commands to maintain it",
+        record.display()
+    );
+    Ok(())
+}
+
 /// Install or replace the mount, and return a report of what changed.
 pub fn install(command: &Install) -> Result<serde_json::Value> {
     let esp = &command.esp;
+    check_legacy_command(esp)?;
     let source = match &command.source {
         Some(source) => {
             Some(fs::read(source).with_context(|| format!("cannot read {}", source.display()))?)
@@ -183,52 +199,107 @@ pub(crate) fn add_mount(
     source: Option<&[u8]>,
     options: Option<&str>,
 ) -> Result<serde_json::Value> {
+    add_mount_in(esp, image, source, options, Layout::Legacy)
+}
+
+pub(crate) fn add_mount_in(
+    esp: &Path,
+    image: &[u8],
+    source: Option<&[u8]>,
+    options: Option<&str>,
+    layout: Layout,
+) -> Result<serde_json::Value> {
+    validate_mount_image(image, layout)?;
+    prepare_mount(esp, source, options, layout)?;
+    publish_loader(esp, image)?;
+    let [loader, options, source, boot_log] = installed_paths(esp, layout);
+    Ok(json!({
+        "loader": loader,
+        "source": source.is_file().then_some(source),
+        "options": options.is_file().then_some(options),
+        "boot_log": boot_log,
+    }))
+}
+
+/// Northwood setup needs both the path and plist contracts.
+pub(crate) fn supports_northwood_layout(image: &[u8]) -> bool {
+    let marker = northwood_config::MOUNT_CAPABILITY;
+    Layout::supports_northwood(image) && image.windows(marker.len()).any(|window| window == marker)
+}
+
+pub(crate) fn validate_mount_image(image: &[u8], layout: Layout) -> Result<()> {
     ensure!(image.starts_with(b"MZ"), "the image is not a PE image");
     ensure!(
         mount_interface::find(image).is_some(),
         "the image is not a stela.efi: it carries no mount interface marker"
     );
-    fs::create_dir_all(esp.join(MOUNT))?;
-    fs::create_dir_all(esp.join(LOADER_DIRECTORY))?;
+    ensure!(
+        layout == Layout::Legacy || supports_northwood_layout(image),
+        "the EFI image lacks support for the Northwood setup layout or nwconfig.plist"
+    );
+    Ok(())
+}
+
+/// Put the selected layout's files in place before activating the loader.
+pub(crate) fn prepare_mount(
+    esp: &Path,
+    source: Option<&[u8]>,
+    options: Option<&str>,
+    layout: Layout,
+) -> Result<()> {
+    fs::create_dir_all(esp.join(layout.esp_dir()))?;
     if let Some(source) = source {
-        write_atomic(&esp.join(SOURCE), source, false)?;
+        write_atomic(&esp.join(layout.esp_path(layout::SOURCE)), source, false)?;
     }
     if let Some(options) = options {
-        write_atomic(&esp.join(OPTIONS), options.as_bytes(), false)?;
+        write_atomic(
+            &esp.join(layout.esp_path(layout::OPTIONS)),
+            options.as_bytes(),
+            false,
+        )?;
     }
     // An existing log keeps its earlier boots. `stela.efi` writes its
     // clusters wherever the volume put them.
-    if !esp.join(BOOT_LOG).is_file() {
-        write_atomic(
-            &esp.join(BOOT_LOG),
-            &vec![0; boot_log::LOG_BYTES as usize],
-            true,
-        )?;
+    let path = esp.join(layout.esp_path(layout::BOOT_LOG));
+    if !path.is_file() {
+        write_atomic(&path, &vec![0; boot_log::LOG_BYTES as usize], true)?;
     }
-    // The loader goes in last, so the USB never boots it without its files.
-    write_atomic(&esp.join(LOADER), image, false)?;
-    Ok(json!({
-        "loader": esp.join(LOADER),
-        "source": esp.join(SOURCE).is_file().then(|| esp.join(SOURCE)),
-        "options": esp.join(OPTIONS).is_file().then(|| esp.join(OPTIONS)),
-        "boot_log": esp.join(BOOT_LOG),
-    }))
+    Ok(())
 }
 
-/// Paths relative to the ESP that `install` writes, for reports.
-pub(crate) const INSTALLED: [&str; 4] = [LOADER, OPTIONS, SOURCE, BOOT_LOG];
+/// Activate a previously prepared mount at the shared UEFI entry point.
+pub(crate) fn publish_loader(esp: &Path, image: &[u8]) -> Result<()> {
+    fs::create_dir_all(esp.join(LOADER_DIRECTORY))?;
+    write_atomic(&esp.join(LOADER), image, false)
+}
+
+/// The shared loader and the selected layout's mount files, for reports.
+pub(crate) fn installed_paths(esp: &Path, layout: Layout) -> [PathBuf; 4] {
+    [
+        esp.join(LOADER),
+        esp.join(layout.esp_path(layout::OPTIONS)),
+        esp.join(layout.esp_path(layout::SOURCE)),
+        esp.join(layout.esp_path(layout::BOOT_LOG)),
+    ]
+}
 
 /// Remove the loader, when it is Stela's, and the files `install` wrote,
 /// and return a report.
 pub fn uninstall(esp: &Path, owned: bool) -> Result<serde_json::Value> {
+    check_legacy_command(esp)?;
+    uninstall_in(esp, owned, Layout::Legacy)
+}
+
+pub(crate) fn uninstall_in(esp: &Path, owned: bool, layout: Layout) -> Result<serde_json::Value> {
     let stela = match owned {
         true => Some(true),
         false => loader_is_stela(esp)?,
     };
-    let mut remove = vec![esp.join(OPTIONS), esp.join(SOURCE), esp.join(BOOT_LOG)];
-    if stela == Some(true) {
-        remove.insert(0, esp.join(LOADER));
-    }
+    let [loader, options, source, boot_log] = installed_paths(esp, layout);
+    let remove = (stela == Some(true))
+        .then_some(loader)
+        .into_iter()
+        .chain([options, source, boot_log]);
     let mut files = Vec::new();
     for file in remove {
         if file.is_file() {
@@ -237,7 +308,7 @@ pub fn uninstall(esp: &Path, owned: bool) -> Result<serde_json::Value> {
         }
     }
     // Directories go only when nothing else is left in them.
-    for directory in [esp.join(MOUNT), esp.join(LOADER_DIRECTORY)] {
+    for directory in [esp.join(layout.esp_dir()), esp.join(LOADER_DIRECTORY)] {
         if fs::read_dir(&directory).is_ok_and(|mut entries| entries.next().is_none()) {
             fs::remove_dir(&directory)?;
         }

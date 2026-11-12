@@ -15,6 +15,7 @@ pub mod metal;
 pub mod nouveau;
 
 pub mod cold;
+pub mod intel;
 pub mod nouveau_chip;
 
 #[cfg(feature = "linux-kernel")]
@@ -76,6 +77,8 @@ pub struct Adapter {
     pub vendor: Vendor,
     pub device: u16,
     pub class: [u8; 3],
+    /// Read-only Gemini Lake graphics memory inventory, if requested.
+    pub glk_memory: Option<Result<intel::glk::MemoryLayout, intel::glk::Error>>,
 }
 
 impl Adapter {
@@ -87,7 +90,16 @@ impl Adapter {
             vendor: Vendor::from_pci(function.vendor),
             device: function.device,
             class: function.class,
+            glk_memory: None,
         })
+    }
+
+    /// Inventory with an optional read-only Gemini Lake PCI memory observation.
+    /// Even when the observation fails, keep the adapter in the inventory.
+    pub fn inspect<C: ConfigSpace>(function: &mut Function<C>) -> Option<Self> {
+        let mut adapter = Self::discover(function)?;
+        adapter.glk_memory = intel::glk::inspect_memory(function);
+        Some(adapter)
     }
 
     /// Every discovered adapter remains unbound until a real port exists.

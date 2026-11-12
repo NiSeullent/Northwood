@@ -1,0 +1,15 @@
+[package]
+name = "northwood-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The Northwood UEFI configuration schema and XML property-list parser"
+
+[features]
+std = []
+
+[lints]
+workspace = true

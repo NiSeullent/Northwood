@@ -1,11 +1,12 @@
 //! Vendor firmware provisioning for a native-driver requirement inventory.
 //! Network/cache policy stays in the CLI; the loader validates pins/packages.
 use anyhow::{Context, Result, ensure};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{blocking::Client, header, redirect::Policy};
 use std::{
     fs::{self, File},
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 use stela_drivers::firmware::{Requirement, Target};
@@ -14,6 +15,11 @@ use stela_loader::host_firmware::{
     recipes::{self, Artifact, Plan},
     requirements::{self, Inventory, Request},
 };
+use stela_loader::mount_interface::layout::{BOOT_LOG, FIRMWARE, Layout};
+
+pub(super) fn directory(esp: &Path, layout: Layout) -> PathBuf {
+    esp.join(layout.esp_path(FIRMWARE))
+}
 
 pub(super) fn read_inventory(path: &Path) -> Result<Inventory> {
     let file = File::open(path)?;
@@ -48,12 +54,37 @@ fn read_cached(path: &Path, artifact: &Artifact) -> Result<Vec<u8>> {
 }
 
 fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
+    let primary = download_member(client, artifact, &artifact.url(), false);
+    if artifact.source != recipes::WIRELESS_REGDB {
+        return primary;
+    }
+    primary.or_else(|error| {
+        let mirror = format!(
+            "https://kernel.googlesource.com/pub/scm/linux/kernel/git/wens/wireless-regdb/+/{}/{}?format=TEXT",
+            artifact.revision, artifact.member,
+        );
+        download_member(client, artifact, &mirror, true)
+            .with_context(|| format!("wireless-regdb primary source failed: {error:#}"))
+    })
+}
+
+fn download_member(
+    client: &Client,
+    artifact: &Artifact,
+    url: &str,
+    encoded: bool,
+) -> Result<Vec<u8>> {
+    let wire_length = if encoded {
+        artifact.length.div_ceil(3) * 4
+    } else {
+        artifact.length
+    };
     // A minute, and the file at 32 kB/s: a GPU's 64 MB firmware may take
     // many minutes on a slow network.
-    let timeout = Duration::from_secs(60 + artifact.length as u64 / 32_000);
+    let timeout = Duration::from_secs(60 + wire_length as u64 / 32_000);
     let mut response = crate::net::send(&format!("downloading {}", artifact.member), || {
         client
-            .get(artifact.url())
+            .get(url)
             .header(header::ACCEPT_ENCODING, "identity")
             .timeout(timeout)
     })?
@@ -65,25 +96,40 @@ fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
     ensure!(
         response
             .content_length()
-            .is_none_or(|n| n == artifact.length as u64),
+            .is_none_or(|n| n == wire_length as u64),
         "firmware source length differs from its pin"
     );
-    let mut bytes = Vec::with_capacity(artifact.length);
+    let mut bytes = Vec::with_capacity(wire_length);
     response
         .by_ref()
-        .take(artifact.length as u64 + 1)
+        .take(wire_length as u64 + 1)
         .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() == wire_length,
+        "firmware source length differs from its pin"
+    );
+    if encoded {
+        bytes = STANDARD
+            .decode(bytes)
+            .context("wireless-regdb mirror returned invalid base64")?;
+    }
     artifact.verify(&bytes)?;
     Ok(bytes)
 }
 
-fn cached(client: &Client, directory: &Path, artifact: &Artifact) -> Result<Vec<u8>> {
+fn cached(client: Option<&Client>, directory: &Path, artifact: &Artifact) -> Result<Vec<u8>> {
     let path = directory.join(artifact.sha256);
     match fs::symlink_metadata(&path) {
         Ok(_) => return read_cached(&path, artifact),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    let client = client.with_context(|| {
+        format!(
+            "offline firmware cache is missing {} ({})",
+            artifact.member, artifact.sha256
+        )
+    })?;
     let bytes = download(client, artifact)?;
     fs::create_dir_all(directory)?;
     ensure!(
@@ -93,9 +139,13 @@ fn cached(client: &Client, directory: &Path, artifact: &Artifact) -> Result<Vec<
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     temporary.write_all(&bytes)?;
     temporary.as_file().sync_all()?;
-    temporary
-        .persist_noclobber(&path)
-        .with_context(|| format!("cannot publish immutable firmware cache {}", path.display()))?;
+    if let Err(error) = temporary.persist_noclobber(&path)
+        && error.error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(error).with_context(|| {
+            format!("cannot publish immutable firmware cache {}", path.display())
+        });
+    }
     host_firmware::sync_directory(directory)?;
     read_cached(&path, artifact)
 }
@@ -133,9 +183,10 @@ pub(super) fn missing(fix: &str) -> String {
 /// Add what a Wi-Fi network needs to the firmware on the USB's EFI partition
 /// `esp`, whose boot program is `mount_image`: the regulatory database, and
 /// the files of this computer's Wi-Fi adapters whose PCI IDs name them.
-pub(super) fn provision_wifi(
+pub(super) fn provision_wifi_in(
     host: &dyn super::host::Host,
     esp: &Path,
+    layout: Layout,
     mount_image: &[u8],
 ) -> Result<()> {
     // A boot program that reads no firmware from the USB has no Wi-Fi driver
@@ -143,15 +194,21 @@ pub(super) fn provision_wifi(
     if !host_firmware::supports_mount(mount_image) {
         return Ok(());
     }
-    provision(ProvisionOptions {
-        requirements: None,
-        gpu: None,
-        wifi: Some(&host.network_adapters()?),
-        destination: &esp.join(host_firmware::DIRECTORY),
-        cache: &super::cache_dir().join("firmware"),
-        dry_run: false,
-        mount_image,
-    })
+    let (destination, installed) = publication_paths(esp, layout, mount_image)?;
+    provision_from(
+        ProvisionOptions {
+            requirements: None,
+            gpu: None,
+            wifi: Some(&host.network_adapters()?),
+            profile: None,
+            offline: false,
+            destination: &destination,
+            cache: &super::cache_dir().join("firmware"),
+            dry_run: false,
+            mount_image,
+        },
+        &installed,
+    )
     .context("the Wi-Fi network is set, but the USB did not get the Wi-Fi firmware")?;
     Ok(())
 }
@@ -219,6 +276,12 @@ const NO_WIFI_FILES: &str = "this computer has no Wi-Fi adapter whose firmware s
     so the USB has none: the PC needs wired \
     Ethernet, or run setup on the PC itself";
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(super) enum Profile {
+    #[value(name = "lenovo-ideapad-1-15igl7", alias = "15igl7")]
+    Lenovo15Igl7,
+}
+
 /// Firmware inputs, cache and destination for one provisioning request.
 pub(super) struct ProvisionOptions<'a> {
     pub(super) requirements: Option<&'a Path>,
@@ -228,6 +291,8 @@ pub(super) struct ProvisionOptions<'a> {
     /// add the regulatory database and their files to what the destination
     /// holds.
     pub(super) wifi: Option<&'a [(u16, u16)]>,
+    pub(super) profile: Option<Profile>,
+    pub(super) offline: bool,
     pub(super) destination: &'a Path,
     pub(super) cache: &'a Path,
     pub(super) dry_run: bool,
@@ -259,12 +324,24 @@ fn binds(image: &host_firmware::Image<'_>, request: &Request) -> bool {
 /// What the newest firmware inventory in a USB's boot log asks for that the
 /// USB's firmware lacks: files with a pinned source, which `repair` and
 /// `update stela` add, and files without one, which they name.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Requested {
+    layout: Layout,
     pub(super) pinned: Vec<Request>,
     pub(super) unpinned: Vec<Request>,
     /// Why the newest inventory line holds none.
     pub(super) unreadable: Option<String>,
+}
+
+impl Default for Requested {
+    fn default() -> Self {
+        Self {
+            layout: Layout::Legacy,
+            pinned: Vec::new(),
+            unpinned: Vec::new(),
+            unreadable: None,
+        }
+    }
 }
 
 /// A missing file as the reports name it: its name and the driver's target.
@@ -334,13 +411,13 @@ impl Requested {
         if self.pinned.is_empty() {
             return Ok(None);
         }
-        let destination = esp.join(host_firmware::DIRECTORY);
+        let (destination, installed) = publication_paths(esp, self.layout, mount_image)?;
         let mut inventory = Inventory::default();
         for request in &self.pinned {
             inventory.observe(request.view())?;
         }
-        keep_installed(&mut inventory, &destination, true)?;
-        publish_plan(&inventory, &destination, cache, dry_run, mount_image).map(Some)
+        keep_installed(&mut inventory, &installed, true)?;
+        publish_plan(&inventory, &destination, cache, dry_run, false, mount_image).map(Some)
     }
 }
 
@@ -348,32 +425,41 @@ impl Requested {
 /// USB's firmware lacks, for a boot program `mount_image`. A USB without a
 /// log or without such a line, and a boot program that reads no firmware
 /// from the USB, need nothing.
-pub(super) fn requested(esp: &Path, mount_image: &[u8]) -> Result<Requested> {
+#[cfg(test)]
+fn requested(esp: &Path, mount_image: &[u8]) -> Result<Requested> {
+    requested_in(esp, Layout::Legacy, mount_image)
+}
+
+pub(super) fn requested_in(esp: &Path, layout: Layout, mount_image: &[u8]) -> Result<Requested> {
+    let empty = || Requested {
+        layout,
+        ..Requested::default()
+    };
     if !host_firmware::supports_mount(mount_image) {
-        return Ok(Requested::default());
+        return Ok(empty());
     }
-    let Some(log) = fs::read(esp.join(crate::efi::BOOT_LOG))
+    let Some(log) = fs::read(esp.join(layout.esp_path(BOOT_LOG)))
         .ok()
         .and_then(|region| stela_runtime::pc::boot_log::read(&region).ok())
     else {
-        return Ok(Requested::default());
+        return Ok(empty());
     };
     let inventory = match requirements::newest(&log.stream) {
-        None => return Ok(Requested::default()),
+        None => return Ok(empty()),
         Some(Ok(inventory)) => inventory,
         Some(Err(error)) => {
             return Ok(Requested {
                 unreadable: Some(error.0),
-                ..Requested::default()
+                ..empty()
             });
         }
     };
-    let manifest = installed_manifest(&esp.join(host_firmware::DIRECTORY))?;
+    let manifest = installed_manifest(&catalog_directory(esp, layout, mount_image)?)?;
     let installed = manifest
         .as_deref()
         .map(host_firmware::Manifest::parse)
         .transpose()?;
-    let mut requested = Requested::default();
+    let mut requested = empty();
     for request in inventory.requests() {
         if requirements::read_by_boot(&request.view().target)
             || installed
@@ -389,6 +475,35 @@ pub(super) fn requested(esp: &Path, mount_image: &[u8]) -> Result<Requested> {
         }
     }
     Ok(requested)
+}
+
+/// The catalog visible to this EFI, which may be the legacy fallback during
+/// a layout transition. A present modern manifest takes precedence.
+pub(super) fn catalog_directory(esp: &Path, layout: Layout, image: &[u8]) -> Result<PathBuf> {
+    if layout == Layout::Northwood || Layout::supports_northwood(image) {
+        let modern = directory(esp, Layout::Northwood);
+        if installed_manifest(&modern)?.is_some() {
+            return Ok(modern);
+        }
+    }
+    Ok(directory(esp, Layout::Legacy))
+}
+
+/// The catalog destination and the active catalog whose bindings it must keep.
+pub(super) fn publication_paths(
+    esp: &Path,
+    layout: Layout,
+    image: &[u8],
+) -> Result<(PathBuf, PathBuf)> {
+    let destination = directory(esp, layout);
+    let installed = catalog_directory(esp, layout, image)?;
+    ensure!(
+        layout == Layout::Northwood || destination == installed,
+        "the current EFI reads host firmware from {}; writing {} would leave that catalog in use",
+        installed.display(),
+        destination.display()
+    );
+    Ok((destination, installed))
 }
 
 /// Require what the firmware in `destination` holds, when `add` says the
@@ -424,11 +539,19 @@ fn keep_installed(inventory: &mut Inventory, destination: &Path, add: bool) -> R
     Ok(())
 }
 
-pub(super) fn provision(options: ProvisionOptions<'_>) -> Result<String> {
+#[cfg(test)]
+fn provision(options: ProvisionOptions<'_>) -> Result<String> {
+    let installed = options.destination;
+    provision_from(options, installed)
+}
+
+pub(super) fn provision_from(options: ProvisionOptions<'_>, installed: &Path) -> Result<String> {
     let ProvisionOptions {
         requirements,
         gpu,
         wifi,
+        profile,
+        offline,
         destination,
         cache,
         dry_run,
@@ -438,7 +561,11 @@ pub(super) fn provision(options: ProvisionOptions<'_>) -> Result<String> {
         Some(path) => read_inventory(path)?,
         None => Inventory::default(),
     };
-    keep_installed(&mut inventory, destination, gpu.is_some() || wifi.is_some())?;
+    keep_installed(
+        &mut inventory,
+        installed,
+        gpu.is_some() || wifi.is_some() || profile.is_some(),
+    )?;
     if let Some(chip) = gpu {
         recipes::require_gsp(&mut inventory, chip)?;
     }
@@ -448,7 +575,21 @@ pub(super) fn provision(options: ProvisionOptions<'_>) -> Result<String> {
             recipes::require_wifi(&mut inventory, vendor, device)?;
         }
     }
-    publish_plan(&inventory, destination, cache, dry_run, mount_image)
+    if let Some(Profile::Lenovo15Igl7) = profile {
+        recipes::require_15igl7_wifi(&mut inventory)?;
+    }
+    let mut report = publish_plan(
+        &inventory,
+        destination,
+        cache,
+        dry_run,
+        offline,
+        mount_image,
+    )?;
+    if profile.is_some() {
+        report.push_str("Profile lenovo-ideapad-1-15igl7 selects Wi-Fi firmware candidates. Live device initialization is checked at boot.\n");
+    }
+    Ok(report)
 }
 
 /// Plan `inventory`'s pinned files and, unless `dry_run`, download them into
@@ -458,6 +599,7 @@ fn publish_plan(
     destination: &Path,
     cache: &Path,
     dry_run: bool,
+    offline: bool,
     mount_image: &[u8],
 ) -> Result<String> {
     let plan = Plan::select(inventory)?;
@@ -469,7 +611,7 @@ fn publish_plan(
                 .map(|selection| selection.recipe.image.length),
         )?;
     let mut report = format!(
-        "Host firmware: {} exact observed bindings, {} pinned image/license artifacts\n",
+        "Host firmware: {} exact firmware bindings, {} pinned image/license artifacts\n",
         plan.selections().len(),
         plan.artifacts().len()
     );
@@ -488,14 +630,18 @@ fn publish_plan(
         report.push_str("Dry run: no downloads or writes.\n");
         return Ok(report);
     }
-    let client = Client::builder()
-        .user_agent(concat!("stela/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(120))
-        .redirect(Policy::none())
-        .build()?;
+    let client = (!offline)
+        .then(|| {
+            Client::builder()
+                .user_agent(concat!("stela/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(120))
+                .redirect(Policy::none())
+                .build()
+        })
+        .transpose()?;
     let package = plan.package(|artifact| {
-        cached(&client, cache, artifact)
+        cached(client.as_ref(), cache, artifact)
             .map_err(|e| host_firmware::Error(format!("firmware provisioning: {e:#}")))
     })?;
     package.check_mount(mount_image)?;
@@ -570,6 +716,86 @@ mod tests {
             assert!(read_cached(&alias, &artifact).is_err());
         }
     }
+
+    #[test]
+    fn offline_cache_miss_names_the_pin_and_reuse_verifies_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = Artifact {
+            source: "https://vendor.invalid",
+            revision: "synthetic",
+            member: "one.bin",
+            length: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+        let missing = cached(None, dir.path(), &artifact).unwrap_err().to_string();
+        assert!(missing.contains(artifact.member) && missing.contains(artifact.sha256));
+        let path = dir.path().join(artifact.sha256);
+        assert!(!path.exists());
+        fs::write(&path, b"abc").unwrap();
+        assert_eq!(cached(None, dir.path(), &artifact).unwrap(), b"abc");
+        fs::write(&path, b"xyz").unwrap();
+        assert!(cached(None, dir.path(), &artifact).is_err());
+    }
+
+    #[test]
+    fn lenovo_profile_dry_run_plans_exact_cnvi_and_regulatory_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("firmware");
+        let cache = dir.path().join("cache");
+        let provision = |dry_run| {
+            provision(ProvisionOptions {
+                requirements: None,
+                gpu: None,
+                wifi: None,
+                profile: Some(Profile::Lenovo15Igl7),
+                offline: true,
+                destination: &destination,
+                cache: &cache,
+                dry_run,
+                mount_image: &host_firmware::MOUNT_CAPABILITY,
+            })
+        };
+        let report = provision(true).unwrap();
+        assert!(report.contains("iwlwifi-9000-pu-b0-jf-b0-46.ucode"));
+        assert!(report.contains("pci:8086:31dc"));
+        assert!(report.contains("regulatory.db.p7s"));
+        let error = provision(false).unwrap_err().to_string();
+        assert!(
+            error.contains("offline firmware cache is missing"),
+            "{error}"
+        );
+        assert!(!destination.exists());
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    #[ignore = "network oracle: pinned vendor firmware and license downloads"]
+    fn lenovo_profile_provisions_the_same_package_online_and_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let online = dir.path().join("online");
+        let offline = dir.path().join("offline");
+        for (destination, cache_only) in [(&online, false), (&offline, true)] {
+            provision(ProvisionOptions {
+                requirements: None,
+                gpu: None,
+                wifi: None,
+                profile: Some(Profile::Lenovo15Igl7),
+                offline: cache_only,
+                destination,
+                cache: &cache,
+                dry_run: false,
+                mount_image: &host_firmware::MOUNT_CAPABILITY,
+            })
+            .unwrap();
+            let package = host_firmware::Package::read(destination).unwrap();
+            assert_eq!(package.inventory(), (3, 1527001));
+        }
+        assert_eq!(
+            fs::read(online.join("manifest.json")).unwrap(),
+            fs::read(offline.join("manifest.json")).unwrap()
+        );
+    }
     #[test]
     fn dry_run_plans_pins_without_cache_or_destination_writes() {
         let dir = tempfile::tempdir().unwrap();
@@ -581,6 +807,8 @@ mod tests {
             requirements: Some(&inventory),
             gpu: None,
             wifi: None,
+            profile: None,
+            offline: false,
             destination: &destination,
             cache: &cache,
             dry_run: true,
@@ -600,6 +828,8 @@ mod tests {
                 requirements: Some(&inventory),
                 gpu: None,
                 wifi: None,
+                profile: None,
+                offline: false,
                 destination: &destination,
                 cache: &cache,
                 dry_run: true,
@@ -617,6 +847,8 @@ mod tests {
                 requirements: None,
                 gpu: None,
                 wifi: Some(adapters),
+                profile: None,
+                offline: false,
                 destination: &dir.path().join("destination"),
                 cache: &dir.path().join("cache"),
                 dry_run: true,
@@ -633,7 +865,7 @@ mod tests {
         ] {
             assert!(text.contains(name), "{name}: {text}");
         }
-        assert!(text.contains("3 exact observed bindings"), "{text}");
+        assert!(text.contains("3 exact firmware bindings"), "{text}");
         // An AX210 and an RTL8822CE.
         let text = plan(&[(0x8086, 0x2725), (0x10ec, 0xc822)]);
         for name in [
@@ -644,10 +876,10 @@ mod tests {
         ] {
             assert!(text.contains(name), "{name}: {text}");
         }
-        assert!(text.contains("4 exact observed bindings"), "{text}");
+        assert!(text.contains("4 exact firmware bindings"), "{text}");
         // No adapter setup knows: the database alone.
         let text = plan(&[(0x8086, 0x125c)]);
-        assert!(text.contains("1 exact observed bindings"), "{text}");
+        assert!(text.contains("1 exact firmware bindings"), "{text}");
         assert!(!dir.path().join("destination").exists());
     }
 
@@ -724,6 +956,8 @@ mod tests {
                 requirements: None,
                 gpu,
                 wifi: None,
+                profile: None,
+                offline: false,
                 destination: &destination,
                 cache: &dir.path().join("cache"),
                 dry_run: true,
@@ -739,9 +973,13 @@ mod tests {
 
     /// A boot log on `esp` whose boots print `lines`.
     fn boot_log(esp: &Path, boots: &[&str]) {
-        fs::create_dir_all(esp.join("EFI/stela")).unwrap();
+        boot_log_in(esp, Layout::Legacy, boots);
+    }
+
+    fn boot_log_in(esp: &Path, layout: Layout, boots: &[&str]) {
+        fs::create_dir_all(esp.join(layout.esp_dir())).unwrap();
         fs::write(
-            esp.join(crate::efi::BOOT_LOG),
+            esp.join(layout.esp_path(BOOT_LOG)),
             crate::boot_log::tests::region(boots),
         )
         .unwrap();
@@ -759,6 +997,66 @@ mod tests {
     fn realtek(name: &str, xid: &str) -> serde_json::Value {
         serde_json::json!({"name":name,"target":{"driver":"realtek","hardware":"10ec:8168",
             "revision":xid,"board":null},"minimum_bytes":4})
+    }
+
+    #[test]
+    fn modern_requests_use_the_modern_boot_log_and_publication_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let esp = dir.path();
+        let legacy = requests_line(&[realtek("rtl_nic/rtl8168f-1.fw", "xid-480")]);
+        let modern = requests_line(&[realtek("rtl_nic/rtl8168d-1.fw", "xid-281")]);
+        boot_log_in(esp, Layout::Legacy, &[&legacy]);
+        boot_log_in(esp, Layout::Northwood, &[&modern]);
+        let image = host_firmware::MOUNT_CAPABILITY;
+        let found = requested_in(esp, Layout::Northwood, &image).unwrap();
+        assert_eq!(found.layout, Layout::Northwood);
+        assert_eq!(found.pinned[0].name, "rtl_nic/rtl8168d-1.fw");
+        let plan = found
+            .plan(esp, &image, &esp.join("cache"), true)
+            .unwrap()
+            .unwrap();
+        assert!(plan.contains("rtl_nic/rtl8168d-1.fw"), "{plan}");
+        assert_eq!(
+            directory(esp, found.layout),
+            esp.join("EFI/northwood/firmware")
+        );
+        assert!(!directory(esp, Layout::Legacy).exists());
+    }
+
+    #[test]
+    fn firmware_catalog_precedence_follows_the_efi_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let esp = dir.path();
+        let old = host_firmware::MOUNT_CAPABILITY;
+        let mut modern = old.to_vec();
+        modern.extend_from_slice(&Layout::MOUNT_CAPABILITY);
+        let legacy_path = directory(esp, Layout::Legacy);
+        let modern_path = directory(esp, Layout::Northwood);
+        assert_eq!(
+            catalog_directory(esp, Layout::Northwood, &modern).unwrap(),
+            legacy_path
+        );
+        fs::create_dir_all(&modern_path).unwrap();
+        fs::write(
+            modern_path.join("manifest.json"),
+            br#"{"schema":1,"images":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_directory(esp, Layout::Legacy, &modern).unwrap(),
+            modern_path
+        );
+        assert_eq!(
+            catalog_directory(esp, Layout::Legacy, &old).unwrap(),
+            legacy_path
+        );
+        assert!(publication_paths(esp, Layout::Legacy, &modern).is_err());
+        assert_eq!(
+            publication_paths(esp, Layout::Northwood, &modern)
+                .unwrap()
+                .0,
+            modern_path
+        );
     }
 
     #[test]
@@ -822,7 +1120,7 @@ mod tests {
         // The plan keeps what the USB holds and downloads nothing in a dry run.
         let cache = dir.path().join("cache");
         let plan = found.plan(&esp, &image, &cache, true).unwrap().unwrap();
-        assert!(plan.contains("2 exact observed bindings"), "{plan}");
+        assert!(plan.contains("2 exact firmware bindings"), "{plan}");
         assert!(plan.contains("rtl_nic/rtl8168e-3.fw"), "{plan}");
         assert!(plan.contains("rtl_nic/rtl8168d-1.fw"), "{plan}");
         assert!(plan.contains("Dry run"), "{plan}");
@@ -872,6 +1170,8 @@ mod tests {
             requirements: Some(&inventory),
             gpu: None,
             wifi: None,
+            profile: None,
+            offline: false,
             destination: &destination,
             cache: &cache,
             dry_run: false,
@@ -922,6 +1222,8 @@ mod tests {
             requirements: Some(&inventory),
             gpu: None,
             wifi: None,
+            profile: None,
+            offline: false,
             destination: &destination,
             cache: &cache,
             dry_run: false,

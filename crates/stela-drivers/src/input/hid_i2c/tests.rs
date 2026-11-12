@@ -32,6 +32,7 @@ unsafe impl Minimum for MinimumTime {
 }
 struct Hardware {
     time: Rc<Cell<u64>>,
+    descriptor_register: u16,
     desc: [u8; 30],
     report_desc: Vec<u8>,
     input: VecDeque<Vec<u8>>,
@@ -84,6 +85,7 @@ impl Hardware {
     fn new(time: Rc<Cell<u64>>, vendor: u16, product: u16) -> Self {
         Self {
             time,
+            descriptor_register: 0x20,
             desc: descriptor(vendor, product),
             report_desc: REPORT_DESCRIPTOR.to_vec(),
             input: VecDeque::new(),
@@ -220,7 +222,7 @@ impl Bus for Model {
             [Operation::Write(register), Operation::Read(output)] if register.len() == 2 => {
                 let reg = u16::from_le_bytes([register[0], register[1]]);
                 match reg {
-                    0x20 => {
+                    register if register == h.descriptor_register => {
                         assert_eq!(output.len(), 30);
                         output.copy_from_slice(&h.desc);
                     }

@@ -424,6 +424,20 @@ pub(super) fn emit_direct_with_add_sub_capture(
                 };
                 // ANDN folds a frame operand and sets N/Z with C/V clear.
                 code.asm().andn(size, work, inverted, left);
+            } else if kind == Logical::And
+                && invert
+                && amount == 0
+                && !target.data_independent_timing()
+                && let Some(inverted) = code.host(operand)
+                && inverted != work
+            {
+                // (left | right) ^ right is left & !right. Keep the resident
+                // right unchanged and avoid staging its complement. XOR
+                // also sets N/Z and clears C/V for BICS.
+                let mut asm = code.asm();
+                take(&mut asm, Size::Qword, work, left);
+                asm.alu(Alu::Or, size, work, inverted);
+                asm.alu(Alu::Xor, size, work, inverted);
             } else if kind == Logical::Or
                 && left == Register::Zero
                 && !invert
@@ -754,10 +768,40 @@ mod tests {
     }
 
     #[test]
-    fn bmi1_bic_preserves_aliases_and_bics_flags() {
-        if !TargetCpu::detect().supports(TargetCpu::Bmi1) {
-            return;
-        }
+    fn unshifted_bic_uses_two_ops_for_a_resident_inverted_operand_without_bmi1() {
+        // BIC W16,W16,W15 from the 26B123 kernel. W16 is pinned to R12D and
+        // the hot block keeps W15 in its second local register, R9D.
+        let operation = Operation::LogicalRegister {
+            width: Width::W32,
+            kind: Logical::And,
+            invert: true,
+            flags: false,
+            destination: Register::X(16),
+            left: Register::X(16),
+            right: Register::X(15),
+            shift: Shift::Lsl,
+            amount: 0,
+        };
+        let emit = |target| {
+            let mut code = Code::pinned();
+            code.set_local_registers(Some([None, Some(Register::X(15)), None, None]));
+            assert!(emit_direct(&mut code, &operation, target));
+            code
+        };
+        let target = TargetCpu::X86_64_V2.with_lzcnt();
+        let compact = emit(target);
+        // or r12d,r9d; xor r12d,r9d.
+        assert_eq!(&compact[..], [0x45, 0x09, 0xcc, 0x45, 0x31, 0xcc]);
+        assert_eq!(compact.instructions(), 2);
+        assert_eq!(
+            emit(target.with_data_independent_timing()).instructions(),
+            3
+        );
+    }
+
+    #[test]
+    fn bic_preserves_aliases_and_bics_flags_on_both_paths() {
+        let host = TargetCpu::detect();
         let mut initial = GuestState::default();
         initial.x[0] = 0x89ab_cdef_8000_0000;
         initial.x[8] = 0x5555_5555_0000_0000;
@@ -796,8 +840,14 @@ mod tests {
                         state
                     };
                     for pinned in [false, true] {
-                        let state = run(TargetCpu::Bmi1, pinned);
-                        assert_eq!(state, run(TargetCpu::Baseline, pinned));
+                        let state = run(TargetCpu::Baseline, pinned);
+                        assert_eq!(
+                            state,
+                            run(TargetCpu::Baseline.with_data_independent_timing(), pinned)
+                        );
+                        if host.supports(TargetCpu::Bmi1) {
+                            assert_eq!(state, run(TargetCpu::Bmi1, pinned));
+                        }
                         assert_eq!(state.nzcv & 0x3000_0000, 0);
                     }
                 }

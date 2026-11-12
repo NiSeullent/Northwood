@@ -1,5 +1,6 @@
 use super::*;
 use core::cell::UnsafeCell;
+use stela_contracts::gate::MemoryRange;
 
 #[repr(C, align(16))]
 struct Storage(UnsafeCell<[u8; 128]>);
@@ -39,7 +40,106 @@ unsafe fn model(ranges: &[ReservedSystemRamRange], owner: Arc<Storage>) -> Regis
         system,
         target: TargetCpu::Baseline,
         erg_bytes: 64,
+        descriptor_frames: None,
     }
+}
+
+mod descriptor_leases;
+
+#[test]
+fn a_wired_buffer_copies_in_logical_order_across_fragmented_ram() {
+    let storage = Storage::new();
+    let layout = [
+        range(&storage, 0x4000, 0, 64),
+        range(&storage, 0x8000, 64, 64),
+    ];
+    // SAFETY: storage remains with the registration and has no other writer.
+    let ram = Arc::new(unsafe { model(&layout, storage) });
+    let wired = WiredRam::new(
+        Arc::clone(&ram),
+        &[
+            MemoryRange {
+                address: 0x8010,
+                bytes: 32,
+            },
+            MemoryRange {
+                address: 0x4010,
+                bytes: 32,
+            },
+        ],
+    )
+    .unwrap();
+    let mut output = [0x71; 16];
+    let mut first = [0; 64];
+    let mut second = [0; 64];
+    // SAFETY: the fixture retains the registered bytes. The local buffers
+    // are private and act as an independent device allocation.
+    unsafe {
+        ram.publish_physical(0x4000, &[0x11; 64]).unwrap();
+        ram.publish_physical(0x8000, &[0x22; 64]).unwrap();
+        wired.read_into(24, &mut output).unwrap();
+        assert_eq!(output[..8], [0x22; 8]);
+        assert_eq!(output[8..], [0x11; 8]);
+        wired.publish_from(24, &[0x9d; 16]).unwrap();
+        ram.read_physical(0x4000, &mut first).unwrap();
+        ram.read_physical(0x8000, &mut second).unwrap();
+    }
+    assert_eq!(first[..16], [0x11; 16]);
+    assert_eq!(first[16..24], [0x9d; 8]);
+    assert_eq!(first[24..], [0x11; 40]);
+    assert_eq!(second[..40], [0x22; 40]);
+    assert_eq!(second[40..48], [0x9d; 8]);
+    assert_eq!(second[48..], [0x22; 16]);
+    let registration = Arc::downgrade(&ram);
+    drop(ram);
+    // SAFETY: the owned plan keeps the fixture RAM and the output is private.
+    unsafe { wired.read_into(24, &mut output) }.unwrap();
+    assert_eq!(output, [0x9d; 16]);
+    drop(wired);
+    assert!(registration.upgrade().is_none());
+}
+
+#[test]
+fn a_wired_copy_refuses_a_hole_overlap_or_out_of_bounds_span() {
+    let storage = Storage::new();
+    let layout = [range(&storage, 0x4000, 0, 64)];
+    // SAFETY: storage remains with the registration and has no other writer.
+    let ram = Arc::new(unsafe { model(&layout, storage) });
+    let valid = MemoryRange {
+        address: 0x4000,
+        bytes: 32,
+    };
+    let hole = MemoryRange {
+        address: 0x4040,
+        bytes: 32,
+    };
+    assert_eq!(
+        WiredRam::new(Arc::clone(&ram), &[valid, hole]).err(),
+        Some(MemoryStatus::Translation)
+    );
+    assert_eq!(
+        WiredRam::new(Arc::clone(&ram), &[valid, valid]).err(),
+        Some(MemoryStatus::InvalidRequest)
+    );
+    let wires = [valid];
+    let wired = WiredRam::new(Arc::clone(&ram), &wires).unwrap();
+    let mut output = [0x71; 8];
+    let mut ram_bytes = [0; 32];
+    // SAFETY: the fixture retains the registered bytes and the slices are
+    // private device-side allocations.
+    unsafe {
+        assert_eq!(wired.read_into(25, &mut output).unwrap_err().completed, 0);
+        assert_eq!(
+            wired
+                .publish_from(u64::MAX - 3, &[0x92; 8])
+                .unwrap_err()
+                .completed,
+            0
+        );
+        ram.read_physical(valid.address, &mut ram_bytes).unwrap();
+    }
+    assert_eq!(output, [0x71; 8]);
+    assert_eq!(ram_bytes, [0x53; 32]);
 }
 
 #[test]

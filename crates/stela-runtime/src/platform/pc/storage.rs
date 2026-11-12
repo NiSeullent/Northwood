@@ -133,6 +133,23 @@ pub fn open(
     devices: &mut Vec<Box<dyn BlockDevice>>,
     target: &Target,
 ) -> Result<PartitionDevice<Box<dyn BlockDevice>>, StorageError> {
+    let (index, partition) = locate_target(devices, target)?;
+    Ok(PartitionDevice::new(devices.swap_remove(index), partition))
+}
+
+/// Check the same native disk and partition selection as `open`, using only
+/// device identities and GPT reads. Keep all disks in the inventory.
+pub fn verify_target(
+    devices: &mut [Box<dyn BlockDevice>],
+    target: &Target,
+) -> Result<(), StorageError> {
+    locate_target(devices, target).map(|_| ())
+}
+
+fn locate_target(
+    devices: &mut [Box<dyn BlockDevice>],
+    target: &Target,
+) -> Result<(usize, gpt::Partition), StorageError> {
     let index = find(devices, &target.serial)?;
     let table = gpt::read(&mut *devices[index]).map_err(StorageError::Table)?;
     let mut partitions = table
@@ -148,7 +165,7 @@ pub fn open(
     if partition.type_guid == Guid::ESP {
         return Err(StorageError::SystemPartition(target.partition));
     }
-    Ok(PartitionDevice::new(devices.swap_remove(index), partition))
+    Ok((index, partition))
 }
 
 /// Take the one disk in `devices` whose GPT holds partition `guid` and
@@ -222,28 +239,11 @@ fn locate(
     devices: &mut [Box<dyn BlockDevice>],
     named: &Named,
 ) -> Result<(usize, gpt::Partition), StorageError> {
-    let (index, partition) = match named {
-        Named::Unique(guid) | Named::Host(guid) => find_any(devices, *guid)?,
-        Named::Disk(target) => {
-            let index = find(devices, &target.serial)?;
-            let table = gpt::read(&mut *devices[index]).map_err(StorageError::Table)?;
-            let mut matching = table
-                .partitions
-                .into_iter()
-                .filter(|partition| partition.unique_guid == target.partition);
-            let partition = matching
-                .next()
-                .ok_or(StorageError::NoPartition(target.partition))?;
-            if matching.next().is_some() {
-                return Err(StorageError::AmbiguousPartition(target.partition));
-            }
-            (index, partition)
-        }
-    };
-    if partition.type_guid == Guid::ESP && !matches!(named, Named::Host(_)) {
-        return Err(StorageError::SystemPartition(partition.unique_guid));
+    match named {
+        Named::Unique(guid) => find_unique(devices, *guid),
+        Named::Host(guid) => find_any(devices, *guid),
+        Named::Disk(target) => locate_target(devices, target),
     }
-    Ok((index, partition))
 }
 
 /// The index of the one disk in `devices` whose GPT holds partition `guid`,
@@ -419,6 +419,41 @@ mod tests {
             Some(StorageError::AmbiguousDisk(String::from("disk-a"), 2))
         );
         assert_eq!(devices.len(), 4);
+    }
+
+    #[test]
+    fn saved_install_target_can_be_verified_on_a_read_only_disk() {
+        let esp = "AAAAAAAA-0000-0000-0000-000000000001";
+        let data = table::DATA.parse().unwrap();
+        let mut disk = table::formatted(
+            "selected",
+            &[
+                table::partition(Guid::ESP, esp, 34, 99),
+                table::partition(data, TARGET, 100, 199),
+            ],
+        );
+        disk.identity.read_only = true;
+        let mut devices: Vec<Box<dyn BlockDevice>> = vec![Box::new(disk)];
+        let selected = target(&format!("selected:{TARGET}"));
+        verify_target(&mut devices, &selected).unwrap();
+        assert_eq!(devices[0].identity().serial, "selected");
+        assert!(matches!(
+            verify_target(&mut devices, &target(&format!("absent:{TARGET}"))),
+            Err(StorageError::NoDisk { .. })
+        ));
+        assert_eq!(
+            verify_target(&mut devices, &target(&format!("selected:{}", Guid::ESP))),
+            Err(StorageError::NoPartition(Guid::ESP))
+        );
+        assert_eq!(
+            verify_target(&mut devices, &target(&format!("selected:{esp}"))),
+            Err(StorageError::SystemPartition(esp.parse().unwrap()))
+        );
+        devices.push(Box::new(RamDisk::new("selected", 8, 512)));
+        assert!(matches!(
+            verify_target(&mut devices, &selected),
+            Err(StorageError::AmbiguousDisk(_, 2))
+        ));
     }
 
     #[test]

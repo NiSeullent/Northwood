@@ -191,6 +191,111 @@ fn url_compatibility_adapter_keeps_the_same_diagnostic() {
     );
     assert_eq!(split_url("http://h/p"), Ok(("h", "/p")));
 }
+
+#[test]
+fn range_network_check_is_https_only_and_preserves_the_post_option() {
+    let url = "https://swcdn.apple.com/robots.txt";
+    let options = System::parse(&format!("--system --network-check-get {url}")).unwrap();
+    assert_eq!(options.network_check_get.as_deref(), Some(url));
+    assert_eq!(options.network_check, None);
+    assert_eq!(options.diagnostic_option(), Some("--network-check-get"));
+    assert_eq!(System::parse(&options.to_string()).unwrap(), options);
+    let post = System::parse(&format!("--system --network-check {url}")).unwrap();
+    assert_eq!(post.network_check.as_deref(), Some(url));
+    assert_eq!(post.network_check_get, None);
+    assert_eq!(
+        System::parse("--system --network-check-get http://h/p"),
+        Err(Error::NetworkCheckGetHttps),
+    );
+    assert_eq!(
+        System::parse(&format!(
+            "--system --network-check-get {url} --network-check {url}"
+        )),
+        Err(Error::DuplicateNetworkCheck),
+    );
+}
+
+#[test]
+fn pinned_network_ranges_keep_http_identity_and_order() {
+    let etag = r#""07f74ff625a3a6fb6bdb10bc3d52d2c5-3051""#;
+    let first =
+        format!("--network-check-range http://h/p 25141250282 25595669502 25595669503 {etag}");
+    let second = format!("--network-check-range https://h/p 0 65535 25595669503 {etag}");
+    let options = System::parse(&format!("--system {first} {second}")).unwrap();
+    assert_eq!(options.diagnostic_option(), Some("--network-check-range"));
+    assert_eq!(options.network_check_ranges.len(), 2);
+    let wide = &options.network_check_ranges[0];
+    assert_eq!(wide.url, "http://h/p");
+    assert_eq!(
+        (wide.first, wide.last, wide.total),
+        (25141250282, 25595669502, 25595669503)
+    );
+    assert_eq!(wide.etag, etag);
+    assert_eq!(options.network_check_ranges[1].url, "https://h/p");
+    assert_eq!(System::parse(&options.to_string()).unwrap(), options);
+    assert_eq!(
+        System::parse(&format!("--system {first} {second} {first}")),
+        Err(Error::NetworkCheckRangeLimit),
+    );
+    for other in [
+        "--network-check http://h/p",
+        "--network-check-get https://h/p",
+    ] {
+        for line in [
+            format!("--system {first} {other}"),
+            format!("--system {other} {first}"),
+        ] {
+            assert_eq!(System::parse(&line), Err(Error::DuplicateNetworkCheck));
+        }
+    }
+}
+
+#[test]
+fn range_reopen_requires_a_same_object_plain_http_pair() {
+    let first = r#"--network-check-range http://h/p 0 9999999 10000000 "v1""#;
+    let second = r#"--network-check-range http://h/p 100 199 10000000 "v1""#;
+    let options =
+        System::parse(&format!("--system --network-check-reopen {first} {second}")).unwrap();
+    assert!(options.network_check_reopen);
+    assert_eq!(System::parse(&options.to_string()).unwrap(), options);
+    for pair in [
+        first.into(),
+        format!("{first} {}", second.replace("http:", "https:")),
+        format!("{first} {}", second.replace("v1", "v2")),
+        format!("{first} {}", second.replace("10000000", "10000001")),
+    ] {
+        assert_eq!(
+            System::parse(&format!("--system --network-check-reopen {pair}")),
+            Err(Error::NetworkCheckReopen),
+        );
+    }
+}
+
+#[test]
+fn pinned_network_ranges_refuse_invalid_extents_and_tags() {
+    let prefix = "--system --network-check-range http://h/p";
+    for extent in ["2 1 3", "1 2 2", "0 0 0"] {
+        assert_eq!(
+            System::parse(&format!(r#"{prefix} {extent} "v1""#)),
+            Err(Error::NetworkCheckRangeExtent),
+        );
+    }
+    for tag in [r#"W/"v1""#, "v1", r#""""#, r#""a"b""#, "\"v\u{7f}\""] {
+        assert_eq!(
+            System::parse(&format!("{prefix} 0 0 1 {tag}")),
+            Err(Error::NetworkCheckRangeEtag),
+        );
+    }
+    assert_eq!(
+        System::parse(&format!("{prefix} 0 0 1")),
+        Err(Error::MissingNetworkCheckRange)
+    );
+    assert_eq!(
+        System::parse(r#"--system --network-check-range ftp://h/p 0 0 1 "v1""#),
+        Err(Error::UrlScheme),
+    );
+}
+
 #[test]
 fn https_and_syntax_hardening_keep_raw_valid_configuration_values() {
     let raw = "https://H:443/a/../p%2f?sig=%2B%3d";

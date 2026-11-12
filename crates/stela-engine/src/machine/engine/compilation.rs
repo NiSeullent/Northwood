@@ -1689,9 +1689,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 if operation.is_none() {
                     self.report_exit_mismatch(index, next_pc, word);
                 }
-                self.completing(next_pc, |machine| {
+                let unprivileged = matches!(operation, Some(SystemOperation::Unprivileged(_)));
+                let retired = self.cpu.retired;
+                let step = self.completing(next_pc, |machine| {
                     machine.complete_system_instruction(word, operation)
-                })
+                });
+                if unprivileged && super::scheduler::native_instruction_incomplete(&step) {
+                    self.cpu.retired = retired;
+                }
+                step
             }
             Ok(ExitKind::FloatingPoint) => {
                 self.retire_before(index, next_pc);

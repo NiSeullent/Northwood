@@ -1,6 +1,6 @@
 //! A conservative limit, never CPU or memory execution permission. Keep the
-//! legacy XMM, scalar GPR and VEX vector recipes both sides have, which is
-//! what blocks compile for. The current side's VEX recipes already need its
+//! memory guarantees and instruction recipes both sides have, which is what
+//! blocks compile for. The current side's VEX recipes already need its
 //! live YMM state, so a limit only removes them; AVX-512 state and DIT
 //! cannot be enabled by a caller-provided declaration.
 use stela_compiler::TargetCpu;
@@ -23,6 +23,7 @@ pub(in crate::memory) fn restrict(actual: TargetCpu, limit: TargetCpu) -> Target
         (TargetCpu::Cx8, TargetCpu::with_cx8),
         (TargetCpu::Cx16, TargetCpu::with_cx16),
         (TargetCpu::AtomicLoad16, TargetCpu::with_atomic_load16),
+        (TargetCpu::LineAtomic, TargetCpu::with_line_atomic),
         // Scalar GPR extensions, which use no extended register state.
         (TargetCpu::Bmi1, TargetCpu::with_bmi1),
         (TargetCpu::Bmi2, TargetCpu::with_bmi2),
@@ -52,7 +53,8 @@ mod tests {
         .with_sha()
         .with_gfni()
         .with_lzcnt()
-        .with_atomic_load16();
+        .with_atomic_load16()
+        .with_line_atomic();
 
     #[test]
     fn neither_limit_nor_current_target_can_promote_the_other() {
@@ -74,6 +76,7 @@ mod tests {
                 TargetCpu::Gfni,
                 TargetCpu::Lzcnt,
                 TargetCpu::AtomicLoad16,
+                TargetCpu::LineAtomic,
                 LEGACY,
             ] {
                 let common = restrict(left, right);
@@ -114,12 +117,37 @@ mod tests {
             assert!(!restrict(TargetCpu::X86_64_V2, rich).supports(kept));
             assert!(!restrict(rich, TargetCpu::X86_64_V2).supports(kept));
         }
-        for excluded in [TargetCpu::Avx512f, TargetCpu::Doit, TargetCpu::LineAtomic] {
+        for excluded in [TargetCpu::Avx512f, TargetCpu::Doit] {
             assert!(!common.supports(excluded));
         }
         // Scalar GPR extensions use no extended state.
         for kept in [TargetCpu::Bmi1, TargetCpu::Bmi2, TargetCpu::Movbe] {
             assert!(common.supports(kept));
         }
+    }
+
+    #[test]
+    fn line_atomicity_survives_only_the_current_and_common_worker_intersection() {
+        use stela_compiler::{
+            GuestAddress, Options,
+            block::{BlockProfile, Features},
+        };
+        let intel = TargetCpu::X86_64_V2.with_line_atomic();
+        let other = TargetCpu::X86_64_V2;
+        assert_eq!(restrict(intel, intel), intel);
+        assert_eq!(restrict(intel, other), other);
+        assert_eq!(restrict(other, intel), other);
+        assert!(!restrict(intel, intel).supports(TargetCpu::AtomicLoad16));
+
+        // LDAPR X8, [X9] from the SPTM boot uses the normal direct lowering.
+        let compile = |target| {
+            stela_compiler::compile(
+                &0xf8bf_c128u32.to_le_bytes(),
+                GuestAddress(0x1000),
+                &Options::new(BlockProfile::new(Features::SYSTEM_MODE), target),
+            )
+        };
+        assert!(compile(restrict(intel, intel)).is_ok());
+        assert!(compile(restrict(intel, other)).is_err());
     }
 }

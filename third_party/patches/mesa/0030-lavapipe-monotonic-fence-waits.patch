@@ -1,0 +1,257 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@localhost>
+Subject: [PATCH] lavapipe: use monotonic waits for software fences
+
+Vulkan wait deadlines are already monotonic. Use Mesa's monotonic
+condition variables for lavapipe pipe syncs and llvmpipe software
+fences, so finite waits do not depend on a realtime clock. Keep the
+indefinite waits and signal paths on the same conditions.
+
+Northwood downstream patch.
+Mesa base: ddaf85e353442d9d7f192fdcf1823e652e3f2ee3
+
+diff --git a/src/gallium/drivers/llvmpipe/lp_fence.c b/src/gallium/drivers/llvmpipe/lp_fence.c
+index 4377750..bdba1e3 100644
+--- a/src/gallium/drivers/llvmpipe/lp_fence.c
++++ b/src/gallium/drivers/llvmpipe/lp_fence.c
+@@ -103,8 +103,15 @@ lp_fence_create(unsigned rank)
+    pipe_reference_init(&fence->reference, 1);
+    fence->type = LP_FENCE_TYPE_SW;
+ 
+-   (void) mtx_init(&fence->mutex, mtx_plain);
+-   cnd_init(&fence->signalled);
++   if (mtx_init(&fence->mutex, mtx_plain) != thrd_success) {
++      FREE(fence);
++      return NULL;
++   }
++   if (u_cnd_monotonic_init(&fence->signalled) != thrd_success) {
++      mtx_destroy(&fence->mutex);
++      FREE(fence);
++      return NULL;
++   }
+ 
+    fence->id = p_atomic_inc_return(&fence_id) - 1;
+    fence->rank = rank;
+@@ -128,7 +135,7 @@ lp_fence_destroy(struct lp_fence *fence)
+ 
+    if (fence->type == LP_FENCE_TYPE_SW) {
+       mtx_destroy(&fence->mutex);
+-      cnd_destroy(&fence->signalled);
++      u_cnd_monotonic_destroy(&fence->signalled);
+    }
+ #ifdef HAVE_LIBDRM
+    else {
+@@ -162,7 +169,7 @@ lp_fence_signal(struct lp_fence *fence)
+ 
+       /* Wakeup all threads waiting on the mutex:
+       */
+-      cnd_broadcast(&fence->signalled);
++      u_cnd_monotonic_broadcast(&fence->signalled);
+ 
+       mtx_unlock(&fence->mutex);
+    }
+@@ -199,7 +206,7 @@ lp_fence_wait(struct lp_fence *f)
+       mtx_lock(&f->mutex);
+       assert(f->issued);
+       while (f->count < f->rank) {
+-         cnd_wait(&f->signalled, &f->mutex);
++         u_cnd_monotonic_wait(&f->signalled, &f->mutex);
+       }
+       mtx_unlock(&f->mutex);
+    }
+@@ -215,24 +222,24 @@ lp_fence_wait(struct lp_fence *f)
+ bool
+ lp_fence_timedwait(struct lp_fence *f, uint64_t timeout)
+ {
+-   struct timespec ts, abs_ts;
+-
+-   timespec_get(&ts, TIME_UTC);
+-
+-   bool ts_overflow = timespec_add_nsec(&abs_ts, &ts, timeout);
+-
+    if (LP_DEBUG & DEBUG_FENCE)
+       debug_printf("%s %d\n", __func__, f->id);
+ 
+    if (f->type == LP_FENCE_TYPE_SW) {
++      const uint64_t abs_timeout = os_time_get_absolute_timeout(timeout);
++      const bool wait_forever = abs_timeout == OS_TIMEOUT_INFINITE;
++      struct timespec deadline;
++      if (!wait_forever)
++         timespec_from_nsec(&deadline, abs_timeout);
++
+       mtx_lock(&f->mutex);
+       assert(f->issued);
+       while (f->count < f->rank) {
+          int ret;
+-         if (ts_overflow)
+-            ret = cnd_wait(&f->signalled, &f->mutex);
++         if (wait_forever)
++            ret = u_cnd_monotonic_wait(&f->signalled, &f->mutex);
+          else
+-            ret = cnd_timedwait(&f->signalled, &f->mutex, &abs_ts);
++            ret = u_cnd_monotonic_timedwait(&f->signalled, &f->mutex, &deadline);
+          if (ret != thrd_success)
+             break;
+       }
+diff --git a/src/gallium/drivers/llvmpipe/lp_fence.h b/src/gallium/drivers/llvmpipe/lp_fence.h
+index f4b0ed0..4254e3d 100644
+--- a/src/gallium/drivers/llvmpipe/lp_fence.h
++++ b/src/gallium/drivers/llvmpipe/lp_fence.h
+@@ -30,6 +30,7 @@
+ #define LP_FENCE_H
+ 
+ 
++#include "util/cnd_monotonic.h"
+ #include "util/u_thread.h"
+ #include "pipe/p_state.h"
+ #include "util/u_inlines.h"
+@@ -51,7 +52,7 @@ struct lp_fence
+    unsigned id;
+ 
+    mtx_t mutex;
+-   cnd_t signalled;
++   struct u_cnd_monotonic signalled;
+ 
+    bool issued;
+    unsigned rank;
+diff --git a/src/gallium/frontends/lavapipe/lvp_pipe_sync.c b/src/gallium/frontends/lavapipe/lvp_pipe_sync.c
+index 02348f4..ca790bb 100644
+--- a/src/gallium/frontends/lavapipe/lvp_pipe_sync.c
++++ b/src/gallium/frontends/lavapipe/lvp_pipe_sync.c
+@@ -33,14 +33,19 @@ lvp_pipe_sync_validate(ASSERTED struct lvp_pipe_sync *sync)
+ }
+ 
+ static VkResult
+-lvp_pipe_sync_init(UNUSED struct vk_device *vk_device,
++lvp_pipe_sync_init(struct vk_device *vk_device,
+                    struct vk_sync *vk_sync,
+                    uint64_t initial_value)
+ {
+    struct lvp_pipe_sync *sync = vk_sync_as_lvp_pipe_sync(vk_sync);
+ 
+-   mtx_init(&sync->lock, mtx_plain);
+-   cnd_init(&sync->changed);
++   if (mtx_init(&sync->lock, mtx_plain) != thrd_success)
++      return vk_errorf(vk_device, VK_ERROR_UNKNOWN, "mtx_init failed");
++
++   if (u_cnd_monotonic_init(&sync->changed) != thrd_success) {
++      mtx_destroy(&sync->lock);
++      return vk_errorf(vk_device, VK_ERROR_UNKNOWN, "cnd_init failed");
++   }
+    sync->signaled = (initial_value != 0);
+    sync->fence = NULL;
+ 
+@@ -57,7 +62,7 @@ lvp_pipe_sync_finish(struct vk_device *vk_device,
+    lvp_pipe_sync_validate(sync);
+    if (sync->fence)
+       device->pscreen->fence_reference(device->pscreen, &sync->fence, NULL);
+-   cnd_destroy(&sync->changed);
++   u_cnd_monotonic_destroy(&sync->changed);
+    mtx_destroy(&sync->lock);
+ }
+ 
+@@ -70,7 +75,7 @@ lvp_pipe_sync_signal_with_fence(struct lvp_device *device,
+    lvp_pipe_sync_validate(sync);
+    sync->signaled = fence == NULL;
+    device->pscreen->fence_reference(device->pscreen, &sync->fence, fence);
+-   cnd_broadcast(&sync->changed);
++   u_cnd_monotonic_broadcast(&sync->changed);
+    mtx_unlock(&sync->lock);
+ }
+ 
+@@ -87,7 +92,7 @@ lvp_pipe_sync_signal(struct vk_device *vk_device,
+    sync->signaled = true;
+    if (sync->fence)
+       device->pscreen->fence_reference(device->pscreen, &sync->fence, NULL);
+-   cnd_broadcast(&sync->changed);
++   u_cnd_monotonic_broadcast(&sync->changed);
+    mtx_unlock(&sync->lock);
+ 
+    return VK_SUCCESS;
+@@ -105,7 +110,7 @@ lvp_pipe_sync_reset(struct vk_device *vk_device,
+    sync->signaled = false;
+    if (sync->fence)
+       device->pscreen->fence_reference(device->pscreen, &sync->fence, NULL);
+-   cnd_broadcast(&sync->changed);
++   u_cnd_monotonic_broadcast(&sync->changed);
+    mtx_unlock(&sync->lock);
+ 
+    return VK_SUCCESS;
+@@ -126,7 +131,7 @@ lvp_pipe_sync_move(struct vk_device *vk_device,
+    bool signaled = src->signaled;
+    src->fence = NULL;
+    src->signaled = false;
+-   cnd_broadcast(&src->changed);
++   u_cnd_monotonic_broadcast(&src->changed);
+    mtx_unlock(&src->lock);
+ 
+    mtx_lock(&dst->lock);
+@@ -134,7 +139,7 @@ lvp_pipe_sync_move(struct vk_device *vk_device,
+       device->pscreen->fence_reference(device->pscreen, &dst->fence, NULL);
+    dst->fence = fence;
+    dst->signaled = signaled;
+-   cnd_broadcast(&dst->changed);
++   u_cnd_monotonic_broadcast(&dst->changed);
+    mtx_unlock(&dst->lock);
+ 
+    return VK_SUCCESS;
+@@ -158,34 +163,17 @@ lvp_pipe_sync_wait_locked(struct lvp_device *device,
+ 
+       int ret;
+       if (abs_timeout_ns >= INT64_MAX) {
+-         /* Common infinite wait case */
+-         ret = cnd_wait(&sync->changed, &sync->lock);
++         ret = u_cnd_monotonic_wait(&sync->changed, &sync->lock);
+       } else {
+-         /* This is really annoying.  The C11 threads API uses CLOCK_REALTIME
+-          * while all our absolute timeouts are in CLOCK_MONOTONIC.  Best
+-          * thing we can do is to convert and hope the system admin doesn't
+-          * change the time out from under us.
+-          */
+-         uint64_t rel_timeout_ns = abs_timeout_ns - now_ns;
+-
+-         struct timespec now_ts, abs_timeout_ts;
+-         timespec_get(&now_ts, TIME_UTC);
+-         if (timespec_add_nsec(&abs_timeout_ts, &now_ts, rel_timeout_ns)) {
+-            /* Overflowed; may as well be infinite */
+-            ret = cnd_wait(&sync->changed, &sync->lock);
+-         } else {
+-            ret = cnd_timedwait(&sync->changed, &sync->lock, &abs_timeout_ts);
+-         }
++         struct timespec deadline;
++         timespec_from_nsec(&deadline, abs_timeout_ns);
++         ret = u_cnd_monotonic_timedwait(&sync->changed, &sync->lock, &deadline);
+       }
+       if (ret == thrd_error)
+          return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
+ 
+       lvp_pipe_sync_validate(sync);
+ 
+-      /* We don't trust the timeout condition on cnd_timedwait() because of
+-       * the potential clock issues caused by using CLOCK_REALTIME.  Instead,
+-       * update now_ns, go back to the top of the loop, and re-check.
+-       */
+       now_ns = os_time_get_nano();
+    }
+ 
+diff --git a/src/gallium/frontends/lavapipe/lvp_private.h b/src/gallium/frontends/lavapipe/lvp_private.h
+index bdb6114..8d09f3a 100644
+--- a/src/gallium/frontends/lavapipe/lvp_private.h
++++ b/src/gallium/frontends/lavapipe/lvp_private.h
+@@ -31,6 +31,7 @@
+ 
+ #include <llvm/Config/llvm-config.h>
+ 
++#include "util/cnd_monotonic.h"
+ #include "util/macros.h"
+ #include "util/list.h"
+ #include "util/u_dynarray.h"
+@@ -267,7 +268,7 @@ struct lvp_pipe_sync {
+    struct vk_sync base;
+ 
+    mtx_t lock;
+-   cnd_t changed;
++   struct u_cnd_monotonic changed;
+ 
+    bool signaled;
+    struct pipe_fence_handle *fence;

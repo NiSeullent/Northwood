@@ -6,6 +6,7 @@
 //! prepared its SSD, and Install macOS once it has (`selection::ready`). Up and Down move the
 //! highlight, Enter starts the highlighted entry, and an entry's key (`1`-`9`,
 //! then `a`-`z`) starts it at once; a firmware entry restarts the PC into it.
+//! Diagnostics builds add a hardware report after the existing choices.
 //! When the first entry, the one `stela.cfg` holds, is the only Mac that
 //! can start now, it starts at once unless a key is held or pressed within
 //! [`GLANCE`], as a Mac shows its startup options only when asked
@@ -18,7 +19,10 @@
 //! its setup entry highlighted ([`hold`]).
 use crate::{
     console::{self, Framebuffer, font},
-    firmware::entries::{self, Entry},
+    firmware::{
+        entries::{self, Entry},
+        esp,
+    },
     output,
     selection::{self, Readiness},
     status,
@@ -28,12 +32,13 @@ use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
 use stela_contracts::refuse;
 use stela_loader::mount_interface::{
-    CHOICES_FILE, CHOSEN_DISK, ChoiceKind, Choices, DISK_FILE, Opening, opening, with_disk,
+    CHOSEN_DISK, ChoiceKind, Choices, Opening,
+    layout::{CHOICES, SELECTED_DISK},
+    opening, with_disk,
 };
 use uefi::{
-    CString16,
     boot::{self, EventType, TimerTrigger, Tpl},
-    fs::{FileSystem, PathBuf},
+    fs::FileSystem,
     proto::console::text::{Key, ScanCode},
 };
 
@@ -125,11 +130,8 @@ fn pressed() -> Option<Press> {
 
 /// The volume's startup choices; `None` when it has none or they cannot be
 /// read, which is reported.
-fn read(volume: &mut FileSystem) -> Option<Choices> {
-    let path = CString16::try_from(CHOICES_FILE).map(PathBuf::from).ok()?;
-    if !matches!(volume.try_exists(&path), Ok(true)) {
-        return None;
-    }
+pub(crate) fn read_legacy(volume: &mut FileSystem) -> Option<Choices> {
+    let path = esp::find(volume, CHOICES).ok()??;
     let choices = volume
         .read(&path)
         .map_err(|_| refuse!("cannot read choices.cfg"))
@@ -144,18 +146,44 @@ fn read(volume: &mut FileSystem) -> Option<Choices> {
     }
 }
 
+fn read(volume: &mut FileSystem) -> Option<Choices> {
+    let legacy = read_legacy(volume);
+    crate::firmware::northwood_choices(volume, legacy)
+}
+
+fn saved_disk(volume: &mut FileSystem) -> Result<Option<String>, &'static str> {
+    let Some(path) =
+        esp::find(volume, SELECTED_DISK).map_err(|_| "cannot locate the saved install target")?
+    else {
+        return Ok(None);
+    };
+    let bytes = volume
+        .read(&path)
+        .map_err(|_| "cannot read the saved install target")?;
+    let text = String::from_utf8(bytes).map_err(|_| "saved install target is not UTF-8")?;
+    Ok(Some(text))
+}
+
 /// The partition Install macOS chose (`SERIAL:GUID`), when it chose one.
 pub fn chosen_disk(volume: &mut FileSystem) -> Option<String> {
-    let path = CString16::try_from(DISK_FILE).map(PathBuf::from).ok()?;
-    let text = String::from_utf8(volume.read(&path).ok()?).ok()?;
+    let text = saved_disk(volume).ok()??;
     let disk = text.trim();
     match disk.parse::<stela_runtime::pc::storage::Target>() {
         Ok(_) => Some(disk.into()),
-        Err(_) => {
-            output::arguments(format_args!("CHOSEN DISK refused: {disk:?}\n"));
+        Err(reason) => {
+            output::arguments(format_args!("CHOSEN DISK refused: {reason}\n"));
             None
         }
     }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn diagnostic_disk(
+    volume: &mut FileSystem,
+) -> Result<Option<stela_runtime::pc::storage::Target>, &'static str> {
+    saved_disk(volume)?
+        .map(|text| text.trim().parse())
+        .transpose()
 }
 
 /// `options` with the chosen disk in place of [`CHOSEN_DISK`], or as they
@@ -178,6 +206,7 @@ pub fn unchosen(options: &[u8]) -> bool {
 
 /// The heading over the firmware's entries.
 const PC: &str = "This PC";
+const DIAGNOSTICS: &str = "Diagnostics";
 
 /// The SSD (`--storage`) a startup choice's options name.
 fn storage(options: &str) -> Option<&str> {
@@ -192,6 +221,7 @@ enum Item {
     Choice(usize, ChoiceKind),
     /// One of the PC firmware's own boot entries.
     Firmware(Entry),
+    Diagnostics,
 }
 
 /// The menu.
@@ -212,7 +242,12 @@ struct Menu<'a> {
 impl<'a> Menu<'a> {
     /// The menu of `choices`: those that can start now, then the firmware's
     /// entries. `held` is why the machine can only be set up.
-    fn new(choices: &'a Choices, held: Option<&'a str>, disk: Option<String>) -> Self {
+    fn new(
+        choices: &'a Choices,
+        held: Option<&'a str>,
+        disk: Option<String>,
+        allow_diagnostics: bool,
+    ) -> Self {
         // A choice on a disk not chosen yet waits for Install macOS.
         let resolved: Vec<Option<String>> = choices
             .entries
@@ -273,6 +308,15 @@ impl<'a> Menu<'a> {
             );
         }
         items.extend(entries::list().into_iter().map(Item::Firmware));
+        if allow_diagnostics
+            && cfg!(feature = "diagnostics")
+            && !choices
+                .entries
+                .iter()
+                .any(|entry| stela_boot_core::options::HostCheck::parse(&entry.options).is_ok())
+        {
+            items.push(Item::Diagnostics);
+        }
         let selected = match held {
             Some(_) => items
                 .iter()
@@ -314,6 +358,7 @@ impl<'a> Menu<'a> {
         match item {
             Item::Choice(n, _) => &self.choices.entries[*n].name,
             Item::Firmware(entry) => &entry.name,
+            Item::Diagnostics => DIAGNOSTICS,
         }
     }
 
@@ -332,7 +377,7 @@ impl<'a> Menu<'a> {
         let mut firmware = false;
         for index in (first..self.items.len()).take(fits) {
             let item = &self.items[index];
-            if !firmware && matches!(item, Item::Firmware(_)) {
+            if !firmware && matches!(item, Item::Firmware(_) | Item::Diagnostics) {
                 firmware = true;
                 y += 16;
                 canvas.text(left + 16, y, PC, 1, ui::DIM);
@@ -392,14 +437,23 @@ impl<'a> Menu<'a> {
     }
 }
 
+/// The selected option line and the menu name that supplied it.
+pub(crate) struct Selection {
+    pub(crate) options: Vec<u8>,
+    pub(crate) entry: Option<String>,
+}
+
 /// Log the chosen entry; its options, on `disk`.
-fn chosen(choices: &Choices, index: usize, disk: Option<&str>) -> Vec<u8> {
+fn chosen(choices: &Choices, index: usize, disk: Option<&str>) -> Selection {
     let entry = &choices.entries[index];
     output::arguments(format_args!("CHOICE {} ({})\n", index + 1, entry.name));
     status::info(&format!("Starting {}", entry.name));
-    with_disk(&entry.options, disk)
-        .unwrap_or_else(|| entry.options.clone())
-        .into_bytes()
+    Selection {
+        options: with_disk(&entry.options, disk)
+            .unwrap_or_else(|| entry.options.clone())
+            .into_bytes(),
+        entry: Some(entry.name.clone()),
+    }
 }
 
 /// Whether a key asks for the menu: one already pressed or held, or one
@@ -412,7 +466,7 @@ fn asked() -> bool {
 /// disk not chosen yet opens the disk picker first ([`installer::choose`]),
 /// and returns to the menu when it is left. A firmware entry chosen
 /// restarts the PC into it. `None` without console input to choose with.
-fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Option<Vec<u8>> {
+fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Option<Selection> {
     loop {
         let index = menu.run()?;
         match &menu.items[index] {
@@ -422,8 +476,9 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
                 let Some(disk) = crate::installer::choose() else {
                     continue;
                 };
-                let path = CString16::try_from(DISK_FILE).map(PathBuf::from).ok()?;
-                if volume.write(&path, format!("{disk}\n")).is_err() {
+                let recorded = esp::destination(volume, SELECTED_DISK)
+                    .is_ok_and(|path| volume.write(path, format!("{disk}\n")).is_ok());
+                if !recorded {
                     menu.notice = Some("The chosen disk could not be recorded on the USB.");
                     continue;
                 }
@@ -435,6 +490,14 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
                 output::arguments(format_args!("CHOICE firmware entry ({})\n", entry.name));
                 menu.notice = Some(entries::start(entry.number));
             }
+            Item::Diagnostics => {
+                output::arguments(format_args!("CHOICE {DIAGNOSTICS}\n"));
+                status::info("Starting Diagnostics");
+                return Some(Selection {
+                    options: stela_boot_core::options::HOST_CHECK.as_bytes().to_vec(),
+                    entry: None,
+                });
+            }
         }
     }
 }
@@ -442,18 +505,25 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
 /// The options to boot: the chosen entry's, or `options` (`stela.cfg`).
 /// `held` is why the default boot can only wait for the setup restore, when
 /// it can.
-pub fn choose(volume: &mut FileSystem, options: Vec<u8>, held: Option<&str>) -> Vec<u8> {
+pub(crate) fn choose(volume: &mut FileSystem, options: Vec<u8>, held: Option<&str>) -> Selection {
     if let Some(reason) = held {
-        return hold(volume, reason).unwrap_or(options);
+        return hold_menu(volume, reason, true).unwrap_or_else(|| without_choices(volume, options));
     }
     let Some(choices) = read(volume) else {
-        return options;
+        return without_choices(volume, options);
     };
-    // Only a key pressed before the menu opens asks for it.
-    if choices.timeout_seconds == 0 && pressed().is_none() {
+    // Diagnostic media allow the same brief key window even with a zero
+    // timeout, so the memory refusal's next step works on those media.
+    if choices.timeout_seconds == 0
+        && !(if cfg!(feature = "diagnostics") {
+            asked()
+        } else {
+            pressed().is_some()
+        })
+    {
         return chosen(&choices, 0, chosen_disk(volume).as_deref());
     }
-    let opened = Menu::new(&choices, None, chosen_disk(volume));
+    let opened = Menu::new(&choices, None, chosen_disk(volume), true);
     if opened.glance
         && !asked()
         && let Some(Item::Choice(n, _)) = opened.items.first()
@@ -464,14 +534,50 @@ pub fn choose(volume: &mut FileSystem, options: Vec<u8>, held: Option<&str>) -> 
         .unwrap_or_else(|| chosen(&choices, 0, chosen_disk(volume).as_deref()))
 }
 
+/// Make Diagnostics reachable even on media with only a default option line.
+fn without_choices(volume: &mut FileSystem, options: Vec<u8>) -> Selection {
+    if cfg!(feature = "diagnostics")
+        && let Ok(text) = core::str::from_utf8(&options)
+        && stela_boot_core::options::System::is_system(text)
+        && asked()
+    {
+        let choices = Choices {
+            timeout_seconds: 0,
+            entries: alloc::vec![stela_loader::mount_interface::Choice {
+                name: String::from("Continue startup"),
+                options: String::from(text),
+            }],
+        };
+        let opened = Menu::new(&choices, None, chosen_disk(volume), true);
+        if let Some(selected) = menu(volume, &choices, opened)
+            && selected.options.as_slice() == stela_boot_core::options::HOST_CHECK.as_bytes()
+        {
+            return selected;
+        }
+    }
+    Selection {
+        options,
+        entry: None,
+    }
+}
+
 /// Wait at the menu after `reason`, with no countdown, as LLB waits in
 /// recovery mode for a restore host: the machine can only be set up. The
 /// setup entry starts highlighted; any entry may be chosen, and one that
 /// cannot boot either returns here. Returns the chosen entry's options;
 /// `None` when the volume has no choices or no console input to choose with.
-pub fn hold(volume: &mut FileSystem, reason: &str) -> Option<Vec<u8>> {
+pub(crate) fn hold(volume: &mut FileSystem, reason: &str) -> Option<Selection> {
+    hold_menu(volume, reason, false)
+}
+
+fn hold_menu(volume: &mut FileSystem, reason: &str, allow_diagnostics: bool) -> Option<Selection> {
     let choices = read(volume)?;
     output::arguments(format_args!("HOLD {reason}\n"));
-    let held = Menu::new(&choices, Some(reason), chosen_disk(volume));
+    let held = Menu::new(
+        &choices,
+        Some(reason),
+        chosen_disk(volume),
+        allow_diagnostics,
+    );
     menu(volume, &choices, held)
 }

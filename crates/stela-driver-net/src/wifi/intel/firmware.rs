@@ -12,6 +12,8 @@ use crate::bytes::le32;
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::ops::Range;
 
+pub mod legacy;
+
 pub(super) const HEADER_BYTES: usize = 88;
 pub(super) const TLV_HEADER_BYTES: usize = 8;
 const MAGIC: u32 = 0x0a4c_5749;
@@ -132,6 +134,7 @@ pub struct SelfLoadPlan<'a> {
 
 #[derive(Debug)]
 pub struct Firmware<'a> {
+    bytes: &'a [u8],
     human_readable: &'a [u8; 64],
     version: u32,
     build: u32,
@@ -224,6 +227,7 @@ impl<'a> Firmware<'a> {
             return Err(Error::Header);
         }
         let mut image = Self {
+            bytes,
             human_readable: bytes[8..72].try_into().expect("header checked"),
             version: le32(bytes, 72),
             build: le32(bytes, 76),

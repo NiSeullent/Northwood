@@ -4,7 +4,10 @@
 //! EDK2 reference: tianocore/edk2@4dfdca63a93497203f197ec98ba20e2327e4afe4,
 //! MdeModulePkg/Bus/Pci/PciBusDxe/PciIo.c::PciIoGetBarAttributes. Range
 //! observation is checked Start+Length; raw maximum is held separately.
+use crate::ecam::RootWindow;
 use core::ops::Range;
+pub mod glk;
+pub mod lpss;
 pub const QWORD_BYTES: usize = 46;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DescriptorError {
@@ -29,6 +32,69 @@ pub struct BarRegion {
     pub host: Range<u64>,
     pub translation: u64,
     pub pci: Range<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootBarError {
+    NoWindow,
+    Ambiguous,
+    Conflicting,
+    InvalidTranslation,
+}
+
+/// Decode the address and width of an assigned Type 0 non-prefetchable
+/// memory BAR from its configuration words.
+fn observe_memory_bar(layout: u32, low: u32, high: u32, alignment: u64) -> Option<(u64, u64)> {
+    if (layout >> 16) & 0x7f != 0 {
+        return None;
+    }
+    let (bits, high) = match low & 15 {
+        0 => (32, 0),
+        4 if high != u32::MAX => (64, high),
+        _ => return None,
+    };
+    let pci_base = u64::from(low & !15) | u64::from(high) << 32;
+    (pci_base != 0 && pci_base.is_multiple_of(alignment)).then_some((pci_base, bits))
+}
+
+fn root_memory_windows<'a>(
+    root: &RootWindow,
+    windows: &'a [RootWindow],
+) -> impl Iterator<Item = &'a RootWindow> {
+    let (segment, bridge) = (root.segment, root.bridge);
+    windows.iter().filter(move |window| {
+        window.space == 0 && window.segment == segment && window.bridge == bridge
+    })
+}
+
+/// Translate the observed extent through one memory descriptor of the
+/// captured root.
+fn original_root_host(
+    pci_base: u64,
+    bytes: u64,
+    root: &RootWindow,
+    windows: &[RootWindow],
+) -> Result<u64, RootBarError> {
+    let last = bytes
+        .checked_sub(1)
+        .and_then(|offset| pci_base.checked_add(offset))
+        .ok_or(RootBarError::InvalidTranslation)?;
+    let mut candidates = root_memory_windows(root, windows)
+        .filter(|window| window.minimum <= pci_base && last <= window.maximum);
+    let first = candidates.next().ok_or(RootBarError::NoWindow)?;
+    let mut repeated = false;
+    for candidate in candidates {
+        if candidate.translation != first.translation {
+            return Err(RootBarError::Conflicting);
+        }
+        repeated = true;
+    }
+    if repeated {
+        return Err(RootBarError::Ambiguous);
+    }
+    pci_base
+        .checked_add(first.translation)
+        .ok_or(RootBarError::InvalidTranslation)
 }
 
 /// The firmware framebuffer's observed Type 0 PCI BAR. The copied words

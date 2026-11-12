@@ -38,8 +38,8 @@ use core::{
 use stela_drivers::{
     bus::pci::{Address, EcamWindow},
     platform::acpi::{
-        Interrupt, Mode, PciId, SERVICES_ABI_BYTES, SERVICES_ABI_VERSION, Services, Session,
-        Status, Value, Work,
+        Interrupt, Mode, NOT_FOUND, PciId, SERVICES_ABI_BYTES, SERVICES_ABI_VERSION, Services,
+        Session, Status, Value, Work,
     },
     usb::typec::ucsi::acpi::attachment as ucsi,
 };
@@ -1160,6 +1160,62 @@ impl HostAcpi {
     }
     pub(super) fn take_power_button(&self) -> bool {
         POWER_BUTTON.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether a present device reports exactly this primary `_HID`.
+    pub(super) fn has_primary_hid(&'static self, hid: &str) -> bool {
+        if hid.is_empty() {
+            return false;
+        }
+        let hid = String::from(hid);
+        // SAFETY: this permanent provider is held by the leaked Session.
+        let provider = unsafe { &*self.provider };
+        provider
+            .executor
+            .call_owned(5_000_000, move || {
+                // An ID-filtered ACPICA walk also executes and matches _CID.
+                let Ok(devices) = self.session.all_devices() else {
+                    return false;
+                };
+                devices.into_iter().any(|device| {
+                    let primary = device
+                        .child("_HID")
+                        .and_then(|object| object.evaluate(None, &[]));
+                    let matches = match primary {
+                        Ok(Some(Value::String(bytes))) => bytes == hid.as_bytes(),
+                        Ok(Some(Value::Integer(value))) => {
+                            let Ok(id) = u32::try_from(value) else {
+                                return false;
+                            };
+                            // EISA encodes three letters and four hex digits.
+                            let id = id.swap_bytes();
+                            let letter = |shift: u32| char::from(b'@' + ((id >> shift) & 31) as u8);
+                            hid == alloc::format!(
+                                "{}{}{}{:04X}",
+                                letter(26),
+                                letter(21),
+                                letter(16),
+                                id & 0xffff
+                            )
+                        }
+                        _ => false,
+                    };
+                    if !matches {
+                        return false;
+                    }
+                    // The walk also reports functioning devices with bit 0
+                    // clear. Only a missing _STA defaults to present.
+                    match device.child("_STA") {
+                        Ok(status) => matches!(
+                            status.evaluate(None, &[]),
+                            Ok(Some(Value::Integer(flags))) if flags & 1 != 0
+                        ),
+                        Err(NOT_FOUND) => true,
+                        Err(_) => false,
+                    }
+                })
+            })
+            .unwrap_or(false)
     }
 
     pub(super) fn poll(&'static self) {

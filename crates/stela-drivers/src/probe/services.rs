@@ -27,6 +27,24 @@ pub struct ArrivalInventory<'a> {
         &'a mut dyn FnMut(Address, u16) -> Result<Option<u32>, crate::bus::pci::ConfigError>,
 }
 
+/// The namespace connection to a matched LPSS function before claiming it.
+/// The address and speed come from the ACPI resource. The descriptor register
+/// includes any selected board override.
+#[cfg(feature = "native-acpi")]
+pub struct LpssI2cObservation<'a> {
+    pub pci: crate::bus::pci::Identity,
+    pub hid: &'a str,
+    pub device: &'a str,
+    pub controller: &'a str,
+    pub address: crate::bus::i2c::Address,
+    pub speed: u32,
+    pub gpio_interrupt: bool,
+    pub descriptor: u16,
+}
+
+#[cfg(feature = "native-acpi")]
+pub type LpssI2cObserver = for<'a> fn(LpssI2cObservation<'a>);
+
 /// Why a service refused a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceError {
@@ -201,6 +219,20 @@ pub unsafe trait NativeServices {
     /// requires.
     #[cfg(feature = "native-acpi")]
     fn acpi(&self) -> Option<&'static crate::platform::acpi::Session>;
+
+    /// Validated I²C-HID rules for this host. Probe borrows them only while
+    /// it attaches the ACPI devices.
+    #[cfg(feature = "native-acpi")]
+    fn hid_quirks(&self) -> &[super::HidQuirk<'_>] {
+        &[]
+    }
+
+    /// An optional reporter for ACPI and PCI observations. The callback
+    /// receives facts only and cannot authorize requester or BAR ownership.
+    #[cfg(feature = "native-acpi")]
+    fn lpss_i2c_observer(&self) -> Option<LpssI2cObserver> {
+        None
+    }
 
     /// Reserve memory resource `ordinal` of `device`'s `_CRS` from the
     /// mount's native broker, for a controller the namespace describes, as

@@ -128,6 +128,7 @@ impl ParseState<'_> {
             }
             "--survey" => options.survey = true,
             VERIFY_ON_READ => options.verify_on_read = true,
+            NO_VOLUME_LOG => options.no_volume_log = true,
             UPDATE_RESTORE => options.update_restore = true,
             "--development-restore" => options.development_restore = true,
             "--idle-skip" => options.idle_skip = true,
@@ -209,12 +210,45 @@ impl ParseState<'_> {
                     Error::DuplicateNativePciIoapic,
                 )?;
             }
-            "--network-check" => {
+            "--network-check" | "--network-check-get" => {
                 let url = value().ok_or(Error::MissingNetworkUrl)?;
-                parse_url(url)?;
-                if options.network_check.replace(String::from(url)).is_some() {
+                let parsed = parse_url(url)?;
+                if options.network_check.is_some()
+                    || options.network_check_get.is_some()
+                    || !options.network_check_ranges.is_empty()
+                {
                     return Err(Error::DuplicateNetworkCheck);
                 }
+                if name == "--network-check-get" {
+                    if parsed.scheme != stela_runtime::net::http::Scheme::Https {
+                        return Err(Error::NetworkCheckGetHttps);
+                    }
+                    options.network_check_get = Some(String::from(url));
+                } else {
+                    options.network_check = Some(String::from(url));
+                }
+            }
+            NETWORK_CHECK_RANGE => {
+                if options.network_check.is_some() || options.network_check_get.is_some() {
+                    return Err(Error::DuplicateNetworkCheck);
+                }
+                if options.network_check_ranges.len() == MAX_NETWORK_CHECK_RANGES {
+                    return Err(Error::NetworkCheckRangeLimit);
+                }
+                let mut field = || value().ok_or(Error::MissingNetworkCheckRange);
+                options.network_check_ranges.push(NetworkCheckRange {
+                    url: String::from(field()?),
+                    first: number(field()?)?,
+                    last: number(field()?)?,
+                    total: number(field()?)?,
+                    etag: String::from(field()?),
+                });
+            }
+            NETWORK_CHECK_REOPEN => {
+                flag(
+                    &mut options.network_check_reopen,
+                    Error::DuplicateNetworkCheck,
+                )?;
             }
             "--ecid" => {
                 let ecid = number(value().ok_or(Error::MissingEcid)?)?;

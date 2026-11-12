@@ -9,8 +9,10 @@ publish = false
 description = "Firmware-independent logic of stela.efi: stela.cfg options, ACPI, topology, paging and console decoders"
 
 [features]
+config-validation = ["dep:anyhow", "dep:northwood-config"]
 # `_CRS` interrupt routes, decoded by the drivers' ACPI resource types.
 native-acpi = ["stela-drivers/native-acpi"]
+metal-vulkan = ["stela-drivers/metal-vulkan"]
 
 [dependencies]
 stela-driver-base = { path = "../stela-driver-base" }
@@ -32,6 +34,8 @@ stela-runtime = { path = "../stela-runtime", default-features = false }
 stela-soc-data = { path = "../stela-soc-data", default-features = false }
 
 [target.'cfg(not(target_os = "uefi"))'.dependencies]
+anyhow = { workspace = true, optional = true }
+northwood-config = { path = "../northwood-config", optional = true }
 stela-compiler = { path = "../stela-compiler" }
 stela-contracts = { path = "../stela-contracts" }
 stela-formats = { path = "../stela-formats" }
@@ -42,7 +46,9 @@ stela-runtime = { path = "../stela-runtime" }
 stela-soc-data = { path = "../stela-soc-data" }
 
 [dev-dependencies]
+northwood-config = { path = "../northwood-config" }
 stela-driver-base = { path = "../stela-driver-base", features = ["test-support"] }
+stela-engine = { path = "../stela-engine", features = ["test-support"] }
 serde_json.workspace = true
 # An independent SHA-256 the tests check digests against.
 sha2 = { version = "0.10", default-features = false }

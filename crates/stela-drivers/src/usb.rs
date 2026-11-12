@@ -17,6 +17,7 @@ pub mod ethernet;
 pub mod forwarding;
 pub mod handoff;
 pub mod hid;
+pub mod rndis;
 pub mod storage;
 pub mod typec;
 pub mod xhci;

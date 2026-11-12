@@ -324,7 +324,14 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
     }
     /// The ASR sender of the job that sends the image, while one does.
     pub fn asr(&self) -> Option<&super::asr::Sender> {
-        self.jobs.iter().find_map(|transfer| transfer.job.asr())
+        self.asr_transfer().map(|(sender, _)| sender)
+    }
+    /// The current ASR sender and its own stream handle once it has opened.
+    pub fn asr_transfer(&self) -> Option<(&super::asr::Sender, Option<H>)> {
+        self.jobs.iter().find_map(|transfer| {
+            let sender = transfer.job.asr()?;
+            Some((sender, transfer.handle))
+        })
     }
     /// Close all owned streams after a terminal refusal, without emitting any
     /// further protocol bytes. Caller keeps polling while the guest advances.

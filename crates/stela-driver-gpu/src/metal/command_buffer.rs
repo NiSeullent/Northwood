@@ -234,6 +234,14 @@ pub struct Segment {
     pub binds: Vec<SparseBind>,
     pub commands: Vec<Command>,
     pub signals: Vec<(Semaphore, u64)>,
+    pub(crate) guest_load: Option<super::vulkan::backend::GuestRows>,
+    pub(crate) guest_store: Option<super::vulkan::backend::GuestRows>,
+}
+
+impl Segment {
+    pub(crate) fn copies_guest_rows(&self) -> bool {
+        self.guest_load.is_some() || self.guest_store.is_some()
+    }
 }
 
 /// A committed command buffer, ready for the queue.
@@ -668,10 +676,12 @@ fn buffer_slot(index: u32) -> Result<usize> {
 fn merge_unwaited(segments: Vec<Segment>) -> Vec<Segment> {
     let mut merged: Vec<Segment> = Vec::with_capacity(segments.len());
     for segment in segments {
-        let Some(last) = merged
-            .last_mut()
-            .filter(|_| segment.waits.is_empty() && segment.binds.is_empty())
-        else {
+        let Some(last) = merged.last_mut().filter(|last| {
+            segment.waits.is_empty()
+                && segment.binds.is_empty()
+                && !segment.copies_guest_rows()
+                && !last.copies_guest_rows()
+        }) else {
             merged.push(segment);
             continue;
         };
@@ -720,11 +730,16 @@ impl Recorder {
     fn start_segment(&mut self, waits: Vec<(Semaphore, u64)>) {
         self.segments.push(Segment {
             waits,
-            binds: Vec::new(),
             commands: alloc::vec![Command::Barrier(FULL)],
-            signals: Vec::new(),
+            ..Segment::default()
         });
         self.hazards = Hazards::default();
+    }
+
+    fn segment(&mut self) -> &mut Segment {
+        self.segments
+            .last_mut()
+            .expect("a command buffer always has a segment")
     }
 
     fn commands(&mut self) -> &mut Vec<Command> {

@@ -17,6 +17,7 @@ use crate::ui;
 use alloc::{string::String, vec, vec::Vec};
 use core::{
     cell::UnsafeCell,
+    ops::Range,
     sync::atomic::{AtomicBool, Ordering},
 };
 use font::Font;
@@ -103,8 +104,7 @@ fn gop() -> Option<(Handle, ScopedProtocol<GraphicsOutput>)> {
 }
 
 static FIRMWARE_ACCESS: Access = Access::new();
-/// The display refused to show its second frame: every frame goes to the
-/// first.
+/// The display refused a flip. Write into whichever frame it shows.
 static FLIP_REFUSED: AtomicBool = AtomicBool::new(false);
 
 struct ScreenUse(Option<Permit<'static>>);
@@ -278,39 +278,47 @@ impl Framebuffer {
         }
     }
 
-    /// Present one complete frame with a single permit, including the
-    /// console's transfer to guest scanout. With two frames in video memory
-    /// it fills the hidden one and then shows it, so the display never reads
-    /// a frame half written.
-    pub(crate) fn show_frame(&self, rows: &[u8], before: impl FnOnce() -> bool) -> bool {
+    /// Update the dirty rows of a single-buffer display with one permit.
+    /// If a flip failed, update the entire frame at the actual scanout offset.
+    pub(crate) fn show_visible_rows(
+        &self,
+        rows: &[u8],
+        dirty: Range<usize>,
+        before: impl FnOnce() -> bool,
+    ) -> bool {
         let Some(_access) = self.use_screen() else {
+            return false;
+        };
+        let Some(base) = self.visible_base() else {
             return false;
         };
         let row_bytes = self.width * BYTES_PER_PIXEL;
         if row_bytes == 0 || !before() {
             return false;
         }
-        let hidden = self.hidden_frame();
-        let first = hidden.map_or(0, |lines| lines * self.stride * BYTES_PER_PIXEL);
-        for (y, pixels) in rows.chunks_exact(row_bytes).take(self.height).enumerate() {
-            self.write_row(self.base + first, y, pixels);
-        }
-        if let Some(lines) = hidden {
-            let shown = self.show_lines_from(lines);
-            if shown != u16::try_from(lines).ok() {
-                // The display kept a frame: present into the one it shows.
-                FLIP_REFUSED.store(true, Ordering::Relaxed);
-                crate::output::arguments(format_args!(
-                    "DISPLAY refused the flip to its second frame; presents into the one it shows\n"
-                ));
-                let shown = shown.map_or(0, usize::from);
-                let at = if shown == self.height { shown } else { 0 };
-                for (y, pixels) in rows.chunks_exact(row_bytes).take(self.height).enumerate() {
-                    self.write_row(self.base + at * self.stride * BYTES_PER_PIXEL, y, pixels);
-                }
-            }
+        let dirty = if self.flip.is_some() {
+            0..self.height
+        } else {
+            dirty
+        };
+        for (y, pixels) in rows
+            .chunks_exact(row_bytes)
+            .take(dirty.end.min(self.height))
+            .enumerate()
+            .skip(dirty.start)
+        {
+            self.write_row(base, y, pixels);
         }
         true
+    }
+
+    /// DISPI may retain the second frame after a refused flip. Both complete
+    /// frames are mapped, so any offset through `height` can hold the visible rows.
+    fn visible_base(&self) -> Option<usize> {
+        let lines = self
+            .dispi(crate::pci_io::DISPI_Y_OFFSET, None)
+            .map_or(0, usize::from);
+        (lines <= self.height).then(|| self.base + lines * self.stride * BYTES_PER_PIXEL)
     }
 
     /// Which of the display's two frames is not on screen, when it has two:
@@ -345,7 +353,7 @@ impl Framebuffer {
     /// Show the hidden frame `half`, which [`Self::fill_rows`] filled, once
     /// `before` has run. A display that refuses the flip gets the whole
     /// frame, from `fill` through the RAM row `row`, in the one it shows,
-    /// as [`Self::show_frame`] does.
+    /// as [`Self::show_visible_rows`] does.
     pub(crate) fn show_half(
         &self,
         half: usize,
@@ -368,11 +376,10 @@ impl Framebuffer {
             crate::output::arguments(format_args!(
                 "DISPLAY refused the flip to its second frame; presents into the one it shows\n"
             ));
-            let shown = shown.map_or(0, usize::from);
-            let at = if shown == self.height { shown } else { 0 };
+            let base = self.visible_base().ok_or_else(refused)?;
             for y in 0..self.height {
                 fill(y, row)?;
-                self.write_row(self.base + at * self.stride * BYTES_PER_PIXEL, y, row);
+                self.write_row(base, y, row);
             }
         }
         Ok(())

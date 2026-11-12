@@ -7,6 +7,9 @@ use crate::machine::{exception::Pstate, system::Register};
 
 type TestMachine = Machine<FakeHost, NoDevices>;
 
+#[cfg(all(host_memory, target_arch = "x86_64"))]
+mod canonical;
+
 const PTRUE_P0_B: u32 = 0x2518_e3e0; // ptrue p0.b
 const INDEX_Z1_0_1: u32 = 0x0421_4001; // index z1.b, #0, #1
 const INDEX_Z2_3_0: u32 = 0x0420_4062; // index z2.b, #3, #0
@@ -30,7 +33,7 @@ fn streaming(words: &[u32]) -> Option<TestMachine> {
 
 /// Enable FP, SVE and SME at EL1 (vectors at 0x1_0000), and enter
 /// streaming mode with ZA at BASE.
-fn enable_streaming(machine: &mut TestMachine) {
+fn enable_streaming<D: Devices>(machine: &mut Machine<FakeHost, D>) {
     machine.cpu.registers.set(Register::VBAR_EL1, 0, 0x1_0000);
     for register in [Register::CPACR_EL1, Register::CPTR_EL2] {
         machine

@@ -1,17 +1,21 @@
 <h1 align="center">
   <img src="assets/stela-icon.png" alt="" width="96"><br>
-  Stela
+  Northwood
 </h1>
 
-Stela boots unmodified Apple silicon macOS on x86-64 PCs. It is a UEFI boot
-program with an arm64-to-x86-64 translator, a Metal driver for NVIDIA GPUs and
-a model of Apple silicon hardware. macOS and most apps start, but it is slow and needs
-much more testing, as of v0.1.0
+Northwood is a fork of Stela that boots Apple silicon macOS on x86-64 PCs.
+It combines a UEFI boot program, an arm64-to-x86-64 translator, a Metal driver
+for NVIDIA GPUs and a model of Apple silicon hardware.
 
 > [!WARNING]
-Stela is very much still in development. Your chances of getting it booted are low as of v0.1.0, major hardware support/fixes are on the way.
+Northwood is still in development. Check the [hardware notes](hardware/) for
+device-specific support and verification status.
 
 ## Translator
+
+Northwood keeps Stela's translated arm64 UEFI boot path. Its `northwood
+import-oc` tool reads an existing configuration and exports reviewable
+Northwood hints for that path.
 
 An ahead-of-time and just-in-time compiler translates arm64e code to x86-64.
 It covers more than 3,000 AArch64 instruction encodings, maps guest registers
@@ -39,33 +43,44 @@ Stela currently models the Mac mini (M2) and runs macOS 27.
 
 ## Install
 
-1. Download `stela` from the
-   [releases page](https://github.com/tylertms/Stela/releases).
-2. On the PC that will run macOS, run `sudo ./stela setup` (Linux, macOS) or
-   double-click `stela.exe` (Windows).
+1. Download the archive for your system from
+   [Northwood releases](https://github.com/NiSeullent/Northwood/releases).
+2. On the PC that will run macOS, run `sudo ./northwood setup` on Linux or
+   macOS. On Windows, run `northwood.exe setup` or open `stela.exe` for the
+   installer wizard. The `stela setup` command also works.
 3. Choose the USB stick, the macOS version and the Mac model, then confirm.
    Setup erases the USB stick.
 4. Boot the PC from the USB stick.
+
+The removable-media entry is `EFI/BOOT/BOOTX64.EFI`. With the bundled
+Northwood loader, a fresh setup writes `EFI/northwood/nwconfig.plist` and
+keeps its data under `northwood/`. Setup labels a newly formatted data
+partition `NORTHWOOD`. Updates and repairs preserve the recorded layout,
+including `EFI/stela` and `stela/` on existing Stela media.
 
 ## Build
 
 You need [Rust](https://rustup.rs) and LLVM with Clang 21 or newer.
 
 ```sh
-git clone https://github.com/tylertms/Stela
-cd Stela
+git clone https://github.com/NiSeullent/Northwood
+cd Northwood
 cargo xtask dist
 ```
 
-This writes `target/release/stela`. The first build fetches and compiles
-Linux, Mesa and LLVM sources and takes a long time.
+The build writes `target/release/northwood`, `target/release/stela` and a
+matching `northwood.efi`. The first build fetches and compiles Linux, Mesa
+and LLVM sources.
 
 ## Legal
 
-Stela contains no Apple software. You are responsible for following Apple's
+Setup obtains macOS from Apple. You are responsible for following Apple's
 software license agreement and terms of use.
 
-Stela's code is GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+The project source defaults to GPL-2.0-or-later. The UEFI program is
+distributed under GPL-2.0-only and the CLI under GPL-3.0-or-later. See
+[LICENSING.md](LICENSING.md), [LICENSE](LICENSE), [NOTICE](NOTICE) and
+[CREDITS.md](CREDITS.md).
 
 ## Community
 

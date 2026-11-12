@@ -10,7 +10,7 @@
 //! function identity are unsafe producer obligations, not config-bit inferences.
 use super::regs;
 use super::{
-    Address, CapabilityError, ConfigSpace, Function,
+    Address, BARS, Bar, CapabilityError, ConfigSpace, Function, Identity,
     owned::{ConfigRetention, OwnedConfig},
 };
 use crate::bus::mmio::owned::{Error as MappingError, Mapping};
@@ -140,6 +140,19 @@ impl StoppedRequester {
 
     pub fn address(&self) -> Address {
         self.address
+    }
+
+    pub fn identity(&self) -> Identity {
+        self.function.identity()
+    }
+
+    /// Size BARs while retaining the original stop and DMA binding state.
+    /// On refusal, retain this owner and do not retry as though no write ran.
+    pub fn bars(&mut self) -> Result<[Option<Bar>; BARS], ClaimError> {
+        self.check_stopped()?;
+        let bars = self.function.bars()?;
+        self.check_stopped()?;
+        Ok(bars)
     }
 
     pub fn requester(&self) -> u16 {

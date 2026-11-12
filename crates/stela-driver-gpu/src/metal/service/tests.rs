@@ -488,6 +488,80 @@ fn calls_carry_exact_records_of_known_operations() {
 }
 
 #[test]
+fn hosted_lavapipe_negotiates_only_qualified_formats_and_commands() {
+    use crate::metal::{capabilities::FormatCapabilities, device::Device};
+    use wire::commands::{BlitCode, ComputeCode, FillBuffer};
+
+    let mut backend = MockBackend::new();
+    backend.physical.as_mut().unwrap().features.shader_float16 = false;
+    let device = Device::new_hosted_lavapipe(backend, MockCompiler::default()).unwrap();
+    let mut service = Service::new(device, DeviceEpoch::from_registered(NonZeroU64::MIN));
+    let connection = connect(&mut service);
+    let block: Block = call(
+        &mut service,
+        connection,
+        Operation::Capabilities,
+        &Empty {},
+        &mut Memory::default(),
+    )
+    .unwrap();
+    let caps = block.capabilities().unwrap();
+    assert!(caps.families().is_empty());
+    assert!(caps.supports_texture_sample_count(1));
+    assert!(!caps.supports_texture_sample_count(4));
+    assert!(!caps.framebuffer_reads);
+    assert_eq!(caps.limits.max_color_attachments, 1);
+    assert_eq!(caps.limits.max_argument_buffer_resources, 0);
+    for format in PixelFormat::ALL {
+        let expected = match format {
+            PixelFormat::Rgba8Unorm | PixelFormat::Bgra8Unorm => {
+                FormatCapabilities::COLOR | FormatCapabilities::BLIT
+            }
+            _ => FormatCapabilities::EMPTY,
+        };
+        assert_eq!(caps.format(*format), expected, "{format:?}");
+    }
+    assert_eq!(
+        status(call::<_, Handle>(
+            &mut service,
+            connection,
+            Operation::NewHeap,
+            &wire::HeapDescriptorRecord::default(),
+            &mut Memory::default(),
+        )),
+        Status::Unsupported
+    );
+    let buffer = new_buffer(&mut service, connection, StorageMode::Private);
+    let mut stream = Stream::default();
+    stream
+        .push(BlitCode::Begin.raw(), &Empty {}, &[])
+        .push(
+            BlitCode::FillBuffer.raw(),
+            &FillBuffer {
+                buffer,
+                start: 0,
+                length: 4,
+                value: 5,
+            },
+            &[],
+        )
+        .end();
+    assert!(commit(&mut service, connection, &stream).is_ok());
+    assert!(
+        submitted(&mut service)
+            .iter()
+            .any(|command| matches!(command, Command::FillBuffer { .. }))
+    );
+    let submissions = service.device().backend().submissions.len();
+    stream.entry(ComputeCode::SetTexture.raw(), &[]);
+    assert_eq!(
+        status(commit(&mut service, connection, &stream)),
+        Status::Unsupported
+    );
+    assert_eq!(service.device().backend().submissions.len(), submissions);
+}
+
+#[test]
 fn source_libraries_arrive_as_air() {
     let mut service = service();
     let connection = connect(&mut service);

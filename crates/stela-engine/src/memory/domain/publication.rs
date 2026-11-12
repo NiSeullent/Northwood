@@ -2,6 +2,7 @@
 
 use super::{
     AccessKind, Arc, MemoryBacking, MemoryStatus, MemorySystem, Ordering, access, monitor,
+    service::FrozenPhysicalWriters,
 };
 use alloc::vec::Vec;
 use stela_compiler::TargetCpu;
@@ -153,7 +154,21 @@ impl MemorySystem {
         backing: &Arc<MemoryBacking>,
         offset: usize,
         bytes: &[u8],
+        receipts: Option<&mut Vec<super::SourceWriteReceipt>>,
+    ) -> Result<(), PublicationFault> {
+        // SAFETY: the caller supplies pinned storage and private staging.
+        unsafe { self.publish_with(backing, offset, bytes, receipts, None) }
+    }
+
+    /// `writers` must come from this system when the caller already holds
+    /// the physical writer gates.
+    pub(super) unsafe fn publish_with(
+        &self,
+        backing: &Arc<MemoryBacking>,
+        offset: usize,
+        bytes: &[u8],
         mut receipts: Option<&mut Vec<super::SourceWriteReceipt>>,
+        writers: Option<&FrozenPhysicalWriters<'_>>,
     ) -> Result<(), PublicationFault> {
         let preflight_fault = |status| PublicationFault {
             status,
@@ -219,33 +234,40 @@ impl MemorySystem {
                 status: MemoryStatus::Domain,
                 completed: part.offset,
             })?;
-            self.reservations
-                .with_writer(&range, monitor::Invalidation::BeforeAttempt, || {
-                    mutation.attempting();
-                    // SAFETY: whole host extent and scalar recipes were checked;
-                    // the caller pins rights and lifetime, with private staging.
-                    unsafe {
-                        access::write_part(
-                            part.address as *mut u8,
-                            part.bytes,
-                            value,
-                            TargetCpu::Baseline,
-                        )
-                    }?;
-                    if let Some(receipt) = mutation.complete()
-                        && let Some(receipts) = receipts.as_mut()
-                    {
-                        receipts.push(receipt);
-                    }
-                    Ok::<_, access::AccessError>(())
-                })
-                .map_err(|error| PublicationFault {
-                    status: match error {
-                        monitor::AccessError::Monitor(_) => MemoryStatus::Domain,
-                        monitor::AccessError::Memory(_) => MemoryStatus::Unsupported,
-                    },
-                    completed: part.offset,
-                })?;
+            let write = || {
+                mutation.attempting();
+                // SAFETY: whole host extent and scalar recipes were checked;
+                // the caller pins rights and lifetime, with private staging.
+                unsafe {
+                    access::write_part(
+                        part.address as *mut u8,
+                        part.bytes,
+                        value,
+                        TargetCpu::Baseline,
+                    )
+                }?;
+                if let Some(receipt) = mutation.complete()
+                    && let Some(receipts) = receipts.as_mut()
+                {
+                    receipts.push(receipt);
+                }
+                Ok::<_, access::AccessError>(())
+            };
+            let result = match writers {
+                Some(writers) => writers.with_writer(&range, write),
+                None => self.reservations.with_writer(
+                    &range,
+                    monitor::Invalidation::BeforeAttempt,
+                    write,
+                ),
+            };
+            result.map_err(|error| PublicationFault {
+                status: match error {
+                    monitor::AccessError::Monitor(_) => MemoryStatus::Domain,
+                    monitor::AccessError::Memory(_) => MemoryStatus::Unsupported,
+                },
+                completed: part.offset,
+            })?;
         }
         Ok(())
     }

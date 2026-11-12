@@ -245,6 +245,7 @@ pub struct Controller {
     owner: Rc<()>,
     state: State,
     fault: Option<Error>,
+    legacy_released: Option<bool>,
     operational: usize,
     /// The device table: each root port's device, then the devices behind
     /// hubs ([`CHILDREN`] entries).

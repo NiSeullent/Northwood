@@ -1,7 +1,7 @@
 //! The `stela` command line prepares a USB that boots Stela to install macOS
 //! on a PC and reads the boot log. Research and development commands belong to
 //! `stela-dev`, which uses this library's boot-bundle and restore-image tools.
-use clap::{Parser, Subcommand};
+use clap::{FromArgMatches, Parser, Subcommand};
 use std::process::ExitCode;
 
 pub mod apfs;
@@ -12,6 +12,7 @@ pub mod efi;
 pub use stela_gpu_maintenance as gpu;
 mod net;
 mod progress;
+mod report;
 pub mod restore;
 mod setup;
 
@@ -63,6 +64,19 @@ pub(crate) enum Command {
     /// Print every boot log stela.efi kept on a disk image or a raw partition:
     /// it finds each machine-state partition, or SSD partition tail, itself.
     BootLog(boot_log::BootLog),
+    /// Summarize recorded Linux PCI and USB inventories as a Markdown report.
+    Report(report::Report),
+    /// Inspect Northwood configuration files.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Validate an XML nwconfig.plist and its effective boot options.
+    Validate { file: std::path::PathBuf },
 }
 
 // Windows ships the direct installer; other hosts expose these subcommands.
@@ -78,7 +92,57 @@ impl Command {
         match self {
             Self::Setup(command) => command.run(),
             Self::BootLog(command) => command.run(),
+            Self::Report(command) => command.run(),
+            Self::Config {
+                command: ConfigCommand::Validate { file },
+            } => stela_boot_core::config_validation::validate_file(&file),
         }
+    }
+}
+
+/// The portable installer and reporting commands embedded by another CLI.
+/// Implements the same Clap grammar as `stela`'s portable entry point.
+pub struct HostCommand(Command);
+
+impl FromArgMatches for HostCommand {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Command::from_arg_matches(matches).map(Self)
+    }
+
+    fn from_arg_matches_mut(matches: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Command::from_arg_matches_mut(matches).map(Self)
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.0.update_from_arg_matches(matches)
+    }
+
+    fn update_from_arg_matches_mut(
+        &mut self,
+        matches: &mut clap::ArgMatches,
+    ) -> Result<(), clap::Error> {
+        self.0.update_from_arg_matches_mut(matches)
+    }
+}
+
+impl Subcommand for HostCommand {
+    fn augment_subcommands(command: clap::Command) -> clap::Command {
+        Command::augment_subcommands(command)
+    }
+
+    fn augment_subcommands_for_update(command: clap::Command) -> clap::Command {
+        Command::augment_subcommands_for_update(command)
+    }
+
+    fn has_subcommand(name: &str) -> bool {
+        Command::has_subcommand(name)
+    }
+}
+
+impl HostCommand {
+    /// Run a parsed command and report its result with Stela's CLI behavior.
+    pub fn run(self) -> ExitCode {
+        finish(self.0.run())
     }
 }
 
@@ -88,6 +152,10 @@ pub fn main() -> ExitCode {
     let result = installer();
     #[cfg(not(windows))]
     let result = commands();
+    finish(result)
+}
+
+fn finish(result: anyhow::Result<()>) -> ExitCode {
     let code = match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -119,9 +187,14 @@ struct Installer {
 
 #[cfg(windows)]
 fn installer() -> anyhow::Result<()> {
-    Installer::parse_from(installer_arguments(std::env::args_os()))
-        .setup
-        .run()
+    let arguments: Vec<_> = std::env::args_os().collect();
+    if arguments.get(1).is_some_and(|word| word == "config") {
+        Cli::parse_from(arguments).command.run()
+    } else {
+        Installer::parse_from(installer_arguments(arguments))
+            .setup
+            .run()
+    }
 }
 
 /// `stela.exe`'s arguments without a leading `setup`, so the `stela setup
@@ -189,7 +262,10 @@ mod tests {
     fn help_lists_shipped_commands() {
         let help = Cli::command().render_help().to_string();
         assert!(
-            help.contains("setup") && help.contains("boot-log") && !help.contains("\n  gpu"),
+            help.contains("setup")
+                && help.contains("boot-log")
+                && help.contains("config")
+                && !help.contains("\n  gpu"),
             "{help}"
         );
         for command in [

@@ -28,10 +28,10 @@
 //! last boot asked for and the USB lacks (`firmware::requested`), keeping
 //! what the USB holds, and names files without a pinned source.
 use super::{
-    CHOICES_PATH, Environment, LOADER_PATH, RECORD, Record, Reported, Request, apply_install,
-    bundle, check_bundle_revision, describe_install, ecid::Ecid, fix, host::Host, host::bytes_text,
-    installed, interrupted_text, machines, plan_install, publish, read_record, revision_mismatch,
-    state, update, write_record,
+    Environment, LOADER_PATH, Record, Reported, Request, apply_install, bundle,
+    check_bundle_revision, describe_install, ecid::Ecid, fix, host::Host, host::bytes_text,
+    installed, interrupted_text, machines, plan_install, publish, read_record,
+    record::read_inspection_record, revision_mismatch, state, update, write_record,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -39,6 +39,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use stela_loader::mount_interface::layout::{self, Layout};
 use stela_loader::{boot_selection, mount_interface, recovery};
 use {
     stela_formats::apfs, stela_formats::apfs::Container,
@@ -181,7 +182,27 @@ fn translations_status(record: &Record, report: &mut Report) {
     }
 }
 
-fn efi_status(environment: &Environment<'_>, record: &Record, report: &mut Report) {
+fn swap_status(host: &dyn Host, record: &Record, report: &mut Report) {
+    let Some(store) = &record.volume_swap else {
+        return;
+    };
+    let directory = store.directory(&record.volume, record.layout);
+    report.line(
+        "swap store",
+        format!("{} ({})", directory.display(), bytes_text(store.bytes)),
+    );
+    if let Err(error) = store.validate_volume(host, record) {
+        report.problem(format!(
+            "Cannot verify the recorded swap volume ({error:#})"
+        ));
+        return;
+    }
+    for problem in store.problems(&record.volume, record.layout) {
+        report.problem(format!("Swap store needs attention ({problem})"));
+    }
+}
+
+fn efi_status(environment: &Environment<'_>, record: &Record, layout: Layout, report: &mut Report) {
     let tool = record.esp.join(LOADER_PATH);
     match fs::read(&tool) {
         Ok(image) => {
@@ -216,24 +237,45 @@ fn efi_status(environment: &Environment<'_>, record: &Record, report: &mut Repor
             report.problem(format!("{} is missing: {fix}", tool.display()))
         }
     }
-    let repair = report.fix("repair");
-    let options = fs::read_to_string(record.esp.join("EFI/stela/stela.cfg")).unwrap_or_default();
-    match record.options_text() {
-        Ok(expected) if options != expected => {
-            report.problem(format!("stela.cfg differs from the setup record: {repair}"))
+    let canonical = match super::nwconfig_publish::status(&record.esp) {
+        Ok(Some(parsed)) => {
+            report.line("nwconfig.plist", "valid");
+            for warning in parsed.warnings {
+                report.line("note", format!("nwconfig.plist unknown key {warning:?}"));
+            }
+            true
         }
-        Ok(_) => {}
-        Err(error) => report.problem(format!(
-            "stela.cfg cannot be written from the setup record: {error:#}"
-        )),
+        Ok(None) => false,
+        Err(error) => {
+            report.problem(format!("nwconfig.plist: {error:#}"));
+            false
+        }
+    };
+    let repair = report.fix("repair");
+    let mirrors_required = layout == Layout::Legacy || !canonical;
+    let options = record.esp.join(layout.esp_path(layout::OPTIONS));
+    if mirrors_required || options.try_exists().unwrap_or(true) {
+        let options = fs::read_to_string(options).unwrap_or_default();
+        match record.options_text() {
+            Ok(expected) if options != expected => {
+                report.problem(format!("stela.cfg differs from the setup record: {repair}"))
+            }
+            Ok(_) => {}
+            Err(error) => report.problem(format!(
+                "stela.cfg cannot be written from the setup record: {error:#}"
+            )),
+        }
     }
-    let choices = fs::read_to_string(record.esp.join(CHOICES_PATH)).ok();
-    match record.choices_text() {
-        Ok(expected) if choices != expected => report.problem(format!(
-            "the startup choices (choices.cfg) differ from the setup record: {repair}"
-        )),
-        Ok(_) => {}
-        Err(error) => report.problem(format!("the startup choices: {error:#}")),
+    let choices = record.esp.join(layout.esp_path(layout::CHOICES));
+    if mirrors_required || choices.try_exists().unwrap_or(true) {
+        let choices = fs::read_to_string(choices).ok();
+        match record.choices_text() {
+            Ok(expected) if choices != expected => report.problem(format!(
+                "the startup choices (choices.cfg) differ from the setup record: {repair}"
+            )),
+            Ok(_) => {}
+            Err(error) => report.problem(format!("the startup choices: {error:#}")),
+        }
     }
 }
 
@@ -243,7 +285,7 @@ fn firmware_status(record: &Record, report: &mut Report) {
     let Ok(tool) = fs::read(record.esp.join(LOADER_PATH)) else {
         return;
     };
-    let requested = match super::firmware::requested(&record.esp, &tool) {
+    let requested = match super::firmware::requested_in(&record.esp, record.layout, &tool) {
         Ok(requested) => requested,
         Err(error) => {
             report.problem(format!("the USB's host firmware: {error:#}"));
@@ -274,6 +316,62 @@ fn firmware_status(record: &Record, report: &mut Report) {
     }
 }
 
+/// The most recent boot captured by the USB, separate from media integrity.
+fn memory_status(record: &Record, report: &mut Report) {
+    let Some(log) = super::state::diagnostic_boot_log(record) else {
+        report.line("last boot", "no readable USB boot log");
+        return;
+    };
+    let diagnostics =
+        crate::boot_log::diagnostics::Diagnostics::latest(&log.bytes, log.overwritten);
+    report.line("last boot", log.path.display());
+    match diagnostics.usable_mib {
+        Some(usable) => match diagnostics
+            .minimum_mib
+            .filter(|_| diagnostics.memory_refused)
+        {
+            Some(minimum) => report.line(
+                "usable RAM",
+                format!("{usable} MiB ({minimum} MiB required)"),
+            ),
+            None => report.line("usable RAM", format!("{usable} MiB")),
+        },
+        None => report.line("usable RAM", "not recorded"),
+    }
+    if diagnostics.memory_refused {
+        let state = if diagnostics.estimate {
+            "refused by diagnostic memory check"
+        } else {
+            "boot refused before selecting a profile"
+        };
+        report.line("memory profile", state);
+    } else {
+        match diagnostics.profile {
+            Some(profile) if diagnostics.estimate => {
+                report.line(
+                    "memory profile",
+                    format!("{profile} (one-worker diagnostic estimate)"),
+                );
+            }
+            Some(profile) => report.line("memory profile", profile),
+            None => report.line("memory profile", "not recorded"),
+        }
+    }
+    report.line(
+        "swap",
+        diagnostics.swap.as_deref().unwrap_or("not recorded"),
+    );
+    if diagnostics.memory_refused || diagnostics.swap_refused {
+        report.line(
+            "next diagnostic",
+            format!(
+                "On the target PC, press a key at USB startup and choose Diagnostics if available. Read the log with {}.",
+                report.fix("boot-log")
+            ),
+        );
+    }
+}
+
 /// The command that puts back the active build's restore files: `--fetch`
 /// downloads that build, the whole image when the medium holds it.
 fn image_fix(report: &Report) -> String {
@@ -284,7 +382,7 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
     let repair = report.fix("repair");
     let image = image_fix(report);
     for kept in &record.bundles {
-        let directory = kept.directory(&record.volume);
+        let directory = kept.directory_in(&record.volume, record.layout);
         let role = if kept.build == record.build && kept.generation() == record.generation() {
             "active"
         } else {
@@ -555,7 +653,7 @@ fn foreign_problem(install: &str, region: &str) -> String {
 
 /// `status`.
 pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String> {
-    let record = read_record(environment, usb)?;
+    let (record, layout, path) = read_inspection_record(environment, usb)?;
     let mut report = Report {
         text: String::new(),
         problems: Vec::new(),
@@ -563,19 +661,25 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String
     };
     let _ = writeln!(
         report.text,
-        "Stela setup on {} ({}):",
+        "{} setup on {} ({}):",
+        match layout {
+            Layout::Northwood => "Northwood",
+            Layout::Legacy => "Stela",
+        },
         record.esp.display(),
-        record.esp.join(RECORD).display()
+        path.display()
     );
     if !record.complete {
         report.problem(interrupted_text(&record, usb));
     }
     report.line("model", &record.model);
     report.line("macOS build", &record.build);
-    efi_status(environment, &record, &mut report);
+    efi_status(environment, &record, layout, &mut report);
+    memory_status(&record, &mut report);
     firmware_status(&record, &mut report);
     bundle_status(environment, &record, &mut report);
     translations_status(&record, &mut report);
+    swap_status(environment.host, &record, &mut report);
     for install in &record.installs {
         install_status(environment, &record, install, &mut report);
     }
@@ -624,9 +728,15 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
             fix(usb, "update stela")
         );
     }
-    update::check_firmware_support(&esp, &tool)?;
+    update::check_firmware_support(&esp, record.layout, &tool)?;
+    let swap_repairs = if let Some(store) = &record.volume_swap {
+        store.validate_volume(environment.host, &record)?;
+        store.repair_plan(&record.volume, record.layout)?
+    } else {
+        Vec::new()
+    };
     // The firmware the last boot asked for and the USB lacks.
-    let requested = super::firmware::requested(&esp, &tool)?;
+    let requested = super::firmware::requested_in(&esp, record.layout, &tool)?;
     // Machines without an ECID get one; their bundles are prepared again.
     let ipsw = command.optional_image()?;
     if ipsw.is_some() {
@@ -726,7 +836,7 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
         writeln!(
             text,
             "  remove         {}",
-            old.directory(&record.volume).display()
+            old.directory_in(&record.volume, record.layout).display()
         )?;
     }
     // What an interrupted update left beside the active build and
@@ -752,7 +862,7 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
         for (kind, ecid) in super::restore_bundles(&record.install_machines()) {
             let intact = record.restore_bundle(kind, ecid).is_some_and(|b| {
                 bundle::verify(
-                    &bundle::in_place(&b.directory(&record.volume)),
+                    &bundle::in_place(&b.directory_in(&record.volume, record.layout)),
                     &b.manifest_sha256,
                 )
                 .is_empty()
@@ -890,6 +1000,9 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     for repair in &store_repairs {
         writeln!(text, "  translations   {repair}")?;
     }
+    for repair in &swap_repairs {
+        writeln!(text, "  swap store     {repair}")?;
+    }
     if command.dry_run {
         text.push_str("Dry run: nothing was changed.\n");
         return Ok(text);
@@ -912,6 +1025,13 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     }
     if let (Some(plan), Some(ipsw)) = (install, &ipsw) {
         apply_install(environment, &mut record, ipsw, plan)?;
+    }
+    if let Some(store) = &record.volume_swap
+        && !swap_repairs.is_empty()
+    {
+        store.validate_volume(environment.host, &record)?;
+        super::volume_log::prepare(&record)?;
+        store.publish(&record.volume, record.layout)?;
     }
     publish(&mut record)?;
     write_record(&esp, &record)?;

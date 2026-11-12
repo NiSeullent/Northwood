@@ -4,8 +4,8 @@
 //!
 //! It follows Microsoft's FAT specification (the "FAT: General Overview of
 //! On-Disk Format" boot sector, FAT and directory entry layouts): the volume
-//! is FAT32 by its cluster count, never by its label, and paths name 8.3
-//! short entries, which every FAT driver writes beside a long name. A file
+//! is FAT32 by its cluster count. Paths use short names or VFAT long names
+//! bound to their short entries by order and checksum. A file
 //! comes back as the device extents of its cluster chain, cut to its size.
 //! Nothing is written, and a malformed volume or chain is refused.
 //! [`format`] holds the structures of a new volume.
@@ -14,7 +14,9 @@ use alloc::{format, string::String, vec, vec::Vec};
 use stela_contracts::bytes::{le16, le32};
 
 pub mod format;
-use core::fmt;
+mod long_name;
+mod ownership;
+use core::{fmt, ops::RangeInclusive};
 use {stela_formats::payload::ReadAt, stela_formats::payload::pieces::Extent};
 
 const BOOT_SIGNATURE: u16 = 0xaa55;
@@ -44,14 +46,20 @@ const FAT_WINDOW: usize = 4096;
 pub enum FatError {
     /// The partition is not a FAT32 volume.
     NotFat32(&'static str),
-    /// A path component is not an 8.3 name.
+    /// A path component is not a valid FAT filename.
     Name(String),
     Missing(String),
     NotDirectory(String),
     NotFile(String),
+    FileSize {
+        path: String,
+        actual: u64,
+        expected: RangeInclusive<u64>,
+    },
     /// A cluster chain is malformed.
     Chain(String, &'static str),
     Fragmented(String),
+    ExtentLimit(String, usize),
     Io(String),
 }
 
@@ -59,10 +67,20 @@ impl fmt::Display for FatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFat32(why) => write!(f, "not a FAT32 volume: {why}"),
-            Self::Name(name) => write!(f, "{name} is not an 8.3 name"),
+            Self::Name(name) => write!(f, "{name} is not a valid FAT name"),
             Self::Missing(path) => write!(f, "{path} is missing"),
             Self::NotDirectory(path) => write!(f, "{path} is not a directory"),
             Self::NotFile(path) => write!(f, "{path} is not a file"),
+            Self::FileSize {
+                path,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "{path} has {actual} bytes, expected {} through {}",
+                expected.start(),
+                expected.end()
+            ),
             Self::Chain(path, why) => write!(f, "{path}: {why}"),
             Self::Fragmented(path) => {
                 write!(
@@ -70,6 +88,7 @@ impl fmt::Display for FatError {
                     "{path} takes more than {MAX_EXTENTS} extents; copy it again"
                 )
             }
+            Self::ExtentLimit(path, limit) => write!(f, "{path} takes more than {limit} extents"),
             Self::Io(what) => write!(f, "read failed: {what}"),
         }
     }
@@ -209,7 +228,14 @@ impl<R: ReadAt> Fat32<R> {
 
     /// The extents of the chain from `first` holding `bytes` (`None`: the
     /// whole chain, for a directory).
-    fn chain(&mut self, path: &str, first: u32, bytes: Option<u64>) -> Result<File, FatError> {
+    fn chain(
+        &mut self,
+        path: &str,
+        first: u32,
+        bytes: Option<u64>,
+        max_bytes: u64,
+        max_extents: usize,
+    ) -> Result<File, FatError> {
         let fail = |why| FatError::Chain(String::from(path), why);
         let mut extents: Vec<Extent> = Vec::new();
         let mut held = 0u64;
@@ -230,14 +256,23 @@ impl<R: ReadAt> Fat32<R> {
             if steps > self.clusters {
                 return Err(fail("the chain loops"));
             }
+            held += self.cluster_bytes;
+            if held > max_bytes {
+                return Err(fail("the directory exceeds its byte limit"));
+            }
             let offset = self.cluster_offset(cluster);
             match extents.last_mut() {
                 Some(last) if last.offset + last.bytes == offset => {
                     last.bytes += self.cluster_bytes
                 }
                 _ => {
-                    if extents.len() == MAX_EXTENTS {
-                        return Err(FatError::Fragmented(String::from(path)));
+                    if extents.len() == max_extents {
+                        let path = String::from(path);
+                        return Err(if max_extents == MAX_EXTENTS {
+                            FatError::Fragmented(path)
+                        } else {
+                            FatError::ExtentLimit(path, max_extents)
+                        });
                     }
                     extents.push(Extent {
                         offset,
@@ -245,7 +280,6 @@ impl<R: ReadAt> Fat32<R> {
                     });
                 }
             }
-            held += self.cluster_bytes;
             let next = self.next(cluster)?;
             let full = bytes.is_some_and(|bytes| held >= bytes);
             match next {
@@ -279,9 +313,14 @@ impl<R: ReadAt> Fat32<R> {
         &mut self,
         path: &str,
         cluster: u32,
-        name: &[u8; 11],
+        name: &str,
+        directory_bytes: u64,
+        require_unique: bool,
     ) -> Result<Option<(u8, u32, u32)>, FatError> {
-        let directory = self.chain(path, cluster, None)?;
+        let directory = self.chain(path, cluster, None, directory_bytes, MAX_EXTENTS)?;
+        let short = short_name(name);
+        let mut long = long_name::Entries::new();
+        let mut found = None;
         for extent in &directory.extents {
             for at in (0..extent.bytes).step_by(self.directory_sector.len()) {
                 self.reader
@@ -290,10 +329,19 @@ impl<R: ReadAt> Fat32<R> {
                 for entry in self.directory_sector.as_chunks::<ENTRY_BYTES>().0 {
                     let attributes = entry[11];
                     match entry[0] {
-                        ENTRY_END => return Ok(None),
-                        ENTRY_FREE => continue,
-                        _ if attributes & ATTRIBUTE_LONG_NAME == ATTRIBUTE_LONG_NAME => continue,
-                        _ if attributes & ATTRIBUTE_VOLUME_ID != 0 => continue,
+                        ENTRY_END => return Ok(found),
+                        ENTRY_FREE => {
+                            long.clear();
+                            continue;
+                        }
+                        _ if attributes == ATTRIBUTE_LONG_NAME => {
+                            long.push(entry);
+                            continue;
+                        }
+                        _ if attributes & ATTRIBUTE_VOLUME_ID != 0 => {
+                            long.clear();
+                            continue;
+                        }
                         _ => {}
                     }
                     let mut stored = [0u8; 11];
@@ -301,18 +349,54 @@ impl<R: ReadAt> Fat32<R> {
                     if stored[0] == ENTRY_KANJI_E5 {
                         stored[0] = ENTRY_FREE;
                     }
-                    if stored.to_ascii_uppercase() == *name {
+                    let matches = short.is_some_and(|name| stored.to_ascii_uppercase() == name)
+                        || long.matches(name, &entry[..11]);
+                    long.clear();
+                    if matches {
                         let first = u32::from(le16(entry, 20)) << 16 | u32::from(le16(entry, 26));
-                        return Ok(Some((attributes, first, le32(entry, 28))));
+                        let matched = (attributes, first, le32(entry, 28));
+                        if !require_unique {
+                            return Ok(Some(matched));
+                        }
+                        if found.replace(matched).is_some() {
+                            return Err(FatError::Chain(
+                                String::from(path),
+                                "more than one directory entry matches the name",
+                            ));
+                        }
                     }
                 }
             }
         }
-        Ok(None)
+        Ok(found)
     }
 
-    /// The file at `path`, `/`-separated 8.3 names from the root.
+    /// The file at `path`, `/`-separated FAT names from the root.
     pub fn file(&mut self, path: &str) -> Result<File, FatError> {
+        self.file_bounded(path, u64::MAX, 0..=u64::MAX, MAX_EXTENTS)
+    }
+
+    /// Bound the allocated clusters examined in each directory and the
+    /// number of runs collected for the file. Check the directory entry's
+    /// file size before following any part of the file's cluster chain.
+    pub(crate) fn file_bounded(
+        &mut self,
+        path: &str,
+        directory_bytes: u64,
+        file_bytes: RangeInclusive<u64>,
+        file_extents: usize,
+    ) -> Result<File, FatError> {
+        self.file_bounded_by_name(path, directory_bytes, file_bytes, file_extents, false)
+    }
+
+    pub(crate) fn file_bounded_by_name(
+        &mut self,
+        path: &str,
+        directory_bytes: u64,
+        file_bytes: RangeInclusive<u64>,
+        file_extents: usize,
+        require_unique: bool,
+    ) -> Result<File, FatError> {
         let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         let Some((leaf, directories)) = components.split_last() else {
             return Err(FatError::NotFile(String::from(path)));
@@ -322,8 +406,10 @@ impl<R: ReadAt> Fat32<R> {
         for component in directories {
             walked.push('/');
             walked.push_str(component);
-            let name = short_name(component).ok_or_else(|| FatError::Name(walked.clone()))?;
-            match self.find(&walked, cluster, &name)? {
+            if !long_name::valid_component(component) && short_name(component).is_none() {
+                return Err(FatError::Name(walked));
+            }
+            match self.find(&walked, cluster, component, directory_bytes, require_unique)? {
                 None => return Err(FatError::Missing(walked)),
                 Some((attributes, _, _)) if attributes & ATTRIBUTE_DIRECTORY == 0 => {
                     return Err(FatError::NotDirectory(walked));
@@ -334,13 +420,31 @@ impl<R: ReadAt> Fat32<R> {
         }
         walked.push('/');
         walked.push_str(leaf);
-        let name = short_name(leaf).ok_or_else(|| FatError::Name(walked.clone()))?;
-        match self.find(&walked, cluster, &name)? {
+        if !long_name::valid_component(leaf) && short_name(leaf).is_none() {
+            return Err(FatError::Name(walked));
+        }
+        match self.find(&walked, cluster, leaf, directory_bytes, require_unique)? {
             None => Err(FatError::Missing(walked)),
             Some((attributes, _, _)) if attributes & ATTRIBUTE_DIRECTORY != 0 => {
                 Err(FatError::NotFile(walked))
             }
-            Some((_, first, bytes)) => self.chain(&walked, first, Some(u64::from(bytes))),
+            Some((_, first, bytes)) => {
+                let actual = u64::from(bytes);
+                if !file_bytes.contains(&actual) {
+                    return Err(FatError::FileSize {
+                        path: walked,
+                        actual,
+                        expected: file_bytes,
+                    });
+                }
+                self.chain(
+                    &walked,
+                    first,
+                    Some(actual),
+                    u64::MAX,
+                    file_extents.min(MAX_EXTENTS),
+                )
+            }
         }
     }
 }
@@ -477,6 +581,20 @@ pub(crate) mod tests {
             cluster
         }
 
+        /// A fixture directory with a single long-name entry preceding its alias.
+        pub(crate) fn long_directory(
+            &mut self,
+            parent: u32,
+            slot: u64,
+            name: &str,
+            short: &[u8; 11],
+        ) -> u32 {
+            assert!(name.encode_utf16().count() <= 13);
+            self.disk
+                .write(data(parent) + slot * 32, &long_entry(name, short, 1, true));
+            self.directory(parent, slot + 1, short)
+        }
+
         /// A file of `contents` in `clusters`, linked in that order.
         pub(crate) fn file_in(
             &mut self,
@@ -511,6 +629,51 @@ pub(crate) mod tests {
             bytes.extend(chunk);
         }
         bytes
+    }
+
+    #[test]
+    fn bounded_lookup_checks_size_and_run_count_before_following_file_clusters() {
+        let mut volume = Volume::new();
+        volume.entry(2, 0, b"WRONG   BIN", 0x20, 0, 512);
+        volume.entry(2, 1, b"SPLIT   BIN", 0x20, 8, 1536);
+        volume.link(&[8, 10, 12]);
+        volume.set(12, BAD_CLUSTER);
+        let mut fat = Fat32::open(volume.disk).unwrap();
+
+        assert_eq!(
+            fat.file_bounded("wrong.bin", 512, 1024..=1024, 1),
+            Err(FatError::FileSize {
+                path: String::from("/wrong.bin"),
+                actual: 512,
+                expected: 1024..=1024,
+            })
+        );
+        assert!(matches!(fat.file("wrong.bin"), Err(FatError::Chain(..))));
+        assert_eq!(
+            fat.file_bounded("split.bin", 512, 1536..=1536, 2),
+            Err(FatError::ExtentLimit(String::from("/split.bin"), 2))
+        );
+        assert!(matches!(
+            fat.file("split.bin"),
+            Err(FatError::Chain(_, "the chain names a bad cluster"))
+        ));
+    }
+
+    #[test]
+    fn bounded_lookup_limits_even_a_contiguous_directory_chain() {
+        let mut volume = Volume::new();
+        volume.link(&[2, 3]);
+        volume.entry(2, 0, b"EMPTY   BIN", 0x20, 0, 0);
+        let mut fat = Fat32::open(volume.disk).unwrap();
+        assert!(matches!(
+            fat.file_bounded("empty.bin", 512, 0..=0, 1),
+            Err(FatError::Chain(_, "the directory exceeds its byte limit"))
+        ));
+        assert_eq!(fat.file("empty.bin").unwrap().bytes, 0);
+        assert_eq!(
+            fat.file_bounded("empty.bin", 1024, 0..=0, 1).unwrap().bytes,
+            0
+        );
     }
 
     #[test]
@@ -553,12 +716,76 @@ pub(crate) mod tests {
             ),
             ("EFI/stela", "/EFI/stela is not a file"),
             (
-                "EFI/stela/a.long-name",
-                "/EFI/stela/a.long-name is not an 8.3 name",
+                "EFI/stela/a?.bin",
+                "/EFI/stela/a?.bin is not a valid FAT name",
             ),
         ] {
             assert_eq!(fat.file(path).unwrap_err().to_string(), error, "{path}");
         }
+    }
+
+    #[test]
+    fn finds_a_long_directory_across_a_fragmented_directory_chain() {
+        let mut volume = Volume::new();
+        volume.link(&[2, 19]);
+        for slot in 0..15 {
+            volume.disk.write(data(2) + slot * 32, &[ENTRY_FREE]);
+        }
+        let short = b"NORTHW~1   ";
+        let name = "Northwood Setup";
+        volume
+            .disk
+            .write(data(2) + 15 * 32, &long_entry(name, short, 2, true));
+        volume
+            .disk
+            .write(data(19), &long_entry(name, short, 1, false));
+        let directory = volume.directory(19, 1, short);
+        volume.file(directory, 0, b"RECORD  BIN", b"test record");
+        let mut fat = Fat32::open(volume.disk).unwrap();
+        let long = fat.file("northwood setup/record.bin").unwrap();
+        assert_eq!(long, fat.file("NORTHW~1/RECORD.BIN").unwrap());
+        assert_eq!(read(&mut fat, &long), b"test record");
+    }
+
+    #[test]
+    fn ignores_unbound_long_names_and_checks_bounds_on_a_valid_long_name() {
+        let mut volume = Volume::new();
+        let short = b"NORTHW~1CFG";
+        let mut invalid = long_entry("northwood.cfg", short, 1, true);
+        invalid[13] ^= 1;
+        volume.disk.write(data(2), &invalid);
+        volume.file(2, 1, short, b"old");
+        let real = b"NORTHW~2CFG";
+        volume.disk.write(
+            data(2) + 2 * 32,
+            &long_entry("northwood.cfg", real, 1, true),
+        );
+        volume.file(2, 3, real, b"new record");
+        let mut fat = Fat32::open(volume.disk).unwrap();
+        let old = fat.file("NORTHW~1.CFG").unwrap();
+        assert_eq!(read(&mut fat, &old), b"old");
+        let new = fat.file("Northwood.cfg").unwrap();
+        assert_eq!(read(&mut fat, &new), b"new record");
+        assert!(matches!(
+            fat.file_bounded("Northwood.cfg", 512, 3..=3, 1),
+            Err(FatError::FileSize { actual: 10, .. })
+        ));
+    }
+
+    fn long_entry(name: &str, short: &[u8; 11], order: u8, last: bool) -> [u8; 32] {
+        let mut entry = [0; 32];
+        entry[0] = if last { order | 0x40 } else { order };
+        entry[11] = 0x0f;
+        entry[13] = long_name::checksum(short);
+        let words = name
+            .encode_utf16()
+            .chain(core::iter::once(0))
+            .chain(core::iter::repeat(0xffff))
+            .skip(usize::from(order - 1) * 13);
+        for (word, at) in words.zip([1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30]) {
+            entry[at..at + 2].copy_from_slice(&word.to_le_bytes());
+        }
+        entry
     }
 
     #[test]

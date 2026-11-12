@@ -125,6 +125,15 @@ impl Fifo {
     }
 }
 
+#[cfg(feature = "native-profile")]
+#[derive(Default)]
+struct RegisterProfile {
+    reads: u64,
+    writes: u64,
+    rxdata_reads: u64,
+    txdata_writes: u64,
+}
+
 pub struct Spi {
     nor: Nor,
     irq: AicInput,
@@ -144,6 +153,8 @@ pub struct Spi {
     external_cs: bool,
     lifecycle: LifecycleState,
     configuration: u8,
+    #[cfg(feature = "native-profile")]
+    profile: RegisterProfile,
 }
 impl Spi {
     pub fn new(image: Image, irq: AicInput, external_cs: bool) -> Self {
@@ -171,6 +182,8 @@ impl Spi {
                 retention: false,
             },
             configuration: u8::MAX,
+            #[cfg(feature = "native-profile")]
+            profile: RegisterProfile::default(),
         }
     }
     #[cfg(test)]
@@ -180,6 +193,28 @@ impl Spi {
     /// The NOR sectors changed since the last call (`Nor::take_dirty`).
     pub fn take_dirty(&mut self) -> Vec<(usize, Vec<u8>)> {
         self.nor.take_dirty()
+    }
+    /// Successful SPI register accesses and NOR commands completed at CS
+    /// deassertion since the last report. No register or payload values.
+    #[cfg(feature = "native-profile")]
+    pub(crate) fn take_profile(&mut self) -> alloc::string::String {
+        let spi = core::mem::take(&mut self.profile);
+        let nor = self.nor.take_profile();
+        alloc::format!(
+            "mmio_reads={} mmio_writes={} rxdata_reads={} txdata_writes={} \
+             reads={} read_bytes={} programs={} program_bytes={} erases={} erase_bytes={} status_bytes={}",
+            spi.reads,
+            spi.writes,
+            spi.rxdata_reads,
+            spi.txdata_writes,
+            nor.reads,
+            nor.read_bytes,
+            nor.programs,
+            nor.program_bytes,
+            nor.erases,
+            nor.erase_bytes,
+            nor.status_bytes,
+        )
     }
     /// Board wiring, independent of command/transfer boundaries. External
     /// GPIO's output is active low, just as PIN.CS is for internal selection.
@@ -395,6 +430,14 @@ impl MmioDevice for Spi {
             _ => return Err(error(refuse!("unmodeled SPI register"))),
         };
         self.interrupt(access);
+        #[cfg(feature = "native-profile")]
+        {
+            self.profile.reads = self.profile.reads.saturating_add(1);
+            self.profile.rxdata_reads = self
+                .profile
+                .rxdata_reads
+                .saturating_add(u64::from(offset == RXDATA));
+        }
         Ok(u64::from(value))
     }
     fn write(
@@ -518,6 +561,14 @@ impl MmioDevice for Spi {
             return Err(error(reason));
         }
         self.interrupt(access);
+        #[cfg(feature = "native-profile")]
+        {
+            self.profile.writes = self.profile.writes.saturating_add(1);
+            self.profile.txdata_writes = self
+                .profile
+                .txdata_writes
+                .saturating_add(u64::from(offset == TXDATA));
+        }
         Ok(())
     }
 
@@ -798,6 +849,19 @@ mod tests {
         write(&mut spi, PIN, CS_HIGH, &mut a);
         write(&mut spi, STATUS, 0x400023, &mut a);
         assert_eq!(spi.read(STATUS, Width::Word, &mut a), Ok(0));
+        #[cfg(feature = "native-profile")]
+        {
+            assert!(spi.read(RXDATA, Width::Word, &mut a).is_err());
+            assert!(spi.write(TXDATA, Width::Word, 0x100, &mut a).is_err());
+            assert!(
+                spi.take_profile()
+                    .starts_with("mmio_reads=6 mmio_writes=12 rxdata_reads=4 txdata_writes=4 ")
+            );
+            assert!(
+                spi.take_profile()
+                    .starts_with("mmio_reads=0 mmio_writes=0 rxdata_reads=0 txdata_writes=0 ")
+            );
+        }
         assert!(!latch.is_asserted(Wire::Aic(irq)));
     }
     #[test]

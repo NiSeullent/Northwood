@@ -580,14 +580,9 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         service.device().set_clock(host.ticks);
         // Completion needs no invalidation when every host-visible memory
         // type is coherent.
-        let publishable = service
-            .device()
-            .backend()
-            .physical_device()
-            .memory
-            .types
-            .iter()
-            .all(|kind| {
+        let backend = service.device().backend();
+        let publishable = !backend.uses_guest_copy_transport()
+            && backend.physical_device().memory.types.iter().all(|kind| {
                 !kind.properties.contains(MemoryProperties::HOST_VISIBLE)
                     || kind.properties.contains(MemoryProperties::HOST_COHERENT)
             });
@@ -1643,6 +1638,29 @@ mod tests {
             DeviceEpoch::from_registered(NonZeroU64::MIN),
         );
         SharedService::new(service, HOST)
+    }
+
+    #[test]
+    fn guest_copy_transport_disables_early_native_completion() {
+        let mut backend = MockBackend::new();
+        backend.guest_copy_imports = true;
+        for kind in &mut backend.physical.as_mut().unwrap().memory.types {
+            if kind.properties.contains(MemoryProperties::HOST_VISIBLE) {
+                kind.properties |= MemoryProperties::HOST_COHERENT;
+            }
+        }
+        let service = Service::new(
+            device_on(backend),
+            DeviceEpoch::from_registered(NonZeroU64::MIN),
+        );
+        let shared = SharedService::new(service, HOST);
+        assert!(!shared.publishable.load(Ordering::Acquire));
+        assert!(shared.marker_value().is_none());
+        let timeline = shared.timeline.fetch_add(1, Ordering::AcqRel) + 1;
+        shared.submitted.store(3, Ordering::Release);
+        shared.completed_through(timeline, 3);
+        assert!(!shared.signaled());
+        assert_eq!(shared.reached.load(Ordering::Acquire), 0);
     }
 
     #[test]

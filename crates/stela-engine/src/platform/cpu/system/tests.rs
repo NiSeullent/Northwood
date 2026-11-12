@@ -65,9 +65,12 @@ fn vex_vector_recipes_require_live_ymm_state() {
 fn optional_legacy_extensions_require_live_declarations_without_osxsave() {
     let mut actual = baseline();
     actual.declarations.extended_ecx = CPUID_LZCNT;
-    assert_eq!(actual.target(), Ok(TargetCpu::Lzcnt));
+    assert_eq!(actual.target(), Ok(TargetCpu::Lzcnt.with_line_atomic()));
     actual.declarations.cpuid7_ecx = CPUID_GFNI;
-    assert_eq!(actual.target(), Ok(TargetCpu::Lzcnt.with_gfni()));
+    assert_eq!(
+        actual.target(),
+        Ok(TargetCpu::Lzcnt.with_gfni().with_line_atomic())
+    );
     assert_eq!(actual.controls.cr4 & (1 << 18), 0);
     let proof = NativeSystemTarget {
         observed: actual,
@@ -75,28 +78,34 @@ fn optional_legacy_extensions_require_live_declarations_without_osxsave() {
         target: actual.target().unwrap(),
     };
     actual.declarations.extended_ecx = 0;
-    assert_eq!(actual.target(), Ok(TargetCpu::Gfni));
+    assert_eq!(actual.target(), Ok(TargetCpu::Gfni.with_line_atomic()));
     assert_eq!(
         proof.revalidate_observation(actual),
         Err(Refusal::TargetChanged)
     );
     actual.declarations.cpuid7_ecx = 0;
-    assert_eq!(actual.target(), Ok(TargetCpu::Baseline));
+    assert_eq!(actual.target(), Ok(TargetCpu::LineAtomic));
 }
 
 #[test]
 fn legacy_xmm_floor_never_invents_extended_features() {
     let mut actual = baseline();
-    assert_eq!(actual.target(), Ok(TargetCpu::Baseline));
+    assert_eq!(actual.target(), Ok(TargetCpu::LineAtomic));
     actual.declarations.cpuid1_edx |= 1 << 8;
     actual.declarations.cpuid1_ecx |= 1 << 13;
-    let expected = TargetCpu::Baseline.with_cx8().with_cx16();
+    let expected = TargetCpu::LineAtomic.with_cx8().with_cx16();
     assert_eq!(actual.target(), Ok(expected));
     // Legacy XMM features report what the processor has, tier by tier.
     actual.declarations.cpuid1_ecx |= CPUID_SSSE3;
-    assert_eq!(actual.target(), Ok(TargetCpu::Ssse3.with_cx8().with_cx16()));
+    assert_eq!(
+        actual.target(),
+        Ok(TargetCpu::Ssse3.with_cx8().with_cx16().with_line_atomic())
+    );
     actual.declarations.cpuid1_ecx |= CPUID_SSE41;
-    assert_eq!(actual.target(), Ok(TargetCpu::Sse41.with_cx8().with_cx16()));
+    assert_eq!(
+        actual.target(),
+        Ok(TargetCpu::Sse41.with_cx8().with_cx16().with_line_atomic())
+    );
     actual.declarations.cpuid1_ecx |= CPUID_SSE42 | CPUID_PCLMULQDQ | CPUID_POPCNT | CPUID_AES;
     actual.declarations.cpuid7_ebx |= CPUID_SHA;
     let expected = TargetCpu::Sse42
@@ -105,7 +114,8 @@ fn legacy_xmm_floor_never_invents_extended_features() {
         .with_aes()
         .with_sha()
         .with_cx8()
-        .with_cx16();
+        .with_cx16()
+        .with_line_atomic();
     assert_eq!(actual.target(), Ok(expected));
     actual.controls.cr4 |= 1 << 18; // OSXSAVE does not admit AVX or a wider target.
     actual.declarations.cpuid1_ecx |= !(1 << 28);
@@ -122,12 +132,13 @@ fn legacy_xmm_floor_never_invents_extended_features() {
 fn scalar_vex_extensions_follow_vex_decoding_and_fast_bit_deposit() {
     let mut actual = baseline();
     actual.declarations.cpuid7_ebx = CPUID_BMI1 | CPUID_BMI2;
-    assert_eq!(actual.target(), Ok(TargetCpu::Baseline));
+    assert_eq!(actual.target(), Ok(TargetCpu::LineAtomic));
     actual.declarations.cpuid1_ecx |= CPUID_AVX;
     let fast = TargetCpu::AtomicLoad16
         .with_bmi1()
         .with_bmi2()
-        .with_fast_pdep();
+        .with_fast_pdep()
+        .with_line_atomic();
     assert_eq!(actual.target(), Ok(fast));
     actual.declarations.cpuid1_ecx &= !CPUID_AVX;
     for (vendor, family, pdep) in [
@@ -155,11 +166,12 @@ fn scalar_vex_extensions_follow_vex_decoding_and_fast_bit_deposit() {
 fn aligned_atomic_legacy_xmm_capability_is_independent_of_os_avx_state() {
     let mut actual = baseline();
     actual.declarations.cpuid1_ecx |= 1 << 28;
-    assert_eq!(actual.target(), Ok(TargetCpu::AtomicLoad16));
+    let intel = TargetCpu::AtomicLoad16.with_line_atomic();
+    assert_eq!(actual.target(), Ok(intel));
     assert_eq!(actual.controls.cr4 & (1 << 18), 0);
     assert!(!actual.target().unwrap().supports(TargetCpu::Avx2));
     actual.controls.cr4 |= 1 << 18;
-    assert_eq!(actual.target(), Ok(TargetCpu::AtomicLoad16));
+    assert_eq!(actual.target(), Ok(intel));
     let proof = NativeSystemTarget {
         observed: actual,
         lease: None,
@@ -181,6 +193,36 @@ fn aligned_atomic_legacy_xmm_capability_is_independent_of_os_avx_state() {
         proof.revalidate_observation(actual),
         Err(Refusal::ProcessorChanged)
     );
+}
+
+#[test]
+fn line_atomicity_requires_a_current_p6_or_later_intel_processor() {
+    let intel = baseline();
+    let target = intel.target().unwrap();
+    assert!(target.supports(TargetCpu::LineAtomic));
+    assert!(!target.supports(TargetCpu::AtomicLoad16));
+    assert!(!target.supports(TargetCpu::Avx2));
+    let proof = NativeSystemTarget {
+        observed: intel,
+        target,
+        lease: None,
+    };
+    let mut current = intel;
+    current.declarations.family = 5;
+    assert_eq!(current.target(), Ok(TargetCpu::Baseline));
+    assert_eq!(
+        proof.revalidate_observation(current),
+        Err(Refusal::TargetChanged)
+    );
+    current.declarations.family = 6;
+    for vendor in [TargetCpu::AMD_VENDOR, TargetCpu::HYGON_VENDOR, [0; 3]] {
+        current.declarations.vendor = vendor;
+        assert_eq!(current.target(), Ok(TargetCpu::Baseline));
+        assert_eq!(
+            proof.revalidate_observation(current),
+            Err(Refusal::ProcessorChanged)
+        );
+    }
 }
 
 #[test]
@@ -561,7 +603,7 @@ fn retirement_reenumerates_mixed_worker_capabilities_without_promoting_avx() {
         modeled_capture(&other, baseline().controls)
             .unwrap()
             .target(),
-        TargetCpu::Baseline
+        TargetCpu::LineAtomic
     );
     owner.revoke();
     let replacement = modeled_owner(baseline());
@@ -573,7 +615,7 @@ fn retirement_reenumerates_mixed_worker_capabilities_without_promoting_avx() {
         modeled_capture(&replacement, baseline().controls)
             .unwrap()
             .target(),
-        TargetCpu::Baseline
+        TargetCpu::LineAtomic
     );
     rich.declarations.vendor = [0; 3];
     let unknown = modeled_owner(rich);
@@ -737,6 +779,7 @@ fn one_owner_enumeration_then_one_live_identity_probe_per_boundary() {
                 ecx: TargetCpu::INTEL_VENDOR[2],
             },
             1 => Cpuid {
+                eax: 6 << 8,
                 edx: CPUID_FLOOR_EDX,
                 ..Cpuid::default()
             },
@@ -796,7 +839,10 @@ fn one_owner_enumeration_then_one_live_identity_probe_per_boundary() {
         live,
     )
     .unwrap();
-    assert_eq!(proof.target(), TargetCpu::Lzcnt.with_gfni());
+    assert_eq!(
+        proof.target(),
+        TargetCpu::Lzcnt.with_gfni().with_line_atomic()
+    );
     for _ in 1..4 {
         proof
             .revalidate_with(|| panic!("no reenumeration"), live)

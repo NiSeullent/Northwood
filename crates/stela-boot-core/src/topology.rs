@@ -356,6 +356,7 @@ pub fn common_native_target(
     let (mut ecx, mut edx, mut structured_ebx, mut structured_ecx) =
         (u32::MAX, u32::MAX, u32::MAX, u32::MAX);
     let mut atomic16 = true;
+    let mut line_atomic = true;
     let mut lzcnt = true;
     // VEX-encoded scalar GPR extensions, which use no extended state:
     // Intel's Pentium and Celeron parts without AVX fault on them.
@@ -399,6 +400,9 @@ pub fn common_native_target(
         } else {
             base_family
         };
+        // Intel SDM Vol. 3A §9.1.1. Cached 16-, 32- and 64-bit accesses
+        // within a cache line are atomic on P6 and later, independently of AVX.
+        line_atomic &= vendor == TargetCpu::INTEL_VENDOR && family >= 6;
         let zen = vendor == TargetCpu::AMD_VENDOR || vendor == TargetCpu::HYGON_VENDOR;
         fast_pdep &= !zen || family >= FAST_PDEP_FAMILY;
     }
@@ -422,6 +426,7 @@ pub fn common_native_target(
         (edx & CX8 != 0, TargetCpu::with_cx8),
         (ecx & CX16 != 0, TargetCpu::with_cx16),
         (atomic16, TargetCpu::with_atomic_load16),
+        (line_atomic, TargetCpu::with_line_atomic),
         (vex && structured_ebx & BMI1 != 0, TargetCpu::with_bmi1),
         (bmi2, TargetCpu::with_bmi2),
         (bmi2 && fast_pdep, TargetCpu::with_fast_pdep),

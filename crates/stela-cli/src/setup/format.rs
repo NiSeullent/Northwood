@@ -342,6 +342,43 @@ mod tests {
     }
 
     #[test]
+    fn northwood_label_matches_the_gpt_and_fat32_volume_metadata() {
+        use stela_loader::mount_interface::layout::Layout as MediaLayout;
+
+        let bytes = 2u64 << 30;
+        let writes = layout(
+            bytes,
+            512,
+            MediaLayout::Northwood.volume_label(),
+            &mut counter(),
+        )
+        .unwrap();
+        let mut disk = Image::new(bytes, 512, &writes);
+        let table = read_gpt(&mut disk).unwrap();
+        let [esp, data] = &table.partitions[..] else {
+            panic!("{:?}", table.partitions)
+        };
+        assert_eq!(esp.type_guid, Guid::ESP);
+        assert_eq!(data.type_guid, BASIC_DATA.parse().unwrap());
+        assert_eq!(esp.name, "EFI System Partition");
+        assert_eq!(data.name, "NORTHWOOD");
+        for (partition, label) in [(esp, b"EFI        "), (data, b"NORTHWOOD  ")] {
+            let base = partition.first_lba * 512;
+            let geometry = Geometry::new(partition.blocks(), 512).unwrap();
+            let mut sector = [0; 512];
+            disk.read_bytes(base, &mut sector);
+            assert_eq!(&sector[71..82], label);
+            let mut backup = [0; 512];
+            disk.read_bytes(base + BACKUP_BOOT_SECTOR * 512, &mut backup);
+            assert_eq!(backup, sector);
+            let mut root = [0; 32];
+            disk.read_bytes(base + geometry.data_sector() * 512, &mut root);
+            assert_eq!(&root[..11], label);
+            assert_eq!(root[11], ATTRIBUTE_VOLUME_ID);
+        }
+    }
+
+    #[test]
     fn four_kib_sector_esps_are_refused_rather_than_misformatted() {
         // 200 MiB of 4 KiB sectors has too few clusters for FAT32.
         let error = layout(2 << 30, 4096, "STELA", &mut counter()).unwrap_err();

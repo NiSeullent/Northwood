@@ -19,6 +19,11 @@
 #ifdef NDEBUG
 #error "These tests require active assertions"
 #endif
+#ifdef STELA_TEST_LAVAPIPE
+void stela_test_lavapipe_software_half(nir_shader *shader);
+void stela_test_lavapipe_software_render(nir_shader *vertex, nir_shader *fragment);
+void stela_test_lavapipe_fp32_preserve(nir_shader *preserve, nir_shader *flush);
+#endif
 
 static const nir_shader_compiler_options nir_options = {.max_unroll_iterations = 32};
 
@@ -4562,9 +4567,328 @@ buffer_reads_name_each_accessed_slot(void)
    stela_metal_release(shader);
 }
 
-int
-main(void)
+static const char *software_half_kernel =
+   "declare half @llvm.fma.f16(half, half, half)\n"
+   "define void @soft(ptr addrspace(1) %out) {\n"
+   "%p1 = getelementptr float, ptr addrspace(1) %out, i64 1\n"
+   "%p2 = getelementptr float, ptr addrspace(1) %out, i64 2\n"
+   "%x = load float, ptr addrspace(1) %out, align 4\n"
+   "%y = load float, ptr addrspace(1) %p1, align 4\n"
+   "%z = load float, ptr addrspace(1) %p2, align 4\n"
+   "%a = fptrunc float %x to half\n"
+   "%b = fptrunc float %y to half\n"
+   "%c = fptrunc float %z to half\n"
+   "%f = call half @llvm.fma.f16(half %a, half %b, half %c)\n"
+   "%result = fpext half %f to float\n"
+   "store float %result, ptr addrspace(1) %out, align 4\n"
+   "ret void\n}\n"
+   "!air.kernel = !{!2}\n"
+   "!2 = !{ptr @soft, !3, !4}\n!3 = !{}\n!4 = !{!40}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\","
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4,"
+   " !\"air.arg_type_name\", !\"float\", !\"air.arg_name\", !\"out\"}\n";
+
+static const char *lavapipe_fp32_kernel =
+   "define void @fp32(ptr addrspace(1) %out) {\n"
+   "%p1 = getelementptr float, ptr addrspace(1) %out, i64 1\n"
+   "%p2 = getelementptr float, ptr addrspace(1) %out, i64 2\n"
+   "%x = load float, ptr addrspace(1) %out, align 4\n"
+   "%y = load float, ptr addrspace(1) %p1, align 4\n"
+   "%z = load float, ptr addrspace(1) %p2, align 4\n"
+   "%add = fadd float %x, %x\n"
+   "%sub = fsub float %y, %x\n"
+   "%mul = fmul float %x, 2.0\n"
+   "%xb = bitcast float %x to i32\n"
+   "%yb = bitcast float %y to i32\n"
+   "%ab = bitcast float %add to i32\n"
+   "%sb = bitcast float %sub to i32\n"
+   "%mb = bitcast float %mul to i32\n"
+   "%okadd = icmp eq i32 %ab, %yb\n"
+   "%oksub = icmp eq i32 %sb, %xb\n"
+   "%okmul = icmp eq i32 %mb, %yb\n"
+   "%lt = fcmp olt float %z, %x\n"
+   "%ge = fcmp oge float %z, %x\n"
+   "%eq = fcmp oeq float %z, %x\n"
+   "%ne = fcmp une float %z, %x\n"
+   "%m0 = select i1 %okadd, i32 1, i32 0\n"
+   "%m1 = select i1 %oksub, i32 2, i32 0\n"
+   "%m2 = select i1 %okmul, i32 4, i32 0\n"
+   "%m3 = select i1 %lt, i32 8, i32 0\n"
+   "%m4 = select i1 %ge, i32 16, i32 0\n"
+   "%m5 = select i1 %eq, i32 32, i32 0\n"
+   "%m6 = select i1 %ne, i32 64, i32 0\n"
+   "%r0 = or i32 %m0, %m1\n"
+   "%r1 = or i32 %r0, %m2\n"
+   "%r2 = or i32 %r1, %m3\n"
+   "%r3 = or i32 %r2, %m4\n"
+   "%r4 = or i32 %r3, %m5\n"
+   "%result = or i32 %r4, %m6\n"
+   "store i32 %result, ptr addrspace(1) %out, align 4\n"
+   "ret void\n}\n"
+   "!air.kernel = !{!2}\n"
+   "!2 = !{ptr @fp32, !3, !4}\n!3 = !{}\n!4 = !{!40}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\","
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4,"
+   " !\"air.arg_type_name\", !\"float\", !\"air.arg_name\", !\"out\"}\n";
+
+static const char *software_vertex =
+   "define " VERTEX_RESULT " @software_vertex(i32 %id) {\n"
+   "%right = icmp eq i32 %id, 1\n"
+   "%bottom = icmp eq i32 %id, 2\n"
+   "%x = select i1 %right, float 3.0, float -1.0\n"
+   "%y = select i1 %bottom, float 3.0, float -1.0\n"
+   "%p0 = insertelement <4 x float> <float 0.0, float 0.0, float 0.0, float 1.0>, float %x, i32 0\n"
+   "%p = insertelement <4 x float> %p0, float %y, i32 1\n"
+   "%r0 = insertvalue " VERTEX_RESULT " undef, <4 x float> %p, 0\n"
+   "%r = insertvalue " VERTEX_RESULT " %r0, <2 x float> <float 0.25, float 0.0>, 1\n"
+   "ret " VERTEX_RESULT " %r\n}\n"
+   "!air.vertex = !{!2}\n!2 = !{ptr @software_vertex, !3, !4}\n!3 = !{!30, !31}\n!4 = !{!40}\n"
+   "!30 = !{!\"air.position\", !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"position\"}\n"
+   "!31 = !{!\"air.vertex_output\", !\"user(uv)\", !\"air.arg_type_name\", !\"float2\","
+   " !\"air.arg_name\", !\"uv\"}\n"
+   "!40 = !{i32 0, !\"air.vertex_id\", !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"id\"}\n";
+
+static const char *software_fragment =
+   "define <4 x float> @software_fragment(<2 x float> %uv) {\n"
+   "%x = extractelement <2 x float> %uv, i32 0\n"
+   "%h = fptrunc float %x to half\n"
+   "%s = fadd half %h, 0xH3800\n"
+   "%r = fpext half %s to float\n"
+   "%color = insertelement <4 x float> <float 0.0, float 0.25, float 0.125, float 1.0>, float %r, i32 0\n"
+   "ret <4 x float> %color\n}\n"
+   "!air.fragment = !{!2}\n!2 = !{ptr @software_fragment, !3, !4}\n!3 = !{!30}\n!4 = !{!40}\n"
+   "!30 = !{!\"air.render_target\", i32 0, i32 0, !\"air.arg_type_name\", !\"float4\","
+   " !\"air.arg_name\", !\"color\"}\n"
+   "!40 = !{i32 0, !\"air.fragment_input\", !\"user(uv)\", !\"air.center\", !\"air.perspective\","
+   " !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"uv\"}\n";
+
+static const char *software_half_color =
+   "define <4 x half> @software_half_color(<2 x float> %uv) {\n"
+   "%x = extractelement <2 x float> %uv, i32 0\n"
+   "%h = fptrunc float %x to half\n"
+   "%r = fadd half %h, 0xH3800\n"
+   "%color = insertelement <4 x half> <half 0xH0000, half 0xH3400, half 0xH3000, half 0xH3c00>, half %r, i32 0\n"
+   "ret <4 x half> %color\n}\n"
+   "!air.fragment = !{!2}\n!2 = !{ptr @software_half_color, !3, !4}\n!3 = !{!30}\n!4 = !{!40}\n"
+   "!30 = !{!\"air.render_target\", i32 0, i32 0, !\"air.arg_type_name\", !\"half4\","
+   " !\"air.arg_name\", !\"color\"}\n"
+   "!40 = !{i32 0, !\"air.fragment_input\", !\"user(uv)\", !\"air.center\", !\"air.perspective\","
+   " !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"uv\"}\n";
+
+static const char *lavapipe_fp32_fragment =
+   "define <4 x float> @fp32_fragment(ptr addrspace(1) %in) {\n"
+   "%x = load float, ptr addrspace(1) %in, align 4\n"
+   "%product = fmul float %x, 2.0\n"
+   "%positive = fcmp ogt float %product, 0.0\n"
+   "%red = select i1 %positive, float 1.0, float 0.0\n"
+   "%color = insertelement <4 x float> <float 0.0, float 0.0, float 0.0, float 1.0>, float %red, i32 0\n"
+   "ret <4 x float> %color\n}\n"
+   "!air.fragment = !{!2}\n!2 = !{ptr @fp32_fragment, !3, !4}\n!3 = !{!30}\n!4 = !{!40}\n"
+   "!30 = !{!\"air.render_target\", i32 0, i32 0, !\"air.arg_type_name\", !\"float4\","
+   " !\"air.arg_name\", !\"color\"}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read\","
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4,"
+   " !\"air.arg_type_name\", !\"float\", !\"air.arg_name\", !\"in\"}\n";
+
+static bool
+has_native_half(nir_shader *shader)
 {
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            const nir_op_info *info = &nir_op_infos[alu->op];
+            if (alu->def.bit_size == 16 &&
+                nir_alu_type_get_base_type(info->output_type) == nir_type_float)
+               return true;
+            for (unsigned i = 0; i < info->num_inputs; ++i) {
+               if (nir_src_bit_size(alu->src[i].src) == 16 &&
+                   nir_alu_type_get_base_type(info->input_types[i]) == nir_type_float)
+                  return true;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+static char *
+preserving_versions(void)
+{
+   char *keep_denorms = ralloc_strdup(NULL, versions);
+   assert(keep_denorms);
+   char *option = strstr(keep_denorms, "!{!23, !24, !25}");
+   assert(option);
+   memset(option + 2, ' ', strlen("!23, "));
+   return keep_denorms;
+}
+
+/* The opt-in path uses the same dynamic AIR and reflection as the hardware
+ * compiler, with explicit rejection for interfaces and FP modes it lacks. */
+static void
+software_half_compilation(void (*dispatch)(nir_shader *))
+{
+   struct stela_air_error error = {0};
+   const struct stela_metal_specialization spec = {.workgroup_size = {1, 1, 1}};
+   char *keep_denorms = preserving_versions();
+   LLVMMemoryBufferRef input = bitcode_built(software_half_kernel, keep_denorms);
+   const char *data = LLVMGetBufferStart(input);
+   size_t size = LLVMGetBufferSize(input);
+   struct stela_metal_reflection reflection;
+   assert(stela_metal_reflect(data, size, "soft", NULL, 0, &reflection, &error));
+   nir_shader *hw = stela_metal_compile_reflected(data, size, "soft", &target, &spec,
+                                                 &reflection, &error);
+   assert(hw && has_native_half(hw));
+   nir_shader *sw = stela_metal_compile_software_reflected(data, size, "soft", &target, &spec,
+                                                          &reflection, &error);
+   assert(sw && !has_native_half(sw));
+   assert(!(sw->info.float_controls_execution_mode & FLOAT_CONTROLS_DENORM_PRESERVE_FP32));
+   nir_validate_shader(hw, "normal Metal AIR");
+   nir_validate_shader(sw, "software Metal AIR");
+   if (dispatch)
+      dispatch(sw);
+   stela_metal_release(sw);
+   stela_metal_release(hw);
+   LLVMDisposeMemoryBuffer(input);
+
+   const char *narrow = "%a = fptrunc float %x";
+   const char *at = strstr(software_half_kernel, narrow);
+   assert(at);
+   char *arithmetic = ralloc_asprintf(NULL, "%.*s%%wide = fmul float %%x, %%y\n"
+                                              "%%a = fptrunc float %%wide%s",
+                                     (int)(at - software_half_kernel), software_half_kernel,
+                                     at + strlen(narrow));
+   input = bitcode_built(arithmetic, keep_denorms);
+   sw = stela_metal_compile_software_reflected(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                              "soft", &target, &spec, NULL, &error);
+   assert(!sw && error.kind == STELA_AIR_TARGET && strstr(error.detail, "denorm preservation"));
+   LLVMDisposeMemoryBuffer(input);
+   ralloc_free(arithmetic);
+   const struct stela_metal_linked_varying varying = {"user(uv)", 8, 0};
+   const struct stela_metal_specialization graphics = {.varyings = &varying, .varying_count = 1, .samples = 1};
+   input = bitcode_built(software_vertex, keep_denorms);
+   sw = stela_metal_compile_software_reflected(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                              "software_vertex", &target, &graphics, NULL, &error);
+   assert(!sw && error.kind == STELA_AIR_TARGET && strstr(error.detail, "flush-to-zero"));
+   LLVMDisposeMemoryBuffer(input);
+   ralloc_free(keep_denorms);
+}
+
+static void
+lavapipe_fp32_compilation(void (*dispatch)(nir_shader *, nir_shader *))
+{
+   struct stela_air_error error = {0};
+   const struct stela_metal_specialization compute = {.workgroup_size = {1, 1, 1}};
+   char *keep_denorms = preserving_versions();
+   LLVMMemoryBufferRef input = bitcode_built(lavapipe_fp32_kernel, keep_denorms);
+   const char *data = LLVMGetBufferStart(input);
+   size_t size = LLVMGetBufferSize(input);
+   assert(!stela_metal_compile_software_reflected(data, size, "fp32", &target, &compute, NULL, &error) &&
+          error.kind == STELA_AIR_TARGET && strstr(error.detail, "denorm preservation"));
+   nir_shader *preserve = stela_metal_compile_lavapipe_reflected(data, size, "fp32", &target, &compute,
+                                                               NULL, &error);
+   assert(preserve && (preserve->info.float_controls_execution_mode & FLOAT_CONTROLS_DENORM_PRESERVE_FP32));
+   const nir_op ops[] = {nir_op_fadd, nir_op_fsub, nir_op_fmul, nir_op_flt, nir_op_fge, nir_op_feq, nir_op_fneu};
+   for (unsigned i = 0; i < ARRAY_SIZE(ops); i++)
+      assert(alu_count(preserve, ops[i]) == 1);
+   LLVMDisposeMemoryBuffer(input);
+
+   input = bitcode(lavapipe_fp32_kernel);
+   nir_shader *flush = stela_metal_compile_lavapipe_reflected(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                                            "fp32", &target, &compute, NULL, &error);
+   assert(flush && (flush->info.float_controls_execution_mode & FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32));
+   assert(!(flush->info.float_controls_execution_mode & FLOAT_CONTROLS_DENORM_PRESERVE_FP32));
+   if (dispatch)
+      dispatch(preserve, flush);
+   stela_metal_release(flush);
+   stela_metal_release(preserve);
+   LLVMDisposeMemoryBuffer(input);
+
+   const struct stela_metal_specialization fragment_spec = {.samples = 1};
+   input = bitcode_built(lavapipe_fp32_fragment, keep_denorms);
+   nir_shader *color = stela_metal_compile_lavapipe_reflected(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                                            "fp32_fragment", &target, &fragment_spec, NULL, &error);
+   assert(color && (color->info.float_controls_execution_mode & FLOAT_CONTROLS_DENORM_PRESERVE_FP32) &&
+          alu_count(color, nir_op_fmul) == 1 && alu_count(color, nir_op_flt) == 1);
+   stela_metal_release(color);
+   LLVMDisposeMemoryBuffer(input);
+
+   const struct stela_metal_linked_varying varying = {"user(uv)", 8, 0};
+   const struct stela_metal_specialization varying_spec = {.varyings = &varying, .varying_count = 1, .samples = 1};
+   input = bitcode_built(software_fragment, keep_denorms);
+   assert(!stela_metal_compile_lavapipe_reflected(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                                  "software_fragment", &target, &varying_spec, NULL, &error) &&
+          error.kind == STELA_AIR_TARGET && strstr(error.detail, "floating-point fragment inputs"));
+   LLVMDisposeMemoryBuffer(input);
+   ralloc_free(keep_denorms);
+}
+
+static void
+software_graphics_compilation(void (*draw)(nir_shader *, nir_shader *))
+{
+   const struct stela_metal_linked_varying varying = {"user(uv)", 8, 0};
+   const struct stela_metal_specialization spec = {.varyings = &varying, .varying_count = 1, .samples = 1};
+   const char *fixtures[] = {software_vertex, software_fragment, software_half_color};
+   const char *entries[] = {"software_vertex", "software_fragment", "software_half_color"};
+   nir_shader *shaders[ARRAY_SIZE(fixtures)];
+   for (unsigned i = 0; i < ARRAY_SIZE(fixtures); i++) {
+      LLVMMemoryBufferRef input = bitcode(fixtures[i]);
+      const char *data = LLVMGetBufferStart(input);
+      const size_t size = LLVMGetBufferSize(input);
+      struct stela_air_error error = {0};
+      mesa_shader_stage stage = i == 0 ? MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT;
+      if (stage == MESA_SHADER_FRAGMENT) {
+         nir_shader *native = stela_metal_compile_reflected(data, size, entries[i], &target,
+                                                             &spec, NULL, &error);
+         assert(native && has_native_half(native));
+         stela_metal_release(native);
+      }
+      shaders[i] = stela_metal_compile_software_reflected(data, size, entries[i], &target,
+                                                           &spec, NULL, &error);
+      assert(shaders[i] && shaders[i]->info.stage == stage && !has_native_half(shaders[i]));
+      assert(shaders[i]->info.float_controls_execution_mode & FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32);
+      nir_validate_shader(shaders[i], "software Metal render fixture");
+      LLVMDisposeMemoryBuffer(input);
+   }
+   for (unsigned i = 1; i < ARRAY_SIZE(fixtures); i++) {
+      if (draw) {
+         printf("Rendering AIR fragment %s\n", entries[i]);
+         draw(shaders[0], shaders[i]);
+      }
+      stela_metal_release(shaders[i]);
+   }
+   stela_metal_release(shaders[0]);
+}
+
+int
+main(int argc, char **argv)
+{
+#ifdef STELA_TEST_LAVAPIPE
+   if (argc == 2 && strcmp(argv[1], "--lavapipe-fp32-preserve") == 0) {
+      glsl_type_singleton_init_or_ref();
+      lavapipe_fp32_compilation(stela_test_lavapipe_fp32_preserve);
+      glsl_type_singleton_decref();
+      return 0;
+   }
+   if (argc == 2 && strcmp(argv[1], "--lavapipe-software-half") == 0) {
+      glsl_type_singleton_init_or_ref();
+      software_half_compilation(stela_test_lavapipe_software_half);
+      glsl_type_singleton_decref();
+      return 0;
+   }
+   if (argc == 2 && strcmp(argv[1], "--lavapipe-software-render") == 0) {
+      glsl_type_singleton_init_or_ref();
+      software_graphics_compilation(stela_test_lavapipe_software_render);
+      glsl_type_singleton_decref();
+      return 0;
+   }
+#endif
+   if (argc != 1) {
+      fprintf(stderr, "Unsupported Metal compiler test argument: %s\n", argv[1]);
+      return 1;
+   }
    glsl_type_singleton_init_or_ref();
    harness();
    modules_list_their_functions();
@@ -4619,6 +4943,9 @@ main(void)
    linked_modules_specialize_their_function_constants();
    command_encoding_reflects_barriers();
    buffer_reads_name_each_accessed_slot();
+   software_half_compilation(NULL);
+   software_graphics_compilation(NULL);
+   lavapipe_fp32_compilation(NULL);
    framebuffer_reads_access_storage_attachments();
    framebuffer_reads_run_their_own_fragment_tests();
    extended_range_outputs_clamp();

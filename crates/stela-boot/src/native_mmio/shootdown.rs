@@ -72,13 +72,13 @@ fn cr4() -> u64 {
     cr4
 }
 
-/// Drop every aperture translation from this processor's TLB and paging
-/// structure caches, in every PCID.
-fn flush() {
+/// Drop non-global translations from this processor's TLB and paging
+/// structure caches, in every PCID, preserving its active root.
+pub(crate) fn flush() {
     let cr4 = cr4();
     if cr4 & CR4_PCIDE == 0 {
         // Without PCIDs a CR3 write drops every non-global translation, and
-        // the aperture's leaves are not global.
+        // both the aperture and guest-facing aliases have non-global leaves.
         // SAFETY: rewrites the live root.
         unsafe {
             asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack, preserves_flags))

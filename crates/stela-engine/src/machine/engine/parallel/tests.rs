@@ -467,6 +467,65 @@ fn first_of_two(
 }
 
 #[test]
+fn native_ram_service_busy_yields_to_the_hub_before_reentry() {
+    use super::super::{
+        NativeEntryError, NativeExit,
+        tests::{BASE, board},
+    };
+    use stela_compiler::block::ExitKind;
+
+    let (hub, _) = hub(2);
+    let home = first_of_two(&[], &hub);
+    let prepared = board(
+        &[0xd503_201f],
+        crate::machine::NoDevices,
+        home.profile.processors.clone(),
+    );
+    let mut worker = home
+        .worker_profile()
+        .start(prepared.cpu, prepared.host, prepared.devices, 1)
+        .unwrap();
+    worker
+        .start_parallel(Arc::clone(&hub), home.cpu.core_locks.clone(), BASE)
+        .unwrap();
+    worker.cpu.pstate.pacm = true;
+    worker.host.native_entry_refusal = Some(NativeEntryError::RamServiceBusy);
+    worker.host.exits.push(NativeExit::Exit {
+        next_pc: BASE + 4,
+        kind: ExitKind::Fallthrough as u64,
+    });
+
+    let retired = worker.cpu.retired;
+    assert!(matches!(
+        worker.run(1),
+        Stop::Unsupported(super::super::Requirement {
+            pc: BASE,
+            kind: RequirementKind::NativeRamServiceBusy,
+            ..
+        })
+    ));
+    assert_eq!(worker.cpu.pc, BASE);
+    assert_eq!(worker.cpu.retired, retired);
+    assert!(worker.cpu.pstate.pacm);
+    assert_eq!(worker.host.exits.len(), 1);
+    assert!(hub.inboxes[1].outside.load(Ordering::Acquire));
+
+    hub.stopped.store(true, Ordering::SeqCst);
+    let stopping_hub = Arc::clone(&hub);
+    worker.host.on_relax = Some(Box::new(move |_| {
+        assert!(stopping_hub.inboxes[1].parked.load(Ordering::SeqCst));
+        stopping_hub.stopped.store(false, Ordering::SeqCst);
+    }));
+    assert_eq!(worker.run(1), Stop::Budget);
+    assert!(!hub.stopped.load(Ordering::SeqCst));
+    assert!(!hub.inboxes[1].parked.load(Ordering::SeqCst));
+    assert_eq!(worker.cpu.pc, BASE + 4);
+    assert_eq!(worker.cpu.retired, retired + 1);
+    assert!(!worker.cpu.pstate.pacm);
+    assert!(worker.host.exits.is_empty());
+}
+
+#[test]
 fn broadcast_profile_counts_posts_and_completion_waits_for_the_attached_owner() {
     let (hub, _) = hub(2);
     let mut machine = first_of_two(&[0xd503_201f], &hub);

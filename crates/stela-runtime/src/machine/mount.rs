@@ -750,7 +750,7 @@ fn add_usbs(
         let id = devices.add_usb(controller, darts.native(controller.iommu, 0)?)?;
         // The native keyboard and pointer plug into the last connector
         // (J473AP usb-drd1), the Mac being the downstream-facing port.
-        let hub = input || !usb.disks.is_empty() || usb.network.is_some();
+        let hub = input || !usb.disks.is_empty() || usb.network.is_some() || usb.reserve_network;
         if hub && index + 1 == usbs && index != 0 {
             let disks = usb.disks.len();
             let network = usb.network;

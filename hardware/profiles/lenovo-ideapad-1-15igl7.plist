@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Match</key>
+  <dict>
+    <key>Manufacturer</key><string>LENOVO</string>
+    <key>Product</key><string>82V7</string>
+    <key>AcpiHid</key><string>SYNA2BA6</string>
+    <key>PciVendor</key><integer>32902</integer>
+    <key>PciDevice</key><integer>12677</integer>
+  </dict>
+  <key>ACPI</key>
+  <dict>
+    <key>Quirks</key>
+    <array>
+      <dict>
+        <key>Match</key><string>SYNA2BA6</string>
+        <key>Kind</key><string>I2cHidDescriptor</string>
+        <key>Value</key><integer>44</integer>
+        <key>Comment</key><string>SBFS value observed with the Lenovo workaround. Verify on the Northwood input path.</string>
+      </dict>
+      <dict>
+        <key>Match</key><string>SYNA2BA6</string>
+        <key>Kind</key><string>I2cHidForcePolling</string>
+        <key>Value</key><integer>8000</integer>
+      </dict>
+    </array>
+  </dict>
+  <key>Graphics</key>
+  <dict>
+    <key>Backend</key><string>Auto</string>
+  </dict>
+  <key>Memory</key>
+  <dict>
+    <key>Profile</key><string>Auto</string>
+    <key>Swap</key>
+    <dict>
+      <key>Enabled</key><true/>
+      <key>SizeGiB</key><integer>32</integer>
+      <key>Location</key><string>Auto</string>
+      <key>GuestSwap</key><true/>
+    </dict>
+  </dict>
+</dict>
+</plist>

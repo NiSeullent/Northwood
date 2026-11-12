@@ -20,6 +20,7 @@ use crate::bus::pci::power::{self, Timer as Minimum};
 use crate::usb::hid::{ParseError, Translator};
 use alloc::{rc::Rc, string::String, vec::Vec};
 use core::mem::ManuallyDrop;
+mod precision_touchpad;
 mod refusal;
 pub use refusal::{Refusal, RefusalCause};
 
@@ -791,15 +792,25 @@ impl<B: Bus, I: Interrupt, T: Timer> HidInput<B, I, T> {
         reason = "a device whose descriptor does not parse goes back to its owner"
     )]
     pub fn new(device: Device<B, I, T>, name: String) -> Result<Self, Refusal<B, I, T>> {
-        let device = ManuallyDrop::new(device);
-        match Translator::describe(device.report_descriptor()) {
-            Ok(translator) => Ok(Self {
-                device,
-                translator,
-                name,
-            }),
-            Err(error) => Err(Refusal::descriptor(device, error)),
+        let mut device = ManuallyDrop::new(device);
+        let translator = match Translator::describe(device.report_descriptor()) {
+            Ok(translator) => translator,
+            Err(error) => return Err(Refusal::descriptor(device, error)),
+        };
+        if let Some(report) = precision_touchpad::mouse_mode_report(&translator)
+            && let Err(error) = device.set_report(
+                ReportType::Feature,
+                report,
+                &[precision_touchpad::MOUSE_MODE],
+            )
+        {
+            return Err(Refusal::transport(device, error));
         }
+        Ok(Self {
+            device,
+            translator,
+            name,
+        })
     }
 
     pub fn device(&self) -> &Device<B, I, T> {

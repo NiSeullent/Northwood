@@ -198,9 +198,14 @@ impl Observation {
         if d.cpuid1_ecx & CPUID_CX16 != 0 {
             target = target.with_cx16();
         }
+        let intel = d.vendor == TargetCpu::INTEL_VENDOR;
+        // Intel SDM Vol. 3A §9.1.1: on P6 and later, a cached scalar
+        // access within a line is atomic without any AVX requirement.
+        if intel && d.family >= 6 {
+            target = target.with_line_atomic();
+        }
         // Scalar GPR extensions: VEX-encoded BMI1 and BMI2 use no extended
         // register state, so they need no XCR0, only VEX decoding.
-        let intel = d.vendor == TargetCpu::INTEL_VENDOR;
         let vex = !intel || d.cpuid1_ecx & CPUID_AVX != 0;
         if vex && d.cpuid7_ebx & CPUID_BMI1 != 0 {
             target = target.with_bmi1();
@@ -240,7 +245,7 @@ impl Observation {
                 target = target.with_avx2();
             }
         }
-        // No AVX-512, cache-line atomicity or DOIT recipe is admitted.
+        // No AVX-512 or DOIT recipe is admitted.
         Ok(target)
     }
 }

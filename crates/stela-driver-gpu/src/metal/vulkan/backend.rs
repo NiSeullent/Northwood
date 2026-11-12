@@ -165,8 +165,62 @@ pub enum Object {
     ExecutionSet(ExecutionSet),
 }
 
+/// Active rows in a transfer-only guest buffer. The logical guest and
+/// private device buffer offsets agree. Padding is outside each row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestRows {
+    pub memory: Memory,
+    pub offset: u64,
+    pub stride: u64,
+    pub bytes: u64,
+    pub count: u32,
+}
+
+pub(crate) const GUEST_COPY_WAIT_NS: u64 = 250_000_000;
+
 pub trait Backend {
     fn physical_device(&self) -> &PhysicalDevice;
+
+    /// A coherent, bidirectionally wired host-pointer import. Such memory
+    /// can back a transfer buffer, but Vulkan images need their own memory.
+    fn is_host_pointer_import(&self, _memory: Memory) -> bool {
+        false
+    }
+
+    /// This device has a provider for copies to/from canonical guest RAM.
+    fn uses_guest_copy_transport(&self) -> bool {
+        false
+    }
+
+    /// The import names guest RAM through a provider and private storage.
+    fn is_guest_copy_import(&self, _memory: Memory) -> bool {
+        false
+    }
+
+    /// Submits GPU work without guest signals and waits for its private
+    /// checkpoint. A successful empty segment also fences earlier work.
+    fn finish_guest_copy_segment(&mut self, _segment: Segment) -> Result<()> {
+        Err(Error::Unsupported("guest copy checkpoint"))
+    }
+
+    /// Pulls active rows into the idle private buffer before a GPU load.
+    ///
+    /// # Safety
+    /// No host or device operation can concurrently access the private
+    /// buffer. The original guest wire is retained.
+    unsafe fn read_guest_rows(&mut self, _rows: GuestRows) -> Result<()> {
+        Err(Error::Unsupported("guest buffer upload"))
+    }
+
+    /// Publishes active rows from a completed GPU copy to guest RAM.
+    /// Failure can follow partial publication and must fail the device.
+    ///
+    /// # Safety
+    /// The private buffer is idle and its device writes are host-visible.
+    /// The original guest wire is retained.
+    unsafe fn publish_guest_rows(&mut self, _rows: GuestRows) -> Result<()> {
+        Err(Error::Unsupported("guest buffer writeback"))
+    }
 
     /// Acknowledges that no queued GPU operation can still access this
     /// backend's resources. The owner has closed admission and observed all

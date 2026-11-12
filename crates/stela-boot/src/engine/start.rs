@@ -310,12 +310,6 @@ fn open_host(
     // `--nor` naming the `--storage` partition keeps the machine state in
     // that partition's tail (`pc::machine_state`): one device, split below.
     let state_in_storage = options.nor.is_some() && options.nor == options.storage;
-    let targets: Vec<&Target> = options
-        .storage
-        .iter()
-        .chain(options.restore_source.iter())
-        .chain(options.nor.iter().filter(|_| !state_in_storage))
-        .collect();
     #[cfg(feature = "diagnostics")]
     if options.audio_check.is_some() && !options.audio_own_hpet {
         output::fatal("the audio check requires an explicit --audio-own-hpet handoff");
@@ -330,7 +324,16 @@ fn open_host(
         mmio: native_mmio,
         remappers,
         _work: kernel_work,
+        pci_ids,
     } = start_platform(handoff, &mut host_owner, options);
+    options.northwood =
+        northwood::configuration(handoff, host_firmware.as_deref(), &pci_ids, host_acpi);
+    let targets: Vec<&Target> = options
+        .storage
+        .iter()
+        .chain(options.restore_source.iter())
+        .chain(options.nor.iter().filter(|_| !state_in_storage))
+        .collect();
     // The signing service is asked only during an install, so a boot that
     // installs nothing leaves the adapter to the guest. An install without a
     // medium partition also streams its remote image.
@@ -345,7 +348,10 @@ fn open_host(
             "INSTALL OFFLINE macOS and Apple's signing answers are on the USB; no network is opened\n"
         ));
     }
-    let wants_network = (options.install.is_some() && !offline) || options.network_check.is_some();
+    let wants_network = (options.install.is_some() && !offline)
+        || options.network_check.is_some()
+        || options.network_check_get.is_some()
+        || !options.network_check_ranges.is_empty();
     let mut devices = start_devices(
         handoff,
         options,
@@ -362,6 +368,7 @@ fn open_host(
         remappers,
         kernel_work,
     );
+    output::boot_stage("drivers-probed");
     remappers.report_faults();
     // An install without staged signing answers cannot finish without
     // Apple's signing server: stop before the restore changes the Mac's
@@ -434,6 +441,50 @@ fn open_host(
             }
             Err(error) => output::fatal(format_args!("the network check failed: {error:?}")),
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(url) = &options.network_check_get {
+        let Some(Ok(network)) = &devices.host_network else {
+            output::fatal("the HTTPS range check could not open the host network")
+        };
+        let (size, body) = network
+            .0
+            .borrow_mut()
+            .check_public_range(url)
+            .unwrap_or_else(|error| {
+                output::fatal(format_args!("the HTTPS range check failed: {error}"))
+            });
+        output::arguments(format_args!(
+            "NETWORK GET {url} status=206 bytes={} object={} sha256={}\n",
+            body.len(),
+            size,
+            stela_formats::sha256(&body),
+        ));
+        output::arguments(format_args!("NETWORK CHECK passed\n"));
+    }
+    #[cfg(feature = "diagnostics")]
+    if !options.network_check_ranges.is_empty() {
+        let Some(Ok(network)) = &devices.host_network else {
+            output::fatal("the exact range check could not open the host network")
+        };
+        let mut network = network.0.borrow_mut();
+        let ranges = &options.network_check_ranges;
+        let passed = if options.network_check_reopen {
+            let [first, next] = ranges.as_slice() else {
+                unreachable!("validated exact range reopen pair");
+            };
+            network
+                .check_reopened_range(first, next)
+                .unwrap_or_else(|error| {
+                    output::fatal(format_args!("the exact range reopen check failed: {error}"))
+                })
+        } else {
+            network.check_exact_ranges(ranges)
+        };
+        if !passed {
+            output::fatal("the exact range check failed");
+        }
+        output::arguments(format_args!("NETWORK EXACT RANGE CHECK passed\n"));
     }
     OpenedHost {
         owner: host_owner,
@@ -723,6 +774,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         &mut host.owner.host(),
         handoff,
         options,
+        &host.ram,
         host.built.as_deref(),
         storage.nvram.take(),
     );
@@ -892,7 +944,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             sep_state,
             board_flash,
             usb_disks,
-            guest_mac: guest_network.as_ref().map(network::GuestNetwork::mac),
+            guest_mac: guest_network.as_ref().and_then(network::GuestNetwork::mac),
             guest_bluetooth: host_bluetooth.is_some(),
         },
         board.as_ref(),
@@ -1188,6 +1240,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         )
     }
     .unwrap_or_else(|error| output::fatal(error));
+    run::heap_report("guest-ready", &crate::ALLOCATOR.usage());
     if options.parallel {
         // The workers are held for good, and their cores run PEs instead.
         // SAFETY: as for `run_serialized` below.
@@ -1223,6 +1276,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         .parallel
         .then(storage::TaggedRoots::enable)
         .flatten();
+    output::boot_stage("boot-pe-dispatch");
     run_machine(machine, options, handoff, io, |machine, limit| {
         // SAFETY: the same fixed workers and canonical producer set stay
         // kept; an unsupported native service returns without fallback.
@@ -1252,8 +1306,54 @@ fn open_gpus(
     remappers: &'static remapping::Remappers,
     handoff: &Handoff,
     firmware: &Option<alloc::sync::Arc<stela_drivers::firmware::Catalog>>,
-    adapters: Vec<stela_drivers::gpu::Adapter>,
+    mut adapters: Vec<stela_drivers::gpu::Adapter>,
+    drivers: Option<&northwood_config::Drivers>,
 ) -> bool {
+    use stela_boot_core::gpu_status::{self, Reason};
+    use stela_drivers::{gpu::Vendor, probe::registry::Resolution};
+
+    if let Some(drivers) = drivers {
+        let policy = northwood::Policy::new(Some(drivers));
+        let pci = policy.pci();
+        let mut refused = Vec::new();
+        adapters.retain(|adapter| {
+            if adapter.vendor != Vendor::Nvidia {
+                return true;
+            }
+            let Err(resolution) = pci.admit_nvmodern(adapter) else {
+                return true;
+            };
+            let reason = match resolution {
+                Resolution::Disabled(_) => Reason::PolicyDisabled,
+                Resolution::Blocked => Reason::PolicyBlocked,
+                Resolution::ForceRejected => Reason::PolicyForceRejected,
+                _ => Reason::Other,
+            };
+            let message = gpu_status::refused(&adapter.address.to_string(), adapter.device, reason);
+            output::arguments(format_args!("GPU POLICY {message}\n"));
+            refused.push(message);
+            false
+        });
+        if let Some((first, rest)) = refused.split_first() {
+            let has_candidate = adapters
+                .iter()
+                .any(|adapter| adapter.vendor == Vendor::Nvidia);
+            let info = if has_candidate {
+                refused.as_slice()
+            } else {
+                crate::status::begin("Starting the GPU");
+                crate::status::warn(first);
+                rest
+            };
+            for message in info {
+                crate::status::info(message);
+            }
+            if !has_candidate {
+                return false;
+            }
+        }
+    }
+
     let heap = handoff.heap.physical..handoff.heap.physical + handoff.heap.bytes;
     let guest_ram = handoff.guest[..handoff.guest_count]
         .iter()
@@ -1271,7 +1371,7 @@ fn open_gpus(
         return false;
     }
     let tsc_hz = handoff.tsc_hz;
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
     let heap_bytes = heap.end - heap.start;
     crate::status::begin("Starting the GPU");
     let gop = if handoff.screen.is_some() {
@@ -1298,7 +1398,6 @@ fn open_gpus(
         Ok((claimed, _, Some(random))) if !claimed.is_empty() => (claimed, random),
         Ok((_, refused, _)) => {
             // Each GPU that did not start, and why, or that there is none.
-            use stela_boot_core::gpu_status;
             match refused.split_first() {
                 None => crate::status::warn(&gpu_status::none()),
                 Some((first, rest)) => {
@@ -1332,7 +1431,7 @@ fn open_gpus(
         random,
         tsc_hz,
         wall: handoff.wall,
-        #[cfg(feature = "nvk")]
+        #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
         heap_bytes,
     };
     let opening = host::rdtsc();
@@ -1409,17 +1508,13 @@ fn place_devices(
     let reset = options.bundle.then_some(entry);
     // Board device firmware images travel in the bundle by guest file name;
     // a bundle built from an installed disk finds them in the board's flash.
-    let files = &handoff.files[..handoff.file_count];
     let carried = |name: &str| -> Option<&[u8]> {
         match built {
             Some(built) => built
                 .iter()
                 .find(|(file, _)| file == name)
                 .map(|(_, bytes)| bytes.as_slice()),
-            None => files
-                .iter()
-                .find(|file| file.name() == name)
-                .map(bundle::contents),
+            None => restore::inventory_file(handoff, name),
         }
     };
     let flash = board_flash.as_ref();
@@ -1478,6 +1573,7 @@ fn place_devices(
             usb: stela_soc::machine::UsbCables {
                 disks: placement.usb_disks,
                 network: placement.guest_mac,
+                reserve_network: options.guest_network,
                 bluetooth: placement.guest_bluetooth,
             },
             scanout,
@@ -2164,6 +2260,7 @@ struct Platform {
     acpi: Option<&'static aml::HostAcpi>,
     mmio: Option<&'static crate::native_mmio::Source>,
     remappers: &'static remapping::Remappers,
+    pci_ids: Vec<(u16, u16)>,
     /// Affine runtime/source remain held through paused/quarantined frames.
     /// Its producer services require their own complete admission graph.
     _work: Option<&'static kernel_work::KernelWork>,
@@ -2345,6 +2442,10 @@ fn start_platform(
             }
         }
     });
+    let pci_ids = contained_pci
+        .as_ref()
+        .and_then(|pci| pci.device_ids().ok())
+        .unwrap_or_default();
     if let Some(screen) = handoff.screen {
         match (&contained_pci, screen.pci_source) {
             (Some(pci), Some(source)) => {
@@ -2363,6 +2464,14 @@ fn start_platform(
                 }
             }
             _ => output::arguments(format_args!("HOST GOP PCI source unavailable\n")),
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(pci) = &contained_pci {
+        // SAFETY: the same parked fabric still excludes competing config writers.
+        unsafe {
+            pci.report_glk_attachment(handoff.screen);
+            pci.report_lpss_attachment();
         }
     }
     // The remapping units, taken before any host driver starts DMA.
@@ -2459,6 +2568,7 @@ fn start_platform(
         acpi: host_acpi,
         mmio: native_mmio,
         remappers: alloc::boxed::Box::leak(alloc::boxed::Box::new(remappers)),
+        pci_ids,
         _work: work,
     }
 }
@@ -2563,6 +2673,17 @@ fn start_devices(
     let mut fdr_device = None;
     let mut host_usb = None;
     let mut host_bluetooth = None;
+    let volume_log = handoff.volume_log;
+    let owned_swap = if handoff.storage.present && kernel_work.is_some() {
+        super::swap::Probe::for_boot(
+            handoff.memory_profile,
+            options.northwood.as_ref().map(|config| &config.memory.swap),
+            options.storage.as_ref().or(options.preboot.as_ref()),
+            handoff.boot_esp,
+        )
+    } else {
+        None
+    };
     let (services, medium, preboot, host_input, host_network, usb_disks, guest_network, host_disks) =
         if targets.is_empty()
             && options.install_source.is_none()
@@ -2573,7 +2694,9 @@ fn start_devices(
             && !options.external_disks
             && !options.guest_network
             && translation_store.is_none()
+            && volume_log.is_none()
             && fdr_partition.is_none()
+            && owned_swap.is_none()
         {
             (
                 Vec::new(),
@@ -2621,13 +2744,18 @@ fn start_devices(
             let medium_partition = options.install_source;
             let log_partition = handoff.log_partition.map(Guid);
             let usb4_approved = options.usb4_approved.clone();
+            let drivers = options.northwood.as_ref().map(|config| &config.drivers);
+            let owned_drivers = drivers.cloned();
+            let acpi_quirks = options.northwood.as_ref().map(|config| config.acpi.clone());
             let work = kernel_work
                 .unwrap_or_else(|| output::fatal("native probe requires an owned continuation"));
             let opened = work.call_owned(60_000_000, move || {
                 let native = mmio.map(|mmio| {
                     services::Services::new(mmio, remappers, host_acpi, heap, tsc_hz, usb4_approved)
+                        .with_hid_quirks(northwood::hid_quirks(acpi_quirks.as_ref()))
                 });
                 let targets: Vec<_> = owned_targets.iter().collect();
+                let policy = northwood::Policy::new(owned_drivers.as_ref());
                 // SAFETY: one admitted foreground task under the work
                 // dispatcher's loader-root/driver guard. Owned handoff, inputs
                 // and kept services survive completion or quarantine.
@@ -2645,9 +2773,12 @@ fn start_devices(
                             preboot: owned_preboot.as_ref(),
                             store: translation_store,
                             log: log_partition,
+                            volume_log: volume_log.map(|log| Guid(log.partition)),
+                            swap: owned_swap.as_ref(),
                             fdr: fdr_partition,
                             usb_disks: &owned_usb,
                             wifi: owned_wifi.as_ref(),
+                            policy: policy.pci(),
                             external,
                         },
                     )
@@ -2659,6 +2790,7 @@ fn start_devices(
                 preboot,
                 store,
                 log,
+                volume_log: data_log,
                 fdr,
                 inputs,
                 mut links,
@@ -2696,14 +2828,68 @@ fn start_devices(
                     count(disks, "disk", "disks")
                 ),
             });
-            if options.boots_macos()
-                && open_gpus(work, mmio, remappers, handoff, host_firmware, gpus)
-            {
-                gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
+            if options.boots_macos() {
+                use northwood_config::GraphicsBackend;
+
+                let backend = options
+                    .northwood
+                    .as_ref()
+                    .map_or(GraphicsBackend::Auto, |config| config.graphics.backend);
+                match backend {
+                    GraphicsBackend::Auto | GraphicsBackend::NvModern => {
+                        if open_gpus(work, mmio, remappers, handoff, host_firmware, gpus, drivers) {
+                            gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
+                        }
+                    }
+                    GraphicsBackend::Gop => crate::status::info(
+                        "Graphics/Backend=GOP selects the firmware framebuffer without Metal",
+                    ),
+                    GraphicsBackend::I915 => {
+                        crate::status::info("Graphics/Backend=i915 is unavailable in this build")
+                    }
+                    GraphicsBackend::Xe => {
+                        crate::status::info("Graphics/Backend=Xe is unavailable in this build")
+                    }
+                    GraphicsBackend::Northbridge => {
+                        #[cfg(feature = "pthread-runtime-probe")]
+                        if let Some(window) = mmio.and_then(|mmio| mmio.window())
+                            && let Ok(entropy) = crate::random::source()
+                            && let Ok(random) = stela_linux::random::Seeded::from_entropy(&*entropy)
+                        {
+                            let machine = gpu::Machine {
+                                work,
+                                window,
+                                random,
+                                tsc_hz: handoff.tsc_hz,
+                                wall: handoff.wall,
+                                heap_bytes: handoff.heap.bytes,
+                            };
+                            match gpu::probe_pthread(machine) {
+                                Ok(()) => output::arguments(format_args!(
+                                    "NORTHBRIDGE PTHREAD timeout=monotonic signal=parked join=retired\n"
+                                )),
+                                Err(error) => output::arguments(format_args!(
+                                    "NORTHBRIDGE PTHREAD refused: {error}\n"
+                                )),
+                            }
+                        } else {
+                            output::arguments(format_args!(
+                                "NORTHBRIDGE PTHREAD refused: native stack window or entropy unavailable\n"
+                            ));
+                        }
+                        #[cfg(not(feature = "pthread-runtime-probe"))]
+                        crate::status::info(
+                            "Graphics/Backend=Northbridge is unavailable in this build",
+                        );
+                    }
+                }
             }
             disks.profile_callbacks(options.profile);
             if let Some(log) = log {
                 crate::log_file::resume(log);
+            }
+            if let (Some(device), Some(log)) = (data_log, volume_log) {
+                crate::log_file::resume_volume(device, log);
             }
             if let Some(store) = store {
                 translations::set_partition(store);
@@ -2716,23 +2902,10 @@ fn start_devices(
             // The guest's controller hangs off the hub of its keyboard.
             host_bluetooth = host_controller.filter(|_| options.input);
             // The guest's adapter is its own: the mount's client keeps the
-            // first one. Without one the Mac boots with no network, which
-            // is reported once.
+            // first one. An empty guest port can take an adapter later.
             let guest_network = options
                 .guest_network
-                .then(|| {
-                    network::GuestNetwork::open(&mut links, wants_network)
-                        .inspect_err(|error| {
-                            output::arguments(format_args!("guest network refusal: {error}\n"));
-                            // Optional: macOS boots without it.
-                            crate::status::info(
-                                "macOS starts without a network: no supported network \
-                                 adapter is free for it",
-                            );
-                        })
-                        .ok()
-                })
-                .flatten();
+                .then(|| network::GuestNetwork::open(&mut links, wants_network));
             // A missing network is reported here and refused only by what
             // needs it, so the mount still boots and logs how far it gets.
             let network = wants_network.then(|| {

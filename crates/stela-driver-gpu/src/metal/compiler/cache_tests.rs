@@ -230,6 +230,27 @@ fn a_compilation_made_again_is_lent_from_the_cache() {
 }
 
 #[test]
+fn software_shader_profiles_have_distinct_nir_cache_keys() {
+    let (mut compiler, library) = caching();
+    let specialization = Specialization {
+        workgroup_size: Some([64, 1, 1]),
+        ..Specialization::default()
+    };
+    let [native, software, lavapipe] =
+        [Lowering::Native, Lowering::SoftwareHalf, Lowering::Lavapipe].map(|lowering| {
+            compiler.lowering = lowering;
+            compiler
+                .plan(library, "kernel", &specialization, None, None, None)
+                .unwrap()
+                .key
+                .unwrap()
+        });
+    assert_ne!(native, software);
+    assert_ne!(native, lavapipe);
+    assert_ne!(software, lavapipe);
+}
+
+#[test]
 fn a_deferred_compilation_runs_outside_and_the_call_finds_it() {
     let (mut compiler, library) = caching();
     let lock = compiler.compile_lock(core::hint::spin_loop);

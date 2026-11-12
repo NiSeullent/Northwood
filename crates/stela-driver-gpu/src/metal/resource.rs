@@ -21,6 +21,7 @@ use super::{
     vulkan::{
         BufferCreate, BufferUsage, ComponentSwizzle, Format, ImageAspects, ImageCreate,
         ImageTiling, ImageType, ImageUsage, ImageViewType, MemoryProperties as M, SampleCounts,
+        command::{BufferImageCopy, Subresource},
         object::{
             BufferInfo, BufferViewInfo, ImageInfo, ImageViewInfo, LinearLayout, MemoryRequest,
             SubresourceRange,
@@ -976,6 +977,77 @@ fn view_type_compatible(parent: TextureType, view: TextureType) -> bool {
         T::D3 => view == T::D3,
         T::TextureBuffer => view == T::TextureBuffer,
     }
+}
+
+/// Plans a host buffer's renderable image and the exact texel range copied
+/// between that image and the buffer.
+pub(crate) fn staged_buffer_texture(
+    capabilities: &Capabilities,
+    descriptor: &TextureDescriptor,
+    buffer_length: u64,
+    offset: u64,
+    bytes_per_row: u64,
+) -> Result<(TexturePlan, BufferImageCopy)> {
+    require(
+        descriptor.pixel_format == PixelFormat::Bgra8Unorm
+            && descriptor.texture_type == TextureType::D2
+            && descriptor.mipmap_level_count == 1
+            && descriptor.sample_count == 1
+            && descriptor.array_length == 1
+            && descriptor.usage == TextureUsage::RENDER_TARGET
+            && descriptor.options.storage_mode == StorageMode::Shared
+            && descriptor.swizzle.is_identity(),
+        "host buffer textures require a shared, single-sample BGRA8 render target",
+    )?;
+    let format = capabilities.format(descriptor.pixel_format);
+    require(
+        format.contains(C::COLOR | C::BLIT) && !format.contains(C::RAW_RENDER),
+        "BGRA8 attachment and transfer support for a host buffer texture",
+    )?;
+    let mut image_descriptor = *descriptor;
+    image_descriptor.options.storage_mode = StorageMode::Private;
+    let mut plan = texture(capabilities, &image_descriptor)?;
+    // This image has no shader descriptors. The original host buffer is
+    // the only CPU-visible storage.
+    plan.views = ShaderViews::default();
+    plan.image.usage =
+        ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::COLOR_ATTACHMENT;
+    plan.image.flags = ImageCreate::EMPTY;
+    plan.image.view_formats.clear();
+
+    let [width, height, _] = plan.image.extent;
+    let row_bytes = u64::from(width) * 4;
+    ensure(
+        offset.is_multiple_of(4)
+            && bytes_per_row.is_multiple_of(4)
+            && bytes_per_row >= row_bytes
+            && bytes_per_row <= i32::MAX as u64,
+        "host buffer texture offset and row pitch",
+    )?;
+    let row_length = u32::try_from(bytes_per_row / 4)
+        .map_err(|_| super::error::Error::Invalid("host buffer texture row pitch"))?;
+    let end = u64::from(height - 1)
+        .checked_mul(bytes_per_row)
+        .and_then(|bytes| bytes.checked_add(row_bytes))
+        .and_then(|bytes| offset.checked_add(bytes));
+    ensure(
+        end.is_some_and(|end| end <= buffer_length),
+        "host buffer texture extends past the buffer",
+    )?;
+    let region = BufferImageCopy {
+        buffer_offset: offset,
+        buffer_row_length: row_length,
+        buffer_image_height: 0,
+        subresource: Subresource {
+            aspects: ImageAspects::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        offset: [0; 3],
+        extent: plan.image.extent,
+    };
+    Ok((plan, region))
 }
 
 /// `newTextureWithDescriptor:offset:bytesPerRow:` on a buffer: a 2D linear

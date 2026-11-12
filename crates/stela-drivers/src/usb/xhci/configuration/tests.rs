@@ -340,6 +340,66 @@ fn unsupported_interfaces_never_become_a_successful_plan() {
 }
 
 #[test]
+fn rndis_pairs_only_the_explicit_control_and_data_interfaces() {
+    use crate::usb::cdc::tests::rndis_configuration;
+
+    for signature in [[2, 2, 0xff], [0xe0, 1, 3]] {
+        let configuration = rndis_configuration(42, signature);
+        let dev = device(vec![configuration.clone()]);
+        let all = interfaces(&configuration);
+        let binding = plan(&dev, &all[0], &all).unwrap();
+        assert_eq!(binding.settings(0), [(0, 0), (1, 0)]);
+        assert_eq!(binding.endpoints().len(), 3);
+        assert!(!primary(&all[1]));
+        for (offset, wrong) in [(16, 2), (21, 1), (22, 0), (25, 1), (36, 1), (48, 0x82)] {
+            let mut malformed = configuration.clone();
+            malformed[offset] = wrong;
+            let all = interfaces(&malformed);
+            assert!(plan(&dev, &all[0], &all).is_err(), "offset {offset}");
+        }
+        let mut duplicate_union = configuration;
+        duplicate_union.splice(23..23, [5, 0x24, 6, 0, 1]);
+        let all = interfaces(&duplicate_union);
+        assert!(plan(&dev, &all[0], &all).is_err());
+    }
+}
+
+#[test]
+fn wireless_class_bluetooth_still_uses_the_hci_plan() {
+    let configuration = vec![
+        9, 2, 39, 0, 1, 7, 0, 0x80, 50, 9, 4, 0, 0, 3, 0xe0, 1, 1, 0, 7, 5, 0x81, 3, 16, 0, 1, 7,
+        5, 0x82, 2, 64, 0, 0, 7, 5, 0x02, 2, 64, 0, 0,
+    ];
+    let mut dev = device(vec![configuration]);
+    select(&mut dev).unwrap();
+    let all = interfaces(&dev.configuration);
+    assert!(matches!(plan(&dev, &all[0], &all), Ok(Plan::Bluetooth(_))));
+}
+
+#[test]
+fn equal_cdc_coverage_prefers_ncm_then_ecm_then_rndis() {
+    use crate::usb::cdc::tests::rndis_configuration;
+
+    let mut ncm = ecm(9);
+    ncm[15] = cdc::NCM;
+    ncm.splice(18..18, [6, 0x24, 0x1a, 0, 1, 1]);
+    let total = ncm.len() as u16;
+    ncm[2..4].copy_from_slice(&total.to_le_bytes());
+    let rndis = rndis_configuration(42, [0xe0, 1, 3]);
+    for (configurations, value) in [
+        (vec![rndis.clone()], 42),
+        (vec![rndis.clone(), ecm(7)], 7),
+        (vec![rndis.clone(), ecm(7), ncm.clone()], 9),
+        (vec![ncm, ecm(7), rndis.clone()], 9),
+        (vec![storage(6), rndis], 6),
+    ] {
+        let mut dev = device(configurations);
+        select(&mut dev).unwrap();
+        assert_eq!(dev.configuration_value(), value);
+    }
+}
+
+#[test]
 fn unsupported_or_unobserved_realtek_revision_preserves_compatible_cdc_choice() {
     let mut vendor = storage(7);
     vendor[14..17].copy_from_slice(&[0xff, 0, 0]);

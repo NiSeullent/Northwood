@@ -31,11 +31,20 @@ pub fn check_pieces(
     root: &mut Directory,
     directory: &str,
     manifest: &PayloadManifest,
+    has_source: bool,
 ) -> Result<()> {
-    let pieces = match &manifest.layout {
-        Layout::Pieces { pieces, .. } => pieces,
+    let pieces = match (&manifest.layout, has_source) {
+        (Layout::Pieces { pieces, .. }, true) => pieces,
         // Streamed after boot services end, over the mount's own network.
-        Layout::Remote { .. } => return Ok(()),
+        (Layout::Remote { .. }, false) => return Ok(()),
+        (Layout::Pieces { .. }, false) => {
+            return Err(refuse!("a local install medium requires --install-source"));
+        }
+        (Layout::Remote { .. }, true) => {
+            return Err(refuse!(
+                "a network install inventory cannot use --install-source"
+            ));
+        }
         _ => {
             return Err(refuse!(
                 "--install names a payload that is not an install medium"

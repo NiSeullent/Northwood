@@ -12,11 +12,18 @@ use crate::{
 use alloc::{sync::Arc, vec::Vec};
 use core::ptr::NonNull;
 use stela_compiler::{TargetCpu, context::memory::MemoryStatus};
+use stela_contracts::gate::MemoryRange;
 
+mod binding;
 mod completion;
+mod descriptor_frames;
 mod transfer;
-pub use completion::CanonicalRamService;
-pub use transfer::DescriptorReader;
+use binding::RamBinding;
+pub use binding::{CpuRamBinding, RamPageKind};
+pub use completion::{CanonicalRamService, ClosedDescriptorFrame, NonresidentRamFrame};
+pub use transfer::{DescriptorReader, WiredRam};
+
+pub(crate) const REGISTERED_FRAME_BYTES: usize = descriptor_frames::FRAME_BYTES;
 
 const GRANULE: usize = 16;
 const MAX_RANGES: usize = 4096;
@@ -37,6 +44,7 @@ pub enum RegistrationError {
     PhysicalAlias,
     NativeTarget,
     Backing,
+    FrameTracking,
     Domain(MemoryStatus),
 }
 
@@ -45,6 +53,69 @@ struct Region {
     host_pa: u64,
     bytes: usize,
     backing: Arc<MemoryBacking>,
+    wire_base: usize,
+}
+
+impl Region {
+    fn wire_index(&self, physical: u64) -> usize {
+        let frame = descriptor_frames::FRAME_BYTES as u64;
+        self.wire_base + (physical / frame - self.source_pa / frame) as usize
+    }
+}
+
+/// Prepared access to the exact ranges of one raw DMA export. Drop releases
+/// an unpublished preparation and keeps the exact frames of a possible
+/// publication. The registration must outlive every published external use.
+#[must_use]
+pub struct ExternalDmaLoan<'a> {
+    binding: RamBinding<'a>,
+    ranges: &'a [MemoryRange],
+    _pins: Option<descriptor_frames::RangePin<'a>>,
+    publication_started: bool,
+}
+
+impl ExternalDmaLoan<'_> {
+    /// Mark before the first possible externally visible mapping effect.
+    pub fn begin_publication(&mut self) {
+        self.publication_started = true;
+    }
+
+    /// Permit returning the temporary pins.
+    ///
+    /// # Safety
+    /// No external reference escaped, and all CPU aliases and their cached
+    /// translations have been removed. A published DMA buffer needs its own
+    /// final-reference and DMA teardown evidence instead.
+    pub unsafe fn cancel_publication(&mut self) {
+        self.publication_started = false;
+    }
+}
+
+impl Drop for ExternalDmaLoan<'_> {
+    fn drop(&mut self) {
+        let ram = self.binding.ram;
+        let Some(frames) = ram.descriptor_frames.as_ref() else {
+            return;
+        };
+        if !self.publication_started {
+            return;
+        }
+        // The scoped pins remain held until the exact bits are visible.
+        for range in self.ranges {
+            let mut address = range.address;
+            let mut remaining = range.bytes;
+            while remaining != 0 {
+                let (region, offset) = ram.region(address).expect("validated DMA range");
+                let bytes = remaining.min((region.bytes - offset) as u64);
+                frames.wire(
+                    region.wire_index(address),
+                    region.wire_index(address + bytes - 1),
+                );
+                address += bytes;
+                remaining -= bytes;
+            }
+        }
+    }
 }
 
 /// The only canonical backing identities for this reserved physical RAM.
@@ -56,6 +127,7 @@ pub struct RegisteredSystemRam {
     system: Arc<MemorySystem>,
     target: TargetCpu,
     erg_bytes: u64,
+    descriptor_frames: Option<descriptor_frames::DescriptorFrames>,
 }
 
 impl RegisteredSystemRam {
@@ -127,7 +199,95 @@ impl RegisteredSystemRam {
             system,
             target,
             erg_bytes,
+            descriptor_frames: None,
         })
+    }
+
+    /// Enable 16 KiB frame admission before publishing this RAM owner.
+    /// The physical backing and guest-visible geometry stay fixed.
+    pub fn enable_descriptor_frame_leases(&mut self) -> Result<(), RegistrationError> {
+        if self.descriptor_frames.is_some() {
+            return Ok(());
+        }
+        let mut count = 0usize;
+        for region in &mut self.regions {
+            region.wire_base = count;
+            let last = region.wire_index(region.source_pa + region.bytes as u64 - 1);
+            count = last
+                .checked_add(1)
+                .ok_or(RegistrationError::FrameTracking)?;
+        }
+        self.descriptor_frames = Some(descriptor_frames::DescriptorFrames::new(count)?);
+        Ok(())
+    }
+
+    fn pin_descriptor(
+        &self,
+        physical: u64,
+    ) -> Result<Option<descriptor_frames::DescriptorPin<'_>>, MemoryStatus> {
+        let Some(frames) = &self.descriptor_frames else {
+            return Ok(None);
+        };
+        let pin = frames.try_pin(physical).ok_or(MemoryStatus::Domain)?;
+        self.check_frame_residency(physical, 1)?;
+        Ok(Some(pin))
+    }
+
+    fn pin_range(
+        &self,
+        physical: u64,
+        bytes: usize,
+    ) -> Result<Option<descriptor_frames::RangePin<'_>>, MemoryStatus> {
+        let Some(frames) = &self.descriptor_frames else {
+            return Ok(None);
+        };
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let last = physical
+            .checked_add(bytes as u64 - 1)
+            .ok_or(MemoryStatus::Translation)?;
+        let pin = frames
+            .try_pin_range(physical, last)
+            .ok_or(MemoryStatus::Domain)?;
+        self.check_frame_residency(physical, bytes)?;
+        Ok(Some(pin))
+    }
+
+    /// Observe the first nonresident 16 KiB frame intersecting a range.
+    /// Unregistered gaps are ignored. An empty or overflowing range has no
+    /// result. This observation does not pin the range or validate its access.
+    pub fn nonresident_frame(&self, physical: u64, bytes: usize) -> Option<u64> {
+        let frames = self.descriptor_frames.as_ref()?;
+        if !frames.has_nonresident() {
+            return None;
+        }
+        let last = physical.checked_add(u64::try_from(bytes.checked_sub(1)?).ok()?)?;
+        let frame_bytes = descriptor_frames::FRAME_BYTES as u64;
+        let first_region = self
+            .regions
+            .partition_point(|region| region.source_pa + region.bytes as u64 <= physical);
+        for region in &self.regions[first_region..] {
+            if region.source_pa > last {
+                break;
+            }
+            let start = physical.max(region.source_pa);
+            let end = last.min(region.source_pa + region.bytes as u64 - 1);
+            let first_index = region.wire_index(start);
+            let last_index = region.wire_index(end);
+            if let Some(index) = (first_index..=last_index).find(|&i| frames.is_nonresident(i)) {
+                let frame = start / frame_bytes + (index - first_index) as u64;
+                return Some(frame * frame_bytes);
+            }
+        }
+        None
+    }
+
+    fn check_frame_residency(&self, physical: u64, bytes: usize) -> Result<(), MemoryStatus> {
+        if self.nonresident_frame(physical, bytes).is_some() {
+            return Err(MemoryStatus::Nonresident);
+        }
+        Ok(())
     }
 
     /// Source/host physical extents. Metadata does not lend host
@@ -161,12 +321,23 @@ impl RegisteredSystemRam {
     }
 
     fn region(&self, physical: u64) -> Option<(&Region, usize)> {
+        self.region_at(physical, None)
+            .map(|(_, region, offset)| (region, offset))
+    }
+
+    fn region_at(&self, physical: u64, hint: Option<usize>) -> Option<(usize, &Region, usize)> {
+        let at = |index| {
+            let region: &Region = self.regions.get(index)?;
+            let offset = usize::try_from(physical.checked_sub(region.source_pa)?).ok()?;
+            (offset < region.bytes).then_some((index, region, offset))
+        };
+        if let Some(found) = hint.and_then(at) {
+            return Some(found);
+        }
         let index = self
             .regions
             .partition_point(|region| region.source_pa <= physical);
-        let region = self.regions.get(index.checked_sub(1)?)?;
-        let offset = usize::try_from(physical - region.source_pa).ok()?;
-        (offset < region.bytes).then_some((region, offset))
+        at(index.checked_sub(1)?)
     }
 
     /// Observe initialized physical RAM through native scalar reads.
@@ -194,6 +365,22 @@ impl RegisteredSystemRam {
     /// # Safety
     /// The `read_physical` private-output and live-registration contract applies.
     pub unsafe fn read_physical_progress(
+        &self,
+        physical: u64,
+        output: &mut [u8],
+    ) -> Result<(), crate::memory::domain::PublicationFault> {
+        let _pin = self.pin_range(physical, output.len()).map_err(|status| {
+            crate::memory::domain::PublicationFault {
+                status,
+                completed: 0,
+            }
+        })?;
+        // SAFETY: same private output and live backing, with admission held.
+        unsafe { self.read_physical_unpinned(physical, output) }
+    }
+
+    /// The caller keeps registered admission or the exact closed frame.
+    unsafe fn read_physical_unpinned(
         &self,
         physical: u64,
         output: &mut [u8],
@@ -286,6 +473,7 @@ impl RegisteredSystemRam {
             return Err(MemoryStatus::Alignment);
         }
         self.preflight(physical, bytes)?;
+        let _pin = self.pin_range(physical, bytes)?;
         let width = [1, 2, 4, 8, 16]
             .into_iter()
             .find(|&width| offset / width == (offset + bytes - 1) / width)
@@ -337,15 +525,24 @@ impl RegisteredSystemRam {
         }
     }
 
-    /// Validate physical geometry and kept backing permissions for a
-    /// DMA descriptor. No bytes are copied and no translation is cached.
+    /// Check residency, physical geometry and kept backing permissions for a
+    /// DMA descriptor. This does not pin the range for later use.
     pub fn check_dma_range(
         &self,
         physical: u64,
         bytes: usize,
         write: bool,
     ) -> Result<(), MemoryStatus> {
-        self.preflight(physical, bytes)?;
+        self.check_physical(physical, bytes)?;
+        self.check_dma_permissions(physical, bytes, write)
+    }
+
+    fn check_dma_permissions(
+        &self,
+        physical: u64,
+        bytes: usize,
+        write: bool,
+    ) -> Result<(), MemoryStatus> {
         let mut done = 0;
         while done < bytes {
             let (region, offset) = self
@@ -369,12 +566,53 @@ impl RegisteredSystemRam {
         Ok(())
     }
 
+    /// Validate each range and keep the union of its temporary pins.
+    /// The loan supplies placement metadata; it grants no DMA permission
+    /// and gives no completion proof.
+    pub fn prepare_external_dma<'a>(
+        &'a self,
+        ranges: &'a [MemoryRange],
+    ) -> Result<ExternalDmaLoan<'a>, MemoryStatus> {
+        let binding = self.binding()?;
+        let mut stripes = 0;
+        for range in ranges.iter().filter(|range| range.bytes != 0) {
+            let bytes = usize::try_from(range.bytes).map_err(|_| MemoryStatus::Translation)?;
+            self.preflight_geometry(range.address, bytes)?;
+            let last = range
+                .address
+                .checked_add(range.bytes - 1)
+                .ok_or(MemoryStatus::Translation)?;
+            stripes |= descriptor_frames::DescriptorFrames::range_stripes(range.address, last);
+        }
+        let pins = self
+            .descriptor_frames
+            .as_ref()
+            .map(|frames| frames.try_pin_stripes(stripes).ok_or(MemoryStatus::Domain))
+            .transpose()?;
+        binding.validate()?;
+        for range in ranges.iter().filter(|range| range.bytes != 0) {
+            let bytes = usize::try_from(range.bytes).map_err(|_| MemoryStatus::Translation)?;
+            binding.check_range(range.address, bytes)?;
+            self.check_dma_permissions(range.address, bytes, true)?;
+        }
+        Ok(ExternalDmaLoan {
+            binding,
+            ranges,
+            _pins: pins,
+            publication_started: false,
+        })
+    }
+
     pub(crate) fn check_physical(&self, physical: u64, bytes: usize) -> Result<(), MemoryStatus> {
-        self.preflight(physical, bytes)
+        self.binding()?.check_range(physical, bytes)
     }
 
     fn preflight(&self, physical: u64, bytes: usize) -> Result<(), MemoryStatus> {
         self.domain.check_execution()?;
+        self.preflight_geometry(physical, bytes)
+    }
+
+    fn preflight_geometry(&self, physical: u64, bytes: usize) -> Result<(), MemoryStatus> {
         if bytes == 0 {
             return Ok(());
         }
@@ -481,6 +719,7 @@ unsafe fn bindings<O: Send + Sync + 'static>(
             host_pa: range.host_pa,
             bytes: range.bytes,
             backing,
+            wire_base: 0,
         });
     }
     regions.sort_unstable_by_key(|region| region.source_pa);
@@ -525,6 +764,7 @@ pub unsafe fn fixture_for<O: Send + Sync + 'static>(
         system,
         target,
         erg_bytes: 64,
+        descriptor_frames: None,
     }
 }
 

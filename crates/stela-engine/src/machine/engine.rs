@@ -6,8 +6,9 @@ mod mirrors;
 mod reports;
 use boundary::*;
 pub use boundary::{
-    CodePartitions, CodeWindow, ConsumedPair, DeviceError, Devices, Host, LocalRegisters,
-    LockedMemory, NativeView, NoDevices, PassiveRegisters, ScalarRead, Settled, Start, UnlockedDma,
+    CodePartitions, CodeWindow, ConsumedPair, DeviceError, DeviceSiteRam, Devices, Host,
+    LocalRegisters, LockedMemory, NativeEntryError, NativeView, NoDevices, PassiveRegisters,
+    ScalarRead, Settled, Start, UnlockedDma,
 };
 use compilation::{PENDING_EXITS, PendingExits};
 use mirrors::*;
@@ -119,10 +120,11 @@ pub use processors::{
 };
 pub use recovery::{NativeFailure, NativeFailureReason, UnsettledChain};
 pub use shared_memory::{
-    HeldRamService, MAX_NATIVE_EPOCH_BODIES, NativeCohort, NativeEpochDeadline, NativeEpochEnd,
-    NativeEpochStatistics, NativeRun, NativeRunIdentity, NativeRunObservation, NativeTransport,
-    ReturnedRun, ServiceHost, ServiceTransport, SharedMemory, SharedMemoryFailure,
-    SharedMemoryRefusal, dispatch_native_run, recover_native_run,
+    CpuMappingsRevokedFrame, HeldRamService, MAX_NATIVE_EPOCH_BODIES, NativeCohort,
+    NativeEpochDeadline, NativeEpochEnd, NativeEpochStatistics, NativeRun, NativeRunIdentity,
+    NativeRunObservation, NativeTransport, ReturnedRun, ServiceHost, ServiceTransport,
+    SharedMemory, SharedMemoryFailure, SharedMemoryRefusal, dispatch_native_run,
+    recover_native_run,
 };
 #[cfg(feature = "native-profile")]
 pub use shared_memory::{NativeDataTlbStatistics, NativeSourceStatistics};
@@ -376,6 +378,10 @@ pub enum FaultCause {
     Guest(mmu::Fault),
     /// The access translated to a physical address that is not RAM.
     Device { physical: u64 },
+    /// The access or its page walk reached a registered nonresident frame.
+    NonresidentRam { frame: u64 },
+    /// The host could not verify its registered RAM binding for this access.
+    RamBinding,
     /// The guest configured translation this engine does not implement.
     Translation(mmu::Unsupported),
     /// An x86 #GP: the address is not canonical for x86 (tags, wild pointers).

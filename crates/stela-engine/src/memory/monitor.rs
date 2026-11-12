@@ -10,8 +10,8 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::{cell::RefCell, marker::PhantomData};
 
 const MIN_ERG_BYTES: u64 = 16;
 const MAX_ERG_BYTES: u64 = 2048;
@@ -202,6 +202,9 @@ struct GlobalMark<B, M, A> {
 }
 
 type Entries<B> = BTreeMap<Key, Weak<Epoch<B>>>;
+// Only the frozen writer borrows entries through a shared mutex guard.
+// Ordinary callers use get_mut() through their exclusive mutex guard.
+type Stripe<B> = RefCell<Entries<B>>;
 
 struct Reservation<B, M, A> {
     epoch: Arc<Epoch<B>>,
@@ -228,7 +231,7 @@ impl Drop for FailureBoundary<'_> {
 /// never a reservation. Fairness is whatever std::Mutex provides.
 pub struct MonitorDomain<B, M, A> {
     erg_bytes: u64,
-    stripes: Vec<Mutex<Entries<B>>>,
+    stripes: Vec<Mutex<Stripe<B>>>,
     failed: AtomicBool,
     mapping: PhantomData<fn() -> (M, A)>,
 }
@@ -276,12 +279,12 @@ impl<B, M, A> Drop for GlobalRetirement<'_, B, M, A> {
     }
 }
 
-/// Keeps every physical writer gate without changing bytes or reservations.
+/// Keeps every physical writer gate. Acquisition changes no reservation.
 /// Only the canonical memory owner uses this while native frames are recovered.
-/// No monitor operation may reenter while the guard is held.
+/// Held writes use these guards directly and cannot reenter the monitor.
 pub(in crate::memory) struct FrozenWriters<'a, B, M, A> {
     domain: &'a MonitorDomain<B, M, A>,
-    _gates: Vec<MutexGuard<'a, Entries<B>>>,
+    gates: Vec<MutexGuard<'a, Stripe<B>>>,
 }
 
 impl<B, M, A> FrozenWriters<'_, B, M, A> {
@@ -290,8 +293,41 @@ impl<B, M, A> FrozenWriters<'_, B, M, A> {
     pub(in crate::memory) fn fail(&self) {
         self.domain.failed.store(true, Ordering::Release);
     }
+
     pub(in crate::memory) fn validate_current(&self) -> Result<(), MonitorError> {
         self.domain.check_execution()
+    }
+
+    fn invalidate(&self, stripe: usize, range: &WriteRange<B>) -> Result<(), MonitorError> {
+        let mut entries = self.gates[stripe].try_borrow_mut().map_err(|_| {
+            self.fail();
+            MonitorError::Poisoned
+        })?;
+        self.domain.invalidate(&mut entries, range);
+        Ok(())
+    }
+
+    /// Invalidate before the attempted write, using the gates already held.
+    pub(in crate::memory) fn with_writer<T, E>(
+        &self,
+        range: &WriteRange<B>,
+        write: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, AccessError<E>> {
+        let domain = self.domain;
+        let _failure = FailureBoundary(&domain.failed);
+        self.validate_current()?;
+        let first = range.offset / domain.erg_bytes;
+        let last = (range.offset + range.bytes - 1) / domain.erg_bytes;
+        if first == last {
+            let stripe = domain.stripe(Key::new(&range.backing, first));
+            self.invalidate(stripe, range)?;
+        } else {
+            for stripe in domain.writer_stripes(range) {
+                self.invalidate(stripe, range)?;
+            }
+        }
+        self.validate_current()?;
+        write().map_err(AccessError::Memory)
     }
 }
 
@@ -306,7 +342,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         Ok(Arc::new(Self {
             erg_bytes,
             stripes: (0..stripe_count)
-                .map(|_| Mutex::new(BTreeMap::new()))
+                .map(|_| Mutex::new(RefCell::new(BTreeMap::new())))
                 .collect(),
             failed: AtomicBool::new(false),
             mapping: PhantomData,
@@ -472,6 +508,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         let mut entries = self.stripes[self.stripe(key)]
             .lock()
             .unwrap_or_else(crate::platform::sync::PoisonError::into_inner);
+        let entries = entries.get_mut();
         if entries
             .get(&key)
             .is_some_and(|epoch| epoch.strong_count() == 0)
@@ -493,7 +530,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         Ok(())
     }
 
-    fn lock(&self, stripe: usize) -> Result<MutexGuard<'_, Entries<B>>, MonitorError> {
+    fn lock(&self, stripe: usize) -> Result<MutexGuard<'_, Stripe<B>>, MonitorError> {
         self.check_execution()?;
         let guard = self.stripes[stripe].lock().map_err(|_| {
             self.failed.store(true, Ordering::Release);
@@ -529,6 +566,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         let mut entries = self.stripes[self.stripe(key)]
             .lock()
             .unwrap_or_else(crate::platform::sync::PoisonError::into_inner);
+        let entries = entries.get_mut();
         if entries
             .get(&key)
             .is_some_and(|epoch| epoch.strong_count() == 0)
@@ -592,6 +630,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         };
         let value = {
             let mut entries = self.lock(self.stripe(key))?;
+            let entries = entries.get_mut();
             let _gate_failure = FailureBoundary(&self.failed);
             if !access.mapping.is_live() {
                 return Err(MonitorError::DeadMapping.into());
@@ -654,6 +693,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         };
         let result = {
             let mut entries = self.lock(self.stripe(key))?;
+            let entries = entries.get_mut();
             let _gate_failure = FailureBoundary(&self.failed);
             if !access.mapping.is_live() {
                 Err(MonitorError::DeadMapping.into())
@@ -775,12 +815,12 @@ impl<B, M, A> MonitorDomain<B, M, A> {
             let mut entries = self.lock(self.stripe(key))?;
             let _gate_failure = FailureBoundary(&self.failed);
             if policy == Invalidation::BeforeAttempt {
-                self.invalidate(&mut entries, range);
+                self.invalidate(entries.get_mut(), range);
                 self.check_execution()?;
             }
             let result = write();
             if policy == Invalidation::OnCommit && result.is_ok() {
-                self.invalidate(&mut entries, range);
+                self.invalidate(entries.get_mut(), range);
                 self.check_execution()?;
             }
             return result.map_err(AccessError::Memory);
@@ -794,14 +834,14 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         let _gate_failure = FailureBoundary(&self.failed);
         if policy == Invalidation::BeforeAttempt {
             for entries in &mut guards {
-                self.invalidate(entries, range);
+                self.invalidate(entries.get_mut(), range);
             }
             self.check_execution()?;
         }
         let result = write();
         if policy == Invalidation::OnCommit && result.is_ok() {
             for entries in &mut guards {
-                self.invalidate(entries, range);
+                self.invalidate(entries.get_mut(), range);
             }
             self.check_execution()?;
         }
@@ -836,7 +876,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         self.check_execution()?;
         Ok(Some(FrozenWriters {
             domain: self,
-            _gates: gates,
+            gates,
         }))
     }
 
@@ -844,15 +884,15 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         let _failure = FailureBoundary(&self.failed);
         // Declare before gates so generic backing payload destruction is outside all gates.
         let mut deferred_epochs = Vec::new();
-        let _guards = self
+        let mut guards = self
             .stripes
             .iter()
             .map(|stripe| stripe.lock().map_err(|_| MonitorError::Poisoned))
             .collect::<Result<Vec<_>, _>>()?;
         mapping.live.store(false, Ordering::Release);
         // Finite mapping-lifetime spurious opening; not universal ISA semantics.
-        for entries in &_guards {
-            for weak in entries.values() {
+        for entries in &mut guards {
+            for weak in entries.get_mut().values() {
                 if let Some(epoch) = weak.upgrade() {
                     self.open_epoch(&epoch, Some(core::ptr::from_ref(mapping) as usize));
                     deferred_epochs.push(epoch);
@@ -866,7 +906,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
     fn entry_count(&self) -> usize {
         self.stripes
             .iter()
-            .map(|stripe| stripe.lock().unwrap().len())
+            .map(|stripe| stripe.lock().unwrap().get_mut().len())
             .sum()
     }
 }

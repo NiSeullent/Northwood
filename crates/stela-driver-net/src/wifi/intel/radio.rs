@@ -25,6 +25,133 @@ pub enum Error {
     MissingApi(Stage),
     Version { stage: Stage, declared: u8 },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BluetoothConfigError {
+    MissingApi,
+    DuplicateApi,
+    Version { command: u8, notification: u8 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BluetoothConfig([u8; 8]);
+
+impl BluetoothConfig {
+    const ID: Id = Id {
+        group: 0,
+        opcode: 0x9b,
+        version: 0,
+    };
+    const PAYLOAD_VERSION: u8 = 6;
+
+    pub(super) fn from_firmware(firmware: &Firmware<'_>) -> Result<Self, BluetoothConfigError> {
+        let id = Self::ID.wire();
+        let mut entries = firmware
+            .command_versions()
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| entry.group == id.group && entry.command == id.opcode);
+        let entry = entries.next().ok_or(BluetoothConfigError::MissingApi)?;
+        if entries.next().is_some() {
+            return Err(BluetoothConfigError::DuplicateApi);
+        }
+        if (entry.command_version, entry.notification_version) != (Self::PAYLOAD_VERSION, 0) {
+            return Err(BluetoothConfigError::Version {
+                command: entry.command_version,
+                notification: entry.notification_version,
+            });
+        }
+        Ok(Self::normal(firmware))
+    }
+
+    fn normal(firmware: &Firmware<'_>) -> Self {
+        let mut payload = [0; 8];
+        payload[..4].copy_from_slice(&1u32.to_le_bytes()); // BT_COEX_NW.
+        let modules = (1u32 << 2) | (1 << 4) | u32::from(firmware.supports_capability(67));
+        payload[4..].copy_from_slice(&modules.to_le_bytes());
+        Self(payload)
+    }
+
+    pub(super) fn id(self) -> Id {
+        Self::ID
+    }
+
+    pub(super) fn payload(&self) -> &[u8; 8] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocConfigurationError {
+    MissingCapability,
+    DuplicateApi,
+    Version { command: u8, notification: u8 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SocConfiguration([u8; 8]);
+
+impl SocConfiguration {
+    const ID: Id = Id {
+        group: 2,
+        opcode: 1,
+        version: 0,
+    };
+    const CAPABILITY: u32 = 37;
+    const PAYLOAD_VERSIONS: [u8; 2] = [1, 2];
+
+    /// Encode the iwl9560 shared-clock platform selected for PCI 8086:31dc.
+    pub(super) fn for_31dc(firmware: &Firmware<'_>) -> Result<Self, SocConfigurationError> {
+        Self::for_legacy(firmware, false, 670)
+    }
+
+    fn for_legacy(
+        firmware: &Firmware<'_>,
+        discrete: bool,
+        latency: u32,
+    ) -> Result<Self, SocConfigurationError> {
+        if !firmware.supports_capability(Self::CAPABILITY) {
+            return Err(SocConfigurationError::MissingCapability);
+        }
+        let mut entries = firmware
+            .command_versions()
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| entry.group == Self::ID.group && entry.command == Self::ID.opcode);
+        if let Some(entry) = entries.next() {
+            if entries.next().is_some() {
+                return Err(SocConfigurationError::DuplicateApi);
+            }
+            if !Self::PAYLOAD_VERSIONS.contains(&entry.command_version)
+                || entry.notification_version != 0
+            {
+                return Err(SocConfigurationError::Version {
+                    command: entry.command_version,
+                    notification: entry.notification_version,
+                });
+            }
+        }
+        // API 46 does not list this command. Linux gates it on the capability
+        // and the DISCRETE flag has the same encoding in v1 and v2.
+        Ok(Self::new(u32::from(discrete), latency))
+    }
+
+    fn new(flags: u32, latency: u32) -> Self {
+        let mut payload = [0; 8];
+        payload[..4].copy_from_slice(&flags.to_le_bytes());
+        payload[4..].copy_from_slice(&latency.to_le_bytes());
+        Self(payload)
+    }
+
+    pub(super) fn id(self) -> Id {
+        Self::ID
+    }
+
+    pub(super) fn payload(&self) -> &[u8; 8] {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitialCommand {
     stage: Stage,
@@ -102,33 +229,22 @@ impl InitialPlan {
             &[1],
             u32::from(tx_antennas).to_le_bytes().to_vec(),
         )?;
-        let mut bt = 1u32.to_le_bytes().to_vec(); // BT_COEX_NW, never force BT/WiFi antenna.
-        let modules = (1u32 << 2) | (1 << 4) | u32::from(firmware.supports_capability(67));
-        bt.extend(modules.to_le_bytes());
+        let bt = BluetoothConfig::normal(firmware);
         out.push(
             firmware,
             Stage::BluetoothCoexistence,
-            Id {
-                group: 0,
-                opcode: 0x9b,
-                version: 0,
-            },
-            &[6],
-            bt,
+            bt.id(),
+            &[BluetoothConfig::PAYLOAD_VERSION],
+            bt.payload().to_vec(),
         )?;
-        if firmware.supports_capability(37) {
-            let mut soc = platform.soc_flags().to_le_bytes().to_vec();
-            soc.extend(platform.xtal_latency.to_le_bytes());
+        if firmware.supports_capability(SocConfiguration::CAPABILITY) {
+            let soc = SocConfiguration::new(platform.soc_flags(), platform.xtal_latency);
             out.push(
                 firmware,
                 Stage::SocLatency,
-                Id {
-                    group: 2,
-                    opcode: 1,
-                    version: 0,
-                },
-                &[1, 2],
-                soc,
+                soc.id(),
+                &SocConfiguration::PAYLOAD_VERSIONS,
+                soc.payload().to_vec(),
             )?;
         }
         Ok(out)
@@ -213,6 +329,72 @@ mod tests {
             raw: Vec::new(),
         }
     }
+
+    #[test]
+    fn legacy_soc_requires_capability_and_accepts_compatible_command_metadata() {
+        let bytes = image(Some(0x330018), false, false, false);
+        assert_eq!(
+            SocConfiguration::for_31dc(&Firmware::parse(&bytes).unwrap()),
+            Err(SocConfigurationError::MissingCapability)
+        );
+
+        let bytes = image(Some(0x330018), false, false, true);
+        let table = 108;
+        let soc = table + 3 * 4;
+        for version in [None, Some(1), Some(2)] {
+            let mut bytes = bytes.clone();
+            if let Some(version) = version {
+                bytes[soc + 2] = version;
+            } else {
+                bytes[soc] = 0x7f;
+            }
+            let firmware = Firmware::parse(&bytes).unwrap();
+            let request = SocConfiguration::for_31dc(&firmware).unwrap();
+            assert_eq!(request.id(), SocConfiguration::ID);
+            assert_eq!(request.payload(), &[0, 0, 0, 0, 0x9e, 2, 0, 0]);
+        }
+
+        let mut conflicting = bytes.clone();
+        conflicting[soc + 3] = 1;
+        assert_eq!(
+            SocConfiguration::for_31dc(&Firmware::parse(&conflicting).unwrap()),
+            Err(SocConfigurationError::Version {
+                command: 2,
+                notification: 1,
+            })
+        );
+        let mut duplicate = bytes;
+        duplicate.copy_within(soc..soc + 4, table);
+        assert_eq!(
+            SocConfiguration::for_31dc(&Firmware::parse(&duplicate).unwrap()),
+            Err(SocConfigurationError::DuplicateApi)
+        );
+    }
+
+    #[test]
+    #[ignore = "oracle: STELA_IWLWIFI_IMAGES"]
+    fn pinned_api_46_images_encode_legacy_soc_configuration() {
+        use crate::wifi::intel::firmware::legacy::Sku;
+
+        let directory = std::env::var("STELA_IWLWIFI_IMAGES").expect("firmware directory");
+        for (sku, payload) in [
+            (Sku::Cnvi9000, [0, 0, 0, 0, 0x9e, 2, 0, 0]),
+            (Sku::WirelessAc9260, [1, 0, 0, 0, 0, 0, 0, 0]),
+        ] {
+            let bytes =
+                std::fs::read(std::path::Path::new(&directory).join(sku.firmware_name())).unwrap();
+            let firmware = Firmware::parse(&bytes).unwrap();
+            assert_eq!(firmware.api_version(), 46);
+            assert!(firmware.command_version(2, 1).is_none());
+            let request = match sku {
+                Sku::Cnvi9000 => SocConfiguration::for_31dc(&firmware),
+                Sku::WirelessAc9260 => SocConfiguration::for_legacy(&firmware, true, 0),
+            }
+            .unwrap();
+            assert_eq!(request.payload(), &payload);
+        }
+    }
+
     #[test]
     fn cold_prefix_order_offload_exact_header_versions_and_standalone_latencies() {
         for offload in [false, true] {

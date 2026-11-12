@@ -375,6 +375,51 @@ fn publication_invalidates_cross_address_space_alias_reservations_including_aba(
 }
 
 #[test]
+fn publication_under_frozen_gates_invalidates_only_reached_reservations() {
+    let system = system();
+    let backing = backing(RIGHTS);
+    let first = domain(&system, &backing, GUEST_BASE);
+    let alias = domain(&system, &backing, ALIAS_BASE);
+    let mut overwritten = system.reservations.thread();
+    let mut neighbor = system.reservations.thread();
+    let neighbor_access = reservation_access(&first, 16);
+    system
+        .reservations
+        .load(&mut overwritten, &reservation_access(&first, 0), || {
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    system
+        .reservations
+        .load(&mut neighbor, &neighbor_access, || Ok::<_, ()>(()))
+        .unwrap();
+
+    let writers = system.reservations.try_freeze_writers().unwrap().unwrap();
+    // SAFETY: the fixture owns both aliases and all readers, the source
+    // is private, and these are this system's retained writer guards.
+    unsafe { system.publish_with(&backing, 0, &[0, 0x5a], None, Some(&writers)) }.unwrap();
+    drop(writers);
+
+    assert_eq!(
+        system
+            .reservations
+            .store(&mut overwritten, &reservation_access(&alias, 0), || {
+                Ok::<_, ()>(())
+            })
+            .unwrap(),
+        monitor::ConditionalWrite::Failed
+    );
+    assert_eq!(
+        system
+            .reservations
+            .store(&mut neighbor, &neighbor_access, || Ok::<_, ()>(()))
+            .unwrap(),
+        monitor::ConditionalWrite::Stored(())
+    );
+    assert_eq!(snapshot(&backing)[..2], [0, 0x5a]);
+}
+
+#[test]
 fn wrong_coherence_owner_and_invalid_bounds_have_no_byte_effects() {
     let system = system();
     let backing = backing(RIGHTS);

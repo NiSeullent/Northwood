@@ -15,13 +15,7 @@ use alloc::format;
 use stela_drivers::block::BlockDevice;
 use stela_drivers::gpu::metal::native::pipeline_store::{self, HEADER_BYTES, MAX_BYTES};
 use stela_formats::payload::pieces::Extent;
-use uefi::{
-    boot,
-    proto::media::{
-        file::{File as _, FileInfo, FileMode},
-        fs::SimpleFileSystem,
-    },
-};
+use uefi::proto::media::file::{File as _, FileInfo, FileMode};
 
 /// The handoff file holding the file's size and the stored pipelines.
 pub const FILE: &str = "pipelines";
@@ -37,18 +31,9 @@ const TRANSFER_BYTES: usize = 1 << 20;
 /// The pipelines the store's volume holds, as the handoff file's pages:
 /// run before boot services end. `None` without a store or its file.
 pub fn read() -> Option<Region> {
-    for handle in boot::find_handles::<SimpleFileSystem>().ok()? {
-        let Ok(mut volume) = boot::open_protocol_exclusive::<SimpleFileSystem>(handle) else {
-            continue;
-        };
-        let Ok(mut root) = volume.open_volume() else {
-            continue;
-        };
-        if translations::bound(&mut root).is_none() {
-            continue;
-        }
-        let path = format!("{}\\{NAME}", translations::DIRECTORY);
-        let Some(mut file) = translations::open(&mut root, &path, FileMode::Read) else {
+    translations::with_configured(|_, root, layout, _| {
+        let path = translations::uefi_store_path(layout, NAME);
+        let Some(mut file) = translations::open(root, &path, FileMode::Read) else {
             output::arguments(format_args!(
                 "PIPELINES no {path}: compiled pipelines compile every boot; `stela setup \
                  repair` prepares the file\n"
@@ -96,12 +81,11 @@ pub fn read() -> Option<Region> {
         output::arguments(format_args!(
             "PIPELINES {path} file={size} stored={stored}\n"
         ));
-        return Some(Region {
+        Some(Region {
             physical: physical as u64,
             bytes: bytes as u64,
-        });
-    }
-    None
+        })
+    })
 }
 
 /// Give the Metal device the stored pipelines of the handoff file

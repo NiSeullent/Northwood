@@ -234,6 +234,11 @@ pub struct UsbEthernet {
 }
 
 impl UsbEthernet {
+    /// The addressed device generation that owns this link.
+    pub fn slot_id(&self) -> SlotId {
+        self.id
+    }
+
     pub fn driver(&self) -> &'static str {
         match self.chip {
             Backend::Realtek(_) => "usb-rtl815x",

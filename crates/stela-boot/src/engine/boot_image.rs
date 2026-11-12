@@ -20,6 +20,7 @@ pub(super) fn load(
     host: &mut impl Host,
     handoff: &Handoff,
     options: &Options,
+    ram: &[host::RamRange],
     built: Option<&[(String, Vec<u8>)]>,
     nvram: Option<Nvram>,
 ) -> GuestImage {
@@ -33,6 +34,21 @@ pub(super) fn load(
     if options.bundle {
         crate::status::begin("Loading macOS into memory");
         let files = &handoff.files[..handoff.file_count];
+        let layout = &handoff.bundle_layout;
+        if built.is_some() && (!layout.backing().is_empty() || !layout.kernel_parts().is_empty()) {
+            output::fatal("a disk-built bundle has firmware-staged parts");
+        }
+        for backing in layout.backing() {
+            let placed = options
+                .dram_base
+                .checked_add(backing.guest_offset)
+                .and_then(|guest| stela_boot_core::ram::run(ram, guest));
+            if !placed.is_some_and(|(physical, bytes)| {
+                physical == backing.region.physical && bytes >= backing.region.bytes
+            }) {
+                output::fatal("the adopted bundle does not match the guest RAM placement");
+            }
+        }
         let dram = bundle::Dram {
             base: options.dram_base,
             backed: options.ram_bytes,
@@ -40,7 +56,7 @@ pub(super) fn load(
         };
         let loaded = match built {
             Some(built) => bundle::load_built(host, built, dram, framebuffer, nvram),
-            None => bundle::load(host, files, dram, framebuffer, nvram),
+            None => bundle::load(host, files, layout, dram, framebuffer, nvram),
         };
         let loaded = match loaded {
             Ok(loaded) => loaded,

@@ -13,6 +13,8 @@ use crate::{native_memory, native_mmio, output};
 use alloc::{boxed::Box, rc::Rc, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use stela_boot_core::{passthrough::Passthrough, remapping::initial::Access};
+#[cfg(feature = "diagnostics")]
+use stela_drivers::probe::services::{LpssI2cObservation, LpssI2cObserver};
 use stela_drivers::{
     bus::{
         dma::{
@@ -32,7 +34,7 @@ use stela_drivers::{
         thunderbolt::manager::{Platform, Uuid},
     },
     platform::acpi::resources::{self, DeviceResources, MemoryBroker, Resource, Space},
-    probe::{NativeServices, ServiceError},
+    probe::{HidQuirk, NativeServices, ServiceError},
 };
 
 /// Whether a passthrough domain was handed out, which is reported once.
@@ -42,6 +44,7 @@ pub(super) struct Services<'a> {
     mmio: &'a native_mmio::Source,
     remappers: &'a super::remapping::Remappers,
     acpi: Option<&'static HostAcpi>,
+    hid_quirks: Vec<HidQuirk<'a>>,
     heap: core::ops::Range<u64>,
     guest_ram: Vec<core::ops::Range<u64>>,
     tsc_hz: u64,
@@ -92,7 +95,43 @@ fn broker_refusal(error: resources::Error) -> ServiceError {
 /// controller through the ACPI namespace.
 const I8042_IRQS: [u8; 2] = [1, 12];
 
+#[cfg(feature = "diagnostics")]
+fn report_lpss_i2c(observed: LpssI2cObservation<'_>) {
+    use stela_drivers::bus::i2c::Address as I2cAddress;
+
+    let identity = u32::from(observed.pci.vendor) | u32::from(observed.pci.device) << 16;
+    if !stela_boot_core::firmware_pci::lpss::matches(identity) {
+        return;
+    }
+    let (address, bits) = match observed.address {
+        I2cAddress::SevenBit(address) => (u16::from(address), 7),
+        I2cAddress::TenBit(address) => (address, 10),
+    };
+    let irq = if observed.gpio_interrupt {
+        "gpio"
+    } else {
+        "apic-polled"
+    };
+    output::arguments(format_args!(
+        "HOST LPSS-I2C ACPI pci={} id={:04x}:{:04x} hid={} device={} controller={} \
+         addr={address:#04x} addr-bits={bits} speed={} irq={irq} descriptor={:#04x}\n",
+        observed.pci.address,
+        observed.pci.vendor,
+        observed.pci.device,
+        observed.hid,
+        observed.device,
+        observed.controller,
+        observed.speed,
+        observed.descriptor,
+    ));
+}
+
 impl<'a> Services<'a> {
+    pub(super) fn with_hid_quirks(mut self, quirks: Vec<HidQuirk<'a>>) -> Self {
+        self.hid_quirks = quirks;
+        self
+    }
+
     /// These services' DMA domains also admit the host pages behind guest
     /// RAM, which the guest's GPU work reaches.
     pub(super) fn with_guest_ram(mut self, guest_ram: Vec<core::ops::Range<u64>>) -> Self {
@@ -133,6 +172,7 @@ impl<'a> Services<'a> {
             mmio,
             remappers,
             acpi,
+            hid_quirks: Vec::new(),
             heap,
             tsc_hz,
             usb4_approved,
@@ -149,6 +189,15 @@ impl<'a> Services<'a> {
 // and each claimed i801's ports, which nothing else here uses. Firmware
 // memory is the AML provider's own mapping of RAM the map leaves to firmware.
 unsafe impl NativeServices for Services<'_> {
+    fn hid_quirks(&self) -> &[HidQuirk<'_>] {
+        &self.hid_quirks
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn lpss_i2c_observer(&self) -> Option<LpssI2cObserver> {
+        Some(report_lpss_i2c)
+    }
+
     fn embedded_controller(
         &self,
     ) -> Result<Option<stela_drivers::platform::ec::capability::Installed<'static>>, ServiceError>

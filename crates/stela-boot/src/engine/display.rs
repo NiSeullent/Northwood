@@ -70,6 +70,8 @@ struct Staged {
     spent: u64,
     /// The row copied before it is written to video memory.
     row: Vec<u8>,
+    /// Whether a complete frame has reached the firmware display.
+    shown: bool,
     /// Whether a refused frame was reported.
     refused: bool,
 }
@@ -157,6 +159,7 @@ pub fn flush(turn: Turn) -> u64 {
         if STAGED.held.load(Ordering::Relaxed) {
             break;
         }
+        let mut first_frame = false;
         let more = with_staged(|staged| {
             let staged = staged.as_mut()?;
             let started = super::host::rdtsc();
@@ -170,6 +173,7 @@ pub fn flush(turn: Turn) -> u64 {
                     let spent = core::mem::take(&mut staged.spent);
                     present_took(spent);
                     staged.frame.spent(spent, finished);
+                    first_frame = !core::mem::replace(&mut staged.shown, true);
                     None
                 }
                 Err(reason) => {
@@ -183,6 +187,9 @@ pub fn flush(turn: Turn) -> u64 {
                 }
             }
         });
+        if first_frame {
+            output::boot_stage("first_gop_frame");
+        }
         let Some(whole) = more else {
             break;
         };
@@ -211,8 +218,8 @@ enum Step {
 
 impl Staged {
     /// Write the next [`FLUSH_ROWS`] rows the hidden frame lacks, and show
-    /// it once it lacks none. A display with one frame takes the kept frame
-    /// whole. A frame starts with the rows changed until then; those that
+    /// it once it lacks none. A display with one frame takes its dirty rows
+    /// in one turn. A frame starts with the rows changed until then; those that
     /// change while it is written wait for the next, so a frame ends.
     fn step(&mut self, turn: Turn, now: u64) -> Result<Step> {
         let late = TICK_RATE.load(Ordering::Relaxed) / 1000 * LATE_MICROS / 1000;
@@ -246,8 +253,11 @@ impl Staged {
             Ok(())
         };
         let Some(hidden) = self.screen.hidden_half() else {
-            // One frame in video memory, which holds what both would.
-            if !self.screen.show_frame(self.frame.frame(), take_screen) {
+            if !self.screen.show_visible_rows(
+                self.frame.frame(),
+                self.stale[0].clone(),
+                take_screen,
+            ) {
                 return Err(refuse!("firmware framebuffer access was refused"));
             }
             self.stale = [0..0, 0..0];
@@ -429,6 +439,7 @@ impl GopScanout {
                 started: 0,
                 spent: 0,
                 row: Vec::new(),
+                shown: false,
                 refused: false,
             });
         });

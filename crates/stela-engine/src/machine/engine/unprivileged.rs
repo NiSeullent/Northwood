@@ -7,7 +7,7 @@
 //! made at, EL0 when unprivileged.
 use super::{
     DeviceError, Devices, FETCH_PAGE, Host, Machine, RamTables, RequirementKind, Step, Stop,
-    Translated, tags::TagCheck,
+    Translated, device_access::ram_refused, tags::TagCheck,
 };
 use crate::machine::{
     cpu::Exception,
@@ -48,6 +48,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let mut requester = self.cpu.requester();
         requester.unprivileged = !privileged;
         let access = if write { Access::Write } else { Access::Read };
+        let registered = self
+            .operand_ram()
+            .map_err(|reason| self.unsupported(reason))?;
+        let mut tables = registered.as_ref().map(|ram| ram.tables());
         // Translate every page piece before touching memory.
         let mut pieces = Vec::new();
         let mut done = 0;
@@ -56,13 +60,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let length =
                 ((FETCH_PAGE - (virtual_address & (FETCH_PAGE - 1))) as usize).min(bytes - done);
             let controls = self.cpu.controls(self.cpu.regime());
-            match mmu::translate(
-                &controls,
-                virtual_address,
-                access,
-                requester,
-                &mut RamTables(&mut self.host),
-            ) {
+            let outcome = match tables.as_mut() {
+                Some(tables) => tables
+                    .translate(&controls, virtual_address, access, requester)
+                    .map_err(|reason| self.unsupported(reason))?,
+                None => mmu::translate(
+                    &controls,
+                    virtual_address,
+                    access,
+                    requester,
+                    &mut RamTables(&mut self.host),
+                ),
+            };
+            match outcome {
                 Translated::Mapped(translation) => pieces.push((translation, length)),
                 Translated::Fault(fault) => {
                     let exception = self.data_abort_exception(virtual_address, fault, write, false);
@@ -96,33 +106,54 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Ok(());
         }
         if operand.base != Register::Sp
-            && let TagCheck::Failed(exception) = self.tag_check(&watched, requester, None)?
+            && let TagCheck::Failed(exception) =
+                self.tag_check_with_tables(&watched, requester, None, tables.as_mut())?
         {
             self.take(exception);
             return Ok(());
         }
+        let physical_pieces = || {
+            pieces
+                .iter()
+                .map(|&(translation, length)| (translation.physical, length))
+        };
         let mut data;
-        let ram = pieces.iter().all(|&(translation, length)| {
-            let mut probe = [0u8; 1];
-            self.host.read_ram(translation.physical, &mut probe)
-                && self
-                    .host
-                    .read_ram(translation.physical + length as u64 - 1, &mut probe)
-        });
+        let ram = if let Some(registered) = &registered {
+            registered
+                .resident(&self.host, physical_pieces())
+                .map_err(|reason| self.unsupported(reason))?
+        } else {
+            pieces.iter().all(|&(translation, length)| {
+                let mut probe = [0u8; 1];
+                self.host.read_ram(translation.physical, &mut probe)
+                    && self
+                        .host
+                        .read_ram(translation.physical + length as u64 - 1, &mut probe)
+            })
+        };
         let value = self.read_register(operand.data);
         if ram {
             data = value.to_le_bytes();
-            let mut offset = 0;
-            for (translation, length) in pieces {
-                let range = offset..offset + length;
-                if write {
-                    self.host.write_ram(translation.physical, &data[range]);
-                } else {
-                    self.host.read_ram(translation.physical, &mut data[range]);
+            if let Some(registered) = &registered {
+                // SAFETY: the pieces passed preflight under this loan and data is private staging.
+                unsafe { registered.transfer(&mut self.host, physical_pieces(), &mut data, write) }
+                    .map_err(|reason| self.unsupported(reason))?;
+            } else {
+                let mut offset = 0;
+                for (physical, length) in physical_pieces() {
+                    let range = offset..offset + length;
+                    if write {
+                        self.host.write_ram(physical, &data[range]);
+                    } else {
+                        self.host.read_ram(physical, &mut data[range]);
+                    }
+                    offset += length;
                 }
-                offset += length;
             }
         } else {
+            // A real device may borrow the exclusive RAM service.
+            let canonical = registered.is_some();
+            drop(registered);
             let [(translation, _)] = pieces[..] else {
                 return Err(self.unprivileged_device(
                     address,
@@ -131,6 +162,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     "unprivileged access crossing out of RAM".into(),
                 ));
             };
+            if canonical
+                && write
+                && self.cpu.canonical_memory.is_some()
+                && self.serial_hold.is_none()
+                && self.devices.requires_canonical_write(
+                    self.current,
+                    translation.physical,
+                    operand.bytes,
+                )
+            {
+                return Err(self.unsupported(ram_refused()));
+            }
             let now = self.now();
             let result = if write {
                 self.device_write(translation.physical, operand.bytes, value, now)
@@ -195,6 +238,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         Stop::Unsupported(requirement)
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod canonical_tests;
 
 #[cfg(test)]
 mod tests {

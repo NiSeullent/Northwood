@@ -215,6 +215,7 @@ StelaGPU::importMemory(uint64_t page, task_t task, mach_vm_address_t address, ma
 {
 	IOReturn refused;
 	IOMemoryDescriptor *memory = wireMemory(task, address, length, kIODirectionOutIn, &refused);
+	bool writable = memory != nullptr;
 	if (!memory) {
 		// A read-only mapping refuses that with a protection failure, and
 		// wires for the GPU's reads alone.
@@ -241,7 +242,12 @@ StelaGPU::importMemory(uint64_t page, task_t task, mach_vm_address_t address, ma
 		write(STELA_GATE_IMPORT_BYTES, bytes);
 		offset += bytes;
 	}
-	write(STELA_GATE_IMPORT_TOKEN, reinterpret_cast<uint64_t>(memory));
+	static_assert((alignof(IOMemoryDescriptor) & STELA_GATE_IMPORT_TOKEN_WRITABLE) == 0);
+	uint64_t token = reinterpret_cast<uint64_t>(memory);
+	if (writable) {
+		token |= STELA_GATE_IMPORT_TOKEN_WRITABLE;
+	}
+	write(STELA_GATE_IMPORT_TOKEN, token);
 	write(STELA_GATE_IMPORT, page);
 	uint64_t handle = read(STELA_GATE_IMPORTED);
 	if (handle != 0) {
@@ -271,7 +277,7 @@ StelaGPU::retireMemory()
 		if (token == 0) {
 			return;
 		}
-		auto memory = reinterpret_cast<IOMemoryDescriptor *>(token);
+		auto memory = reinterpret_cast<IOMemoryDescriptor *>(token & ~STELA_GATE_IMPORT_TOKEN_WRITABLE);
 		memory->complete();
 		memory->release();
 	}

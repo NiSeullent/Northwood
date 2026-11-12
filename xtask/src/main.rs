@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 mod amx;
 mod boot;
+mod catalog;
 mod check;
 mod cpu_reference;
 mod dist;
@@ -35,6 +36,8 @@ enum Task {
     },
     /// Build the release `stela` with its matching `stela.efi` embedded.
     Dist,
+    /// Generate or check the Northwood PCI driver catalog.
+    Catalog(catalog::Catalog),
     /// Run ignored oracle tests whose declared inputs are present and write a dated report.
     Oracles(oracles::Oracles),
     /// Build, run and debug the UEFI mount in x86 QEMU.
@@ -72,6 +75,7 @@ fn main() -> ExitCode {
     let result = match Cli::parse().task {
         Task::Check { fix, low_memory } => check::run(fix, low_memory).map(|()| ExitCode::SUCCESS),
         Task::Dist => dist::run().map(|()| ExitCode::SUCCESS),
+        Task::Catalog(task) => task.run().map(|()| ExitCode::SUCCESS),
         Task::Oracles(task) => task.run().map(|()| ExitCode::SUCCESS),
         Task::Boot(command) => boot::run(command),
         Task::Gpu(command) => gpu::run(command).map(|()| ExitCode::SUCCESS),

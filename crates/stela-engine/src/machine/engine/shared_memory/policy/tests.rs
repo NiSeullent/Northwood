@@ -10,7 +10,7 @@ const DATA: u64 = BASE + 4 * PAGE as u64;
 const LEAF: u64 = BASE + 3 * PAGE as u64 + 4 * 8;
 const DESCRIPTOR: u64 = DATA | 3 | (1 << 10) | (3 << 8);
 #[repr(align(4096))]
-struct Storage(UnsafeCell<[u8; 6 * PAGE]>);
+struct Storage(UnsafeCell<[u8; 8 * PAGE]>);
 // SAFETY: tests never create racing Rust references; the canonical owner
 // keeps these exact bytes and every writer uses its physical system.
 unsafe impl Send for Storage {}
@@ -33,12 +33,25 @@ pub(in crate::machine::engine::shared_memory) fn fixture_for(
     Vec<Register>,
     Arc<RegisteredSystemRam>,
 ) {
-    let storage = Arc::new(Storage(UnsafeCell::new([0; 6 * PAGE])));
+    fixture_with_pages(target, 6)
+}
+
+pub(super) fn fixture_with_pages(
+    target: stela_compiler::TargetCpu,
+    pages: usize,
+) -> (
+    crate::machine::Cpu,
+    crate::machine::CpuProfile,
+    Vec<Register>,
+    Arc<RegisteredSystemRam>,
+) {
+    assert!((6..=8).contains(&pages));
+    let storage = Arc::new(Storage(UnsafeCell::new([0; 8 * PAGE])));
     let range = ReservedSystemRamRange {
         source_pa: BASE,
         host_pa: 0x800000,
         host_base: NonNull::new(storage.0.get().cast()).unwrap(),
-        bytes: 6 * PAGE,
+        bytes: pages * PAGE,
     };
     // SAFETY: test-only byte owner.
     let ram = Arc::new(unsafe { ram_fixture(&[range], storage, target) });

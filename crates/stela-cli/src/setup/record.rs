@@ -1,12 +1,12 @@
-//! The setup record, `EFI/stela/setup.json`: what setup wrote, read by every
-//! later command and written before each change.
+//! The setup journal on the ESP, read by later commands and written before
+//! each change. The journal's directory determines its layout.
 use super::{
-    CHOICES_PATH, CHOOSER_SECONDS, Environment, InstallImage, LOADER_PATH, RECORD, addresses,
+    CHOOSER_SECONDS, Environment, InstallImage, LOADER_PATH, addresses,
     bundle::{self, Kind},
     ecid::Ecid,
-    host::Host,
-    image_is_remote, installed, locate_esp, machines, medium, restore_choice_name, translations,
-    wifi,
+    host::{FileSystem, Host},
+    image_is_remote, installed, locate_esp, locate_esp_with_record, machines, medium,
+    restore_choice_name, translations, wifi,
 };
 use crate::efi;
 use anyhow::{Context, Result, ensure};
@@ -16,7 +16,10 @@ use std::{
     path::{Path, PathBuf},
 };
 use stela_boot_core::options::{System, Uuid};
-use stela_loader::mount_interface::{Choice, Choices};
+use stela_loader::mount_interface::{
+    Choice, Choices,
+    layout::{self, Layout},
+};
 
 /// What setup writes, recorded on the ESP so `uninstall` can remove it.
 /// Records before schema 8 also named a recoveryOS bundle on the USB, and
@@ -26,6 +29,9 @@ use stela_loader::mount_interface::{Choice, Choices};
 pub(super) struct Record {
     pub(super) schema_version: u32,
     pub(super) kind: String,
+    /// Selected from the journal's directory on read, never from its JSON.
+    #[serde(skip, default = "legacy_layout")]
+    pub(super) layout: Layout,
     /// The active macOS build, which Install macOS restores.
     pub(super) build: String,
     pub(super) model: String,
@@ -88,6 +94,9 @@ pub(super) struct Record {
     /// has room for one (`setup::translations`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) translations: Option<translations::Store>,
+    /// Files setup owns on the bound FAT32 data partition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) volume_swap: Option<super::volume_swap::Store>,
     /// The Wi-Fi network every choice joins (`--wifi`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) wifi: Option<wifi::Network>,
@@ -104,6 +113,10 @@ pub(super) fn first_schema() -> u32 {
     1
 }
 
+fn legacy_layout() -> Layout {
+    Layout::Legacy
+}
+
 pub(super) const RECORD_KIND: &str = "stela_setup";
 
 /// Schema 8: no recoveryOS bundle; every setup has an install. Schema 9:
@@ -111,6 +124,16 @@ pub(super) const RECORD_KIND: &str = "stela_setup";
 pub(super) const RECORD_SCHEMA: u32 = 9;
 
 impl Record {
+    fn set_layout(&mut self, layout: Layout) {
+        self.layout = layout;
+        for medium in self.media.iter_mut().chain(self.medium.as_mut()) {
+            medium.layout = layout;
+        }
+        if let Some(store) = self.translations.as_mut() {
+            store.layout = layout;
+        }
+    }
+
     /// Whether installs stream `ipsw`'s build from Apple's servers rather
     /// than read it from the USB, as every setup does but one that already
     /// holds whole images. An erase restore needs the macOS system image,
@@ -178,8 +201,10 @@ impl Record {
             .map(|bundle| bundle.processors)
             .find(|&processors| processors != 0);
         system.profile = self.profile;
-        // The key file is `--wifi`'s default one.
         system.ssid = self.wifi.as_ref().map(|network| network.ssid.clone());
+        if self.layout == Layout::Northwood && system.ssid.is_some() && system.wifi_key.is_none() {
+            system.wifi_key = Some(self.layout.uefi_path(layout::WIFI_KEY));
+        }
         system.wifi_country = self
             .wifi
             .as_ref()
@@ -266,17 +291,21 @@ impl Record {
         if self.restore_bundle(kind, install.ecid).is_none() {
             return Ok(None);
         }
-        let restore = bundle::firmware_path_of(bundle::Identity {
-            kind,
-            build: &self.build,
-            ecid: install.ecid,
-            generation: self.generation(),
-        });
+        let restore = bundle::firmware_path_of_in(
+            self.layout,
+            bundle::Identity {
+                kind,
+                build: &self.build,
+                ecid: install.ecid,
+                generation: self.generation(),
+            },
+        );
         let mut system = install.disk.bundle_options(&restore, install.ecid)?;
         medium.restore_from(&mut system)?;
         system.update_restore = kind == Kind::Update;
         system.verify_on_read = self.verify_on_read;
         system.development_restore = kind == Kind::Restore;
+        system.input = kind == Kind::Restore;
         Ok(Some(self.line(system)))
     }
 
@@ -308,9 +337,11 @@ impl Record {
         let mut missing = Vec::new();
         for kind in bundle::RESTORE_KINDS {
             for ecid in self.install_machines() {
-                let present = self
-                    .restore_bundle(kind, ecid)
-                    .is_some_and(|b| b.directory(&self.volume).join(bundle::MANIFEST).is_file());
+                let present = self.restore_bundle(kind, ecid).is_some_and(|b| {
+                    b.directory_in(&self.volume, self.layout)
+                        .join(bundle::MANIFEST)
+                        .is_file()
+                });
                 if !present {
                     missing.push((kind, ecid));
                 }
@@ -393,7 +424,7 @@ impl Record {
         builds.extend(self.bundles.iter().map(|b| &b.build));
         let mut directories = Vec::new();
         for build in builds {
-            let directory = bundle::build_directory(&self.volume, build);
+            let directory = bundle::build_directory_in(&self.volume, self.layout, build);
             if !directories.contains(&directory) {
                 directories.push(directory);
             }
@@ -405,7 +436,7 @@ impl Record {
 /// Delete the directories of bundles the record no longer names.
 pub(super) fn remove_bundles(record: &Record, stale: &[bundle::Bundle]) -> Result<()> {
     for kept in stale {
-        let directory = kept.directory(&record.volume);
+        let directory = kept.directory_in(&record.volume, record.layout);
         if directory.is_dir() {
             fs::remove_dir_all(directory)?;
         }
@@ -413,15 +444,25 @@ pub(super) fn remove_bundles(record: &Record, stale: &[bundle::Bundle]) -> Resul
     Ok(())
 }
 
-/// Write `stela.cfg`, the startup choices and the entry for the record.
+/// Write the boot configuration and its compatibility files.
 pub(super) fn publish(record: &mut Record) -> Result<()> {
+    let image = fs::read(record.esp.join(LOADER_PATH))?;
+    publish_with_image(record, &image)
+}
+
+/// Publish a complete startup configuration before putting its loader at
+/// the removable-media entry point.
+pub(super) fn publish_with_image(record: &mut Record, image: &[u8]) -> Result<()> {
+    let layout = record.layout;
+    efi::validate_mount_image(image, layout)?;
+    super::volume_log::prepare(record)?;
     if record.bundles.iter().all(|bundle| bundle.processors == 0) {
         let generation = record.generation();
         for kept in &mut record.bundles {
             if kept.build == record.build
                 && kept.generation() == generation
                 && let Some(processors) = bundle::recorded_processors(
-                    &kept.directory(&record.volume),
+                    &kept.directory_in(&record.volume, record.layout),
                     &kept.manifest_sha256,
                 )
             {
@@ -431,22 +472,92 @@ pub(super) fn publish(record: &mut Record) -> Result<()> {
         }
     }
     record.options = record.options_text()?;
-    let choices = record.choices_text()?;
-    let tool = record.esp.join(LOADER_PATH);
-    efi::add_mount(&record.esp, &fs::read(&tool)?, None, Some(&record.options))?;
-    let path = record.esp.join(CHOICES_PATH);
-    match choices {
+    let choices = record.choices()?;
+    let choices_text = choices
+        .as_ref()
+        .map(Choices::encode)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let northwood = super::nwconfig_publish::prepare(
+        &record.esp,
+        image,
+        &record.options,
+        choices.as_ref(),
+        layout,
+    )?;
+    // The existing mirrors are the merge baseline. Keep them intact until
+    // the canonical config is written, so an interrupted publish can retry.
+    if let Some(northwood) = northwood {
+        northwood.write()?;
+    }
+    efi::prepare_mount(&record.esp, None, Some(&record.options), layout)?;
+    let path = record.esp.join(layout.esp_path(layout::CHOICES));
+    match choices_text {
         Some(text) => efi::write_atomic(&path, text.as_bytes(), false)?,
         None if path.exists() => fs::remove_file(&path)?,
         None => {}
     }
-    Ok(())
+    efi::publish_loader(&record.esp, image)
 }
 
 /// The record on the ESP of `usb`, which must be a complete setup's.
 pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<Record> {
     let esp = locate_esp(environment.host, usb)?;
-    let path = esp.join(RECORD);
+    let layout = mutation_layout(&esp)?.unwrap_or(Layout::Legacy);
+    let (record, current) = read_record_at(environment, usb, &esp, layout)?;
+    check_mutation_volume(environment.host, &esp, &current, &record)?;
+    Ok(record)
+}
+
+fn record_exists(esp: &Path, layout: Layout) -> Result<bool> {
+    let path = esp.join(layout.esp_path(layout::RECORD));
+    path.try_exists()
+        .with_context(|| format!("cannot inspect {}", path.display()))
+}
+
+/// Read-only commands prefer the Northwood journal when both are present.
+pub(super) fn layout_at(esp: &Path) -> Result<Option<Layout>> {
+    for layout in Layout::PREFERRED {
+        if record_exists(esp, layout)? {
+            return Ok(Some(layout));
+        }
+    }
+    Ok(None)
+}
+
+/// Writes need one unambiguous owner of the shared loader and configuration.
+pub(super) fn mutation_layout(esp: &Path) -> Result<Option<Layout>> {
+    let [preferred, fallback] = Layout::PREFERRED;
+    let modern = record_exists(esp, preferred)?;
+    let legacy = record_exists(esp, fallback)?;
+    ensure!(
+        !(modern && legacy),
+        "{} holds both Northwood and Stela setup records, which share the boot loader. \
+         Resolve the two records before changing the mounted installer",
+        esp.display()
+    );
+    Ok(modern.then_some(preferred).or(legacy.then_some(fallback)))
+}
+
+/// The setup record for read-only commands, with its actual path and layout.
+pub(super) fn read_inspection_record(
+    environment: &Environment<'_>,
+    usb: &Path,
+) -> Result<(Record, Layout, PathBuf)> {
+    let esp = locate_esp_with_record(environment.host, usb, |esp| Ok(layout_at(esp)?.is_some()))?;
+    let layout = layout_at(&esp)?.unwrap_or(Layout::Legacy);
+    let path = esp.join(layout.esp_path(layout::RECORD));
+    let (record, _) = read_record_at(environment, usb, &esp, layout)?;
+    Ok((record, layout, path))
+}
+
+fn read_record_at(
+    environment: &Environment<'_>,
+    usb: &Path,
+    esp: &Path,
+    layout: Layout,
+) -> Result<(Record, PathBuf)> {
+    let path = esp.join(layout.esp_path(layout::RECORD));
     ensure!(
         path.is_file(),
         "{} has no setup; run `stela setup` first",
@@ -471,12 +582,9 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
         usb.display()
     );
     let mut value = header;
-    rebase(
-        &mut value,
-        &esp,
-        &current_volume(environment.host, &esp, usb),
-    );
-    let record: Record = serde_json::from_value(value)
+    let current = current_volume(environment.host, esp, usb);
+    rebase(&mut value, esp, &current);
+    let mut record: Record = serde_json::from_value(value)
         .with_context(|| format!("cannot read setup record {}", path.display()))?;
     ensure!(
         !record.installs.is_empty(),
@@ -484,7 +592,8 @@ pub(super) fn read_record(environment: &Environment<'_>, usb: &Path) -> Result<R
         path.display(),
         usb.display()
     );
-    Ok(record)
+    record.set_layout(layout);
+    Ok((record, current))
 }
 
 /// Where the data partition of the USB whose EFI partition is `esp` is
@@ -496,6 +605,65 @@ pub(super) fn current_volume(host: &dyn Host, esp: &Path, usb: &Path) -> PathBuf
         return usb.to_path_buf();
     }
     medium::locate(host, esp, None).map_or_else(|_| esp.to_path_buf(), |(volume, _)| volume)
+}
+
+/// A record can name a path from an earlier mount. Mutations may use that
+/// data only after it has been rebased to a mounted partition of this USB.
+fn check_mutation_volume(
+    host: &dyn Host,
+    esp: &Path,
+    current: &Path,
+    record: &Record,
+) -> Result<()> {
+    let data = &record.volume;
+    if data != esp {
+        let esp_disk = host.volume(esp)?.disk;
+        let mounted = if data == current {
+            true
+        } else if current == esp {
+            // The data mount can still be usable when its GPT GUID is
+            // unavailable. Require the exact recorded mount on this USB.
+            host.disks()?.iter().any(|disk| {
+                Some(&disk.identifier) == esp_disk.as_ref()
+                    && disk.partitions.iter().any(|partition| {
+                        partition.content != "EFI" && partition.mount.as_ref() == Some(data)
+                    })
+            })
+        } else {
+            false
+        };
+        ensure!(
+            mounted,
+            "mount the setup's data partition beside {} before changing the installer",
+            esp.display()
+        );
+        let volume = host.volume(data)?;
+        ensure!(
+            esp_disk.is_some() && volume.disk == esp_disk,
+            "{} is not mounted on the same disk as {}",
+            data.display(),
+            esp.display()
+        );
+        ensure!(
+            volume.filesystem == FileSystem::Fat,
+            "{} is not a FAT32 setup data partition",
+            data.display()
+        );
+    }
+    ensure!(
+        record
+            .media
+            .iter()
+            .chain(record.medium.as_ref())
+            .all(|medium| medium.volume == *data)
+            && record
+                .translations
+                .as_ref()
+                .is_none_or(|store| store.volume == *data),
+        "the setup record names files outside its data partition {}",
+        data.display()
+    );
+    Ok(())
 }
 
 /// Move every path of the record `value` to where the USB is mounted now:
@@ -561,7 +729,8 @@ fn rebase(value: &mut serde_json::Value, esp: &Path, volume: &Path) {
 /// it is mounted now ([`rebase`]): the EFI partition `esp`, and the data
 /// partition `usb` names or beside it.
 pub(super) fn read_any_record(host: &dyn Host, esp: &Path, usb: &Path) -> Result<Record> {
-    let path = &esp.join(RECORD);
+    let layout = mutation_layout(esp)?.unwrap_or(Layout::Legacy);
+    let path = &esp.join(layout.esp_path(layout::RECORD));
     let mut value: serde_json::Value = stela_engine::read_json(path)?;
     let schema = value["schema_version"].as_u64().unwrap_or(0);
     ensure!(
@@ -569,7 +738,8 @@ pub(super) fn read_any_record(host: &dyn Host, esp: &Path, usb: &Path) -> Result
         "{} is not a setup record this version understands",
         path.display()
     );
-    rebase(&mut value, esp, &current_volume(host, esp, usb));
+    let current = current_volume(host, esp, usb);
+    rebase(&mut value, esp, &current);
     if schema < 8
         && let Some(bundles) = value
             .get_mut("bundles")
@@ -584,6 +754,7 @@ pub(super) fn read_any_record(host: &dyn Host, esp: &Path, usb: &Path) -> Result
     }
     let mut record: Record = serde_json::from_value(value)
         .with_context(|| format!("{} cannot be read", path.display()))?;
+    check_mutation_volume(host, esp, &current, &record)?;
     record.migrate();
     if schema < 9 {
         record.volume.push("EFI");
@@ -594,6 +765,7 @@ pub(super) fn read_any_record(host: &dyn Host, esp: &Path, usb: &Path) -> Result
             store.volume.push("EFI");
         }
     }
+    record.set_layout(layout);
     Ok(record)
 }
 
@@ -603,24 +775,38 @@ pub(super) fn read_any_record(host: &dyn Host, esp: &Path, usb: &Path) -> Result
 /// [`read_record`]'s do: a USB taken out part way is often mounted somewhere
 /// else when setup runs again.
 pub(super) fn interrupted(host: &dyn Host, esp: &Path, usb: &Path) -> Option<Record> {
-    let mut value: serde_json::Value = stela_engine::read_json(&esp.join(RECORD)).ok()?;
-    rebase(&mut value, esp, &current_volume(host, esp, usb));
-    serde_json::from_value::<Record>(value)
+    let layout = mutation_layout(esp).ok()??;
+    let mut value: serde_json::Value =
+        stela_engine::read_json(&esp.join(layout.esp_path(layout::RECORD))).ok()?;
+    let current = current_volume(host, esp, usb);
+    rebase(&mut value, esp, &current);
+    let mut record = serde_json::from_value::<Record>(value)
         .ok()
-        .filter(|record| record.schema_version == RECORD_SCHEMA && !record.complete)
+        .filter(|record| {
+            record.kind == RECORD_KIND && record.schema_version == RECORD_SCHEMA && !record.complete
+        })?;
+    check_mutation_volume(host, esp, &current, &record).ok()?;
+    record.set_layout(layout);
+    Some(record)
 }
 
 /// Replace the record through a synced sibling file, so a stop at any point
 /// leaves the previous record or this one whole: the record is the journal
 /// every interrupted setup and update is resumed from.
 pub(super) fn write_record(esp: &Path, record: &Record) -> Result<()> {
-    let path = esp.join(RECORD);
+    let current = mutation_layout(esp)?;
+    ensure!(
+        current.is_none_or(|current| current == record.layout),
+        "{} already has a setup record in another layout",
+        esp.display()
+    );
+    let path = esp.join(record.layout.esp_path(layout::RECORD));
     fs::create_dir_all(path.parent().unwrap())?;
     let mut record = record.clone();
     record.schema_version = RECORD_SCHEMA;
     let mut bytes = serde_json::to_vec_pretty(&record)?;
     bytes.push(b'\n');
-    efi::write_atomic(&path, &bytes, false)
+    efi::write_atomic(&path, &bytes, current.is_none())
 }
 
 #[cfg(test)]

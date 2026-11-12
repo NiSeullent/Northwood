@@ -168,6 +168,9 @@ impl Controller {
                     self.recovery = Some(Recovery::Disabling(deadline));
                     return Ok(());
                 }
+                if self.owned.is_some() {
+                    self.registers.confirm_disabled()?;
+                }
                 self.restart_queues()?;
                 let timeout = self.enable()?;
                 let deadline = self.deadline(timeout)?;

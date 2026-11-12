@@ -3,8 +3,8 @@
 //! rights, context changes, page splits, stage-2 entries and a failed
 //! physical owner never reuse an entry they should not.
 use super::super::{
-    Controls, Failure, MemoryStatus, Policy, flags,
-    tests::{fixture, fixture_for, ordinary_transfer},
+    Controls, DataOperation, DataPolicy, DataRequest, Failure, MemoryStatus, Policy, flags,
+    tests::{fixture, fixture_for, fixture_with_pages, ordinary_transfer},
 };
 use super::*;
 use crate::{
@@ -75,6 +75,72 @@ fn authentic_tlb_keeps_translation_until_epoch_but_always_reads_current_bytes() 
     // Faults never fill a negative entry: invalid -> valid needs no invalidation.
     publish(&ram, LEAF, &DESCRIPTOR.to_le_bytes());
     assert_eq!(read(&mut thread), (MemoryStatus::Success, 8));
+}
+
+#[test]
+fn nonresident_ram_refuses_cached_and_fresh_translations_before_mmio() {
+    let (mut cpu, profile, missing, mut ram) = fixture_with_pages(TargetCpu::Baseline, 8);
+    Arc::get_mut(&mut ram)
+        .unwrap()
+        .enable_descriptor_frame_leases()
+        .unwrap();
+    let controls = Controls::capture(&cpu, profile.name, &missing).unwrap();
+    let mut policy = Policy::new(controls.clone(), Arc::clone(&ram));
+    policy.refresh(controls.clone(), 1);
+    let request = DataRequest {
+        address: VA,
+        bytes: 8,
+        flags: 0,
+        pc: Some(0x18000),
+        operation: DataOperation::Ordinary,
+    };
+    let part = DataPart {
+        address: VA,
+        bytes: 8,
+        kind: AccessKind::Read,
+    };
+    assert_eq!(policy.translate_part(request, part), Ok(DATA));
+    assert_eq!(policy.tlb.lookup(part, true), Some(DATA));
+
+    // This model has no worker or raw alias. Call only translation admission
+    // while the real writer service holds the original backing.
+    let closed = ram.try_close_descriptor_frame(DATA).unwrap().unwrap();
+    // SAFETY: this fixture has no workers or raw aliases to retire.
+    let mut frame = unsafe { closed.mark_nonresident() }.unwrap();
+    assert_eq!(
+        policy.translate_part(request, part),
+        Err((MemoryStatus::Nonresident, VA))
+    );
+    policy.refresh(controls.clone(), 2);
+    assert_eq!(policy.tlb.lookup(part, true), None);
+    assert_eq!(
+        policy.translate_part(request, part),
+        Err((MemoryStatus::Nonresident, VA))
+    );
+    cpu.registers.set_raw(Register::MAIR_EL1, 0, 0);
+    let device_controls = Controls::capture(&cpu, profile.name, &missing).unwrap();
+    policy.refresh(device_controls.clone(), 3);
+    assert_eq!(
+        policy.translate_part(request, part),
+        Err((MemoryStatus::Nonresident, VA))
+    );
+    assert!(policy.failure.is_none());
+
+    assert_eq!(frame.try_restore(&[0; 16 * 1024]), Ok(true));
+    drop(frame);
+    policy.refresh(controls, 4);
+    assert_eq!(policy.translate_part(request, part), Ok(DATA));
+
+    let device = DATA + 16 * 1024;
+    publish(&ram, LEAF, &((DESCRIPTOR - DATA) | device).to_le_bytes());
+    policy.refresh(device_controls, 5);
+    assert_eq!(
+        policy.translate_part(request, part),
+        Err((MemoryStatus::Unsupported, VA))
+    );
+    assert!(
+        matches!(policy.failure, Some(Failure::DeviceRead { physical, .. }) if physical == device)
+    );
 }
 
 #[test]

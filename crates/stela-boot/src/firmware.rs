@@ -12,10 +12,10 @@ use core::{
     time::Duration,
 };
 use stela_contracts::refuse;
+use stela_loader::mount_interface::layout::{OPTIONS, SOURCE};
 use uefi::{
-    CStr16, Event,
+    Event,
     boot::{self, AllocateType, EventType, MemoryType, TimerTrigger, Tpl},
-    cstr16,
     fs::FileSystem,
     mem::memory_map::MemoryMap,
     proto::{
@@ -24,13 +24,13 @@ use uefi::{
     },
 };
 
-/// Mount options.
-const OPTIONS: &CStr16 = cstr16!("\\EFI\\stela\\stela.cfg");
-/// A system-mode guest image without a bundle, loaded unchanged.
-const SOURCE: &CStr16 = cstr16!("\\EFI\\stela\\source.bin");
+#[used]
+static NWCONFIG_INTERFACE: [u8; 20] = northwood_config::MOUNT_CAPABILITY;
 pub(crate) const STACK_PAGES: usize = 256;
 
 pub(crate) mod entries;
+pub(crate) mod esp;
+mod northwood;
 mod tsc;
 pub(crate) use pe::loaded_extent;
 use stela_boot_core::pe;
@@ -55,7 +55,11 @@ pub(crate) fn pages(count: usize) -> Result<usize> {
 }
 
 fn configured(volume: &mut FileSystem) -> bool {
-    matches!(volume.try_exists(OPTIONS), Ok(true))
+    has_northwood_config(volume) || matches!(esp::find(volume, OPTIONS), Ok(Some(_)))
+}
+
+fn has_northwood_config(volume: &mut FileSystem) -> bool {
+    matches!(volume.try_exists(northwood::CONFIG), Ok(true))
 }
 
 fn boot_volume() -> Option<(FileSystem, Directory)> {
@@ -80,7 +84,7 @@ pub(crate) fn connect_all() -> usize {
     handles.len()
 }
 
-/// The first file system that has `stela.cfg`.
+/// The first file system that has a boot configuration.
 fn configured_volume() -> Option<(FileSystem, Directory)> {
     boot::find_handles::<SimpleFileSystem>()
         .ok()?
@@ -95,7 +99,7 @@ fn configured_volume() -> Option<(FileSystem, Directory)> {
 
 /// The volume Stela was loaded from. When the firmware names no such volume,
 /// as for an image a boot manager starts from memory, or that volume has no
-/// `stela.cfg`, the first volume with one is used instead.
+/// boot configuration, the first volume with one is used instead.
 pub(crate) fn volume() -> Result<(FileSystem, Directory)> {
     let own = boot_volume().map(|(mut volume, root)| {
         let configured = configured(&mut volume);
@@ -112,27 +116,139 @@ pub(crate) fn volume() -> Result<(FileSystem, Directory)> {
             }
         }
         None => configured_volume().ok_or(refuse!(
-            "no boot volume, and no volume has \\EFI\\stela\\stela.cfg"
+            "no boot volume, and no volume has nwconfig.plist or stela.cfg"
         ))?,
     })
 }
 
-/// `stela.cfg`, or nothing when the volume has none.
-pub(crate) fn options(volume: &mut FileSystem) -> Result<Vec<u8>> {
-    if configured(volume) {
+fn legacy_options(volume: &mut FileSystem) -> Result<Vec<u8>> {
+    if let Some(path) = esp::find(volume, OPTIONS)? {
         volume
-            .read(OPTIONS)
+            .read(path)
             .map_err(|_| refuse!("cannot read stela.cfg"))
     } else {
         Ok(Vec::new())
     }
 }
 
-/// `\EFI\stela\source.bin`, the unchanged guest image.
+/// Prefer the Northwood configuration and use the legacy line as a fallback.
+pub(crate) fn options(volume: &mut FileSystem) -> Result<Vec<u8>> {
+    core::hint::black_box(&NWCONFIG_INTERFACE);
+    crate::output::arguments(format_args!(
+        "NORTHWOOD version={}\n",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let legacy = legacy_options(volume);
+    if has_northwood_config(volume) {
+        let choices = crate::choice::read_legacy(volume);
+        match northwood::settings(volume, legacy.as_deref().ok(), choices.as_ref()) {
+            Ok(settings) => {
+                crate::log_file::set_volume_log(settings.volume_log);
+                crate::output::arguments(format_args!(
+                    "NWCONFIG accepted unknown_keys={}\n",
+                    settings.unknown_keys,
+                ));
+                if let Some(profile) = settings.profile {
+                    crate::output::arguments(format_args!("NWCONFIG profile={profile}\n"));
+                }
+                return Ok(settings.options.into_bytes());
+            }
+            Err(reason) => crate::output::arguments(format_args!(
+                "NWCONFIG {reason}; using the legacy boot defaults\n",
+            )),
+        }
+    }
+    legacy
+}
+
+/// Re-read the configured menu if boot selection returns to it.
+pub(crate) fn northwood_choices(
+    volume: &mut FileSystem,
+    legacy: Option<stela_loader::mount_interface::Choices>,
+) -> Option<stela_loader::mount_interface::Choices> {
+    if has_northwood_config(volume) {
+        let options = legacy_options(volume).ok();
+        if let Ok(settings) = northwood::settings(volume, options.as_deref(), legacy.as_ref()) {
+            return settings.choices;
+        }
+    }
+    legacy
+}
+
+/// Revalidate the exact chosen options before carrying structured settings to the engine.
+pub(crate) fn selected_northwood_config(
+    volume: &mut FileSystem,
+    selected: &crate::choice::Selection,
+) -> Option<Vec<u8>> {
+    use stela_loader::mount_interface::with_disk;
+
+    if !has_northwood_config(volume) {
+        return None;
+    }
+    let legacy = legacy_options(volume).ok();
+    let choices = crate::choice::read_legacy(volume);
+    let settings = northwood::settings(volume, legacy.as_deref(), choices.as_ref()).ok()?;
+    let entry = if settings.explicit_entries {
+        let entries = &settings.choices.as_ref()?.entries;
+        Some(match selected.entry.as_deref() {
+            Some(name) => entries.iter().find(|entry| entry.name == name)?,
+            None => entries.first()?,
+        })
+    } else {
+        None
+    };
+    let options = entry.map_or(settings.options.as_str(), |entry| &entry.options);
+    let disk = crate::choice::chosen_disk(volume);
+    let resolved = with_disk(options, disk.as_deref());
+    if resolved.as_deref().unwrap_or(options).as_bytes() != selected.options {
+        return None;
+    }
+    northwood_config::handoff::encode(&settings.xml, entry.map(|entry| entry.name.as_str()))
+}
+
+/// The built-in Diagnostics item inspects the default boot configuration.
+/// A configured host-check entry inspects its own effective settings.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn diagnostic_northwood_config(
+    volume: &mut FileSystem,
+    entry: Option<&str>,
+) -> core::result::Result<Option<Vec<u8>>, &'static str> {
+    if !has_northwood_config(volume) {
+        return Ok(None);
+    }
+    let legacy = legacy_options(volume).ok();
+    let choices = crate::choice::read_legacy(volume);
+    let settings = northwood::settings(volume, legacy.as_deref(), choices.as_ref())?;
+    let entry = if settings.explicit_entries {
+        let entries = &settings
+            .choices
+            .as_ref()
+            .ok_or("missing boot entries")?
+            .entries;
+        Some(
+            match entry {
+                Some(name) => entries.iter().find(|entry| entry.name == name),
+                None => entries.first(),
+            }
+            .ok_or("missing diagnostics boot entry")?
+            .name
+            .as_str(),
+        )
+    } else {
+        None
+    };
+    northwood_config::handoff::encode(&settings.xml, entry)
+        .map(Some)
+        .ok_or("cannot encode Northwood settings")
+}
+
+/// The unchanged system-mode guest image on the selected ESP.
 pub(crate) fn source(volume: &mut FileSystem) -> Result<Vec<u8>> {
+    let path =
+        esp::find(volume, SOURCE)?.ok_or(refuse!("cannot find source.bin on the boot volume"))?;
     volume
-        .read(SOURCE)
-        .map_err(|_| refuse!("cannot read \\EFI\\stela\\source.bin"))
+        .read(path)
+        .map_err(|_| refuse!("cannot read source.bin on the boot volume"))
 }
 
 /// Page rights of Stela's own PE image: code RX, constants R, data RW+NX.
@@ -295,7 +411,7 @@ pub fn take_over(
     let screen = Framebuffer::from_firmware();
     let mut tables = tables(&image, [0, guard], screen.as_ref())?;
     storage.map(&mut tables)?;
-    crate::output::leave_boot_services();
+    let _ = crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; the heap,
     // stack and tables are LOADER_DATA, which Stela keeps.
     let map = unsafe { boot::exit_boot_services(None) };

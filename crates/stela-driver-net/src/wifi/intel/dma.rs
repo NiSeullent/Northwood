@@ -50,6 +50,16 @@ impl Chunk {
         data: &[u8],
         direction: Direction,
     ) -> Result<Self, Error> {
+        Self::allocate_bounded(source, domain, data, direction, u64::MAX)
+    }
+
+    pub(super) fn allocate_bounded(
+        source: &dyn PageSource,
+        domain: Arc<dyn DmaDomain>,
+        data: &[u8],
+        direction: Direction,
+        address_limit: u64,
+    ) -> Result<Self, Error> {
         if data.is_empty() || data.len() > MAX_CHUNK_BYTES {
             return Err(Error::PayloadSize);
         }
@@ -64,7 +74,7 @@ impl Chunk {
                 return Err(Error::AllocationContract);
             }
             let cpu = pages.cpu_mapping(CacheAttribute::WriteBack)?;
-            let mapping = DmaMapping::map(domain.clone(), pages, direction, u64::MAX)?;
+            let mapping = DmaMapping::map(domain.clone(), pages, direction, address_limit)?;
             let region = Region {
                 address: mapping.address()?,
                 bytes: data.len(),
@@ -99,6 +109,14 @@ impl Chunk {
     }
     pub(super) fn expose(&mut self) {
         self.exposed = true;
+    }
+    /// Shared status observation checked by the actual mapping backend.
+    pub(super) fn observe_u32(&self, offset: usize) -> Result<u32, Error> {
+        Ok(self
+            .mapping
+            .as_ref()
+            .ok_or(Error::State)?
+            .read_coherent_u32(offset)?)
     }
     /// Shared producer/descriptor access only for the owning transport's
     /// explicitly checked coherent requester. Never call on streaming DMA.
@@ -450,6 +468,8 @@ pub(in crate::wifi::intel) mod tests {
             alloc::collections::BTreeSet<(u64, usize, usize)>,
         pub(in crate::wifi::intel) cpu_syncs: usize,
         pub(in crate::wifi::intel) cpu_sync_fail: Option<usize>,
+        pub(in crate::wifi::intel) coherent: bool,
+        pub(in crate::wifi::intel) coherent_reads: Vec<(u64, usize)>,
         pub(in crate::wifi::intel) map_fail: Option<usize>,
         pub(in crate::wifi::intel) sync_fail: Option<usize>,
         pub(in crate::wifi::intel) unmap_fail: Option<usize>,
@@ -559,6 +579,30 @@ pub(in crate::wifi::intel) mod tests {
             ));
             assert!(range.start <= range.end && range.end <= mapping.bytes);
             Ok(())
+        }
+        unsafe fn read_coherent_u32(
+            &self,
+            mapping: DomainMapping,
+            offset: usize,
+            direction: Direction,
+        ) -> Result<u32, DmaError> {
+            let mut r = self.records.lock().unwrap();
+            if !r.coherent {
+                return Err(DmaError::CoherenceUnavailable);
+            }
+            assert_eq!(r.permissions.get(&mapping.id), Some(&direction));
+            assert!(matches!(
+                direction,
+                Direction::FromDevice | Direction::Bidirectional
+            ));
+            assert!(offset.is_multiple_of(4) && offset + 4 <= mapping.bytes);
+            let pointer = r.live[&mapping.id].address(offset, 4).unwrap();
+            r.coherent_reads.push((mapping.id, offset));
+            // SAFETY: the mapping names aligned model RAM, and its domain
+            // lock serializes the fixture's device writes with this read.
+            Ok(u32::from_le(unsafe {
+                pointer.as_ptr().cast::<u32>().read_volatile()
+            }))
         }
     }
     fn image() -> Vec<u8> {

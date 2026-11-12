@@ -22,7 +22,7 @@ use crate::{
             ring,
         },
     },
-    probe::{Devices, Error, Handoff, Warning},
+    probe::{Devices, Error, Handoff, Warning, registry},
 };
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{fmt, mem::ManuallyDrop};
@@ -408,7 +408,11 @@ struct Survey {
     clippy::result_large_err,
     reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
 )]
-unsafe fn survey(handoff: &Handoff, devices: &mut Devices) -> Survey {
+unsafe fn survey(
+    handoff: &Handoff,
+    policy: &registry::DriverPolicy<'_>,
+    devices: &mut Devices,
+) -> Survey {
     let mut found = Survey::default();
     for window in &handoff.ecam {
         if !handoff.is_mapped(&window.range()) {
@@ -455,8 +459,10 @@ unsafe fn survey(handoff: &Handoff, devices: &mut Devices) -> Survey {
                     }
                 }
             }
-            if Kind::of(&function) == Some(Kind::Usb4)
-                && icm::Family::of(function.vendor, function.device).is_none()
+            if matches!(
+                registry::select_pci(&function.identity(), policy).driver(),
+                Some(registry::Driver::Native(Kind::Usb4))
+            ) && icm::Family::of(function.vendor, function.device).is_none()
             {
                 found.hosts.push(address);
             }
@@ -501,6 +507,7 @@ fn pump(hosts: &mut [Host], clock: Clock, ms: u64, mut done: impl FnMut(bool) ->
 pub(in crate::probe) unsafe fn bring_up(
     services: &dyn NativeServices,
     handoff: &Handoff,
+    policy: &registry::DriverPolicy<'_>,
     devices: &mut Devices,
 ) -> Vec<Address> {
     // SAFETY: forwarded.
@@ -508,7 +515,7 @@ pub(in crate::probe) unsafe fn bring_up(
         bridges,
         slots,
         hosts,
-    } = unsafe { survey(handoff, devices) };
+    } = unsafe { survey(handoff, policy, devices) };
     let clock = handoff.clock;
     let isolated = hosts
         .iter()

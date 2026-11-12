@@ -44,6 +44,7 @@ mod host_display;
 mod host_firmware;
 mod lan;
 mod machine;
+mod memory_matrix;
 mod network;
 mod network_check;
 mod preboot;
@@ -138,6 +139,8 @@ pub enum Command {
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
+    /// Verify memory admission and the built-in kernel across QEMU RAM sizes.
+    MemoryMatrix(memory_matrix::Arguments),
 }
 
 #[derive(Args)]
@@ -517,7 +520,8 @@ pub fn run(command: Command) -> Result<ExitCode> {
             println!("{}", build_for_boot(release, diagnostics, true)?.display());
             Ok(ExitCode::SUCCESS)
         }
-        Command::Run(arguments) => launch(*arguments),
+        Command::Run(arguments) => launch(*arguments, true),
+        Command::MemoryMatrix(arguments) => memory_matrix::run(arguments),
     }
 }
 
@@ -716,7 +720,7 @@ fn usb_hpet_preflight(arguments: &Run) -> Result<()> {
     Ok(())
 }
 
-fn launch(arguments: Run) -> Result<ExitCode> {
+fn launch(arguments: Run, print_report: bool) -> Result<ExitCode> {
     // Refuse an incompatible diagnostic before building or opening inputs.
     usb_hpet_preflight(&arguments)?;
     let limit = if arguments.usb_image.is_some() || arguments.bundle.is_some() {
@@ -911,6 +915,7 @@ fn launch(arguments: Run) -> Result<ExitCode> {
             started,
             status,
         },
+        print_report,
     )
 }
 

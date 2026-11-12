@@ -3,7 +3,7 @@
 //! process profile with software PAuth.
 use super::record::{Case, Ending, MEMORY, State};
 use anyhow::{Context, Result};
-use stela_compiler::{GuestAddress, GuestState};
+use stela_compiler::{GuestAddress, GuestState, TargetCpu};
 use stela_engine::blocks::{BlockRuntime, StopReason, ThreadState};
 use stela_engine::memory::{MemoryRegionSpec, OwnedMemory};
 use stela_engine::pauth::{self, Keys};
@@ -22,7 +22,7 @@ const BRANCH_NEXT: u32 = 0x1400_0001;
 const KEY: [u64; 2] = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
 
 /// Run every case and return how each ended.
-pub fn run(cases: &[Case]) -> Result<Vec<Ending>> {
+pub fn run(cases: &[Case], target: TargetCpu) -> Result<Vec<Ending>> {
     let cache = tempfile::tempdir()?;
     let mut runtime = BlockRuntime::new_for_target(
         ADDRESS_SPACE,
@@ -30,7 +30,7 @@ pub fn run(cases: &[Case]) -> Result<Vec<Ending>> {
         stela_compiler::block::BlockProfile::new(
             stela_compiler::block::Features::POINTER_AUTHENTICATION,
         ),
-        stela_compiler::TargetCpu::detect(),
+        target,
     );
     let mut memory = OwnedMemory::map(vec![MemoryRegionSpec {
         guest_address: MEMORY_BASE,

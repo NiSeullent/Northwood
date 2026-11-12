@@ -287,6 +287,38 @@ fn trusted_hashes_name_each_slices_code_directory() {
 }
 
 #[test]
+fn bundle_hashes_seal_both_external_files_on_every_slice() {
+    let (arm64, arm64e) = (object(ARM64), object(ARM64E));
+    let slices = [vec![arm64.as_slice()], vec![arm64e.as_slice()]];
+    let seal = BundleSeal::new(b"Info.plist", b"CodeResources");
+    let raw = link(IDENTIFIER, &slices).unwrap();
+    let bundle = link_bundle(IDENTIFIER, &slices, seal).unwrap();
+    let hashes = bundle_code_hashes(&bundle, seal).unwrap();
+
+    assert_eq!(bundle, link_bundle(IDENTIFIER, &slices, seal).unwrap());
+    assert_eq!(hashes.len(), 2);
+    assert_ne!(hashes, code_hashes(&raw).unwrap());
+    assert!(code_hashes(&bundle).is_err());
+    assert!(bundle_code_hashes(&raw, seal).is_err());
+    assert!(bundle_code_hashes(&bundle, BundleSeal::new(b"different", b"CodeResources")).is_err());
+    assert!(bundle_code_hashes(&bundle, BundleSeal::new(b"Info.plist", b"different")).is_err());
+    for (index, hash) in hashes.iter().enumerate() {
+        let slice = thin(&bundle, index);
+        let header = macho::MachHeader64::<LE>::parse(slice, 0).unwrap();
+        let mut commands = header.load_commands(LE, slice, 0).unwrap();
+        while let Some(command) = commands.next().unwrap() {
+            if command.cmd() == macho::LC_CODE_SIGNATURE {
+                let data: &macho::LinkeditDataCommand<LE> = command.data().unwrap();
+                let directory = &slice[data.dataoff.get(LE) as usize + 20..];
+                assert_eq!(*hash, Sha256::digest(directory)[..20]);
+                assert_eq!(&directory[24..28], &3u32.to_be_bytes());
+                break;
+            }
+        }
+    }
+}
+
+#[test]
 fn trusted_hashes_refuse_truncation_and_changed_signed_pages() {
     let arm64 = object(ARM64);
     let file = link(IDENTIFIER, &[vec![&arm64]]).unwrap();
@@ -308,8 +340,8 @@ fn trusted_hashes_refuse_truncation_and_changed_signed_pages() {
 #[test]
 fn trusted_hashes_refuse_invalid_signature_extents_and_hash_tables() {
     let signed = vec![0; HASH_PAGE as usize + 1];
-    let blob = sign(&signed, IDENTIFIER, 0);
-    code_hash(&signed, &blob).unwrap();
+    let blob = sign(&signed, IDENTIFIER, 0, None);
+    code_hash(&signed, &blob, None).unwrap();
     for (at, value) in [
         (8, 2),
         (16, u32::MAX),
@@ -321,11 +353,11 @@ fn trusted_hashes_refuse_invalid_signature_extents_and_hash_tables() {
     ] {
         let mut changed = blob.clone();
         changed[at..at + 4].copy_from_slice(&value.to_be_bytes());
-        assert!(code_hash(&signed, &changed).is_err(), "offset {at}");
+        assert!(code_hash(&signed, &changed, None).is_err(), "offset {at}");
     }
     let mut changed = blob.clone();
     changed[57] = 1; // SHA-1 cannot be labeled as a SHA-256 trust entry.
-    assert!(code_hash(&signed, &changed).is_err());
+    assert!(code_hash(&signed, &changed, None).is_err());
 }
 
 #[test]

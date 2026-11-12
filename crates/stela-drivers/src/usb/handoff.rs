@@ -81,13 +81,28 @@ impl fmt::Display for Error {
 }
 
 /// What a completed handoff found.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Handed {
     /// Firmware owned the controller.
     pub from_firmware: bool,
-    /// Firmware did not release it in time; ownership was taken with its SMIs
-    /// off regardless.
+    /// Firmware did not release it in time; the forced handoff was attempted.
     pub forced: bool,
+    /// No legacy interception capability, or release and disabled SMIs read back.
+    pub(crate) legacy_released: bool,
+}
+
+impl Handed {
+    const NO_LEGACY: Self = Self {
+        from_firmware: false,
+        forced: false,
+        legacy_released: true,
+    };
+}
+
+impl Default for Handed {
+    fn default() -> Self {
+        Self::NO_LEGACY
+    }
 }
 
 /// Ordered dword register accesses: what the xHCI legacy-support step needs.
@@ -233,6 +248,7 @@ fn memory(bars: &[Option<Bar>], handoff: &Handoff) -> Result<(Mmio, usize), Erro
 const UHCI_LEGSUP: u16 = 0xc0;
 const UHCI_LEGSUP_RO: u16 = 0x5040;
 const UHCI_LEGSUP_RWC: u16 = 0x8f00;
+const UHCI_LEGSUP_ENABLE: u16 = !(UHCI_LEGSUP_RO | UHCI_LEGSUP_RWC);
 const UHCI_USBCMD: usize = 0;
 const UHCI_USBINTR: usize = 4;
 const UHCI_RUN: u16 = 1;
@@ -254,7 +270,7 @@ fn uhci<C: ConfigSpace>(
     if legsup == u16::MAX || command == u16::MAX {
         return Err(Error::Removed);
     }
-    let from_firmware = legsup & !(UHCI_LEGSUP_RO | UHCI_LEGSUP_RWC) != 0;
+    let from_firmware = legsup & UHCI_LEGSUP_ENABLE != 0;
     if from_firmware
         || command & UHCI_RUN != 0
         || command & UHCI_CONFIGURE == 0
@@ -272,6 +288,9 @@ fn uhci<C: ConfigSpace>(
     Ok(Handed {
         from_firmware,
         forced: false,
+        legacy_released: config
+            .read16(UHCI_LEGSUP)
+            .is_ok_and(|value| value & UHCI_LEGSUP_ENABLE == 0),
     })
 }
 
@@ -327,6 +346,7 @@ fn ohci(
     Ok(Handed {
         from_firmware,
         forced,
+        legacy_released: registers.read32(OHCI_CONTROL) & OHCI_CTRL_IR == 0,
     })
 }
 
@@ -339,6 +359,7 @@ const EHCI_RUN: u32 = 1;
 const EHCI_HALTED: u32 = 1 << 12;
 const EHCI_LEGSUP: u32 = 1;
 const EHCI_BIOS_OWNED: u32 = 1 << 16;
+pub(super) const EHCI_LEGACY_SMI_ENABLES: u32 = 0xe03f;
 const EHCI_HANDOFF_US: u64 = 1_000_000;
 
 /// `quirk_usb_disable_ehci` and `ehci_bios_handoff`: take the legacy-support
@@ -377,7 +398,12 @@ fn ehci<C: ConfigSpace>(
         }
         match capability & 0xff {
             EHCI_LEGSUP => {
-                handed = Some(ehci_bios(config, offset, capability, clock, minimum)?);
+                let current = ehci_bios(config, offset, capability, clock, minimum)?;
+                handed = Some(Handed {
+                    legacy_released: current.legacy_released
+                        && handed.is_none_or(|earlier: Handed| earlier.legacy_released),
+                    ..current
+                });
                 if handed.is_some_and(|handed| handed.from_firmware) {
                     registers.write32(operational + EHCI_CONFIGFLAG, 0);
                 }
@@ -404,7 +430,9 @@ fn ehci<C: ConfigSpace>(
     }
     registers.write32(operational + EHCI_USBINTR, 0);
     registers.write32(operational + EHCI_USBSTS, 0x3f);
-    Ok(handed.unwrap_or_default())
+    let mut handed = handed.unwrap_or_default();
+    handed.legacy_released &= count != 0;
+    Ok(handed)
 }
 
 fn ehci_bios<C: ConfigSpace>(
@@ -443,6 +471,12 @@ fn ehci_bios<C: ConfigSpace>(
     Ok(Handed {
         from_firmware,
         forced: !released,
+        legacy_released: config
+            .read32(offset)
+            .is_ok_and(|header| header & EHCI_BIOS_OWNED == 0)
+            && config
+                .read32(offset + 4)
+                .is_ok_and(|control| control & EHCI_LEGACY_SMI_ENABLES == 0),
     })
 }
 
@@ -451,6 +485,7 @@ const XHCI_LEGACY: u32 = 1;
 const XHCI_BIOS_OWNED: u32 = 1 << 16;
 const XHCI_OS_OWNED: u32 = 1 << 24;
 const XHCI_LEGACY_DISABLE_SMI: u32 = (0x7 << 1) | (0xff << 5) | (0x7 << 17);
+const XHCI_LEGACY_SMI_ENABLES: u32 = 1 | (1 << 4) | (0x7 << 13);
 const XHCI_LEGACY_SMI_EVENTS: u32 = 0x7 << 29;
 const XHCI_USBCMD: usize = 0;
 const XHCI_USBSTS: usize = 4;
@@ -497,6 +532,8 @@ pub(crate) fn xhci_legacy<R: Dwords + ?Sized>(
     Ok(Handed {
         from_firmware: header & XHCI_BIOS_OWNED != 0,
         forced: !released,
+        legacy_released: registers.read32(at) & (XHCI_BIOS_OWNED | XHCI_OS_OWNED) == XHCI_OS_OWNED
+            && registers.read32(at + 4) & XHCI_LEGACY_SMI_ENABLES == 0,
     })
 }
 
@@ -517,7 +554,7 @@ fn xhci(
     if operational < 0x20 || operational + XHCI_USBSTS + 4 > bytes {
         return Err(Error::Malformed);
     }
-    let mut handed = Handed::default();
+    let mut handed = Handed::NO_LEGACY;
     let mut offset = (parameters >> 16) as usize * 4;
     while offset != 0 {
         if offset + 8 > bytes {

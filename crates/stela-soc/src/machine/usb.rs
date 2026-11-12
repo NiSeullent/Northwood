@@ -1,8 +1,12 @@
 //! Type-C connectors, USB controllers and the peripherals and network the host
 //! attaches through them.
 
+#[cfg(test)]
+mod tests;
+
 use super::*;
 use crate::Result;
+use core::fmt::Write as _;
 use stela_contracts::refuse;
 
 /// The reason of the power-off a held power button makes.
@@ -157,10 +161,12 @@ impl AppleDevices {
         let UsbCables {
             disks,
             network,
+            reserve_network,
             bluetooth,
         } = cables;
-        let extras = usize::from(network.is_some()) + usize::from(bluetooth);
-        if 1 + extras + disks.len() > hub::MAX_PORTS {
+        let ports = 1 + usize::from(bluetooth) + disks.len();
+        let network_slot = network.is_some() || reserve_network && ports < hub::MAX_PORTS;
+        if ports + usize::from(network_slot) > hub::MAX_PORTS {
             return Err(refuse!("the native hub has seven ports"));
         }
         let network = network.map(Ecm::new).transpose()?;
@@ -175,6 +181,7 @@ impl AppleDevices {
             .ok_or(refuse!("no USB controller on that connector"))?;
         let attachments = Attachments {
             input: Peripheral::new(),
+            network_slot,
             network,
             bluetooth: bluetooth.then(Hci::new),
             disks,
@@ -188,6 +195,42 @@ impl AppleDevices {
             speed: typec::Usb2Speed::High,
         }))?;
         Ok(())
+    }
+
+    fn network_hub(&mut self) -> Option<&mut Hub<Attachments>> {
+        self.usb_masters.iter_mut().find_map(|master| {
+            master
+                .peripheral
+                .as_mut()
+                .filter(|hub| hub.ports.network_slot)
+        })
+    }
+
+    /// Attach a fresh ECM device to the reserved hub port. A replacement
+    /// waits for the guest to acknowledge the previous device's removal.
+    pub fn attach_network(&mut self, mac: Mac) -> Result<bool> {
+        let hub = self
+            .network_hub()
+            .ok_or(refuse!("no USB Ethernet port is reserved"))?;
+        if hub.ports.network.is_some() {
+            return Err(refuse!("the USB Ethernet port is already occupied"));
+        }
+        if !hub.can_connect(Attachments::NETWORK_PORT) {
+            return Ok(false);
+        }
+        hub.ports.network = Some(Ecm::new(mac)?);
+        hub.detect();
+        Ok(true)
+    }
+
+    /// Unplug the ECM device and discard its queues. Mark the disconnect
+    /// immediately so a subsequent attach cannot hide it from the guest.
+    pub fn detach_network(&mut self) {
+        if let Some(hub) = self.network_hub()
+            && hub.ports.network.take().is_some()
+        {
+            hub.disconnect(Attachments::NETWORK_PORT);
+        }
     }
 
     pub(super) fn usb_network(&mut self) -> Result<&mut Ecm> {
@@ -389,13 +432,43 @@ impl AppleDevices {
                             c.to_guest, c.to_host, c.filtered, c.overflowed, c.oversized
                         )
                     });
-                format!(
+                let mut line = format!(
                     "port={} attached={}{why}{host}{hub}{net}",
                     master.number,
                     master.attached || master.peripheral.is_some()
-                )
+                );
+                if !why.is_empty() {
+                    self.append_usb_power_gates(master, &mut line);
+                }
+                line
             })
             .collect()
+    }
+
+    /// Report the domain states already delivered to these exact clients.
+    fn append_usb_power_gates(&self, master: &UsbMaster, line: &mut String) {
+        let mut any = false;
+        for (label, device) in [("controller", master.device), ("phy", master.phy)] {
+            let Some(client) = self.power_clients.iter().find(|link| link.device == device) else {
+                continue;
+            };
+            let mut gated = client
+                .domains
+                .iter()
+                .filter(|(_, state)| state.power == POWER_GATED);
+            let Some((first, _)) = gated.next() else {
+                continue;
+            };
+            line.push_str(if any { " " } else { " pmgr_power_gated=[" });
+            write!(line, "{label}={first:#x}").expect("format a USB diagnostic string");
+            for (address, _) in gated {
+                write!(line, ",{address:#x}").expect("format a USB diagnostic string");
+            }
+            any = true;
+        }
+        if any {
+            line.push(']');
+        }
     }
 
     pub fn take_usb_log(&mut self) -> Option<UsbLog> {

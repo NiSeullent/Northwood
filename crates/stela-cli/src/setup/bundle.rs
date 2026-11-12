@@ -2,7 +2,8 @@
 //! Stela machine (its ECID is in the bundle's `/chosen`), [`Generation`]
 //! (the boot-bundle schema `stela.efi` reads it with, and the revision of
 //! the loader that prepared it) and [`Kind`], in
-//! `stela/boot/<build>/<leaf>` of the USB's FAT32 data partition:
+//! `northwood/boot/<build>/<leaf>` of the USB's FAT32 data partition, or the
+//! corresponding directory under `stela` on legacy media.
 //!
 //! - `restore-<ECID>`: a machine's restore bundle (`stela-dev boot prepare
 //!   --restore`), which the Install macOS choice boots;
@@ -30,6 +31,7 @@ use std::{
     io::Read as _,
     path::{Path, PathBuf},
 };
+use stela_loader::mount_interface::layout::{DATA_BOOT, Layout};
 
 pub(super) const MANIFEST: &str = "bundle.json";
 /// The schema bundles without a suffix have.
@@ -160,9 +162,16 @@ impl Bundle {
     }
 
     /// Its directory on `volume`.
+    #[cfg(test)]
     pub(super) fn directory(&self, volume: &Path) -> PathBuf {
-        directory_of(
+        self.directory_in(volume, Layout::Legacy)
+    }
+
+    /// Its directory on `volume` in the setup's layout.
+    pub(super) fn directory_in(&self, volume: &Path, layout: Layout) -> PathBuf {
+        directory_of_in(
             volume,
+            layout,
             Identity {
                 kind: self.kind,
                 build: &self.build,
@@ -189,24 +198,35 @@ pub(super) fn leaf_of(kind: Kind, ecid: Option<Ecid>, generation: Generation) ->
 }
 
 /// The directory of a build's bundles below a data partition's root.
+#[cfg(test)]
 pub(super) const BOOT_DIRECTORY: &str = "stela/boot";
 
-/// `stela/boot/<build>` on `volume`.
-pub(super) fn build_directory(volume: &Path, build: &str) -> PathBuf {
-    volume.join(BOOT_DIRECTORY).join(build)
+/// The active layout's boot-bundle build directory on `volume`.
+pub(super) fn build_directory_in(volume: &Path, layout: Layout, build: &str) -> PathBuf {
+    volume.join(layout.data_path(DATA_BOOT)).join(build)
 }
 
+#[cfg(test)]
 pub(super) fn directory_of(volume: &Path, identity: Identity<'_>) -> PathBuf {
+    directory_of_in(volume, Layout::Legacy, identity)
+}
+
+pub(super) fn directory_of_in(volume: &Path, layout: Layout, identity: Identity<'_>) -> PathBuf {
     let Identity {
         kind,
         build,
         ecid,
         generation,
     } = identity;
-    build_directory(volume, build).join(leaf_of(kind, ecid, generation))
+    build_directory_in(volume, layout, build).join(leaf_of(kind, ecid, generation))
 }
 
-pub(super) fn firmware_path_of(identity: Identity<'_>) -> String {
+#[cfg(test)]
+fn firmware_path_of(identity: Identity<'_>) -> String {
+    firmware_path_of_in(Layout::Legacy, identity)
+}
+
+pub(super) fn firmware_path_of_in(layout: Layout, identity: Identity<'_>) -> String {
     let Identity {
         kind,
         build,
@@ -214,7 +234,8 @@ pub(super) fn firmware_path_of(identity: Identity<'_>) -> String {
         generation,
     } = identity;
     format!(
-        "\\stela\\boot\\{build}\\{}",
+        "\\{}\\{build}\\{}",
+        layout.data_path(DATA_BOOT).replace('/', "\\"),
         leaf_of(kind, ecid, generation)
     )
 }
@@ -554,6 +575,20 @@ pub(super) mod tests {
                 generation: Generation::FIRST
             }),
             "\\stela\\boot\\26A434\\restore-0000000000000001"
+        );
+        let identity = Identity {
+            kind: Kind::Restore,
+            build: "26A434",
+            ecid: Some(Ecid(1)),
+            generation: Generation::FIRST,
+        };
+        assert_eq!(
+            directory_of_in(Path::new("/mnt/data"), Layout::Northwood, identity),
+            Path::new("/mnt/data/northwood/boot/26A434/restore-0000000000000001")
+        );
+        assert_eq!(
+            firmware_path_of_in(Layout::Northwood, identity),
+            "\\northwood\\boot\\26A434\\restore-0000000000000001"
         );
         assert_eq!(
             firmware_path_of(Identity {

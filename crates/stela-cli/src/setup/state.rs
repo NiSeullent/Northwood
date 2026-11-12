@@ -24,7 +24,7 @@
 //! (`installed::state_area`).
 use super::{
     Environment, Record, Request, check_installed_efi, ecid::Ecid, host::bytes_text, installed,
-    machines,
+    machines, record::read_inspection_record,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -33,9 +33,12 @@ use std::{
     fmt::Write as _,
     fs,
     io::{BufRead, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
-use stela_loader::boot_selection;
+use stela_loader::{
+    boot_selection,
+    mount_interface::layout::{self, Layout},
+};
 use {
     stela_runtime::pc::boot_log, stela_soc::machine::sep_state, stela_soc_data::nor::CAPACITY,
     stela_soc_data::nor::Image, stela_soc_data::nor::nvram::Variables,
@@ -194,36 +197,97 @@ pub(super) fn reset_nvram(
 /// The USB's own log (`mount_interface::BOOT_LOG_FILE`), which every boot
 /// writes from its first line, then the install's on its machine-state
 /// partition; either may be missing.
-pub(super) fn boot_log(
-    environment: &Environment<'_>,
-    record: &Record,
-    command: &Request,
-) -> Result<String> {
-    let path = record.esp.join(crate::efi::BOOT_LOG);
-    let usb = fs::read(&path)
-        .with_context(|| format!("cannot read {}", path.display()))
-        .and_then(|region| {
-            boot_log::read(&region).with_context(|| format!("{} has no boot log", path.display()))
-        })
-        .map(|log| {
-            let mut text = format!(
-                "Boot log on the USB ({}): {}",
-                path.display(),
-                crate::boot_log::summary(&log)
-            );
-            text.push_str(&String::from_utf8_lossy(&log.stream));
-            if !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text
-        });
-    let install = install_log(environment, record, command);
-    match (usb, install) {
+pub(super) fn boot_log(environment: &Environment<'_>, command: &Request) -> Result<String> {
+    let (record, _, _) = read_inspection_record(environment, &command.usb)?;
+    let usb = usb_log(&record.esp, false).map(|(path, log)| {
+        let mut text = format!(
+            "Boot log on the USB ({}): {}",
+            path.display(),
+            crate::boot_log::summary(&log)
+        );
+        text.push_str(&String::from_utf8_lossy(&log.stream));
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text
+    });
+    let install = install_log(environment, &record, command);
+    let complete = match (usb, install) {
         (Ok(usb), Ok(install)) => Ok(format!("{usb}\n{install}")),
         (Ok(usb), Err(error)) => Ok(format!("{usb}\n{error:#}\n")),
         (Err(error), Ok(install)) => Ok(format!("{error:#}\n\n{install}")),
         (Err(usb), Err(install)) => Err(anyhow!("{usb:#}\n{install:#}")),
+    };
+    match super::volume_log::latest(&record, false) {
+        Some((path, bytes)) => {
+            let snapshot = format!(
+                "Loader boot log on the data volume ({}):\n{}\n",
+                path.display(),
+                String::from_utf8_lossy(&bytes).trim_end(),
+            );
+            match complete {
+                Ok(text) => Ok(format!("{text}\n{snapshot}")),
+                Err(error) => Ok(format!("{snapshot}\n{error:#}\n")),
+            }
+        }
+        None => complete,
     }
+}
+
+pub(super) struct DiagnosticBootLog {
+    pub(super) path: PathBuf,
+    pub(super) bytes: Vec<u8>,
+    pub(super) overwritten: bool,
+}
+
+/// Use the first nonempty ESP ring, in Northwood then Stela order.
+/// Otherwise use the latest nonempty DATA snapshot in the setup's layout,
+/// falling back to the other layout. A fresh USB may have neither.
+pub(super) fn diagnostic_boot_log(record: &Record) -> Option<DiagnosticBootLog> {
+    if let Ok((path, log)) = usb_log(&record.esp, true) {
+        let overwritten = log.overwritten() != 0;
+        return Some(DiagnosticBootLog {
+            path,
+            bytes: log.stream,
+            overwritten,
+        });
+    }
+    let (path, bytes) = super::volume_log::latest(record, true)?;
+    Some(DiagnosticBootLog {
+        path,
+        bytes,
+        overwritten: false,
+    })
+}
+
+fn usb_log(esp: &Path, require_output: bool) -> Result<(PathBuf, boot_log::Log)> {
+    let [preferred, fallback] = Layout::PREFERRED;
+    let read =
+        |layout: Layout| read_usb_log(esp.join(layout.esp_path(layout::BOOT_LOG)), require_output);
+    read(preferred).or_else(|preferred_error| {
+        read(fallback).map_err(|fallback_error| {
+            if preferred_error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                fallback_error
+            } else {
+                preferred_error
+            }
+        })
+    })
+}
+
+fn read_usb_log(path: PathBuf, require_output: bool) -> Result<(PathBuf, boot_log::Log)> {
+    let region = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    let log =
+        boot_log::read(&region).with_context(|| format!("{} has no boot log", path.display()))?;
+    ensure!(
+        !require_output || log.stream.iter().any(|byte| !byte.is_ascii_whitespace()),
+        "{} has no boot output",
+        path.display()
+    );
+    Ok((path, log))
 }
 
 fn install_log(

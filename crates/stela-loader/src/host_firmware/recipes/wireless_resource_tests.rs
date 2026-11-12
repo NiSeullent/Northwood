@@ -24,6 +24,34 @@ fn select(requests: &[Request]) -> Result<Plan, Error> {
 }
 
 #[test]
+fn intel_legacy_firmware_pins_only_match_the_correct_pci_device_family() {
+    let cnvi = "iwlwifi-9000-pu-b0-jf-b0-46.ucode";
+    let discrete = "iwlwifi-9260-th-b0-jf-b0-46.ucode";
+    for (hardware, name, length) in [
+        ("pci:8086:31dc", cnvi, 1519568),
+        ("pci:8086:2526", discrete, 1490508),
+    ] {
+        let good = request("wifi-intel", name, hardware, "linux-firmware");
+        let plan = select(&[good]).unwrap();
+        assert_eq!(plan.selections()[0].recipe.image.length, length);
+        assert_eq!(plan.selections()[0].recipe.license, &WIFI_FIRMWARE_LICENSE);
+    }
+    for (hardware, name) in [
+        ("pci:8086:31dc", discrete),
+        ("pci:8086:2526", cnvi),
+        ("pci:8086:2723", cnvi),
+        ("pci:8086:031dc", cnvi),
+    ] {
+        assert!(select(&[request("wifi-intel", name, hardware, "linux-firmware")]).is_err());
+    }
+    let mut inventory = Inventory::default();
+    require_15igl7_wifi(&mut inventory).unwrap();
+    assert_eq!(Plan::select(&inventory).unwrap().selections().len(), 3);
+    let mut automatic = Inventory::default();
+    assert!(!require_wifi(&mut automatic, 0x8086, 0x31dc).unwrap());
+}
+
+#[test]
 fn rtl8822c_normal_and_wow_keep_each_exact_observation_and_share_the_notice() {
     for device in ["c822", "c82f"] {
         let hardware = format!("pci:10ec:{device}:subsys:1a3b:3750:rev:01");

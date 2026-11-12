@@ -2,7 +2,7 @@
 //! flags, and each action on an existing setup is a subcommand with only
 //! the options it takes, so the parser refuses every other combination.
 //! Each form becomes one [`Request`] for the action it names.
-use super::{Action, NextBoot, Request, builds, ecid::Ecid, wifi};
+use super::{Action, NextBoot, Request, builds, ecid::Ecid, firmware, swap, wifi};
 use clap::{Args, Subcommand, builder::TypedValueParser};
 use std::path::PathBuf;
 use stela_boot_core::options::Uuid;
@@ -60,6 +60,9 @@ enum Command {
     /// Install host-device firmware for the PC onto an existing USB.
     #[command(subcommand)]
     HostFirmware(HostFirmware),
+    /// Inspect or plan Northwood Swap storage in disk images.
+    #[command(subcommand)]
+    Swap(Swap),
 }
 
 impl Command {
@@ -74,8 +77,43 @@ impl Command {
             Self::BootLog(command) => command.request(Action::BootLog),
             Self::Configure(command) => command.request(),
             Self::HostFirmware(command) => command.request(),
+            Self::Swap(Swap::Inspect(inspect)) => Request {
+                action: Action::InspectSwap(inspect),
+                ..Request::default()
+            },
+            Self::Swap(Swap::CreateImage(create)) => Request {
+                action: Action::CreateSwapImage(create),
+                ..Request::default()
+            },
+            Self::Swap(Swap::Plan(plan)) => Request {
+                action: Action::PlanSwapImage(plan),
+                ..Request::default()
+            },
+            Self::Swap(Swap::ApplyImage(apply)) => Request {
+                action: Action::ApplySwapImage(apply),
+                ..Request::default()
+            },
+            Self::Swap(Swap::PrepareVolumeImage(prepare)) => Request {
+                action: Action::PrepareSwapVolumeImage(prepare),
+                ..Request::default()
+            },
         }
     }
+}
+
+#[derive(Subcommand)]
+enum Swap {
+    /// Validate the partition type, UUID, header checksum and slot capacity.
+    Inspect(swap::Inspect),
+    /// Preview a swap partition on an existing GPT disk image.
+    Plan(swap::PlanImage),
+    /// Add an initialized swap partition to an existing regular GPT image file.
+    ApplyImage(swap::ApplyImage),
+    /// Prepare a new FAT32 data image with swap files alongside the existing installer.
+    /// Requires mtools and dosfstools.
+    PrepareVolumeImage(swap::PrepareVolumeImage),
+    /// Create a new GPT image with one initialized swap partition.
+    CreateImage(swap::CreateImage),
 }
 
 /// A partition's name, given as is or by its device path (`/dev/disk1s2`,
@@ -160,7 +198,7 @@ impl Image {
 struct Wifi {
     /// Join this Wi-Fi network for the install's network, beside or instead
     /// of Ethernet. Setup asks for its passphrase and writes it to the USB in
-    /// plaintext (`EFI/stela/wifi.key`).
+    /// plaintext (`wifi.key` beside the setup's EFI configuration).
     #[arg(long, value_name = "SSID", value_parser = wifi::ssid)]
     wifi: Option<String>,
     /// Read the Wi-Fi passphrase (8 to 63 characters, or a 64-digit hex PSK)
@@ -340,6 +378,9 @@ struct Create {
     /// or what fits. The mount uses up to 1 GiB of each allocation.
     #[arg(long, value_name = "BYTES", hide = true)]
     translation_store_bytes: Option<u64>,
+    /// Prepare USB swap using up to this many bytes after reserving installer files.
+    #[arg(long, value_name = "BYTES")]
+    volume_swap_bytes: Option<u64>,
     /// The model or size, as setup shows it, of the whole disk `--usb`
     /// names, which erasing a removable disk other than a USB (an SD card,
     /// a FireWire or Thunderbolt disk) needs typed back.
@@ -366,6 +407,7 @@ impl Create {
             profile: self.profile,
             verify_on_read: self.verify_on_read,
             translation_store_bytes: self.translation_store_bytes,
+            volume_swap_bytes: self.volume_swap_bytes,
             confirm_disk: self.confirm_disk,
             ..Request::default()
         };
@@ -664,21 +706,26 @@ enum HostFirmware {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Download pinned vendor firmware for exact requirements captured by
-    /// native drivers. The inventory must come from the target PC, not this
-    /// setup host.
+    /// Provision pinned vendor firmware from the target PC's inventory,
+    /// a known hardware profile or an NVIDIA chip name.
     Fetch {
-        #[arg(value_name = "REQUIREMENTS", required_unless_present = "gpu")]
+        #[arg(value_name = "REQUIREMENTS", required_unless_present_any = ["gpu", "profile"])]
         requirements: Option<PathBuf>,
         /// Also keep what the USB holds, and add the GPU firmware this NVIDIA
         /// chip needs, such as ga104. A boot without it names the chip.
         #[arg(long, value_name = "CHIP")]
         gpu: Option<String>,
+        /// Add the pinned firmware candidates for the target hardware profile.
+        #[arg(long, value_enum)]
+        profile: Option<firmware::Profile>,
         #[command(flatten)]
         usb: Usb,
         /// Cache for pinned host firmware images and redistribution notices.
         #[arg(long, value_name = "DIRECTORY")]
         cache: Option<PathBuf>,
+        /// Use only files already in the cache. Missing pins are errors.
+        #[arg(long)]
+        offline: bool,
         /// Show what would change, and change nothing.
         #[arg(long)]
         dry_run: bool,
@@ -699,13 +746,20 @@ impl HostFirmware {
             Self::Fetch {
                 requirements,
                 gpu,
+                profile,
                 usb,
                 cache,
+                offline,
                 dry_run,
             } => Request {
                 dry_run,
                 host_firmware_cache: cache,
-                ..usb.request(Action::HostFirmwareFetch { requirements, gpu })
+                ..usb.request(Action::HostFirmwareFetch {
+                    requirements,
+                    gpu,
+                    profile,
+                    offline,
+                })
             },
         }
     }

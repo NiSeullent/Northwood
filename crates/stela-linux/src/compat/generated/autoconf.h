@@ -5,6 +5,11 @@
  * not listed are disabled, so debug, tracing, KUnit and fault-injection
  * hooks compile out exactly as in a kernel built without them. */
 #define CONFIG_64BIT 1
+/* Kconfig normally records the selected Clang's version. Linux uses it to
+ * enable the matching compiler diagnostics, including syscall alias pragmas. */
+#ifdef __clang__
+#define CONFIG_CLANG_VERSION (__clang_major__ * 10000 + __clang_minor__ * 100 + __clang_patchlevel__)
+#endif
 /* Select native architecture ownership hooks in the shared Linux sources. */
 #define CONFIG_STELA 1
 #define CONFIG_DEFAULT_HOSTNAME "(none)"

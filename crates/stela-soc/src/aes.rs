@@ -88,7 +88,6 @@ use alloc::vec;
 use stela_contracts::Refusal;
 use stela_contracts::refuse;
 use stela_crypto::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
-#[cfg(test)]
 use stela_soc_data::aes::DEFAULT_ADDRESS_WIDTH;
 #[cfg(test)]
 use stela_soc_data::aes::DKEY_DISTRIBUTE_V5;
@@ -410,6 +409,10 @@ impl Aes {
         self.accessible().is_ok() && !self.lifecycle.quiesced
     }
 
+    fn loses_power(&self, proposed: LifecycleState) -> bool {
+        self.lifecycle.powered && !proposed.powered && !proposed.retention
+    }
+
     fn accessible(&self) -> Result<()> {
         if !self.lifecycle.powered {
             return Err(refuse!("AES power domain is off"));
@@ -421,6 +424,22 @@ impl Aes {
             return Err(refuse!("AES physical reset is asserted"));
         }
         Ok(())
+    }
+
+    fn register_accessible(&self, space: &Space) -> Result<()> {
+        // J473's v3 key-disable word is in the separate SIO aperture.
+        // 26B123 writes it after PMGR has gated the command engine. The
+        // word only adds sticky restrictions and grants no command access.
+        if matches!(space, Space::KeyDisable(_))
+            && self.config.version == 3
+            && self.config.address_width == DEFAULT_ADDRESS_WIDTH
+            && self.config.key_disable.word == 0
+            && self.config.key_disable.keys == [None; 3]
+            && !self.lifecycle.reset
+        {
+            return Ok(());
+        }
+        self.accessible()
     }
 
     fn command_fifo(&self) -> u64 {
@@ -740,19 +759,34 @@ fn key_bytes(command: u32) -> usize {
 
 impl Lifecycle for Aes {
     fn check_lifecycle(&self, proposed: LifecycleState) -> Result<()> {
-        if !self.lifecycle.reset && proposed.reset
-            || self.lifecycle.powered && !proposed.powered && !proposed.retention
-        {
+        if !self.lifecycle.reset && proposed.reset {
             return Err(refuse!(
-                "AES physical reset or nonretained power loss requires qualified key-disable, context and entropy restore semantics"
+                "AES physical reset requires qualified key-disable, context and entropy restore semantics"
+            ));
+        }
+        if self.loses_power(proposed) && (!self.fifo.is_empty() || self.dma_failure.is_some()) {
+            return Err(refuse!(
+                "AES nonretained power loss with outstanding commands or failed DMA"
             ));
         }
         Ok(())
     }
 
     fn set_lifecycle(&mut self, proposed: LifecycleState, access: &mut Access<'_>) {
-        // Gates preserve accepted commands, sticky disable bits,
-        // key contexts, chaining values and already pending interrupts.
+        // A nonretained supply loss on an idle engine resets ordinary
+        // state. Hardware key restrictions stay sticky. Retained gates
+        // preserve commands and interrupts until the engine can run again.
+        if self.loses_power(proposed) {
+            debug_assert!(self.fifo.is_empty() && self.dma_failure.is_none());
+            self.started = false;
+            self.overflow = false;
+            self.watermark = 0;
+            self.int_status = 0;
+            self.int_enable = 0;
+            self.flag = 0;
+            self.keys = [None, None];
+            self.ivs = [[0; BLOCK]; 4];
+        }
         self.lifecycle = proposed;
         self.signal(access);
     }
@@ -773,11 +807,12 @@ impl MmioDevice for Aes {
         _access: &mut Access<'_>,
     ) -> Result<u64, MmioError> {
         let fail = |reason: Refusal| refuse(NAME, offset, width, Direction::Read, reason);
-        self.accessible().map_err(fail)?;
+        let space = self.space(offset);
+        self.register_accessible(&space).map_err(fail)?;
         if width != Width::Word {
             return Err(fail(refuse!("AES registers are 32-bit")));
         }
-        let offset = match self.space(offset) {
+        let offset = match space {
             Space::Block(offset) => offset,
             Space::KeyDisable(at) => {
                 let value = self.read_key_disable(at);
@@ -808,7 +843,8 @@ impl MmioDevice for Aes {
         access: &mut Access<'_>,
     ) -> Result<(), MmioError> {
         let fail = |reason: Refusal| refuse(NAME, offset, width, Direction::Write, reason);
-        self.accessible().map_err(fail)?;
+        let space = self.space(offset);
+        self.register_accessible(&space).map_err(fail)?;
         if self.lifecycle.quiesced
             && (offset == self.command_fifo()
                 || offset == CONTROL && value == u64::from(CONTROL_START))
@@ -819,7 +855,7 @@ impl MmioDevice for Aes {
             return Err(fail(refuse!("AES registers are 32-bit")));
         }
         let value = value as u32;
-        let offset = match self.space(offset) {
+        let offset = match space {
             Space::Block(offset) => offset,
             Space::KeyDisable(at) => return self.write_key_disable(at, value).map_err(fail),
             Space::DKey(at) => return Err(fail(self.dkey_refusal(at).into())),

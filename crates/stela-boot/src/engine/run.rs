@@ -2,6 +2,7 @@
 //! reports the running PEs.
 
 use super::*;
+mod host_clock;
 
 /// Exit kinds by `ExitKind` value, then native faults by cause
 /// (`step_timing::fault_slot`), then System exits at device sites, then the
@@ -787,6 +788,7 @@ pub(super) struct Heartbeat {
     pub(super) pe_counts: Vec<parallel::Counts>,
     /// The shared count at the last beat, 0 before the first.
     pub(super) clock_count: u64,
+    host_clock: Option<host_clock::Samples>,
     /// Lock waits at the last beat: the devices', by call, and the heap's.
     pub(super) lock_waits: ([u64; Call::ALL.len()], u64),
     /// The devices' lock times at the last beat, by call.
@@ -862,6 +864,7 @@ impl Heartbeat {
             retired: machine.retired_instructions(),
             pe_counts: parallel::counts(machine),
             clock_count: 0,
+            host_clock: host_clock::Samples::start(),
             lock_waits: ([0; Call::ALL.len()], 0),
             lock_times: Default::default(),
             board: Default::default(),
@@ -943,6 +946,9 @@ impl Heartbeat {
         mark(&mut cost, "position");
         service.report(tsc_hz);
         mark(&mut cost, "service");
+        if let Some(clock) = &mut self.host_clock {
+            clock.report(tsc_hz);
+        }
         self.report_processors(machine, &next, elapsed, tsc_hz);
         mark(&mut cost, "processors");
         if let (Some(now), Some(then)) = (machine.step_timing().copied(), self.timing) {
@@ -1029,6 +1035,13 @@ impl Heartbeat {
                 }
                 for state in machine.devices.with(|devices| devices.usb_diagnostics()) {
                     output::arguments(format_args!("USB {state}\n"));
+                }
+                #[cfg(feature = "native-profile")]
+                if let Some(profile) = machine
+                    .devices
+                    .with(|devices| devices.take_spi_nor_profile())
+                {
+                    output::arguments(format_args!("SPI NOR PROFILE counter={now:#x} {profile}\n"));
                 }
                 survey_report(machine);
                 occupancy_report(machine, &mut self.occupancy);
@@ -1624,49 +1637,64 @@ fn board_code(
     )
 }
 
-/// `HEAP small=310M large=62M 128K:352/73M cores=300M/20M classes=16:8M,…`:
-/// the heap's live bytes in size-class blocks and free-list allocations,
-/// the latter by power of two where a size holds a megabyte or more, each
-/// tagged core's share, the tagged cores' bytes by size class, the failed
-/// allocations so far and whether the heap is low.
-fn heap_report(heap: &stela_boot_core::heap::Usage) {
-    let large: usize = heap.large.iter().map(|&(_, bytes)| bytes).sum();
-    let mut line = format!(
-        "HEAP small={}M large={}M",
-        heap.live.saturating_sub(large) >> 20,
-        large >> 20
-    );
-    for (bucket, &(count, bytes)) in heap.large.iter().enumerate() {
-        if bytes >= 1 << 20 {
+/// A heap snapshot streamed through the existing formatter, so memory
+/// pressure can be observed without allocating the report's own strings.
+struct HeapReport<'a> {
+    stage: &'a str,
+    usage: &'a stela_boot_core::heap::Usage,
+}
+
+impl fmt::Display for HeapReport<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let heap = self.usage;
+        let large: usize = heap.large.iter().map(|&(_, bytes)| bytes).sum();
+        write!(
+            f,
+            "HEAP stage={} live={} peak_carved={} total={} largest_free={} small={}M large={}M",
+            self.stage,
+            heap.live,
+            heap.peak,
+            heap.total,
+            heap.largest,
+            heap.live.saturating_sub(large) >> 20,
+            large >> 20,
+        )?;
+        for (bucket, &(count, bytes)) in heap.large.iter().enumerate() {
+            if bytes < 1 << 20 {
+                continue;
+            }
             let size = 4096usize << bucket;
-            let size = if size >= 1 << 20 {
-                format!("{}M", size >> 20)
+            let (size, unit) = if size >= 1 << 20 {
+                (size >> 20, 'M')
             } else {
-                format!("{}K", size >> 10)
+                (size >> 10, 'K')
             };
-            line.push_str(&format!(" {size}:{count}/{}M", bytes >> 20));
+            write!(f, " {size}{unit}:{count}/{}M", bytes >> 20)?;
         }
+        f.write_str(" cores=")?;
+        for (index, own) in crate::ALLOCATOR.owned().enumerate() {
+            let separator = if index == 0 { "" } else { "/" };
+            write!(f, "{separator}{}M", own >> 20)?;
+        }
+        f.write_str(" classes=")?;
+        for (class, bytes) in crate::ALLOCATOR.class_live().into_iter().enumerate() {
+            let separator = if class == 0 { "" } else { "," };
+            write!(f, "{separator}{}:{}M", 16 << class, bytes >> 20)?;
+        }
+        // Fallible callers can survive a failure. The pressure flag also
+        // takes fragmentation of the main bins into account.
+        write!(
+            f,
+            " failures={} low={}",
+            crate::ALLOCATOR.failures(),
+            crate::ALLOCATOR.low(),
+        )
     }
-    let cores: Vec<String> = crate::ALLOCATOR
-        .owned()
-        .map(|own| format!("{}M", own >> 20))
-        .collect();
-    line.push_str(&format!(" cores={}", cores.join("/")));
-    let classes: Vec<String> = crate::ALLOCATOR
-        .class_live()
-        .iter()
-        .enumerate()
-        .map(|(class, &bytes)| format!("{}:{}M", 16 << class, bytes >> 20))
-        .collect();
-    line.push_str(&format!(" classes={}", classes.join(",")));
-    // Allocations that found no memory, which fallible callers survive, and
-    // whether the heap is low enough that the engine gives memory back.
-    line.push_str(&format!(
-        " failures={} low={}",
-        crate::ALLOCATOR.failures(),
-        crate::ALLOCATOR.low()
-    ));
-    output::arguments(format_args!("{line}\n"));
+}
+
+pub(super) fn heap_report(stage: &str, heap: &stela_boot_core::heap::Usage) {
+    let report = HeapReport { stage, usage: heap };
+    output::arguments(format_args!("{report}\n"));
     owner_report(heap.live);
 }
 
@@ -1717,6 +1745,7 @@ pub(super) fn beat_report<H: Host>(
     let cpu = &machine.cpu;
     let blocks = (next.blocks - last.blocks).max(1);
     let heap = crate::ALLOCATOR.usage();
+    heap_report("beat", &heap);
     let shadow = host::statistics();
     output::arguments(format_args!(
         "BEAT blocks={} pc={:#x} {}{} lr={:#x} ticks/block={} native={}% \
@@ -1754,7 +1783,6 @@ pub(super) fn beat_report<H: Host>(
         shadow.code_peak >> 20,
         shadow.code_bytes >> 20,
     ));
-    heap_report(&heap);
     output::arguments(format_args!(
         "REGISTERS pe={} pc={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x} x23={:#x} lr={:#x}\n",
         machine.processor(),

@@ -56,9 +56,20 @@ struct Stream {
     received: u32,
     window: u32,
     input: VecDeque<u8>,
+    accepted_bytes: u64,
+    acknowledged_bytes: u64,
+    zero_window_writes: u64,
+    full_window_writes: u64,
+    credit_wait_since: Option<u64>,
+    credit_wait_ticks: u64,
     /// An ACK or RST owed to the peer while the transmit queue was full.
     /// TCP lets one later ACK cover every byte received meanwhile.
     reply: Option<u8>,
+}
+impl Stream {
+    fn outstanding(&self) -> u32 {
+        self.next.wrapping_sub(self.acknowledged)
+    }
 }
 
 pub struct Mux {
@@ -77,6 +88,7 @@ pub struct Mux {
     /// ("Incoming TCP packet is too small").
     short_tcp: u64,
     backpressure: Backpressure,
+    observed_at: u64,
 }
 /// What held back [`Mux::write`] since the connection began: the writes the
 /// peer's receive window refused and those the transmit queue did, and the
@@ -86,6 +98,20 @@ pub struct Backpressure {
     pub window: u64,
     pub queue: u64,
     pub largest_window: u32,
+}
+/// Per-stream transmit accounting. Byte counts include framing above TCP.
+/// Credit wait starts at an attempted write and ends at an observed window
+/// update or ACK that gives the sender room. Time uses the USB session clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamStats {
+    pub accepted_bytes: u64,
+    pub acknowledged_bytes: u64,
+    pub window_bytes: u32,
+    pub outstanding_bytes: u32,
+    pub zero_window_writes: u64,
+    pub full_window_writes: u64,
+    pub credit_wait_ticks: u64,
+    pub credit_waiting: bool,
 }
 impl Default for Mux {
     fn default() -> Self {
@@ -111,6 +137,7 @@ impl Mux {
             logs: VecDeque::new(),
             short_tcp: 0,
             backpressure: Backpressure::default(),
+            observed_at: 0,
         };
         let mut version = Vec::new();
         version.extend_from_slice(&2u32.to_be_bytes());
@@ -134,6 +161,28 @@ impl Mux {
     }
     pub fn backpressure(&self) -> Backpressure {
         self.backpressure
+    }
+    pub(super) fn observe_time(&mut self, now: u64) {
+        self.observed_at = now;
+    }
+    pub(super) fn stream_stats(&self, id: StreamId) -> Option<StreamStats> {
+        let stream = &self.streams[self.stream(id).ok()?];
+        if stream.state != StreamState::Open {
+            return None;
+        }
+        let waiting = stream
+            .credit_wait_since
+            .map_or(0, |since| self.observed_at.saturating_sub(since));
+        Some(StreamStats {
+            accepted_bytes: stream.accepted_bytes,
+            acknowledged_bytes: stream.acknowledged_bytes,
+            window_bytes: stream.window,
+            outstanding_bytes: stream.outstanding(),
+            zero_window_writes: stream.zero_window_writes,
+            full_window_writes: stream.full_window_writes,
+            credit_wait_ticks: stream.credit_wait_ticks.saturating_add(waiting),
+            credit_waiting: stream.credit_wait_since.is_some(),
+        })
     }
     pub fn take_packet(&mut self) -> Option<Vec<u8>> {
         let packet = self.outgoing.pop_front()?;
@@ -239,6 +288,12 @@ impl Mux {
             received: 0,
             window: 0,
             input: VecDeque::new(),
+            accepted_bytes: 0,
+            acknowledged_bytes: 0,
+            zero_window_writes: 0,
+            full_window_writes: 0,
+            credit_wait_since: None,
+            credit_wait_ticks: 0,
             reply: None,
         });
         let index = self.streams.len() - 1;
@@ -270,8 +325,7 @@ impl Mux {
         if stream.state != StreamState::Open {
             return Err(refuse!("usbmux stream is not open"));
         }
-        let outstanding = stream.next.wrapping_sub(stream.acknowledged);
-        let available = stream.window.saturating_sub(outstanding) as usize;
+        let available = stream.window.saturating_sub(stream.outstanding()) as usize;
         let count = bytes
             .len()
             .min(available)
@@ -281,6 +335,13 @@ impl Mux {
         }
         if count == 0 {
             self.backpressure.window += 1;
+            let stream = &mut self.streams[index];
+            if stream.window == 0 {
+                stream.zero_window_writes = stream.zero_window_writes.saturating_add(1);
+            } else {
+                stream.full_window_writes = stream.full_window_writes.saturating_add(1);
+            }
+            stream.credit_wait_since.get_or_insert(self.observed_at);
             return Ok(0);
         }
         if !self.can_emit(self.header() + TCP_HEADER + count) {
@@ -289,7 +350,9 @@ impl Mux {
         }
         let sequence = stream.next;
         self.send_tcp(index, ACK, sequence, &bytes[..count])?;
-        self.streams[index].next = sequence.wrapping_add(count as u32);
+        let stream = &mut self.streams[index];
+        stream.next = sequence.wrapping_add(count as u32);
+        stream.accepted_bytes = stream.accepted_bytes.saturating_add(count as u64);
         Ok(count)
     }
     /// Reading reopens the receive window by a real TCP ACK. Backpressure
@@ -478,9 +541,8 @@ impl Mux {
         ) {
             return Ok(());
         }
-        if acknowledgement.wrapping_sub(stream.acknowledged)
-            > stream.next.wrapping_sub(stream.acknowledged)
-        {
+        let acknowledged = acknowledgement.wrapping_sub(stream.acknowledged);
+        if acknowledged > stream.outstanding() {
             return Err(refuse!("usbmux TCP ACK outside sent sequence range"));
         }
         // Flags other than the state's one expected value tear the stream
@@ -506,9 +568,19 @@ impl Mux {
             }
             stream.input.extend(data.iter().copied());
             stream.received = stream.received.wrapping_add(data.len() as u32);
+            stream.acknowledged_bytes = stream
+                .acknowledged_bytes
+                .saturating_add(u64::from(acknowledged));
         }
         stream.acknowledged = acknowledgement;
         stream.window = window;
+        if window > stream.outstanding()
+            && let Some(since) = stream.credit_wait_since.take()
+        {
+            stream.credit_wait_ticks = stream
+                .credit_wait_ticks
+                .saturating_add(self.observed_at.saturating_sub(since));
+        }
         self.backpressure.largest_window = self.backpressure.largest_window.max(window);
         if connecting || !data.is_empty() {
             stream.reply = Some(ACK);
@@ -683,6 +755,10 @@ mod tests {
         mux.receive(&wire(TCP, &payload, 2)).unwrap();
         assert_eq!(mux.streams[0].received, 1);
         assert_eq!(mux.streams[0].acknowledged, 2);
+        let stats = mux.stream_stats(id).unwrap();
+        assert_eq!(stats.accepted_bytes, 4);
+        assert_eq!(stats.acknowledged_bytes, 4);
+        assert_eq!(stats.outstanding_bytes, 0);
         mux.tx_sequence = u16::MAX;
         mux.take_packet();
         mux.write(id, b"a").unwrap();
@@ -747,6 +823,74 @@ mod tests {
         while mux.write(id, &[0; 4096]).unwrap() != 0 {}
         let backpressure = mux.backpressure();
         assert_eq!((backpressure.window, backpressure.queue), (1, 1));
+    }
+
+    #[test]
+    fn stream_stats_time_credit_waits_and_exclude_other_streams() {
+        let (mut mux, id) = connected();
+        let other = mux.open(12345).unwrap();
+        mux.take_packet().unwrap();
+        mux.receive(&wire(
+            TCP,
+            &tcp_header(12345, other.port, 0, 1, SYN | ACK, 1),
+            2,
+        ))
+        .unwrap();
+        mux.take_packet().unwrap();
+        assert_eq!(mux.stream_stats(other).unwrap().acknowledged_bytes, 0);
+
+        let ack = |mux: &mut Mux, sequence, window| {
+            mux.receive(&wire(
+                TCP,
+                &tcp_header(62078, id.port, 1, sequence, ACK, window),
+                2,
+            ))
+            .unwrap();
+        };
+        ack(&mut mux, 1, 0);
+        mux.observe_time(10);
+        assert_eq!(mux.write(id, b"blocked"), Ok(0));
+        mux.observe_time(13);
+        assert_eq!(mux.write(id, b"retry"), Ok(0));
+        assert_eq!(mux.write(other, b"other"), Ok(5));
+        mux.take_packet().unwrap();
+        let waiting = mux.stream_stats(id).unwrap();
+        assert_eq!(waiting.zero_window_writes, 2);
+        assert_eq!(waiting.credit_wait_ticks, 3);
+        assert!(waiting.credit_waiting);
+
+        mux.observe_time(22);
+        ack(&mut mux, 1, 1); // A duplicate ACK changes just the advertised window.
+        let ready = mux.stream_stats(id).unwrap();
+        assert_eq!(ready.acknowledged_bytes, 0);
+        assert_eq!(ready.credit_wait_ticks, 12);
+        assert!(!ready.credit_waiting);
+        let data = [0x3c; 256];
+        assert_eq!(mux.write(id, &data), Ok(data.len()));
+        let packet = mux.take_packet().unwrap();
+        assert_eq!(&packet[MUX2_HEADER + TCP_HEADER..], &data);
+
+        mux.observe_time(25);
+        assert_eq!(mux.write(id, b"blocked again"), Ok(0));
+        mux.observe_time(31);
+        ack(&mut mux, 129, 1);
+        assert_eq!(
+            mux.stream_stats(id),
+            Some(StreamStats {
+                accepted_bytes: 256,
+                acknowledged_bytes: 128,
+                window_bytes: 256,
+                outstanding_bytes: 128,
+                zero_window_writes: 2,
+                full_window_writes: 1,
+                credit_wait_ticks: 18,
+                credit_waiting: false,
+            })
+        );
+        let other = mux.stream_stats(other).unwrap();
+        assert_eq!(other.accepted_bytes, 5);
+        assert_eq!(other.acknowledged_bytes, 0);
+        assert_eq!(other.credit_wait_ticks, 0);
     }
     #[test]
     fn replies_owed_while_writes_fill_the_queue_are_coalesced_not_fatal() {

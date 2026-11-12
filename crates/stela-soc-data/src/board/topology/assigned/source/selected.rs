@@ -6,6 +6,67 @@ use super::*;
 use crate::Result;
 use stela_contracts::refuse;
 
+const J473_AFFINITIES: [u32; 8] = [0, 1, 2, 3, 0x100, 0x101, 0x102, 0x103];
+
+/// AppleT8110PMGR::restoreHW unconditionally enables both CPU complexes
+/// (26B123 mac14g 0xfffffe0009fbc998 and 0xfffffe0009fbc9d8). The legacy
+/// guest device-table walker assigns CPU numbers in physical record order.
+fn j473_reduced_affinities(
+    root: &Node<'_>,
+    nodes: &[Node<'_>],
+    board: u32,
+    boot_reg: u32,
+    count: usize,
+) -> Result<Option<Vec<u32>>> {
+    if board != 0x24 || count == J473_AFFINITIES.len() {
+        return Ok(None);
+    }
+    let pmgr = root
+        .child("arm-io")
+        .and_then(|io| io.child("pmgr"))
+        .ok_or(refuse!("assigned J473 PMGR is absent"))?;
+    let Some(clusters) = pmgr.property("clusters") else {
+        return Ok(None);
+    };
+    if clusters != [4, 0, 0, 0, 4, 0, 0, 0]
+        || pmgr.property("compatible") != Some(b"pmgr1,t8112\0")
+        || pmgr.property("soc-clusters").is_some()
+        || pmgr.property("acc-harvesting").is_some()
+    {
+        return Err(refuse!("assigned J473 PMGR complex roster is unqualified"));
+    }
+    if count < 2 {
+        return Err(refuse!(
+            "assigned J473 PMGR restore requires a worker for each of its two CPU complexes"
+        ));
+    }
+    if boot_reg != J473_AFFINITIES[0] {
+        return Err(refuse!(
+            "assigned J473 PMGR reduction requires the original first efficiency CPU as BSP"
+        ));
+    }
+    for (index, (node, reg)) in nodes.iter().zip(J473_AFFINITIES).enumerate() {
+        let kind = if reg < 0x100 { b"E\0" } else { b"P\0" };
+        if word(node, "reg")? != reg
+            || word(node, "cpu-id")? != index as u32
+            || property(node, "cluster-type")? != kind
+        {
+            return Err(refuse!(
+                "assigned J473 PMGR reduction differs from the original CPU order"
+            ));
+        }
+    }
+    let efficiency = (count - 1).min(4);
+    let performance = count - efficiency;
+    Ok(Some(
+        J473_AFFINITIES[..efficiency]
+            .iter()
+            .chain(&J473_AFFINITIES[4..4 + performance])
+            .copied()
+            .collect(),
+    ))
+}
+
 impl<'a> BspSource<'a> {
     /// Construct metadata for `count` assigned workers, BSP first. The
     /// caller must keep a started physical roster and join native permission.
@@ -37,19 +98,31 @@ impl<'a> BspSource<'a> {
                 "assigned T8112 worker count exceeds the qualified source envelope"
             ));
         }
-        let mut regs = vec![boot_reg];
-        let boot_complex = boot_reg >> 8;
-        for same_complex in [true, false] {
-            for node in &nodes {
-                let reg = word(node, "reg")?;
-                if reg != boot_reg
-                    && (reg >> 8 == boot_complex) == same_complex
-                    && regs.len() < count
-                {
-                    regs.push(reg);
+        let regs = match j473_reduced_affinities(
+            &root,
+            &nodes,
+            identity.profile.board,
+            boot_reg,
+            count,
+        )? {
+            Some(regs) => regs,
+            None => {
+                let mut regs = vec![boot_reg];
+                let boot_complex = boot_reg >> 8;
+                for same_complex in [true, false] {
+                    for node in &nodes {
+                        let reg = word(node, "reg")?;
+                        if reg != boot_reg
+                            && (reg >> 8 == boot_complex) == same_complex
+                            && regs.len() < count
+                        {
+                            regs.push(reg);
+                        }
+                    }
                 }
+                regs
             }
-        }
+        };
         let mut result = Self::t8112(original, prepared, identity, boot_reg, acc_harvesting)?;
         result.remap_member(0);
         for (ordinal, &reg) in regs.iter().enumerate().skip(1) {

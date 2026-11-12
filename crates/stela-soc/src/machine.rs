@@ -32,7 +32,7 @@ pub use crate::usb::{
     host::{Descriptor as UsbDescriptor, MuxEndpoints},
     mux::{
         Backpressure as MuxBackpressure, State as MuxState, StreamId as MuxStream,
-        StreamState as MuxStreamState,
+        StreamState as MuxStreamState, StreamStats as MuxStreamStats,
     },
     session::Log as UsbLog,
 };
@@ -350,11 +350,12 @@ impl UsbPort {
 /// What the native hub carries besides the keyboard and pointer.
 #[derive(Default)]
 pub struct UsbCables {
-    /// Host disks, each a USB mass storage device (at most five with a
-    /// network adapter, six without).
+    /// Host disks, each a USB mass storage device. See [`Self::disk_ports`].
     pub disks: Vec<Box<dyn BlockDevice>>,
     /// A USB Ethernet adapter with this station address.
     pub network: Option<Mac>,
+    /// Reserve an Ethernet port when the hub has room and no adapter is connected.
+    pub reserve_network: bool,
     /// A USB Bluetooth controller: bridged to one of the host's, or the
     /// model the owner selects with [`AppleDevices::bluetooth_model`].
     pub bluetooth: bool,
@@ -369,40 +370,54 @@ impl UsbCables {
     }
 }
 
-/// The functions on the native hub's ports: the keyboard and pointer on
-/// port 1, then the Ethernet adapter and Bluetooth controller when there are
-/// any, then one mass storage device per host disk.
+/// The native hub puts input on port 1, followed by the Ethernet slot when
+/// reserved, the optional Bluetooth controller and one port per host disk.
 struct Attachments {
     input: Peripheral,
+    network_slot: bool,
     network: Option<Ecm>,
     bluetooth: Option<Hci>,
     disks: Vec<MassStorage>,
 }
 
+impl Attachments {
+    const NETWORK_PORT: usize = 1;
+}
+
 impl hub::Ports for Attachments {
     fn count(&self) -> usize {
-        1 + usize::from(self.network.is_some())
+        1 + usize::from(self.network_slot)
             + usize::from(self.bluetooth.is_some())
             + self.disks.len()
     }
     fn speed(&self, port: usize) -> Speed {
         if port == 0 { Speed::Full } else { Speed::High }
     }
+    fn attached(&self, port: usize) -> bool {
+        !self.network_slot || port != Self::NETWORK_PORT || self.network.is_some()
+    }
     fn function(&mut self, port: usize) -> &mut dyn Function {
-        let input = core::iter::once(&mut self.input as &mut dyn Function);
-        let network = self.network.iter_mut().map(|f| f as &mut dyn Function);
-        let bluetooth = self.bluetooth.iter_mut().map(|f| f as &mut dyn Function);
-        let disks = self.disks.iter_mut().map(|f| f as &mut dyn Function);
+        let input = core::iter::once(Some(&mut self.input as &mut dyn Function));
+        let network = self
+            .network_slot
+            .then(|| self.network.as_mut().map(|f| f as &mut dyn Function));
+        let bluetooth = self
+            .bluetooth
+            .iter_mut()
+            .map(|f| Some(f as &mut dyn Function));
+        let disks = self.disks.iter_mut().map(|f| Some(f as &mut dyn Function));
         let mut functions = input.chain(network).chain(bluetooth).chain(disks);
-        functions.nth(port).expect("a port of the hub's count")
+        functions.nth(port).flatten().expect("an attached hub port")
     }
     fn function_ref(&self, port: usize) -> &dyn Function {
-        let input = core::iter::once(&self.input as &dyn Function);
-        let network = self.network.iter().map(|f| f as &dyn Function);
-        let bluetooth = self.bluetooth.iter().map(|f| f as &dyn Function);
-        let disks = self.disks.iter().map(|f| f as &dyn Function);
+        let input = core::iter::once(Some(&self.input as &dyn Function));
+        let network = self
+            .network_slot
+            .then(|| self.network.as_ref().map(|f| f as &dyn Function));
+        let bluetooth = self.bluetooth.iter().map(|f| Some(f as &dyn Function));
+        let disks = self.disks.iter().map(|f| Some(f as &dyn Function));
         let mut functions = input.chain(network).chain(bluetooth).chain(disks);
-        functions.nth(port).expect("a port of the hub's count")
+        functions.nth(port).flatten().expect("an attached hub port")
     }
 }
 
@@ -554,6 +569,9 @@ impl UsbClient<'_> {
     pub fn backpressure(&self) -> MuxBackpressure {
         self.0.backpressure()
     }
+    pub fn stream_stats(&self, stream: MuxStream) -> Option<MuxStreamStats> {
+        self.0.stream_stats(stream)
+    }
     pub fn control_ready(&self) -> bool {
         self.0.control_ready()
     }
@@ -701,6 +719,14 @@ impl AppleDevices {
         self.nor
             .and_then(|id| self.bus.device_mut::<Spi>(id))
             .map_or_else(Vec::new, Spi::take_dirty)
+    }
+
+    /// Take the board NOR's SPI and command counters for this report interval.
+    #[cfg(feature = "native-profile")]
+    pub fn take_spi_nor_profile(&mut self) -> Option<String> {
+        self.nor
+            .and_then(|id| self.bus.device_mut::<Spi>(id))
+            .map(Spi::take_profile)
     }
 
     /// Drain the `sks`/`pnon`/`scrd` traffic the SEP observed this run under

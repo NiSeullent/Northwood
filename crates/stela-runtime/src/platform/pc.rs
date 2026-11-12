@@ -21,3 +21,4 @@ pub mod gpt;
 pub mod machine_state;
 pub mod power;
 pub mod storage;
+pub mod swap;

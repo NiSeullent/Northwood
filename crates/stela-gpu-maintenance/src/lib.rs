@@ -175,8 +175,19 @@ impl Payload {
             payload.kext_uuid == hex::encode(payload.source_uuid(root)?),
             "GPU payload source UUID differs from its kext objects"
         );
-        let executable = fs::read(root.join(PLUGIN).join("Contents/MacOS/StelaGPU"))?;
-        let mut actual = stela_loader::plugin::code_hashes(&executable)?;
+        use stela_loader::plugin::{self, BundleSeal, CODE_RESOURCES_PATH};
+        let bundle = root.join(PLUGIN);
+        let executable = fs::read(bundle.join("Contents/MacOS/StelaGPU"))?;
+        let mut actual = match fs::read(bundle.join(CODE_RESOURCES_PATH)) {
+            Ok(resources) => {
+                let info = fs::read(bundle.join("Contents/Info.plist"))?;
+                plugin::bundle_code_hashes(&executable, BundleSeal::new(&info, &resources))?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                plugin::code_hashes(&executable)?
+            }
+            Err(error) => return Err(error).context("reading GPU bundle CodeResources"),
+        };
         let mut listed = stela_loader::trust_cache::code_hashes(&fs::read(
             root.join(KEXT)
                 .join(stela_loader::aux_kc::TRUSTED_CODE_FILE),

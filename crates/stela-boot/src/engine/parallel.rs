@@ -14,7 +14,6 @@ use stela_contracts::refuse;
 use stela_engine::machine::Cpu;
 use stela_engine::machine::Host;
 use stela_engine::machine::Machine;
-use stela_engine::machine::Stop;
 use stela_engine::machine::ctrr;
 use stela_engine::machine::engine::Kick;
 use stela_engine::machine::engine::SharedDevices;
@@ -23,6 +22,7 @@ use stela_engine::machine::engine::WorkerProfile;
 use stela_engine::machine::engine::publication::WorkerBinding;
 pub(crate) use stela_engine::machine::engine::{Counts, RunBudget};
 use stela_engine::machine::exception::Pstate;
+use stela_engine::machine::{Requirement, RequirementKind, Stop};
 use stela_soc::machine::AppleDevices;
 
 /// Engine heap bytes per byte of kept block buffers and index/FIFO metadata
@@ -182,7 +182,8 @@ impl Pe {
             own().saturating_sub(before).max(0) >> 10
         ));
         // Waits return to this loop, which publishes the counts.
-        machine.set_wait_limit(Some(host::COUNTER_HZ / WAIT_POLLS_PER_SECOND));
+        let slice_ticks = host::COUNTER_HZ / WAIT_POLLS_PER_SECOND;
+        machine.set_wait_limit(Some(slice_ticks));
         if let Err(stop) = machine.start_parallel(Arc::clone(&hub), core_locks, address) {
             stopped(pe, stop);
         }
@@ -202,12 +203,40 @@ impl Pe {
         let mut stored_report = None;
         // This PE's part of giving the screen its frames while it runs.
         let mut screen = Share::new(super::display::BUSY_SHARE);
+        // A budget or host-service yield does not show that admission
+        // succeeded. Keep the same deadline until guest execution advances.
+        let mut ram_busy_since = None;
+        let mut reported_ram_retry = false;
         loop {
             let limit = machine.statistics.blocks + SLICE;
+            let retired = machine.cpu.retired;
             let stop = machine.run_with_budget(RunBudget {
                 blocks: limit,
-                host_ticks: Some(host::COUNTER_HZ / WAIT_POLLS_PER_SECOND),
+                host_ticks: Some(slice_ticks),
             });
+            if machine.cpu.retired != retired
+                && ram_busy_since.take().is_some()
+                && !reported_ram_retry
+            {
+                output::arguments(format_args!(
+                    "PARALLEL PE {pe} resumed after registered RAM service busy\n"
+                ));
+                reported_ram_retry = true;
+            }
+            if let Stop::Unsupported(Requirement {
+                kind: RequirementKind::NativeRamServiceBusy,
+                ..
+            }) = &stop
+            {
+                let now = host::fresh_counter();
+                let since = *ram_busy_since.get_or_insert(now);
+                if now.wrapping_sub(since) < slice_ticks {
+                    // The next scheduler pass drains Hub mail and can park
+                    // this PE for the BSP. No native block or RAM loan is live.
+                    machine.host.relax();
+                    continue;
+                }
+            }
             #[cfg(feature = "native-profile")]
             if step_timing {
                 let counter = host::fresh_counter();

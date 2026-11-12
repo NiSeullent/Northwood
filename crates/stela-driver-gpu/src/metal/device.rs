@@ -138,6 +138,7 @@ pub struct Device<B: Backend, C: Compiler> {
     backend: B,
     compiler: C,
     capabilities: Capabilities,
+    hosted_lavapipe: bool,
     descriptors: DescriptorHeap,
     /// The universal queue's timeline: command buffer `n` signals `n`.
     timeline: Semaphore,
@@ -332,7 +333,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     /// Opens the device, refusing Vulkan devices that lack a feature the
     /// binding ABI or command model relies on.
-    pub fn new(mut backend: B, compiler: C, platform: &Platform) -> Result<Self> {
+    pub fn new(backend: B, compiler: C, platform: &Platform) -> Result<Self> {
         let physical = backend.physical_device();
         if let Some(missing) = requirements(&physical.features)
             .iter()
@@ -346,14 +347,36 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             compiler.features(),
             ApiFeatures::IMPLEMENTED,
         );
-        let layout = HeapLayout::new(&physical.limits);
+        Self::new_with_capabilities(backend, compiler, capabilities, false)
+    }
+
+    #[cfg(any(test, feature = "metal-linked"))]
+    pub(super) fn new_hosted_lavapipe(backend: B, compiler: C) -> Result<Self> {
+        let capabilities = Capabilities::hosted_lavapipe(backend.physical_device())?;
+        Self::new_with_capabilities(backend, compiler, capabilities, true)
+    }
+
+    fn new_with_capabilities(
+        mut backend: B,
+        compiler: C,
+        capabilities: Capabilities,
+        hosted_lavapipe: bool,
+    ) -> Result<Self> {
+        let layout = HeapLayout::new(&backend.physical_device().limits);
         let timeline = backend.create_semaphore(0)?;
-        let completion = backend.export_semaphore(timeline);
-        let marker = completion_marker(&mut backend);
+        let (completion, marker) = if backend.uses_guest_copy_transport() {
+            (None, None)
+        } else {
+            (
+                backend.export_semaphore(timeline),
+                completion_marker(&mut backend),
+            )
+        };
         Ok(Self {
             backend,
             compiler,
             capabilities,
+            hosted_lavapipe,
             descriptors: DescriptorHeap::new(layout),
             timeline,
             marker,
@@ -384,6 +407,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    pub(super) fn is_hosted_lavapipe(&self) -> bool {
+        self.hosted_lavapipe
     }
 
     pub fn backend(&mut self) -> &mut B {

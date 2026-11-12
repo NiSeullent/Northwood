@@ -18,6 +18,24 @@ pub(super) fn system(options: &System) -> Result<(), Error> {
     {
         return Err(Error::Constraint(Constraint::NativePciIoapicExclusive));
     }
+    if options.network_check_ranges.len() > MAX_NETWORK_CHECK_RANGES {
+        return Err(Error::NetworkCheckRangeLimit);
+    }
+    if !options.network_check_ranges.is_empty()
+        && (options.network_check.is_some() || options.network_check_get.is_some())
+    {
+        return Err(Error::DuplicateNetworkCheck);
+    }
+    for range in &options.network_check_ranges {
+        range.check()?;
+    }
+    if options.network_check_reopen
+        && !matches!(options.network_check_ranges.as_slice(), [first, second]
+            if first.url == second.url && first.total == second.total && first.etag == second.etag
+                && parse_url(&first.url)?.scheme == stela_runtime::net::http::Scheme::Http)
+    {
+        return Err(Error::NetworkCheckReopen);
+    }
     Ok(())
 }
 

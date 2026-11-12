@@ -575,6 +575,10 @@ impl<I: Io> Bot<I> {
     pub fn poisoned(&self) -> bool {
         self.poisoned
     }
+    /// Observe the class state without polling or progressing a recovery.
+    pub(super) fn command_pending(&self) -> bool {
+        self.begun.is_some() || self.recovery.is_some()
+    }
     pub fn now_us(&self) -> u64 {
         self.io.now_us()
     }

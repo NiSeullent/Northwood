@@ -153,6 +153,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         use stela_compiler::block::{
             FaultRecovery, HostFaultSnapshot, RecoverySiteKind, RetirementPhase,
         };
+        if matches!(fault.cause, FaultCause::RamBinding) {
+            return Err(self.fail_native(index, fault, NativeFailureReason::RamBinding));
+        }
         // Source maps locate diagnostics; only a checked exact
         // operand/check site can authorize architectural fault projection.
         let Some(block) = self.code.blocks.get(index) else {
@@ -223,10 +226,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                                 FaultCause::InvalidOpcode => access.atomic(),
                                 FaultCause::NonCanonical
                                 | FaultCause::Device { .. }
+                                | FaultCause::NonresidentRam { .. }
                                 | FaultCause::Translation(_)
                                 | FaultCause::Watched
                                 | FaultCause::TagChecked => true,
-                                FaultCause::Guest(_) => false,
+                                FaultCause::Guest(_) | FaultCause::RamBinding => false,
                             }
                     })
             }
@@ -280,6 +284,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if pc != entry_pc {
             self.cpu.pstate.btype = 0;
         }
+        // Keep the settled source PC and committed prefix. A nonresident
+        // operand or descriptor needs page recovery before executing it again.
+        if let FaultCause::NonresidentRam { frame } = fault.cause {
+            return Err(self.unsupported(RequirementKind::NonresidentRam { frame }));
+        }
         // A native DC ZVA's first store, a native DC clean's read of Xt, or
         // a native exclusive faulted with nothing written (a DC ZVA block is
         // in one page): the engine completes the instruction, reporting Xt
@@ -323,6 +332,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 let address = self.tagged_fault_address(index, pc, fault.address);
                 self.data_abort(address, guest, fault.write, false)
             }
+            FaultCause::NonresidentRam { .. } => unreachable!("returned before emulation"),
+            FaultCause::RamBinding => unreachable!("returned before recovery"),
             FaultCause::Device { physical } => {
                 let word = self.word(index, pc)?;
                 let site = self.device_site_of(index, pc);

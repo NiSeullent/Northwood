@@ -94,6 +94,7 @@ pub(super) fn attach_i8042(
     session: &crate::platform::acpi::Session,
     clock: crate::Clock,
     smbus_hosts: &[super::smbus::Host],
+    usb_legacy_released: bool,
     devices: &mut super::Devices,
 ) {
     use super::{i2c::hardware_id, services::ids};
@@ -156,9 +157,15 @@ pub(super) fn attach_i8042(
         let Some(config) = i8042(direct || !keyboards.is_empty(), !mice.is_empty(), &io)? else {
             return Ok(None);
         };
+        if !usb_legacy_released {
+            return Err(PlatformError::Refused(
+                "USB legacy interception was not ruled out",
+            ));
+        }
         // SAFETY: the namespace lists an i8042 at the standard ports, or the
         // FADT says the board has one there, and the mount's NativeServices
-        // contract grants those ports with IRQ1 and IRQ12 masked.
+        // contract grants those ports with IRQ1 and IRQ12 masked. Every USB
+        // host was checked for legacy interception before probing the ports.
         let registers = unsafe { ps2::PortIo::claim() };
         let firmware_id = match mice.first() {
             Some(mouse) => firmware_id(&pnp_ids(*mouse)?),

@@ -16,13 +16,18 @@
 //! when they allow host transfers and otherwise at the start of the next
 //! submission, and stay there.
 mod blocks;
+mod copy_memory;
 mod deferral;
 mod device_generated;
+mod host_memory;
+#[cfg(feature = "metal-linked")]
+mod lavapipe;
 mod memory;
 mod objects;
 mod physical;
 pub mod pipeline_store;
 mod record;
+mod software;
 mod sparse;
 #[cfg(test)]
 mod tests;
@@ -31,12 +36,12 @@ mod zero;
 use super::{
     binding::{HEAP_SET, HeapLayout, NULL_DESCRIPTOR, PushConstants},
     command_buffer::Segment,
-    error::{Error, Result, ensure},
+    error::{Error, Result, ensure, require},
     vulkan::{
         SampleCounts,
         backend::{
-            Backend, BufferAllocation, Descriptor, MemoryBlocks, Object, Outside, PreparedImport,
-            Requirements, requirements,
+            Backend, BufferAllocation, Descriptor, GUEST_COPY_WAIT_NS, GuestRows, MemoryBlocks,
+            Object, Outside, PreparedImport, Requirements, requirements,
         },
         command::{BufferImageCopy, Command, Subresource},
         object::{
@@ -59,6 +64,7 @@ use alloc::{
 pub use ash::vk;
 use ash::{ext, khr};
 use blocks::{Candidate, Needs, Purpose, Resident, Source, Tiling};
+pub use copy_memory::{GuestCopyLease, GuestCopyProvider};
 use core::{
     any::Any,
     cell::UnsafeCell,
@@ -68,7 +74,13 @@ use core::{
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
+pub use host_memory::{HostAllocation, HostMemoryExporter};
+#[cfg(feature = "metal-linked")]
+pub use lavapipe::open_copied_lavapipe;
+#[cfg(all(feature = "metal-linked", not(target_os = "uefi")))]
+pub use lavapipe::{open_copied_lavapipe as open_hosted_copied_lavapipe, open_hosted_lavapipe};
 use physical::{Extensions, FeatureChain};
+pub use software::{SoftwareDevice, probe_software};
 use stela_contracts::gate::MemoryRange;
 
 /// The driver's loader entry point, and where its messages go.
@@ -455,7 +467,10 @@ pub struct NativeBackend {
     mappings: BTreeMap<u64, Mapping>,
     /// What each [`Memory`] value names, and the blocks resources share.
     memories: memory::Memories,
-    exporter: ManuallyDrop<Arc<dyn MemoryExporter>>,
+    exporter: ManuallyDrop<Option<Arc<dyn MemoryExporter>>>,
+    /// Host leases must also survive an unsuccessful device idle query.
+    host_imports: ManuallyDrop<Option<host_memory::Imports>>,
+    copy_imports: ManuallyDrop<Option<copy_memory::Imports>>,
     /// The driver work calls do outside the service's turn: imports'
     /// exports and allocations, and frees of evicted kept imports.
     outside: Arc<NativeOutside>,
@@ -551,6 +566,59 @@ fn failure(result: vk::Result) -> Error {
 // are this backend's alone.
 unsafe impl Send for NativeBackend {}
 
+fn application() -> vk::ApplicationInfo<'static> {
+    vk::ApplicationInfo::default()
+        .application_name(c"Stela Metal")
+        .engine_name(c"Stela")
+        .api_version(vk::API_VERSION_1_3)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Target {
+    Pci(PciBusInfo),
+    Software,
+}
+
+impl Target {
+    fn matches(self, device: &PhysicalDevice) -> bool {
+        use super::vulkan::{DriverId, PhysicalDeviceType};
+        let identity = &device.identity;
+        match self {
+            Self::Pci(pci) => {
+                identity.driver_id != DriverId::MesaLlvmPipe && identity.pci_bus == Some(pci)
+            }
+            Self::Software => {
+                identity.driver_id == DriverId::MesaLlvmPipe
+                    && identity.device_type == PhysicalDeviceType::Cpu
+                    && identity.pci_bus.is_none()
+                    && identity.api_version >= vk::API_VERSION_1_3
+            }
+        }
+    }
+}
+
+enum MemorySource {
+    DmaBuf(Box<dyn MemoryExporter>),
+    Host(Box<dyn HostMemoryExporter>),
+    #[cfg(all(feature = "metal-linked", not(target_os = "uefi")))]
+    HostedLavapipe(Box<dyn HostMemoryExporter>),
+    #[cfg(feature = "metal-linked")]
+    CopiedLavapipe(Box<dyn GuestCopyProvider>),
+}
+
+fn check_dma_buf(physical: &PhysicalDevice) -> Result<()> {
+    if let Some(missing) = requirements(&physical.features)
+        .iter()
+        .find(|requirement| !requirement.present)
+    {
+        return Err(Error::Unsupported(missing.name));
+    }
+    if !physical.limits.dma_buf_import {
+        return Err(Error::Unsupported("VK_EXT_external_memory_dma_buf"));
+    }
+    Ok(())
+}
+
 impl NativeBackend {
     /// Creates the instance and device of the GPU at `pci`.
     ///
@@ -565,15 +633,54 @@ impl NativeBackend {
         exporter: Box<dyn MemoryExporter>,
         kernels: impl FnOnce(vk::PhysicalDevice) -> Result<InternalKernels>,
     ) -> Result<Self> {
+        // SAFETY: this caller supplies the driver and its compiler's kernels.
+        unsafe {
+            Self::open(
+                loader,
+                Target::Pci(pci),
+                MemorySource::DmaBuf(exporter),
+                kernels,
+            )
+        }
+    }
+
+    /// Opens the admitted lavapipe CPU device using leased host allocations
+    /// for imported buffers. Uses the same shader and queue requirements as
+    /// [`probe_software`].
+    ///
+    /// # Safety
+    ///
+    /// `loader` and `kernels` have the same validity requirements as in
+    /// [`Self::new`]. The exporter provides the original host mappings with
+    /// the lifetime and synchronization contract of [`HostAllocation`].
+    pub unsafe fn new_software(
+        loader: Loader,
+        exporter: Box<dyn HostMemoryExporter>,
+        kernels: impl FnOnce(vk::PhysicalDevice) -> Result<InternalKernels>,
+    ) -> Result<Self> {
+        // SAFETY: the caller supplies the CPU driver and its compiler's kernels.
+        unsafe {
+            Self::open(
+                loader,
+                Target::Software,
+                MemorySource::Host(exporter),
+                kernels,
+            )
+        }
+    }
+
+    unsafe fn open(
+        loader: Loader,
+        target: Target,
+        source: MemorySource,
+        kernels: impl FnOnce(vk::PhysicalDevice) -> Result<InternalKernels>,
+    ) -> Result<Self> {
         let static_fn = ash::StaticFn {
             get_instance_proc_addr: loader.get_instance_proc_addr,
         };
         // SAFETY: the caller guarantees the entry point.
         let entry = unsafe { ash::Entry::from_static_fn(static_fn) };
-        let application = vk::ApplicationInfo::default()
-            .application_name(c"Stela Metal")
-            .engine_name(c"Stela")
-            .api_version(vk::API_VERSION_1_3);
+        let application = application();
         // SAFETY: the caller guarantees the entry point.
         let debug_utils =
             unsafe { entry.enumerate_instance_extension_properties(None) }.is_ok_and(|offered| {
@@ -598,29 +705,48 @@ impl NativeBackend {
             }
             instance.destroy_instance(None);
         };
-        let selected = Self::select(&instance, pci, loader.log);
+        let selected = Self::select(&instance, target, loader.log);
         let Some((physical, extensions, snapshot, family)) = selected else {
             destroy_instance(&instance);
-            return Err(Error::Unsupported("Vulkan device of the GPU"));
+            return Err(Error::Unsupported(match target {
+                Target::Pci(_) => "Vulkan device of the GPU",
+                Target::Software => "Vulkan lavapipe CPU device",
+            }));
         };
-        if let Some(missing) = requirements(&snapshot.features)
-            .iter()
-            .find(|requirement| !requirement.present)
-        {
-            destroy_instance(&instance);
-            return Err(Error::Unsupported(missing.name));
-        }
-        if !snapshot.limits.dma_buf_import {
-            destroy_instance(&instance);
-            return Err(Error::Unsupported("VK_EXT_external_memory_dma_buf"));
-        }
+        let admission = match &source {
+            MemorySource::DmaBuf(_) => check_dma_buf(&snapshot).map(|()| None),
+            MemorySource::Host(_) => {
+                let (fp32, alignment) =
+                    software::probe_properties(&instance, physical, &extensions);
+                software::check(&snapshot, alignment, fp32).map(Some)
+            }
+            #[cfg(all(feature = "metal-linked", not(target_os = "uefi")))]
+            MemorySource::HostedLavapipe(_) => {
+                let (_, alignment) = software::probe_properties(&instance, physical, &extensions);
+                software::check_hosted_lavapipe(&snapshot, alignment).map(Some)
+            }
+            #[cfg(feature = "metal-linked")]
+            MemorySource::CopiedLavapipe(_) => {
+                software::check_hosted_features(&snapshot).map(|()| None)
+            }
+        };
+        let host_alignment = match admission {
+            Ok(alignment) => alignment,
+            Err(error) => {
+                destroy_instance(&instance);
+                return Err(error);
+            }
+        };
 
         let mut features = FeatureChain::new(&extensions, false);
         // SAFETY: `physical` came from this instance; the chain links only
         // structures of supported extensions.
         unsafe { instance.get_physical_device_features2(physical, &mut features.core) };
         features.for_enabling();
-        let names = extensions.enabled();
+        let mut names = extensions.enabled();
+        if host_alignment.is_some() {
+            names.push(ext::external_memory_host::NAME.as_ptr());
+        }
         let priority = [1.0];
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
@@ -638,6 +764,15 @@ impl NativeBackend {
             }
         };
         let has = |name| extensions.has(name);
+        // The bounded CPU profile polls its timeline internally. Lavapipe
+        // can expose the FD extension without exporting opaque-FD timelines.
+        let export_semaphores = match &source {
+            #[cfg(all(feature = "metal-linked", not(target_os = "uefi")))]
+            MemorySource::HostedLavapipe(_) => false,
+            #[cfg(feature = "metal-linked")]
+            MemorySource::CopiedLavapipe(_) => false,
+            _ => has(khr::external_semaphore_fd::NAME),
+        };
         let fns = ExtensionFns {
             host_image_copy: has(ext::host_image_copy::NAME)
                 .then(|| ext::host_image_copy::Device::new(&instance, &device)),
@@ -653,7 +788,7 @@ impl NativeBackend {
                 .then(|| khr::calibrated_timestamps::Device::new(&instance, &device)),
             external_memory_fd: has(khr::external_memory_fd::NAME)
                 .then(|| khr::external_memory_fd::Device::new(&instance, &device)),
-            external_semaphore_fd: has(khr::external_semaphore_fd::NAME)
+            external_semaphore_fd: export_semaphores
                 .then(|| khr::external_semaphore_fd::Device::new(&instance, &device)),
             // A requirement: the device was refused without it.
             conditional: ext::conditional_rendering::Device::new(&instance, &device),
@@ -691,7 +826,25 @@ impl NativeBackend {
         }
         let memories = memory::Memories::new(snapshot.limits.buffer_image_granularity);
         let zeroing = zero::Zeroing::new(snapshot.limits.max_buffer_size, loader.log);
-        let exporter: Arc<dyn MemoryExporter> = Arc::from(exporter);
+        let host = |exporter| {
+            Some(host_memory::Imports::new(
+                exporter,
+                &instance,
+                &device,
+                physical,
+                host_alignment.expect("host admission"),
+            ))
+        };
+        let (exporter, host_imports, copy_imports) = match source {
+            MemorySource::DmaBuf(exporter) => (Some(Arc::from(exporter)), None, None),
+            MemorySource::Host(exporter) => (None, host(exporter), None),
+            #[cfg(all(feature = "metal-linked", not(target_os = "uefi")))]
+            MemorySource::HostedLavapipe(exporter) => (None, host(exporter), None),
+            #[cfg(feature = "metal-linked")]
+            MemorySource::CopiedLavapipe(provider) => {
+                (None, None, Some(copy_memory::Imports::new(provider)))
+            }
+        };
         let outside = Arc::new(NativeOutside::new(
             device.clone(),
             exporter.clone(),
@@ -720,6 +873,8 @@ impl NativeBackend {
             memories,
             outside,
             exporter: ManuallyDrop::new(exporter),
+            host_imports: ManuallyDrop::new(host_imports),
+            copy_imports: ManuallyDrop::new(copy_imports),
             imports: BTreeMap::new(),
             import_cache: ImportCache::default(),
             retired: VecDeque::new(),
@@ -774,12 +929,11 @@ impl NativeBackend {
         Ok(backend)
     }
 
-    /// The device at `pci` with a universal queue family, its supported
-    /// extensions, its snapshot and the family. When none is, why each
-    /// device the driver offers is not goes to `log`.
+    /// The matching device with a universal queue family, its supported
+    /// extensions, its snapshot and the family. Logs any refusals.
     fn select(
         instance: &ash::Instance,
-        pci: PciBusInfo,
+        target: Target,
         log: fn(&str),
     ) -> Option<(vk::PhysicalDevice, Extensions, PhysicalDevice, u32)> {
         // SAFETY: the instance is valid.
@@ -812,10 +966,10 @@ impl NativeBackend {
                 ));
                 return None;
             };
-            if snapshot.identity.pci_bus != Some(pci) {
+            if !target.matches(&snapshot) {
                 rejected.push(format!(
-                    "Vulkan device {index}: at {:?}, not the GPU's {pci:?}",
-                    snapshot.identity.pci_bus
+                    "Vulkan device {index}: {:?} at {:?} does not match {target:?}",
+                    snapshot.identity.driver_id, snapshot.identity.pci_bus
                 ));
                 return None;
             }
@@ -863,7 +1017,7 @@ impl NativeBackend {
         });
         if selected.is_none() {
             log(&format!(
-                "Vulkan offers {} physical devices, none the GPU's {pci:?}",
+                "Vulkan offers {} physical devices, none matching {target:?}",
                 devices.len()
             ));
             rejected.iter().for_each(|reason| log(reason));
@@ -1109,6 +1263,31 @@ impl NativeBackend {
         let Some(allocation) = self.memories.remove(memory) else {
             return;
         };
+        if let Some(import) = self
+            .copy_imports
+            .as_mut()
+            .and_then(|copies| copies.owned.remove(&memory.0))
+        {
+            let token = import.token;
+            drop(import);
+            self.retired.push_back(token);
+        }
+        if let memory::Allocation::Whole { memory, resource } = allocation
+            && let Some(import) = self
+                .host_imports
+                .as_mut()
+                .and_then(|host| host.remove(memory))
+        {
+            if resource {
+                self.memories.blocks.release_own();
+            }
+            self.mappings.remove(&raw(memory));
+            self.zeroing.forget(&self.device, memory);
+            let token = import.token;
+            import.free(&self.device);
+            self.retired.push_back(token);
+            return;
+        }
         if let memory::Allocation::Whole { memory, resource } = allocation
             && let Some((exported, token, ranges)) = self.imports.remove(&raw(memory))
         {
@@ -1163,7 +1342,10 @@ impl NativeBackend {
             // SAFETY: as above; nothing else holds it.
             unsafe { self.device.free_memory(freed.memory, None) };
             if let Some(exported) = freed.exported {
-                self.exporter.unmap(exported);
+                self.exporter
+                    .as_ref()
+                    .expect("dma-buf exporter")
+                    .unmap(exported);
             }
         }
     }
@@ -1393,7 +1575,13 @@ impl NativeBackend {
     }
 
     /// As [`Self::image_needs`], of a buffer.
-    fn buffer_needs(&self, buffer: vk::Buffer) -> (vk::MemoryRequirements, bool) {
+    fn buffer_needs(
+        &self,
+        buffer: vk::Buffer,
+    ) -> (
+        vk::MemoryRequirements,
+        vk::MemoryDedicatedRequirements<'static>,
+    ) {
         let info = vk::BufferMemoryRequirementsInfo2::default().buffer(buffer);
         let mut dedicated = vk::MemoryDedicatedRequirements::default();
         let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
@@ -1403,7 +1591,7 @@ impl NativeBackend {
                 .get_buffer_memory_requirements2(&info, &mut requirements)
         };
         let needs = requirements.memory_requirements;
-        (needs, own(&dedicated))
+        (needs, dedicated)
     }
 
     /// Moves a new image to `GENERAL`: on the host when it allows host
@@ -1633,6 +1821,15 @@ impl Drop for NativeBackend {
         };
         self.memories.blocks.release_all(&mut source);
         self.zeroing.destroy(&self.device);
+        if let Some(host) = self.host_imports.as_mut() {
+            host.release(&self.device);
+        }
+        if let Some(copies) = self.copy_imports.as_mut()
+            && let Some((checkpoint, _)) = copies.checkpoint.take()
+        {
+            // SAFETY: the device acknowledged idle above.
+            unsafe { self.device.destroy_semaphore(checkpoint, None) };
+        }
         let kept = self.import_cache.drain().map(|kept| Freed {
             memory: kept.memory,
             exported: Some(kept.exported),
@@ -1651,7 +1848,10 @@ impl Drop for NativeBackend {
             // SAFETY: the device is idle and the Metal device freed it.
             unsafe { self.device.free_memory(freed.memory, None) };
             if let Some(exported) = freed.exported {
-                self.exporter.unmap(exported);
+                self.exporter
+                    .as_ref()
+                    .expect("dma-buf exporter")
+                    .unmap(exported);
             }
         }
         // SAFETY: after the device idles, nothing uses any object, and each
@@ -1682,6 +1882,8 @@ impl Drop for NativeBackend {
                 messenger.destroy();
             }
             self.instance.destroy_instance(None);
+            ManuallyDrop::drop(&mut self.host_imports);
+            ManuallyDrop::drop(&mut self.copy_imports);
             ManuallyDrop::drop(&mut self.exporter);
             ManuallyDrop::drop(&mut self._entry);
         }
@@ -1795,7 +1997,7 @@ struct Upkeep {
 /// processor's Linux.
 pub(crate) struct NativeOutside {
     device: ash::Device,
-    exporter: Arc<dyn MemoryExporter>,
+    exporter: Option<Arc<dyn MemoryExporter>>,
     /// The memory type imports take, `u32::MAX` until an import found it:
     /// every dma-buf the exporter makes is guest RAM of one kind, and asking
     /// NVK for a descriptor's types imports, maps, unmaps and closes it,
@@ -1841,7 +2043,7 @@ impl NativeOutside {
 
     fn new(
         device: ash::Device,
-        exporter: Arc<dyn MemoryExporter>,
+        exporter: Option<Arc<dyn MemoryExporter>>,
         exportable: bool,
         relax: fn(),
     ) -> Self {
@@ -1887,7 +2089,10 @@ impl NativeOutside {
                 Ok(memory)
             }
             Err(error) => {
-                self.exporter.close(*exported);
+                self.exporter
+                    .as_ref()
+                    .expect("dma-buf exporter")
+                    .close(*exported);
                 self.import_type.store(u32::MAX, Ordering::Release);
                 Err(failure(error))
             }
@@ -1997,7 +2202,10 @@ impl NativeOutside {
         // and no import took it back.
         unsafe { self.device.free_memory(freed.memory, None) };
         if let Some(exported) = freed.exported {
-            self.exporter.unmap(exported);
+            self.exporter
+                .as_ref()
+                .expect("dma-buf exporter")
+                .unmap(exported);
         }
     }
 }
@@ -2016,7 +2224,11 @@ impl Outside for NativeOutside {
                 // The first import finds the type in the turn.
                 return Ok(None);
             };
-            let exported = self.exporter.export(ranges)?;
+            let exported = self
+                .exporter
+                .as_ref()
+                .expect("dma-buf exporter")
+                .export(ranges)?;
             let memory = self.allocate_import(&exported, index)?;
             Ok(Some(MadeImport {
                 memory,
@@ -2106,7 +2318,10 @@ impl Outside for NativeOutside {
         });
         // The driver took the descriptor; the host's mapping is the
         // exporter's either way.
-        self.exporter.unmap(exported);
+        self.exporter
+            .as_ref()
+            .expect("dma-buf exporter")
+            .unmap(exported);
     }
 }
 
@@ -2145,6 +2360,86 @@ impl Backend for NativeBackend {
 
     fn physical_device(&self) -> &PhysicalDevice {
         &self.snapshot
+    }
+
+    fn is_host_pointer_import(&self, memory: Memory) -> bool {
+        self.host_imports.as_ref().is_some_and(|host| {
+            self.resolve(memory)
+                .is_ok_and(|resolved| host.owned.contains_key(&raw(resolved.memory)))
+        })
+    }
+
+    fn uses_guest_copy_transport(&self) -> bool {
+        self.copy_imports.is_some()
+    }
+
+    fn is_guest_copy_import(&self, memory: Memory) -> bool {
+        self.copy_imports
+            .as_ref()
+            .is_some_and(|copies| copies.owned.contains_key(&memory.0))
+    }
+
+    fn finish_guest_copy_segment(&mut self, mut segment: Segment) -> Result<()> {
+        ensure(
+            segment.signals.is_empty() && !segment.copies_guest_rows(),
+            "a private copy segment cannot signal guest events",
+        )?;
+        let copies = self
+            .copy_imports
+            .as_mut()
+            .ok_or(Error::Unsupported("guest copy checkpoint"))?;
+        let (checkpoint, previous) = match copies.checkpoint {
+            Some(value) => value,
+            None => (self.outside.create_semaphore(0)?, 0),
+        };
+        let value = previous.checked_add(1).ok_or(Error::DeviceLost)?;
+        copies.checkpoint = Some((checkpoint, value));
+        let signal = Semaphore(raw(checkpoint));
+        segment.signals.push((signal, value));
+        self.submit(&[segment])?;
+        if !self.wait_semaphore(signal, value, GUEST_COPY_WAIT_NS)? {
+            return Err(Error::DeviceLost);
+        }
+        match self.submit_failure(signal, value) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    unsafe fn read_guest_rows(&mut self, rows: GuestRows) -> Result<()> {
+        let import = self
+            .copy_imports
+            .as_ref()
+            .and_then(|copies| copies.owned.get(&rows.memory.0))
+            .ok_or(Error::Invalid("unknown copied guest buffer"))?;
+        let bytes = import.check_rows(rows)?;
+        for row in 0..rows.count {
+            let offset = rows.offset + u64::from(row) * rows.stride;
+            let mapped = self.mapping(rows.memory, offset, rows.bytes)?;
+            // SAFETY: the caller fenced the private buffer, and this mapped
+            // span is exclusive while the synchronous provider fills it.
+            let output = unsafe { core::slice::from_raw_parts_mut(mapped.pointer.as_ptr(), bytes) };
+            import.lease.read_into(offset, output)?;
+        }
+        Ok(())
+    }
+
+    unsafe fn publish_guest_rows(&mut self, rows: GuestRows) -> Result<()> {
+        let import = self
+            .copy_imports
+            .as_ref()
+            .and_then(|copies| copies.owned.get(&rows.memory.0))
+            .ok_or(Error::Invalid("unknown copied guest buffer"))?;
+        let bytes = import.check_rows(rows)?;
+        for row in 0..rows.count {
+            let offset = rows.offset + u64::from(row) * rows.stride;
+            let mapped = self.mapping(rows.memory, offset, rows.bytes)?;
+            // SAFETY: the transfer and host visibility barrier completed
+            // before the checkpoint. The mapping is private and coherent.
+            let source = unsafe { core::slice::from_raw_parts(mapped.pointer.as_ptr(), bytes) };
+            import.lease.publish_from(offset, source)?;
+        }
+        Ok(())
     }
 
     fn allocate_memory(
@@ -2191,7 +2486,8 @@ impl Backend for NativeBackend {
             // SAFETY: the create info outlives the call.
             unsafe { self.device.create_buffer(create, None) }.map_err(failure)
         })?;
-        let (needs, own) = self.buffer_needs(buffer);
+        let (needs, dedicated) = self.buffer_needs(buffer);
+        let own = own(&dedicated);
         let resource = Resource {
             tiling: Tiling::Linear,
             alignment: LINEAR_PLACEMENT,
@@ -2239,6 +2535,55 @@ impl Backend for NativeBackend {
     }
 
     fn import_memory(&mut self, ranges: &[MemoryRange], token: NonZeroU64) -> Result<Memory> {
+        if let Some(copies) = self.copy_imports.as_ref() {
+            use super::vulkan::{BufferCreate, BufferUsage, MemoryProperties};
+            // SAFETY: copied service admission limits imports to trusted,
+            // live bidirectional wires until we retire their tokens.
+            let import = unsafe { copies.acquire(ranges, token) }?;
+            require(
+                import.bytes <= self.snapshot.limits.max_buffer_size
+                    && import.bytes <= self.snapshot.limits.max_memory_allocation_size,
+                "copied guest transfer buffer length",
+            )?;
+            let info = BufferInfo {
+                size: import.bytes,
+                usage: BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+                flags: BufferCreate::EMPTY,
+            };
+            let needs = self.buffer_requirements(&info)?;
+            let memory = self.allocate(
+                needs.size,
+                MemoryRequest {
+                    required: MemoryProperties::HOST_VISIBLE | MemoryProperties::HOST_COHERENT,
+                    preferred: MemoryProperties::HOST_CACHED,
+                    mapped: true,
+                },
+                needs.memory_types,
+            )?;
+            self.copy_imports
+                .as_mut()
+                .expect("copy provider")
+                .owned
+                .insert(memory.0, import);
+            return Ok(memory);
+        }
+        if let Some(host) = self.host_imports.as_mut() {
+            let (memory, import) =
+                host.allocate(&self.device, &self.snapshot.memory, ranges, token)?;
+            self.mappings.insert(
+                raw(memory),
+                Mapping {
+                    pointer: import.allocation.pointer,
+                    size: import.allocation.bytes.get(),
+                    coherent: true,
+                },
+            );
+            host.owned.insert(raw(memory), import);
+            return Ok(self.memories.insert(memory::Allocation::Whole {
+                memory,
+                resource: false,
+            }));
+        }
         // The same guest RAM imported again: a freed import of it views the
         // same pages, still bound.
         if let Some(kept) = self.import_cache.take(ranges) {
@@ -2257,7 +2602,8 @@ impl Backend for NativeBackend {
                 resource: false,
             }));
         }
-        let exported = self.exporter.export(ranges)?;
+        let exporter = self.exporter.as_ref().expect("dma-buf exporter");
+        let exported = exporter.export(ranges)?;
         let imported = match self.outside.import_type() {
             Some(index) => Ok(index),
             None => self.import_memory_type(exported.fd),
@@ -2265,7 +2611,7 @@ impl Backend for NativeBackend {
         let index = match imported {
             Ok(index) => index,
             Err(error) => {
-                self.exporter.close(exported);
+                exporter.close(exported);
                 return Err(error);
             }
         };
@@ -2318,18 +2664,56 @@ impl Backend for NativeBackend {
             unsafe { self.device.create_buffer(create, None) }.map_err(failure)
         };
         let resolved = self.resolve(memory)?;
-        let buffer = if self.imports.contains_key(&raw(resolved.memory)) {
+        let copied = self.is_guest_copy_import(memory);
+        if copied {
+            use super::vulkan::BufferUsage;
+            require(
+                offset == 0
+                    && info.usage == (BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST),
+                "copied guest memory can only back a transfer buffer",
+            )?;
+        }
+        let host_import = self.host_imports.as_ref().and_then(|host| {
+            host.owned
+                .get(&raw(resolved.memory))
+                .map(|import| (host, import))
+        });
+        let buffer = if let Some((host, _)) = host_import {
+            host.admit_buffer(&self.instance, info)?;
+            objects::imported_buffer(info, software::HOST_ALLOCATION, create)
+        } else if self.imports.contains_key(&raw(resolved.memory)) {
             objects::imported_buffer(info, DMA_BUF, create)
         } else {
             objects::buffer(info, create)
         }?;
-        // SAFETY: the Metal heap placed the buffer within `memory`, which
-        // starts `resolved.offset` into its `VkDeviceMemory`.
-        let bound = unsafe {
-            self.device
-                .bind_buffer_memory(buffer, resolved.memory, resolved.offset + offset)
-        }
-        .map_err(failure);
+        let bound = (|| {
+            let offset = resolved
+                .offset
+                .checked_add(offset)
+                .ok_or(Error::Invalid("buffer placement offset"))?;
+            if let Some((_, import)) = host_import {
+                let (needs, dedicated) = self.buffer_needs(buffer);
+                if dedicated.requires_dedicated_allocation == vk::TRUE {
+                    return Err(Error::Unsupported("dedicated host allocation buffer"));
+                }
+                import.check_binding(needs, offset)?;
+            }
+            if copied {
+                let (needs, dedicated) = self.buffer_needs(buffer);
+                require(
+                    dedicated.requires_dedicated_allocation == vk::FALSE,
+                    "dedicated copied guest transfer buffer",
+                )?;
+                self.mapping(memory, 0, needs.size)?;
+            }
+            // SAFETY: the Metal heap placed the buffer within `memory`,
+            // which starts `resolved.offset` into its `VkDeviceMemory`.
+            unsafe {
+                self.device
+                    .bind_buffer_memory(buffer, resolved.memory, offset)
+            }
+            .map_err(failure)
+        })();
         self.or_destroy(bound, &[Object::Buffer(Buffer(raw(buffer)))])?;
         Ok((Buffer(raw(buffer)), self.address(buffer, info)))
     }
@@ -2391,6 +2775,15 @@ impl Backend for NativeBackend {
         memory: Memory,
         offset: u64,
     ) -> Result<Image> {
+        require(
+            !self.is_guest_copy_import(memory),
+            "image binding to copied guest memory",
+        )?;
+        if let Some(host) = self.host_imports.as_ref()
+            && host.owned.contains_key(&raw(self.resolve(memory)?.memory))
+        {
+            return Err(Error::Unsupported("image binding to a host allocation"));
+        }
         let image = objects::image(info, |create| {
             // SAFETY: the create info and its chain outlive the call.
             unsafe { self.device.create_image(create, None) }.map_err(failure)
@@ -2933,6 +3326,10 @@ impl Backend for NativeBackend {
     }
 
     fn submit(&mut self, segments: &[Segment]) -> Result<()> {
+        ensure(
+            !segments.iter().any(Segment::copies_guest_rows),
+            "host copies must be resolved before Vulkan submission",
+        )?;
         let started = (self.ticks)();
         // The device's completion poll frees what it finds complete
         // (`semaphore_value`). Asking the timeline again here would cost

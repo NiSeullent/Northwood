@@ -1670,6 +1670,7 @@ fn initial_halted_requester_drain_failure_precedes_fresh_mapping_and_bme() {
     };
     assert_eq!(failure.error, Error::Dma(DmaError::DrainUnavailable));
     assert!(failure.is_quarantined());
+    assert_eq!(failure.legacy_released(), Some(true));
     let m = m.lock().unwrap();
     assert_eq!(m.allocations, 0);
     assert!(!m.mapped && !m.bme && !m.retired);
@@ -1691,6 +1692,7 @@ fn sticky_legacy_smi_enable_refuses_handoff_before_reset_dma_and_bme() {
     };
     assert_eq!(failure.error, Error::Register);
     assert!(failure.is_quarantined());
+    assert_eq!(failure.legacy_released(), Some(false));
     let m = m.lock().unwrap();
     assert_eq!(m.allocations, 0);
     assert!(!m.bme && !m.mapped);

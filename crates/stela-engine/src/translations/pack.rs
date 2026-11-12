@@ -25,7 +25,7 @@ use alloc::{
     vec::Vec,
 };
 pub use codec::{DecodeError, DecodeScratch};
-use core::mem::size_of;
+use core::{mem::size_of, ops::Range};
 use stela_crypto::Sha256;
 use stela_crypto::digest::Digest as _;
 
@@ -102,6 +102,10 @@ impl PackFormat {
 /// The bytes of the header, index and index checksum of the pack whose
 /// header is `header`: what to read before its records.
 pub fn prefix_bytes(header: &[u8], translator: &Digest) -> Result<usize, PackError> {
+    read_header(header, translator).map(|(_, count)| prefix_length(count))
+}
+
+fn read_header(header: &[u8], translator: &Digest) -> Result<(PackFormat, usize), PackError> {
     if header.len() < HEADER_BYTES {
         return Err(PackError::Truncated);
     }
@@ -109,7 +113,7 @@ pub fn prefix_bytes(header: &[u8], translator: &Digest) -> Result<usize, PackErr
         return Err(PackError::Magic);
     }
     let word = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().expect("a word"));
-    PackFormat::read(header)?;
+    let format = PackFormat::read(header)?;
     let count = word(MAGIC.len() + 4) as usize;
     if count > MAX_RECORDS {
         return Err(PackError::Count);
@@ -117,44 +121,27 @@ pub fn prefix_bytes(header: &[u8], translator: &Digest) -> Result<usize, PackErr
     if header[MAGIC.len() + 8..HEADER_BYTES] != translator.0 {
         return Err(PackError::Translator);
     }
-    Ok(HEADER_BYTES + count * INDEX_ENTRY_BYTES + CHECKSUM_BYTES)
+    Ok((format, count))
 }
 
-/// A pack's index over its bytes.
+/// A verified index over a pack's header, index and checksum. The record
+/// ranges are relative to the start of the pack. Their contents are checked
+/// separately when decoded.
 #[derive(Debug, Clone, Copy)]
-pub struct Pack<'a> {
+pub struct PackIndex<'a> {
     bytes: &'a [u8],
     count: usize,
     length: usize,
     format: PackFormat,
 }
 
-impl<'a> Pack<'a> {
-    /// The length of the pack whose header, index and checksum start
-    /// `prefix`, checked as [`Self::parse`] checks them.
-    pub fn length(prefix: &[u8], translator: &Digest) -> Result<u64, PackError> {
-        Self::index(prefix, translator).map(|(_, length)| length as u64)
-    }
-
-    /// The pack at the start of `bytes`: its header, index checksum, key
-    /// order and every record's range are checked; bytes past its length
-    /// are ignored.
-    pub fn parse(bytes: &'a [u8], translator: &Digest) -> Result<Self, PackError> {
-        let (count, length) = Self::index(bytes, translator)?;
-        if bytes.len() < length {
-            return Err(PackError::Truncated);
-        }
-        Ok(Self {
-            bytes: &bytes[..length],
-            count,
-            length,
-            format: PackFormat::read(bytes)?,
-        })
-    }
-
-    /// The record count and the pack's length.
-    fn index(prefix: &[u8], translator: &Digest) -> Result<(usize, usize), PackError> {
-        let records_start = prefix_bytes(prefix, translator)?;
+impl<'a> PackIndex<'a> {
+    /// Check the header, index checksum, key order and each record's range.
+    /// The prefix may end before the first record. A reader can compare
+    /// [`Self::length`] with the actual file size before reading a record.
+    pub fn parse(prefix: &'a [u8], translator: &Digest) -> Result<Self, PackError> {
+        let (format, count) = read_header(prefix, translator)?;
+        let records_start = prefix_length(count);
         if prefix.len() < records_start {
             return Err(PackError::Truncated);
         }
@@ -162,7 +149,6 @@ impl<'a> Pack<'a> {
         if Sha256::digest(&prefix[..index_end]).as_slice() != &prefix[index_end..records_start] {
             return Err(PackError::Checksum);
         }
-        let count = (index_end - HEADER_BYTES) / INDEX_ENTRY_BYTES;
         let mut length = records_start;
         let mut previous: Option<Digest> = None;
         for index in 0..count {
@@ -177,20 +163,26 @@ impl<'a> Pack<'a> {
             length = length.max(usize::try_from(end).map_err(|_| PackError::Index)?);
             previous = Some(key);
         }
-        Ok((count, length))
+        Ok(Self {
+            bytes: &prefix[..records_start],
+            count,
+            length,
+            format,
+        })
     }
 
-    pub fn records(&self) -> usize {
-        self.count
+    /// The pack's byte length as declared by its index.
+    pub fn length(&self) -> u64 {
+        self.length as u64
     }
 
-    /// The pack's length in bytes.
-    pub fn bytes(&self) -> usize {
-        self.length
+    /// The size of the verified header, index and checksum.
+    pub fn prefix_bytes(&self) -> usize {
+        prefix_length(self.count)
     }
 
-    /// The record bytes of page key `key`, unchecked.
-    pub fn get(&self, key: &Digest) -> Option<&'a [u8]> {
+    /// The byte range of the record for page key `key`.
+    pub fn record_range(&self, key: &Digest) -> Option<Range<u64>> {
         let (mut low, mut high) = (0, self.count);
         while low < high {
             let middle = (low + high) / 2;
@@ -198,28 +190,74 @@ impl<'a> Pack<'a> {
             match found.cmp(key) {
                 core::cmp::Ordering::Less => low = middle + 1,
                 core::cmp::Ordering::Greater => high = middle,
-                core::cmp::Ordering::Equal => {
-                    return Some(&self.bytes[offset as usize..(offset + bytes) as usize]);
-                }
+                core::cmp::Ordering::Equal => return Some(offset..offset + bytes),
             }
         }
         None
     }
 
+    /// Every record's key and byte range, in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (Digest, Range<u64>)> + '_ {
+        (0..self.count).map(|index| {
+            let (key, offset, bytes) = entry(self.bytes, index);
+            (key, offset..offset + bytes)
+        })
+    }
+}
+
+/// A pack whose prefix and all of its record bytes are resident.
+#[derive(Debug, Clone, Copy)]
+pub struct Pack<'a> {
+    // The resident pack retains the entire byte range on which the verified
+    // index is based. Index access still uses only the header and index.
+    index: PackIndex<'a>,
+}
+
+impl<'a> Pack<'a> {
+    /// The length declared by the verified index at the start of `prefix`.
+    pub fn length(prefix: &[u8], translator: &Digest) -> Result<u64, PackError> {
+        Ok(PackIndex::parse(prefix, translator)?.length())
+    }
+
+    /// Verify the index and require all the referenced record bytes.
+    /// Bytes after the last record are ignored.
+    pub fn parse(bytes: &'a [u8], translator: &Digest) -> Result<Self, PackError> {
+        let mut index = PackIndex::parse(bytes, translator)?;
+        index.bytes = bytes.get(..index.length).ok_or(PackError::Truncated)?;
+        Ok(Self { index })
+    }
+
+    pub fn records(&self) -> usize {
+        self.index.count
+    }
+
+    /// The pack's length in bytes.
+    pub fn bytes(&self) -> usize {
+        self.index.length
+    }
+
+    /// The record bytes of page key `key`, unchecked.
+    pub fn get(&self, key: &Digest) -> Option<&'a [u8]> {
+        Some(self.body(self.index.record_range(key)?))
+    }
+
+    fn body(&self, range: Range<u64>) -> &'a [u8] {
+        &self.index.bytes[range.start as usize..range.end as usize]
+    }
+
     fn record(&self, key: &Digest) -> Option<PackedRecord<'a>> {
         Some(PackedRecord {
             bytes: self.get(key)?,
-            format: self.format,
+            format: self.index.format,
             checked: false,
         })
     }
 
     /// Every record's page key and bytes, in key order.
     pub fn iter(&self) -> impl Iterator<Item = (Digest, &'a [u8])> + '_ {
-        (0..self.count).map(|index| {
-            let (key, offset, bytes) = entry(self.bytes, index);
-            (key, &self.bytes[offset as usize..(offset + bytes) as usize])
-        })
+        self.index
+            .iter()
+            .map(|(key, range)| (key, self.body(range)))
     }
 }
 
@@ -503,12 +541,12 @@ fn layout_over<'a>(
     let Some(pack) = previous else {
         return relayout(records);
     };
-    let base = pack.bytes.as_ptr() as usize;
+    let base = pack.index.bytes.as_ptr() as usize;
     let first_record = pack
         .iter()
         .map(|(_, bytes)| (bytes.as_ptr() as usize - base) as u64)
         .min()
-        .unwrap_or(pack.bytes.len() as u64);
+        .unwrap_or(pack.index.length());
     let prefix = prefix_length(records.len()) as u64;
     if prefix > first_record {
         return relayout(records);
@@ -1629,7 +1667,7 @@ impl<'a> Store<'a> {
                 evicted += 1;
             }
         }
-        let format = self.pack.map_or(PackFormat::Raw, |pack| pack.format);
+        let format = self.pack.map_or(PackFormat::Raw, |pack| pack.index.format);
         Planned {
             layout: layout_over(&self.translator, self.pack, kept, format, bound),
             proven: count,
@@ -1860,7 +1898,7 @@ mod tests {
         assert_eq!(store.record(&second).unwrap().key, second);
         let output = store.plan(u64::MAX, || true).layout.to_vec();
         let pack = Pack::parse(&output, &translator).unwrap();
-        assert_eq!(pack.format, PackFormat::Mixed);
+        assert_eq!(pack.index.format, PackFormat::Mixed);
         assert_eq!(pack.get(&first), Some(compressed.as_slice()));
 
         let old = Layout::new(&translator, records()).to_vec();
@@ -2188,6 +2226,79 @@ mod tests {
     }
 
     #[test]
+    fn the_prefix_indexes_nonresident_records_at_their_file_offsets() {
+        let translator = Digest::of(b"translator");
+        let first = Digest([1; DIGEST_BYTES]);
+        let second = Digest([2; DIGEST_BYTES]);
+        let prefix_len = prefix_length(2);
+        let low = prefix_len as u64 + 64;
+        let high = low + 4096;
+        let bytes = Layout::placed(
+            &translator,
+            vec![
+                (first, high, Piece::New(b"first".to_vec())),
+                (second, low, Piece::New(b"second".to_vec())),
+            ],
+            PackFormat::Mixed,
+            None,
+        )
+        .to_vec();
+        let prefix = &bytes[..prefix_len];
+        let index = PackIndex::parse(prefix, &translator).unwrap();
+        assert_eq!(index.length(), high + 5);
+        assert_eq!(Pack::length(prefix, &translator).unwrap(), index.length());
+        assert_eq!(index.record_range(&first), Some(high..high + 5));
+        assert_eq!(index.record_range(&second), Some(low..low + 6));
+        assert_eq!(index.record_range(&Digest::default()), None);
+        assert_eq!(
+            index.iter().collect::<Vec<_>>(),
+            [(first, high..high + 5), (second, low..low + 6)]
+        );
+        assert_eq!(
+            PackIndex::parse(&prefix[..prefix_len - 1], &translator).unwrap_err(),
+            PackError::Truncated
+        );
+        assert_eq!(
+            Pack::parse(prefix, &translator).unwrap_err(),
+            PackError::Truncated
+        );
+        let resident = Pack::parse(&bytes, &translator).unwrap();
+        assert_eq!(resident.get(&first), Some(&b"first"[..]));
+        assert_eq!(resident.get(&second), Some(&b"second"[..]));
+        assert_eq!(resident.index.format, PackFormat::Mixed);
+    }
+
+    #[test]
+    fn prefix_lookup_refuses_corrupt_checksums_and_invalid_ranges() {
+        let translator = Digest::of(b"translator");
+        let key = Digest::of(b"page");
+        let bytes = Layout::new(&translator, vec![(key, Piece::New(vec![0]))]).to_vec();
+        let prefix_len = prefix_length(1);
+        let mut prefix = bytes[..prefix_len].to_vec();
+        prefix[prefix_len - 1] ^= 1;
+        assert_eq!(
+            PackIndex::parse(&prefix, &translator).unwrap_err(),
+            PackError::Checksum
+        );
+        let offset_at = HEADER_BYTES + DIGEST_BYTES;
+        let index_end = prefix_len - CHECKSUM_BYTES;
+        for (offset, bytes) in [
+            (prefix_len as u64 - 1, 1_u64),
+            (prefix_len as u64, 0),
+            (u64::MAX, 1),
+        ] {
+            prefix[offset_at..offset_at + 8].copy_from_slice(&offset.to_le_bytes());
+            prefix[offset_at + 8..index_end].copy_from_slice(&bytes.to_le_bytes());
+            let checksum = Sha256::digest(&prefix[..index_end]);
+            prefix[index_end..].copy_from_slice(checksum.as_slice());
+            assert_eq!(
+                PackIndex::parse(&prefix, &translator).unwrap_err(),
+                PackError::Index
+            );
+        }
+    }
+
+    #[test]
     fn blocks_past_the_room_to_prove_them_stay_unproven() {
         let translator = translator_id();
         let (first, second) = (Digest::of(b"first page"), Digest::of(b"second page"));
@@ -2407,7 +2518,13 @@ mod tests {
             .iter()
             .map(|(key, bytes)| (key, Piece::Kept(bytes)))
             .collect();
-        let layout = layout_over(&translator, Some(pack), records, pack.format, u64::MAX);
+        let layout = layout_over(
+            &translator,
+            Some(pack),
+            records,
+            pack.index.format,
+            u64::MAX,
+        );
         assert_eq!(layout.changed(), None);
     }
 

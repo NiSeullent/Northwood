@@ -242,6 +242,10 @@ pub mod window {
         IMPORT_BYTES = 0x38;
         /// Control: the nonzero token `RETIRED` will name the import by.
         IMPORT_TOKEN = 0x40;
+        /// Low bit of the kext's aligned descriptor token. Set only when
+        /// its descriptor was wired for both reads and writes. The full
+        /// token, including this bit, must be returned on retirement.
+        IMPORT_TOKEN_WRITABLE = 0x1;
         /// Control: a store of a gate page imports the ranges added for its
         /// connection. Only the kext reaches this page, so only the kernel
         /// names physical memory.

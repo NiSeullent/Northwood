@@ -136,6 +136,69 @@ fn relative_redirect_rebuilds_host_path_and_pins_the_final_range() {
     stack.close_http(transfer);
     assert_eq!(sockets(&stack), 0);
 }
+
+#[test]
+fn an_aborted_full_receive_queue_releases_the_peer_for_the_next_range() {
+    let mut large = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-8191/8192\r\nContent-Length: 8192\r\nETag: \"v1\"\r\n\r\n".to_vec();
+    large.resize(large.len() + 8192, b'x');
+    let small = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4096-4097/8192\r\nContent-Length: 2\r\nETag: \"v1\"\r\n\r\nab".to_vec();
+    let mut stack = stack(vec![large, small]);
+    let mut first = stack
+        .open_http(
+            "http://10.0.2.2/object",
+            HttpRequest::range(0, 8191, Some("\"v1\"")),
+            512,
+            Err(TlsUnavailable::CorrelatedClock),
+        )
+        .unwrap();
+    let mut range = http::Ranged::with_identity(0, 8191, "\"v1\"", 8192).unwrap();
+    let mut consumed = 0;
+    for _ in 0..1024 {
+        assert!(
+            !stack
+                .read_http(&mut first, |bytes, closed| {
+                    range.feed(bytes, closed, |body| consumed += body.len())
+                })
+                .unwrap()
+        );
+        if consumed != 0 {
+            break;
+        }
+    }
+    assert!(consumed > 0 && consumed < 8192);
+    for _ in 0..1024 {
+        stack.poll().unwrap();
+        if stack.http_receive_queue(&first) == Some((512, 512)) {
+            break;
+        }
+    }
+    assert_eq!(stack.http_receive_queue(&first), Some((512, 512)));
+    stack.close_http(first);
+    assert_eq!(sockets(&stack), 0);
+
+    let mut second = stack
+        .open_http(
+            "http://10.0.2.2/object",
+            HttpRequest::range(4096, 4097, Some("\"v1\"")),
+            512,
+            Err(TlsUnavailable::CorrelatedClock),
+        )
+        .unwrap();
+    let mut range = http::Ranged::with_identity(4096, 4097, "\"v1\"", 8192).unwrap();
+    let mut body = Vec::new();
+    for _ in 0..1024 {
+        if stack
+            .read_http(&mut second, |bytes, closed| {
+                range.feed(bytes, closed, |bytes| body.extend_from_slice(bytes))
+            })
+            .unwrap()
+        {
+            break;
+        }
+    }
+    assert_eq!(body, b"ab");
+    assert_eq!(stack.link_mut().requests.len(), 2);
+}
 #[test]
 fn authentication_failures_are_explicit() {
     for (status, expected) in [

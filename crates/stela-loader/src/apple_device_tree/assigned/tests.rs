@@ -990,10 +990,20 @@ fn original_j473_first_p_projection_keeps_source_fields_and_absent_coordinates()
         watchdog_path: "/arm-io/wdt",
     };
     let mut dense = prior.clone();
-    let dense_receipt = Projection::prepare(&plan, &dense, &dense_source)
-        .unwrap()
-        .apply(&mut dense)
-        .unwrap();
+    let dense_projection = Projection::prepare(&plan, &dense, &dense_source);
+    if immutable.property("/arm-io/pmgr", "clusters").is_some() {
+        // The mode0 PMGR roster cannot move the physical P complex to
+        // logical index zero when the original E complex was removed.
+        assert!(
+            dense_projection
+                .unwrap_err()
+                .to_string()
+                .contains("J473 PMGR")
+        );
+        assert_eq!(dense, prior);
+        return;
+    }
+    let dense_receipt = dense_projection.unwrap().apply(&mut dense).unwrap();
     let selected = dense.node("/cpus/cpu4").unwrap();
     assert_eq!(word(selected, "cpu-id").unwrap(), 0);
     assert_eq!(word(selected, "reg").unwrap(), 0x100);
@@ -1015,8 +1025,12 @@ fn original_j473_first_p_projection_keeps_source_fields_and_absent_coordinates()
             .collect::<Vec<_>>(),
         [(4, 0)]
     );
+    let original_enable = bytes(prior.node("/cpus/cpu4").unwrap(), "function-enable_core").unwrap();
+    let selected_enable = bytes(selected, "function-enable_core").unwrap();
+    assert_eq!(&selected_enable[..8], &original_enable[..8]);
+    assert_eq!(&selected_enable[8..], &1u32.to_le_bytes());
     for property in &prior.node("/cpus/cpu4").unwrap().properties {
-        if property.name() != "cpu-id" {
+        if !matches!(property.name(), "cpu-id" | "function-enable_core") {
             assert_eq!(selected.property(property.name()), Some(property));
         }
     }

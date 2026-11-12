@@ -198,6 +198,42 @@ fn manifest_error(what: impl ToString) -> BundleError {
     BundleError::Manifest(what.to_string())
 }
 
+/// One complete manifest region's bytes at their offset in the source file.
+#[derive(Debug, Clone, Copy)]
+pub struct FilePart<'a> {
+    pub offset: u64,
+    pub bytes: &'a [u8],
+}
+
+/// Borrowed file contents as one slice or as nonempty regions in file order.
+#[derive(Debug, Clone, Copy)]
+pub enum FileData<'a> {
+    Whole(&'a [u8]),
+    Parts(&'a [FilePart<'a>]),
+}
+
+impl<'a> FileData<'a> {
+    fn region_bytes(self, region: &Region) -> Option<&'a [u8]> {
+        if region.bytes > region.memory_bytes {
+            return None;
+        }
+        let length = usize::try_from(region.bytes).ok()?;
+        match self {
+            Self::Whole(file) => {
+                let start = usize::try_from(region.file_offset).ok()?;
+                file.get(start..start.checked_add(length)?)
+            }
+            Self::Parts(parts) => {
+                let index = parts
+                    .binary_search_by_key(&region.file_offset, |part| part.offset)
+                    .ok()?;
+                let bytes = parts[index].bytes;
+                (bytes.len() == length).then_some(bytes)
+            }
+        }
+    }
+}
+
 impl Manifest {
     pub fn parse(json: &[u8]) -> Result<Self, BundleError> {
         if json.len() > MAX_MANIFEST_BYTES {
@@ -223,13 +259,6 @@ impl Manifest {
         Ok(manifest)
     }
 
-    fn file(&self, name: &str) -> Result<&File, BundleError> {
-        self.files
-            .iter()
-            .find(|f| f.name == name)
-            .ok_or_else(|| manifest_error(format!("no file {name}")))
-    }
-
     /// Whether the regions cover `file` exactly once, end to end.
     fn tiled(&self, file: &File) -> bool {
         let mut ranges: Vec<(u64, u64)> = self
@@ -249,6 +278,36 @@ impl Manifest {
         cursor == file.bytes
     }
 
+    /// A part-backed file must have a nonempty, exact tile with one part per
+    /// region. Unlike whole files, there is no contiguous buffer to hash for
+    /// bytes outside the tile.
+    fn parts_match(&self, file: &File, parts: &[FilePart<'_>]) -> bool {
+        let mut regions: Vec<_> = self
+            .regions
+            .iter()
+            .filter(|region| region.file == file.name)
+            .collect();
+        if parts.is_empty() || parts.len() != regions.len() {
+            return false;
+        }
+        regions.sort_unstable_by_key(|region| region.file_offset);
+        let mut offset = 0;
+        for (region, part) in regions.into_iter().zip(parts) {
+            if region.file_offset != offset
+                || part.offset != offset
+                || part.bytes.is_empty()
+                || u64::try_from(part.bytes.len()).ok() != Some(region.bytes)
+            {
+                return false;
+            }
+            let Some(end) = offset.checked_add(region.bytes) else {
+                return false;
+            };
+            offset = end;
+        }
+        offset == file.bytes
+    }
+
     /// Check every file's size and every region's extent and SHA-256. A
     /// file the regions do not tile exactly is also checked against its own
     /// SHA-256; a tiled file's region hashes already cover every byte.
@@ -257,47 +316,85 @@ impl Manifest {
         &'a self,
         contents: &dyn Fn(&str) -> Option<&'a [u8]>,
     ) -> Result<Verified<'a>, BundleError> {
+        self.verify_files(&|name| contents(name).map(FileData::Whole))
+    }
+
+    /// Verify the same file and region identities as [`Self::verify`]. A
+    /// file supplied in parts must match its complete manifest region tile.
+    /// The result borrows each region's original bytes for loading.
+    pub fn verify_files<'a>(
+        &'a self,
+        contents: &dyn Fn(&str) -> Option<FileData<'a>>,
+    ) -> Result<Verified<'a>, BundleError> {
         let mut files = Vec::with_capacity(self.files.len());
         for file in &self.files {
-            let bytes = contents(&file.name).ok_or_else(|| BundleError::File {
+            let fail = |reason| BundleError::File {
                 name: file.name.clone(),
-                reason: "was not read".into(),
-            })?;
-            if bytes.len() as u64 != file.bytes {
-                return Err(BundleError::File {
-                    name: file.name.clone(),
-                    reason: format!("is {} bytes, not {}", bytes.len(), file.bytes),
-                });
+                reason,
+            };
+            let data = contents(&file.name).ok_or_else(|| fail("was not read".into()))?;
+            match data {
+                FileData::Whole(bytes) => {
+                    if bytes.len() as u64 != file.bytes {
+                        return Err(fail(format!(
+                            "is {} bytes, not {}",
+                            bytes.len(),
+                            file.bytes
+                        )));
+                    }
+                    if !self.tiled(file) && crate::sha256(bytes) != file.sha256 {
+                        return Err(fail("SHA-256 differs from bundle.json".into()));
+                    }
+                }
+                FileData::Parts(parts) => {
+                    if self
+                        .files
+                        .iter()
+                        .filter(|other| other.name == file.name)
+                        .take(2)
+                        .count()
+                        != 1
+                        || !self.parts_match(file, parts)
+                    {
+                        return Err(fail(
+                            "parts do not match an exact manifest region tile".into(),
+                        ));
+                    }
+                }
             }
-            if !self.tiled(file) && crate::sha256(bytes) != file.sha256 {
-                return Err(BundleError::File {
-                    name: file.name.clone(),
-                    reason: "SHA-256 differs from bundle.json".into(),
-                });
-            }
-            files.push((file.name.as_str(), bytes));
+            files.push((file.name.as_str(), data));
         }
-        let verified = Verified {
-            manifest: self,
-            files,
-        };
+        let mut regions = Vec::with_capacity(self.regions.len());
         for region in &self.regions {
-            let bytes = verified.region_bytes(region)?;
+            let (_, file) = files
+                .iter()
+                .find(|(name, _)| *name == region.file)
+                .ok_or_else(|| manifest_error(format!("no file {}", region.file)))?;
+            let bytes = file
+                .region_bytes(region)
+                .ok_or_else(|| BundleError::Region {
+                    name: region.name.clone(),
+                    reason: format!("lies outside {}", region.file),
+                })?;
             if crate::sha256(bytes) != region.sha256 {
                 return Err(BundleError::Region {
                     name: region.name.clone(),
                     reason: "SHA-256 differs from bundle.json".into(),
                 });
             }
+            regions.push(bytes);
         }
-        Ok(verified)
+        Ok(Verified {
+            manifest: self,
+            regions,
+        })
     }
 }
 
 /// A manifest whose files and regions matched their hashes.
 pub struct Verified<'a> {
     pub manifest: &'a Manifest,
-    files: Vec<(&'a str, &'a [u8])>,
+    regions: Vec<&'a [u8]>,
 }
 
 fn u64_value(value: u64) -> Vec<u8> {
@@ -310,32 +407,6 @@ fn u32_value(value: u64) -> Vec<u8> {
 }
 
 impl<'a> Verified<'a> {
-    fn file_bytes(&self, name: &str) -> Result<&'a [u8], BundleError> {
-        self.manifest.file(name)?;
-        self.files
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, bytes)| *bytes)
-            .ok_or_else(|| manifest_error(format!("no file {name}")))
-    }
-
-    fn region_bytes(&self, region: &Region) -> Result<&'a [u8], BundleError> {
-        let file = self.file_bytes(&region.file)?;
-        let start = usize::try_from(region.file_offset).ok();
-        let end = start.and_then(|s| s.checked_add(usize::try_from(region.bytes).ok()?));
-        match (start, end) {
-            (Some(start), Some(end))
-                if end <= file.len() && region.bytes <= region.memory_bytes =>
-            {
-                Ok(&file[start..end])
-            }
-            _ => Err(BundleError::Region {
-                name: region.name.clone(),
-                reason: format!("lies outside {}", region.file),
-            }),
-        }
-    }
-
     /// The bytes a patch slot takes on `machine`; `None` keeps the prepared
     /// bytes.
     fn patch_value(
@@ -477,12 +548,11 @@ impl<'a> Verified<'a> {
             )));
         }
         let mut regions = Vec::with_capacity(self.manifest.regions.len());
-        for region in &self.manifest.regions {
+        for (region, &bytes) in self.manifest.regions.iter().zip(&self.regions) {
             let fail = |reason: &str| BundleError::Region {
                 name: region.name.clone(),
                 reason: reason.into(),
             };
-            let bytes = self.region_bytes(region)?;
             let end = region
                 .guest_pa
                 .checked_add(region.memory_bytes)

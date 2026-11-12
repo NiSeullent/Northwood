@@ -19,6 +19,8 @@ use crate::Result;
 use alloc::{format, string::String, vec::Vec};
 use stela_contracts::refuse;
 
+pub mod layout;
+
 /// The marker's first bytes.
 pub const MAGIC: [u8; 16] = *b"STELA-MOUNT-IF\x00\x01";
 const FIELDS: usize = 4;
@@ -54,6 +56,24 @@ pub const CHOICES_FILE: &str = "\\EFI\\stela\\choices.cfg";
 /// whole output there from its first line, before and after boot services
 /// end, so every run leaves a log on the USB itself.
 pub const BOOT_LOG_FILE: &str = "\\EFI\\stela\\boot.log";
+/// Plain-text snapshots of the firmware phase on the USB's data partition.
+pub const VOLUME_LOG_DIRECTORY: &str = "stela/logs";
+pub const VOLUME_LOG_SLOTS: [&str; 4] = ["boot-0.log", "boot-1.log", "boot-2.log", "boot-3.log"];
+pub const VOLUME_LOG_BYTES: usize = 256 << 10;
+pub const VOLUME_LOG_PREFIX: &str = "STELA loader boot log #";
+pub const VOLUME_LOG_EMPTY: &str = "STELA loader boot log #0 (unused)\n";
+
+/// The boot sequence in a slot's first line. Zero names a prepared slot.
+pub fn volume_log_sequence(header: &[u8]) -> Option<u64> {
+    let line = header.split(|&byte| byte == b'\n').next()?;
+    let sequence = core::str::from_utf8(line)
+        .ok()?
+        .strip_prefix(VOLUME_LOG_PREFIX)?
+        .split_once(' ')?
+        .0;
+    sequence.parse().ok()
+}
+
 /// The word that stands, in a startup choice's options, for the partition
 /// `stela.efi`'s Install macOS chose for the Mac's internal SSD
 /// (`SERIAL:GUID`), which it keeps in [`DISK_FILE`].

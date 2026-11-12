@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{progress::Phase, restore};
 use anyhow::{Context, Result, ensure};
+use northwood_config::Swap;
 use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -322,10 +323,11 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
         }
         choose_wifi(command)?;
         super::addresses::choose(command)?;
+        choose_swap(command)?;
         cliclack::note(
             "6 / 6  Review",
             format!(
-                "USB        {}\nInstaller  {}\nmacOS      {version} ({})\nMac        {}\n{}{}{}",
+                "USB        {}\nInstaller  {}\nmacOS      {version} ({})\nMac        {}\nUSB swap   {}\n{}{}{}",
                 usb.serial.as_ref().map_or_else(
                     || usb.description(),
                     |serial| format!("{} · serial {serial}", usb.description())
@@ -338,6 +340,10 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
                 names
                     .get(command.model())
                     .map_or(command.model(), String::as_str),
+                match command.volume_swap_bytes {
+                    Some(bytes) => format!("Prepare · {} requested", swap_size(bytes)),
+                    None => "Skip".into(),
+                },
                 match &command.wifi {
                     Some(ssid) => format!("Wi-Fi      {ssid}\n"),
                     None => "Wi-Fi      None (Ethernet)\n".into(),
@@ -358,7 +364,7 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
         if chips.is_empty() {
             cliclack::log::warning(firmware::missing(
                 "`stela setup host-firmware fetch --gpu CHIP --usb USB` (USB: the installer's \
-                 STELA volume)",
+                 data volume)",
             ))?;
         }
         cliclack::log::info(super::create::SIGNING_NOTE)?;
@@ -389,6 +395,40 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
             }
         }
     }
+}
+
+fn swap_size(bytes: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    if bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else {
+        host::bytes_text(bytes)
+    }
+}
+
+fn choose_swap(command: &mut Request) -> Result<()> {
+    let policy = Swap::default();
+    let requested = command.volume_swap_bytes.unwrap_or(policy.bytes);
+    let prepare =
+        cliclack::select("Memory and swap · Does the target PC have 4 GiB of RAM or less?")
+            .item(
+                false,
+                "Skip USB swap",
+                "For PCs with more than 4 GiB of RAM or unknown RAM",
+            )
+            .item(
+                true,
+                "Prepare USB swap",
+                format!(
+                    "Requests {} · Up to {} on FAT32, depending on free space",
+                    swap_size(requested),
+                    swap_size(policy.volume_max_bytes),
+                ),
+            )
+            .initial_value(command.volume_swap_bytes.is_some())
+            .interact()?;
+    command.volume_swap_bytes = prepare.then_some(requested);
+    Ok(())
 }
 
 /// A network installer's Wi-Fi: a network this computer sees or knows, one

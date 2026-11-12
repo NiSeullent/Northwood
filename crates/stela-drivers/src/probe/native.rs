@@ -30,6 +30,7 @@ use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
 use core::{any::Any, cell::RefCell};
 
 pub mod hda;
+pub mod intel_9000;
 pub mod usb4;
 
 /// A Broadcom Tigon3 adapter over owned BAR0 and APE mappings.
@@ -84,52 +85,6 @@ pub(super) enum Kind {
     Hda,
     /// A USB4/Thunderbolt host interface, as `pci.c::nhi_ids` lists them.
     Usb4,
-}
-
-impl Kind {
-    pub(super) fn of(function: &Function) -> Option<Self> {
-        if vmd::Profile::identify(function.vendor, function.device).is_ok() {
-            Some(Self::Vmd)
-        } else if tg3::candidate(function.vendor, function.device, function.class) {
-            Some(Self::Tg3)
-        } else if aqtion::Profile::identify(function.vendor, function.device).is_some()
-            && function.class == [2, 0, 0]
-        {
-            Some(Self::Aqtion)
-        } else if (function.vendor, function.device) == (0x1022, 0x15e4) {
-            Some(Self::Sfh)
-        } else if (function.vendor, function.device) == (0x8086, 0x9d35) {
-            Some(Self::Ish)
-        } else if function.vendor == 0x8086 && function.class[..2] == [2, 0x80] {
-            Some(Self::IntelWifi)
-        } else if function.vendor == 0x14c3 && function.class[..2] == [2, 0x80] {
-            Some(Self::MediatekWifi)
-        } else if function.vendor == 0x10ec
-            && function.class[..2] == [2, 0x80]
-            && realtek_wifi::identity::RTL8822C_DEVICES.contains(&function.device)
-        {
-            Some(Self::RealtekWifi)
-        } else if function.vendor == 0x8086 && intel_pcie::DEVICE_IDS.contains(&function.device) {
-            Some(Self::IntelBluetooth)
-        } else if function.vendor == 0x14e4
-            && function.class[..2] == [2, 0x80]
-            && bcm4377::Chip::of_device(function.device).is_some()
-        {
-            Some(Self::Bcm4377)
-        } else if crate::audio::hda::pci::identify(function).is_ok() {
-            Some(Self::Hda)
-        } else if crate::bus::thunderbolt::controller::Profile::identify(
-            function.vendor,
-            function.device,
-            u32::from_be_bytes([0, function.class[0], function.class[1], function.class[2]]),
-        )
-        .is_ok()
-        {
-            Some(Self::Usb4)
-        } else {
-            None
-        }
-    }
 }
 
 /// A PCI bridge the scan passed.
@@ -245,6 +200,7 @@ pub(super) unsafe fn ehci(
     services: &dyn NativeServices,
     address: Address,
     clock: Clock,
+    legacy_released: &mut bool,
 ) -> Result<ehci::host::Shared, Failure> {
     let minimum = services
         .minimum_delay()
@@ -271,8 +227,16 @@ pub(super) unsafe fn ehci(
     // companions. EHCI proves BIOS release and engine HALT, then drains the
     // original root before binding the domain or allocating its arena.
     match unsafe { ehci::attach(resources) } {
-        Ok((controller, _)) => Ok(Rc::new(RefCell::new(controller))),
-        Err(failure) => Err((Error::Ehci(failure.error), Some(Box::new(failure)))),
+        Ok((controller, _)) => {
+            *legacy_released = true;
+            Ok(Rc::new(RefCell::new(controller)))
+        }
+        Err(failure) => {
+            if let Some(released) = failure.legacy_released() {
+                *legacy_released = released;
+            }
+            Err((Error::Ehci(failure.error), Some(Box::new(failure))))
+        }
     }
 }
 
@@ -1388,12 +1352,14 @@ mod tests {
         let clock = Clock {
             ticks_per_microsecond: 1000,
         };
+        let mut legacy_released = false;
         // SAFETY: all physical services refuse; no device capability exists.
-        let error = unsafe { ehci(&services, address(), clock) };
+        let error = unsafe { ehci(&services, address(), clock, &mut legacy_released) };
         assert!(matches!(
             error,
             Err((Error::Native(ServiceError::Unavailable), None))
         ));
+        assert!(!legacy_released);
         assert!(services.requests.borrow().is_empty());
         assert!(services.preparations.borrow().is_empty());
         assert!(services.stopped.borrow().is_empty());
@@ -1404,12 +1370,14 @@ mod tests {
         let clock = Clock {
             ticks_per_microsecond: 1000,
         };
+        let mut legacy_released = true;
         // SAFETY: refusing services transfer no owner or hardware access.
-        let result = unsafe { ehci(&services, address(), clock) };
+        let result = unsafe { ehci(&services, address(), clock, &mut legacy_released) };
         assert!(matches!(
             result,
             Err((Error::Native(ServiceError::Unavailable), None))
         ));
+        assert!(legacy_released);
         assert_eq!(*services.requests.borrow(), [address()]);
         assert_eq!(*services.preparations.borrow(), [address()]);
         assert!(services.stopped.borrow().is_empty());

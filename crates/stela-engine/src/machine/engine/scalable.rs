@@ -16,7 +16,8 @@
 //! ([`Machine::scalable_numerical`]).
 use super::{
     DeviceError, Devices, FETCH_PAGE, Fetched, Host, InstallError, Machine, NativeCode, RamTables,
-    RequirementKind, Step, Stop, Translated, Variant, tags::TagCheck,
+    RequirementKind, Step, Stop, Translated, Variant, device_access::ram_refused,
+    scheduler::native_instruction_incomplete, tags::TagCheck,
 };
 use crate::scalable::ScalableState;
 use alloc::string::ToString;
@@ -235,6 +236,18 @@ enum Failure {
     Stop(MemoryStatus, Stop),
 }
 
+fn ram_stop_status(stop: &Stop) -> Option<MemoryStatus> {
+    let Stop::Unsupported(requirement) = stop else {
+        return None;
+    };
+    match &requirement.kind {
+        RequirementKind::NonresidentRam { .. } => Some(MemoryStatus::Nonresident),
+        RequirementKind::RamTransfer { status, .. } => Some(*status),
+        RequirementKind::NativePreparation(_) => Some(MemoryStatus::Domain),
+        _ => None,
+    }
+}
+
 /// The memory service of one leaf call: its requests reach `machine`, whose
 /// GuestState and scalable state are lent to the leaf meanwhile.
 struct Service<H: Host, D: Devices> {
@@ -266,7 +279,7 @@ unsafe fn serve<H: Host, D: Devices>(
     let result = crate::platform::unwind::invoke(core::panic::AssertUnwindSafe(|| {
         machine.scalable_access(word, request)
     }));
-    let failure = match result {
+    let mut failure = match result {
         Ok(Ok(())) => {
             view.completed_bytes += u64::from(request.bytes);
             return MemoryStatus::Success as u32;
@@ -284,6 +297,29 @@ unsafe fn serve<H: Host, D: Devices>(
     let status = match &failure {
         Failure::Exception(status, _) | Failure::Stop(status, _) => *status,
     };
+    if let Failure::Stop(_, stop) = &mut failure
+        && ram_stop_status(stop).is_some()
+        && let Stop::Unsupported(requirement) = stop
+    {
+        requirement.address = Some(request.address);
+        match &mut requirement.kind {
+            RequirementKind::RamTransfer { completed, .. } => {
+                view.completed_bytes += *completed as u64;
+                *completed = view.completed_bytes as usize;
+            }
+            RequirementKind::NonresidentRam { frame } if view.completed_bytes != 0 => {
+                // The prefix may already have written RAM or consumed a device.
+                // Keep it distinct from a missing frame before any callback completed.
+                requirement.kind = RequirementKind::RamTransfer {
+                    physical: *frame,
+                    write: request.flags & flags::WRITE != 0,
+                    completed: view.completed_bytes as usize,
+                    status,
+                };
+            }
+            _ => {}
+        }
+    }
     service.failure = Some(failure);
     view.record(status, request.address, request.pc, view.completed_bytes);
     status as u32
@@ -334,7 +370,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // SAFETY: the host gives the address of the installed leaf, compiled
         // for the two-argument context ABI.
         let entry: Entry = unsafe { core::mem::transmute::<usize, Entry>(entry) };
-        self.completing(pc, |machine| machine.call_leaf(entry, profile, word))
+        let retired = self.cpu.retired;
+        let step = self.completing(pc, |machine| machine.call_leaf(entry, profile, word));
+        if native_instruction_incomplete(&step) {
+            self.cpu.retired = retired;
+        }
+        step
     }
 
     /// MOVPRFX on its own, as Arm permits it to run: the move it is,
@@ -594,20 +635,40 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let access = if write { Access::Write } else { Access::Read };
         let controls = self.cpu.controls(self.cpu.regime());
         let requester = self.cpu.requester();
+        let registered = self
+            .operand_ram()
+            .map_err(|reason| self.scalable_ram_failure(reason))?;
+        let mut tables = registered.as_ref().map(|ram| ram.tables());
         let mut pieces: Vec<(u64, usize, MemoryType)> = Vec::with_capacity(2);
         let mut done = 0;
         while done < bytes {
             let virtual_address = address.wrapping_add(done as u64);
             let length =
                 ((FETCH_PAGE - (virtual_address & (FETCH_PAGE - 1))) as usize).min(bytes - done);
-            match mmu::translate_checked(
-                &controls,
-                virtual_address,
-                access,
-                requester,
-                shape,
-                &mut RamTables(&mut self.host),
-            ) {
+            let outcome = match tables.as_mut() {
+                Some(tables) => {
+                    let outcome = mmu::translate_checked(
+                        &controls,
+                        virtual_address,
+                        access,
+                        requester,
+                        shape,
+                        tables,
+                    );
+                    tables
+                        .outcome(outcome)
+                        .map_err(|reason| self.scalable_ram_failure(reason))?
+                }
+                None => mmu::translate_checked(
+                    &controls,
+                    virtual_address,
+                    access,
+                    requester,
+                    shape,
+                    &mut RamTables(&mut self.host),
+                ),
+            };
+            match outcome {
                 // An unaligned element crossing into Device memory faults
                 // there too.
                 Translated::Mapped(translation)
@@ -654,22 +715,45 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Err(Failure::Exception(MemoryStatus::Permission, exception));
         }
         if request.flags & flags::TAG_CHECKED != 0 {
-            match self.tag_check(&watched, requester, None) {
+            match self.tag_check_with_tables(&watched, requester, None, tables.as_mut()) {
                 Ok(TagCheck::Failed(exception)) => {
                     return Err(Failure::Exception(MemoryStatus::TagCheck, exception));
                 }
                 Ok(TagCheck::Passed | TagCheck::Untranslated) => {}
-                Err(stop) => return Err(Failure::Stop(MemoryStatus::Unsupported, stop)),
+                Err(stop) => {
+                    return Err(Failure::Stop(
+                        ram_stop_status(&stop).unwrap_or(MemoryStatus::Unsupported),
+                        stop,
+                    ));
+                }
             }
         }
+        let physical_pieces = || {
+            pieces
+                .iter()
+                .map(|&(physical, length, _)| (physical, length))
+        };
+        let ram = if let Some(registered) = &registered {
+            registered
+                .resident(&self.host, physical_pieces())
+                .map_err(|reason| self.scalable_ram_failure(reason))?
+        } else {
+            physical_pieces().all(|(physical, length)| {
+                let mut probe = [0u8; 1];
+                self.host.read_ram(physical, &mut probe)
+                    && self.host.read_ram(physical + length as u64 - 1, &mut probe)
+            })
+        };
         // SAFETY: the leaf's request names `bytes` of private staging.
         let data = unsafe { core::slice::from_raw_parts_mut(request.data, bytes) };
-        let ram = pieces.iter().all(|&(physical, length, _)| {
-            let mut probe = [0u8; 1];
-            self.host.read_ram(physical, &mut probe)
-                && self.host.read_ram(physical + length as u64 - 1, &mut probe)
-        });
         if ram {
+            if let Some(registered) = &registered {
+                // SAFETY: this is the same loan that admitted every piece.
+                return unsafe {
+                    registered.transfer(&mut self.host, physical_pieces(), data, write)
+                }
+                .map_err(|reason| self.scalable_ram_failure(reason));
+            }
             let mut offset = 0;
             for (physical, length, _) in pieces {
                 let part = &mut data[offset..offset + length];
@@ -687,6 +771,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         if bytes > size_of::<u64>() {
             return Err(stop(self, "a 16-byte SVE or SME element of a device"));
+        }
+        let canonical = registered.is_some();
+        // A real device may need to acquire the exclusive RAM service.
+        drop(registered);
+        if canonical
+            && write
+            && self.cpu.canonical_memory.is_some()
+            && self.serial_hold.is_none()
+            && self
+                .devices
+                .requires_canonical_write(self.current, physical, bytes as u8)
+        {
+            return Err(self.scalable_ram_failure(ram_refused()));
         }
         let now = self.now();
         let mut value = [0u8; size_of::<u64>()];
@@ -715,6 +812,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 ))
             }
         }
+    }
+
+    fn scalable_ram_failure(&self, reason: RequirementKind) -> Failure {
+        let stop = self.unsupported(reason);
+        Failure::Stop(ram_stop_status(&stop).unwrap_or(MemoryStatus::Domain), stop)
     }
 
     fn scalable_device(&self, address: u64, physical: u64, write: bool, detail: String) -> Stop {

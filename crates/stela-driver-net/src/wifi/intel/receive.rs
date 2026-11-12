@@ -11,6 +11,9 @@ use core::ops::Range;
 pub mod mpdu;
 pub mod reorder;
 
+pub(super) const ALIVE_COMMAND: u8 = 1;
+pub(super) const ALIVE_GROUP: u8 = 0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     BufferSize,
@@ -55,22 +58,31 @@ impl<'a> Packet<'a> {
 }
 /// Source frames start at 64-byte boundaries. AX200 permits several per RB;
 /// AX210 consumes one and leaves the rest uninterpreted. Errors fuse iteration.
+#[derive(Clone)]
 pub struct Packets<'a> {
     bytes: &'a [u8],
-    family: Family,
+    one_packet: bool,
     queue: u8,
     offset: usize,
     ended: bool,
 }
 impl<'a> Packets<'a> {
     pub fn new(family: Family, queue: u8, bytes: &'a [u8]) -> Result<Self, Error> {
+        Self::with_layout(queue, bytes, family >= Family::Ax210)
+    }
+
+    pub(super) fn pre_ax210_mq(queue: u8, bytes: &'a [u8]) -> Result<Self, Error> {
+        Self::with_layout(queue, bytes, false)
+    }
+
+    fn with_layout(queue: u8, bytes: &'a [u8], one_packet: bool) -> Result<Self, Error> {
         if bytes.is_empty() || bytes.len() > 16384 || !bytes.len().is_multiple_of(64) || queue > 63
         {
             return Err(Error::BufferSize);
         }
         Ok(Self {
             bytes,
-            family,
+            one_packet,
             queue,
             offset: 0,
             ended: false,
@@ -107,7 +119,7 @@ impl<'a> Iterator for Packets<'a> {
         }
         let raw = &self.bytes[start..start + length];
         self.offset = next;
-        self.ended = self.family >= Family::Ax210;
+        self.ended = self.one_packet;
         Some(Ok(Packet {
             raw_flags: flags,
             command: raw[4],
@@ -125,25 +137,37 @@ pub enum FreeDescriptor {
     Ax200([u8; 8]),
     Ax210([u8; 16]),
 }
+
+pub(super) fn pre_ax210_mq_free(iova: u64, id: u16) -> Result<[u8; 8], Error> {
+    if iova == 0 || !iova.is_multiple_of(4096) {
+        return Err(Error::DescriptorAddress);
+    }
+    if !(1..=0xfff).contains(&id) {
+        return Err(Error::DescriptorId);
+    }
+    Ok((iova | u64::from(id)).to_le_bytes())
+}
+
+pub(super) fn pre_ax210_mq_vid(raw: u32) -> u16 {
+    (raw & 0xfff) as u16
+}
+
 /// Exact donor layouts: AX200 IOVA|12-bitVID; AX210 VID at0 and IOVA at8.
 /// This serialization neither publishes an address nor transfers DMA ownership.
 pub fn free_descriptor(family: Family, iova: u64, id: u16) -> Result<FreeDescriptor, Error> {
-    let alignment = if family == Family::Ax200 { 4096 } else { 2048 };
-    if iova == 0 || !iova.is_multiple_of(alignment) {
+    if family == Family::Ax200 {
+        return pre_ax210_mq_free(iova, id).map(FreeDescriptor::Ax200);
+    }
+    if iova == 0 || !iova.is_multiple_of(2048) {
         return Err(Error::DescriptorAddress);
     }
-    if id == 0 || (family == Family::Ax200 && id > 0xfff) {
+    if id == 0 {
         return Err(Error::DescriptorId);
     }
-    Ok(match family {
-        Family::Ax200 => FreeDescriptor::Ax200((iova | u64::from(id)).to_le_bytes()),
-        _ => {
-            let mut bytes = [0; 16];
-            bytes[..2].copy_from_slice(&id.to_le_bytes());
-            bytes[8..].copy_from_slice(&iova.to_le_bytes());
-            FreeDescriptor::Ax210(bytes)
-        }
-    })
+    let mut bytes = [0; 16];
+    bytes[..2].copy_from_slice(&id.to_le_bytes());
+    bytes[8..].copy_from_slice(&iova.to_le_bytes());
+    Ok(FreeDescriptor::Ax210(bytes))
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UsedDescriptor<'a> {
@@ -164,7 +188,7 @@ pub fn used_descriptor(family: Family, raw: &[u8]) -> Result<UsedDescriptor<'_>,
         return Err(Error::DescriptorSize);
     }
     let (id, fragmented) = match family {
-        Family::Ax200 => ((le32(raw, 0) & 0xfff) as u16, false),
+        Family::Ax200 => (pre_ax210_mq_vid(le32(raw, 0)), false),
         Family::Ax210 => (le16(raw, 4), raw[6] & 1 != 0),
         Family::Bz | Family::Sc => (le16(raw, 0), raw[2] & 1 != 0),
     };
@@ -189,7 +213,7 @@ pub struct Lmac {
     pub debug_addresses: [u32; 8],
 }
 impl Lmac {
-    fn decode(bytes: &[u8]) -> Self {
+    pub(super) fn decode(bytes: &[u8]) -> Self {
         Self {
             major: le32(bytes, 0),
             minor: le32(bytes, 4),
@@ -208,6 +232,25 @@ pub struct Umac {
     pub minor: u32,
     pub debug_addresses: [u32; 2],
 }
+impl Umac {
+    pub(super) fn decode(bytes: &[u8]) -> Self {
+        Self {
+            major: le32(bytes, 0),
+            minor: le32(bytes, 4),
+            debug_addresses: [le32(bytes, 8), le32(bytes, 12)],
+        }
+    }
+}
+
+pub(super) fn alive_flags(payload: &[u8]) -> Result<u16, Error> {
+    let status = le16(payload, 0);
+    let flags = le16(payload, 2);
+    if status != 0xcafe {
+        return Err(Error::AliveRejected { status, flags });
+    }
+    Ok(flags)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Imr {
     pub base: u64,
@@ -230,11 +273,11 @@ impl<'a> Alive<'a> {
     /// The result is plain metadata; only a transport receiving this
     /// packet via its completed current-epoch RX may release ROM DMA.
     pub fn decode(packet: &Packet<'a>, firmware: &Firmware<'_>) -> Result<Self, Error> {
-        if packet.command != 1 || packet.group != 0 {
+        if packet.command != ALIVE_COMMAND || packet.group != ALIVE_GROUP {
             return Err(Error::NotAlive);
         }
         let version = firmware
-            .command_version(0, 1)
+            .command_version(ALIVE_GROUP, ALIVE_COMMAND)
             .map(|v| v.notification_version);
         let minimum = match version {
             Some(6 | 7) => 144,
@@ -248,20 +291,11 @@ impl<'a> Alive<'a> {
                 actual: raw.len(),
             });
         }
-        let status = le16(raw, 0);
-        let flags = le16(raw, 2);
-        if status != 0xcafe {
-            return Err(Error::AliveRejected { status, flags });
-        }
         Ok(Self {
             notification_version: version.unwrap(),
-            flags,
+            flags: alive_flags(raw)?,
             lmac: [Lmac::decode(&raw[4..52]), Lmac::decode(&raw[52..100])],
-            umac: Umac {
-                major: le32(raw, 100),
-                minor: le32(raw, 104),
-                debug_addresses: [le32(raw, 108), le32(raw, 112)],
-            },
+            umac: Umac::decode(&raw[100..116]),
             sku: core::array::from_fn(|i| le32(raw, 116 + i * 4)),
             imr: Imr {
                 base: le64(raw, 128),

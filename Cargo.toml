@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/northwood",
+    "crates/northwood-config",
     "crates/stela-boot-core",
     "crates/stela-crypto",
     "crates/stela-cli",

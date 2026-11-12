@@ -410,6 +410,160 @@ impl FunctionObservation {
         }
     }
 }
+
+/// Diagnostic snapshot through the firmware's exact controller handle. It
+/// supplies neither a controller-stop receipt nor native access permission.
+#[cfg(feature = "diagnostics")]
+fn observe_nvme(
+    handle: Handle,
+    protocol: &mut PciIo,
+    address: Address,
+    header: &[u8; 64],
+    bar0: &Result<Vec<BarRegion>, Error>,
+) {
+    use stela_drivers::{bus::pci::regs, storage::nvme};
+    use uefi::proto::nvme::pass_thru::NvmePassThru;
+
+    if [header[11], header[10], header[9]] != nvme::CLASS {
+        return;
+    }
+    let protocol_test = boot::test_protocol::<NvmePassThru>(OpenProtocolParams {
+        handle,
+        agent: boot::image_handle(),
+        controller: None,
+    });
+    let pass_thru = match &protocol_test {
+        Ok(true) => "present",
+        Ok(false) => "absent",
+        Err(_) => "unavailable",
+    };
+    let command = u16::from_le_bytes([header[4], header[5]]);
+    let mse = command & regs::COMMAND_MEMORY != 0;
+    let bme = command & regs::COMMAND_MASTER != 0;
+    let registers = if !matches!(protocol_test, Ok(true)) {
+        Err("no-pass-thru")
+    } else if !mse {
+        Err("decode-off")
+    } else if !bar0
+        .as_ref()
+        .is_ok_and(|regions| nvme_bar0(header, regions))
+    {
+        Err("bar0-unavailable")
+    } else {
+        let mut read = |offset| {
+            let mut value = 0u32;
+            // SAFETY: the live firmware protocol and assigned, decoding BAR0
+            // cover this aligned 32-bit register and the local output is writable.
+            status(unsafe {
+                (protocol.mem_read)(protocol, 2, 0, offset, 1, ptr::from_mut(&mut value).cast())
+            })?;
+            Ok::<_, Error>(value)
+        };
+        read(0x14)
+            .and_then(|cc| read(0x1c).map(|csts| (cc, csts)))
+            .map_err(|_| "read-refused")
+    };
+    match registers {
+        Ok((cc, csts)) => crate::output::arguments(format_args!(
+            "FW NVME pci={address} pass-thru={pass_thru} mse={mse} bme={bme} cc={cc:#010x} csts={csts:#010x}\n"
+        )),
+        Err(reason) => crate::output::arguments(format_args!(
+            "FW NVME pci={address} pass-thru={pass_thru} mse={mse} bme={bme} registers={reason}\n"
+        )),
+    }
+}
+
+/// Read-only Gemini Lake I²C snapshot. Protocol presence is checked on the
+/// exact PCI handle. This census supplies no stop receipt.
+#[cfg(feature = "diagnostics")]
+fn observe_lpss_i2c(
+    handle: Handle,
+    address: Address,
+    header: &[u8; 64],
+    bar0: &Result<Vec<BarRegion>, Error>,
+) {
+    use stela_boot_core::firmware_pci::lpss::{self, Bar0};
+    use stela_drivers::bus::pci::regs;
+
+    let word = |offset| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+    let identity = word(0);
+    if !lpss::matches(identity) {
+        return;
+    }
+    let vendor = identity as u16;
+    let device = identity >> 16;
+    // UEFI PI 1.8, §17.2.2 and §17.2.7. Inspect GUIDs only and do not
+    // open the interfaces or infer driver binding or child handle state.
+    const I2C_MASTER: uefi::Guid = uefi::guid!("cd72881f-45b5-4feb-98c8-313da8117462");
+    const I2C_HOST: uefi::Guid = uefi::guid!("a5aab9e3-c727-48cd-8bbf-427233854948");
+    let (master, host) = match boot::protocols_per_handle(handle) {
+        Ok(guids) => {
+            let presence = |protocol: &uefi::Guid| {
+                if guids.iter().any(|&guid| guid == protocol) {
+                    "present"
+                } else {
+                    "absent"
+                }
+            };
+            (presence(&I2C_MASTER), presence(&I2C_HOST))
+        }
+        Err(_) => ("unavailable", "unavailable"),
+    };
+    let command = u16::from_le_bytes([header[4], header[5]]);
+    let ioe = command & regs::COMMAND_IO != 0;
+    let mse = command & regs::COMMAND_MEMORY != 0;
+    let bme = command & regs::COMMAND_MASTER != 0;
+    let intx_disabled = command & regs::COMMAND_INTX_DISABLE != 0;
+    let advertised = match bar0 {
+        Ok(regions) if !regions.is_empty() => "advertised",
+        Ok(_) | Err(Error::Firmware(Status::UNSUPPORTED)) => "not-advertised",
+        Err(_) => "unavailable",
+    };
+    crate::output::arguments(format_args!(
+        "FW LPSS-I2C pci={address} id={vendor:04x}:{device:04x} command={command:#06x} \
+         ioe={ioe} mse={mse} bme={bme} intx-disabled={intx_disabled} bar0={advertised} \
+         pci-handle-i2c-master={master} pci-handle-i2c-host={host} stop-evidence=unavailable\n"
+    ));
+    let region = Bar0::observe(word(0x0c), word(0x10), word(0x14))
+        .ok_or("raw-bar0-refused")
+        .and_then(|bar| {
+            let regions = bar0.as_ref().map_err(|_| "descriptor-unavailable")?;
+            bar.firmware_region(regions).ok_or("descriptor-mismatch")
+        });
+    match region {
+        Ok(region) => crate::output::arguments(format_args!(
+            "FW LPSS-I2C BAR0 pci={address} id={vendor:04x}:{device:04x} bus={:#x} host={:#x} bytes={}\n",
+            region.pci.start,
+            region.host.start,
+            region.pci.end - region.pci.start
+        )),
+        Err(state) => crate::output::arguments(format_args!(
+            "FW LPSS-I2C BAR0 pci={address} id={vendor:04x}:{device:04x} state={state}\n"
+        )),
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn nvme_bar0(header: &[u8; 64], regions: &[BarRegion]) -> bool {
+    let [region] = regions else {
+        return false;
+    };
+    let low = u32::from_le_bytes(header[0x10..0x14].try_into().unwrap());
+    let high = u32::from_le_bytes(header[0x14..0x18].try_into().unwrap());
+    let (high, bits) = match low & 7 {
+        0 => (0, 32),
+        4 => (high, 64),
+        _ => return false,
+    };
+    let base = u64::from(low & !15) | u64::from(high) << 32;
+    header[0x0e] & 0x7f == 0
+        && region.resource_type == 0
+        && region.granularity == bits
+        && base != 0
+        && region.pci.start == base
+        && region.pci.end - base >= 0x20
+}
+
 #[derive(Debug)]
 pub enum CaptureFailure {
     Enumeration(Status),
@@ -437,8 +591,8 @@ pub fn capture() -> Result<Census, CaptureFailure> {
         .map_err(|_| CaptureFailure::Allocation)?;
     for handle in handles {
         // SAFETY: GetProtocol is the firmware's scoped instance. This
-        // consumer only reads header/GetLocation/GetBarAttributes; the firmware
-        // keeps controller driving/reset permission until EBS handoff.
+        // consumer only observes the function; the firmware keeps controller
+        // driving and reset permission throughout this loop.
         // All borrowed callbacks and returned pool storage end in this loop.
         let mut protocol = match unsafe {
             boot::open_protocol::<PciIo>(
@@ -479,6 +633,12 @@ pub fn capture() -> Result<Census, CaptureFailure> {
         }) {
             return Err(CaptureFailure::Function(Error::Release(status)));
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            observe_nvme(handle, &mut protocol, address, &header, &bars[0]);
+            observe_lpss_i2c(handle, address, &header, &bars[0]);
+            observe_glk(&mut protocol, address, &header, &bars[0]);
+        }
         result.functions.push(FunctionObservation {
             address,
             header,
@@ -486,6 +646,107 @@ pub fn capture() -> Result<Census, CaptureFailure> {
         });
     }
     Ok(result)
+}
+
+#[cfg(feature = "diagnostics")]
+fn observe_glk(
+    protocol: &mut PciIo,
+    address: Address,
+    header: &[u8; 64],
+    regions: &Result<Vec<BarRegion>, Error>,
+) {
+    use stela_boot_core::firmware_pci::glk::{self, Bar0};
+    use stela_drivers::bus::pci::regs;
+
+    let word = |offset| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+    let identity = word(0);
+    if !glk::matches(identity, word(8)) {
+        return;
+    }
+    let device = identity >> 16;
+    let command = word(4) as u16;
+    let mse = command & regs::COMMAND_MEMORY != 0;
+    let bme = command & regs::COMMAND_MASTER != 0;
+    let low = word(0x10);
+    let high = word(0x14);
+    let region = Bar0::observe(word(0x0c), low, high)
+        .ok_or("raw-bar0-refused")
+        .and_then(|bar| {
+            let regions = regions.as_ref().map_err(|_| "descriptor-unavailable")?;
+            bar.firmware_region(regions)
+                .map(|region| (bar, region))
+                .ok_or("descriptor-mismatch")
+        });
+    match region {
+        Ok((bar, region)) => {
+            crate::output::arguments(format_args!(
+                "FW GLK ATTACH pci={address} device={device:04x} mse={mse} bme={bme} bar0_bus={:#x} bar0_host={:#x} bar0_bytes={} bar0_source=uefi-pci-io\n",
+                region.pci.start,
+                region.host.start,
+                region.pci.end - region.pci.start
+            ));
+            observe_glk_ggtt(protocol, address, bar);
+        }
+        Err(reason) => crate::output::arguments(format_args!(
+            "FW GLK ATTACH pci={address} device={device:04x} mse={mse} bme={bme} bar0_low={low:#x} bar0_next={high:#x} bar0={reason}\n"
+        )),
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn observe_glk_ggtt(
+    protocol: &mut PciIo,
+    address: Address,
+    bar: stela_boot_core::firmware_pci::glk::Bar0,
+) {
+    use stela_boot_core::firmware_pci::glk::BAR0_BYTES;
+    use stela_drivers::{
+        bus::pci::Bar,
+        gpu::intel::glk::{GRAPHICS_CONTROL, ggtt::Geometry},
+    };
+
+    let mut control = 0u16;
+    // SAFETY: this is the live PCI_IO borrow used for the same function's
+    // header and BAR descriptor. Width 1 reads one UINT16 of configuration.
+    let read = unsafe {
+        (protocol.config_read)(
+            protocol,
+            1,
+            GRAPHICS_CONTROL.into(),
+            1,
+            (&mut control as *mut u16).cast(),
+        )
+    };
+    if let Err(error) = status(read) {
+        crate::output::arguments(format_args!(
+            "FW GLK GGTT pci={address} status=config-unavailable error={error:?}\n"
+        ));
+        return;
+    }
+    let bar = Bar::Memory {
+        address: bar.pci_base,
+        size: BAR0_BYTES,
+        prefetchable: false,
+        wide: bar.bits == 64,
+    };
+    match Geometry::from_control(bar, control) {
+        Ok(Some(geometry)) => {
+            let range = geometry.pci_range();
+            crate::output::arguments(format_args!(
+                "FW GLK GGTT pci={address} status=observed pci_start={:#x} pci_end_exclusive={:#x} entries={} gpu_va_bytes={} source=uefi-pci-io\n",
+                range.start,
+                range.end,
+                geometry.entry_count(),
+                geometry.address_space_bytes()
+            ));
+        }
+        Ok(None) => {
+            crate::output::arguments(format_args!("FW GLK GGTT pci={address} status=disabled\n"))
+        }
+        Err(error) => crate::output::arguments(format_args!(
+            "FW GLK GGTT pci={address} status=refused error={error:?}\n"
+        )),
+    }
 }
 
 impl core::fmt::Display for CaptureFailure {

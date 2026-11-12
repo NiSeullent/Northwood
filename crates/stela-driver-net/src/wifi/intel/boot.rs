@@ -117,8 +117,9 @@ pub struct NativeBootIo {
 }
 impl NativeBootIo {
     /// # Safety
-    /// `window` is the claimed AX200/AX210 function's aligned uncached BAR
-    /// mapping covering its 16 KiB. `owner` keeps that real exclusive PCI
+    /// `window` is the claimed AX200, AX210 or Intel 9000 `8086:31dc`
+    /// function's aligned uncached BAR mapping covering its first 16 KiB.
+    /// `owner` keeps that real exclusive PCI
     /// claim and BAR reservation, with all old DMA/IRQs stopped and drained and
     /// PCI interrupt routes disabled; no unrelated/dummy owner checks.
     /// The minimum provider is the actual retained platform grant, usable in this

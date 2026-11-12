@@ -632,7 +632,7 @@ fn inventory_with_nodes<'a>(root: &Node<'a>) -> Result<ResourceInventory<'a>> {
             views.extend(match name {
                 super::UART => &["debug-console"][..],
                 super::SPI => &[super::NOR][..],
-                super::NOR => &[super::NVRAM, super::SYSCFG][..],
+                super::NOR => &[super::NVRAM, super::SYSCFG, super::BOOT_FIRMWARE][..],
                 super::I2C => &[super::HPM_MANAGER][..],
                 super::HPM_MANAGER => &[super::HPM][..],
                 _ => &[],

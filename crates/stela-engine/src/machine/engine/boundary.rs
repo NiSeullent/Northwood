@@ -1,10 +1,36 @@
 //! The x86 host and the board's device bus the engine runs against.
 
 use super::*;
+use crate::memory::RegisteredSystemRam;
+use stela_compiler::context::memory::MemoryStatus;
 use stela_contracts::{
     gate::{GateCall, GateOutcome},
     refuse,
 };
+
+/// A system block that the host refused before executing any native code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeEntryError {
+    /// An active registered RAM service excluded the execution loan.
+    RamServiceBusy,
+    Refused(&'static str),
+}
+
+impl core::fmt::Display for NativeEntryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::RamServiceBusy => "registered RAM native execution refused: memory service busy",
+            Self::Refused(reason) => reason,
+        })
+    }
+}
+
+/// Registered RAM owner for a promoted device site. A native host that
+/// retains aliases supplies the generation those aliases may still use.
+pub struct DeviceSiteRam {
+    pub ram: Arc<RegisteredSystemRam>,
+    pub expected_generation: Option<u64>,
+}
 
 /// One PE's System registers that take none of the board's locks, as
 /// [`Devices::system_register`] serves them.
@@ -96,6 +122,13 @@ pub trait Host {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Retire this held worker's guest-facing direct aliases and cached
+    /// translations for the exact registered RAM. Return true only after
+    /// the aliases are removed and old translations cannot run again.
+    fn revoke_ram_cpu_mappings(&mut self, _request: &publication::RamCpuMappingRevocation) -> bool {
+        false
+    }
+
     /// Source-checked identity kept by this physical worker's local
     /// Host/GS owner. Serial hosts have no native-worker permission.
     fn native_worker(&self) -> Option<publication::WorkerId> {
@@ -111,6 +144,18 @@ pub trait Host {
 
     /// Read guest RAM. False when any byte is not RAM.
     fn read_ram(&mut self, physical: u64, buffer: &mut [u8]) -> bool;
+
+    /// Return the canonical owner if installed. Failure must stop the
+    /// promoted access before trying a legacy probe or a device.
+    fn device_site_ram(&self) -> Result<Option<DeviceSiteRam>, MemoryStatus> {
+        Ok(None)
+    }
+
+    /// Whether the host's retained CPU map still names this GPA page.
+    /// Used only to refuse a registered hole that contradicts that map.
+    fn device_site_has_retained_ram(&self, _page: u64) -> bool {
+        false
+    }
 
     /// Read an aligned, little-endian guest page-table descriptor.
     fn read_ram_descriptor(&mut self, physical: u64) -> Option<u64> {
@@ -257,6 +302,18 @@ pub trait Host {
     /// `code` was returned by [`Host::install`] since the last discard and
     /// was compiled for the system-mode block ABI.
     unsafe fn execute(&mut self, code: NativeCode, state: &mut GuestState) -> NativeExit;
+    /// Like `execute`, with a refusal before any native effects.
+    ///
+    /// # Safety
+    /// The contract of `execute` applies.
+    unsafe fn try_execute(
+        &mut self,
+        code: NativeCode,
+        state: &mut GuestState,
+    ) -> Result<NativeExit, NativeEntryError> {
+        // SAFETY: forwarded under the same installed system block contract.
+        Ok(unsafe { self.execute(code, state) })
+    }
     /// Run an installed context-ABI block through this physical owner's native
     /// recovery frame. `None` refuses context entry before any native effects.
     ///

@@ -1,12 +1,18 @@
 //! The Wi-Fi network `stela.efi` joins for a network install (`--wifi`):
 //! its name and country go in `stela.cfg`, and its passphrase in the key
-//! file beside it, `EFI/stela/wifi.key`, in plaintext.
+//! file beside it in the selected setup directory, in plaintext.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
+use stela_loader::mount_interface::layout::{self, Layout};
 
 /// The key file on the ESP, as `stela.cfg`'s `--wifi` reads it by default.
+#[cfg(test)]
 pub(super) const KEY_PATH: &str = "EFI/stela/wifi.key";
+
+pub(super) fn key_path(layout: Layout) -> String {
+    layout.esp_path(layout::WIFI_KEY)
+}
 
 /// The network a setup joins, as its record keeps it. The passphrase is
 /// only in the key file.
@@ -72,14 +78,15 @@ pub(super) fn ask_passphrase(ssid: &str) -> Result<String> {
 }
 
 /// Write the key file onto the ESP at `esp`.
-pub(super) fn write_key(esp: &Path, passphrase: &str) -> Result<()> {
-    let path = esp.join(KEY_PATH);
+pub(super) fn write_key_in(esp: &Path, passphrase: &str, layout: Layout) -> Result<()> {
+    let path = esp.join(key_path(layout));
     fs::create_dir_all(path.parent().unwrap())?;
-    fs::write(&path, passphrase).with_context(|| format!("writing {}", path.display()))
+    crate::efi::write_atomic(&path, passphrase.as_bytes(), false)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// The plan's line for the network, after its two spaces.
-pub(super) fn describe(network: &Network, esp: &Path) -> String {
+pub(super) fn describe_in(network: &Network, esp: &Path, layout: Layout) -> String {
     format!(
         "{:<14} joins \"{}\"{}; its passphrase is in {} in plaintext",
         "Wi-Fi",
@@ -89,7 +96,7 @@ pub(super) fn describe(network: &Network, esp: &Path) -> String {
             .as_ref()
             .map(|country| format!(" under {country}'s rules"))
             .unwrap_or_default(),
-        esp.join(KEY_PATH).display()
+        esp.join(key_path(layout)).display()
     )
 }
 

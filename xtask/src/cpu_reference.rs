@@ -13,6 +13,7 @@ use std::{
     io::{Read, Write},
     process::{Command, Stdio},
 };
+use stela_compiler::TargetCpu;
 
 mod corpus;
 mod record;
@@ -65,6 +66,9 @@ pub struct CpuReference {
     /// Only the cases whose name contains this text.
     #[arg(long)]
     only: Option<String>,
+    /// Compile for this host-supported x86 target instead of the detected one.
+    #[arg(long)]
+    target: Option<TargetCpu>,
     /// List the case names and exit.
     #[arg(long)]
     list: bool,
@@ -88,6 +92,14 @@ impl CpuReference {
             return Ok(());
         }
         ensure!(!cases.is_empty(), "no case matches");
+        let host = TargetCpu::detect();
+        let target = self.target.unwrap_or(host);
+        let target_id = target.id();
+        ensure!(
+            host.supports(target),
+            "host {} cannot run target {target_id}",
+            host.id()
+        );
         let (reference, source) = if self.recorded {
             let table = recorded()?;
             let outcomes = cases
@@ -116,7 +128,7 @@ impl CpuReference {
             }
             (outcomes, "mac")
         };
-        let stela: Vec<String> = stela::run(&cases)?
+        let stela: Vec<String> = stela::run(&cases, target)?
             .iter()
             .zip(&cases)
             .map(|(ending, case)| record::outcome(case, ending))
@@ -139,7 +151,7 @@ impl CpuReference {
             println!("{name}: known ({})", known_difference(name).unwrap());
         }
         println!(
-            "{} cases, {} match, {} differ, {} known; ledger {}",
+            "target {target_id}: {} cases, {} match, {} differ, {} known; ledger {}",
             cases.len(),
             cases.len() - differences.len(),
             unknown.len(),

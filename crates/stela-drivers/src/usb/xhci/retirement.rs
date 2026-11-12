@@ -52,6 +52,66 @@ struct Quiesced<'a> {
 }
 
 impl Controller {
+    /// End this reserved BOT attachment without resetting or re-enumerating
+    /// its port. The class caller retains its transport and payload buffers.
+    #[expect(
+        clippy::result_large_err,
+        reason = "retain the operation and the exact controller error"
+    )]
+    pub(in crate::usb) fn retire_reserved_bot(
+        &mut self,
+        attachment: crate::usb::storage::ReservedBotAttachment<'_>,
+    ) -> Result<(), crate::usb::storage::UsbRetirementError> {
+        use crate::usb::storage::UsbRetirementError;
+        const PREFLIGHT: &str = "preflight reserved BOT slot retirement";
+        let refused = |error| UsbRetirementError::preflight(PREFLIGHT, error);
+        let (device, endpoints) = attachment.parts();
+        self.hardware.ready().map_err(refused)?;
+        self.reset_preflight(device, endpoints).map_err(refused)?;
+        let slot = device.id.hardware_slot();
+        let state = self.slots[usize::from(slot)].as_ref().unwrap();
+        if state.attachment.parent.is_some()
+            || state.consumer != identity::Consumer::Native
+            || state.endpoints[1].is_none()
+            || state.retired_rings.iter().any(Option::is_some)
+        {
+            return Err(refused(BlockError::Unsupported(
+                "BOT retirement requires one original native root leaf",
+            )));
+        }
+        if self.error.is_some()
+            || self.command_poisoned
+            || self.command_ring_stopped
+            || self.outstanding.is_some()
+            || self.queued_resets.contains(&device.id)
+            || self.posted_for(device.id)
+            || state.endpoints.iter().flatten().any(|endpoint| {
+                !endpoint.enabled
+                    || endpoint.poisoned
+                    || endpoint.in_flight != 0
+                    || !endpoint.ring.normal.idle()
+                    || endpoint.streams.is_some()
+                    || endpoint.iso.is_some()
+            })
+        {
+            return Err(refused(BlockError::Unsupported(
+                "BOT slot or controller still has pending work",
+            )));
+        }
+        // This same mutable borrow fences aliases before the first Stop and
+        // stays held through the acknowledged Disable and DCBAA clear.
+        let uncertain = |(operation, cause)| UsbRetirementError {
+            operation,
+            cause,
+            ownership_uncertain: true,
+        };
+        self.disable_slot(slot, Ownership::Retired)
+            .map_err(uncertain)?;
+        self.dcbaa
+            .sync_dirty()
+            .map_err(|cause| uncertain(("publish retired BOT DCBAA clear", cause)))
+    }
+
     /// Exclusive root-leaf reset is the only published storage return producer.
     /// Its private witness keeps the original generation/current/attachment
     /// through whole-slot retirement and postsettle physical reset.

@@ -230,6 +230,7 @@ pub(super) fn plan_with_controller(
         storage::CLASS => storage::plan(device, interface, all, controller),
         hid::CLASS => hid::plan(interface),
         cdc::COMMUNICATIONS => cdc::plan(interface, all),
+        bluetooth::CLASS if cdc::is_rndis(interface) => cdc::plan(interface, all),
         bluetooth::CLASS => bluetooth::Binding::new(device, interface).map(Plan::Bluetooth),
         0xff if bluetooth::broadcom::is_vendor_interface(device, interface) => {
             bluetooth::Binding::new(device, interface).map(Plan::Bluetooth)
@@ -297,6 +298,7 @@ pub(super) fn active_settings(
 /// Choose the unique configuration offering the greatest number of supported
 /// functions. At equal coverage, an implemented observed vendor Ethernet mode
 /// wins over its generic CDC alternative, as r8152's cfgselector requires.
+/// Prefer NCM, ECM and RNDIS in that order among tied CDC modes.
 /// No supported function leaves the first descriptor selected only
 /// for unused-interface diagnostics; bind will issue no configuration request.
 #[cfg(test)]
@@ -319,7 +321,7 @@ pub(super) fn select_with_controller(
         let mut vendor_ethernet = false;
         let mut uas_count = 0;
         let mut asix = false;
-        let mut cdc = false;
+        let mut cdc = 0;
         let mut endpoints = Vec::new();
         let mut claimed = Vec::new();
         for interface in all.iter().filter(|i| primary(i)) {
@@ -332,7 +334,9 @@ pub(super) fn select_with_controller(
                     vendor_ethernet |= binding.observed_vendor();
                     asix |= binding.asix_candidate();
                 }
-                cdc |= matches!(&binding, Plan::Ethernet(_));
+                if let Plan::Ethernet(binding) = &binding {
+                    cdc = cdc.max(binding.preference());
+                }
                 uas_count +=
                     usize::from(matches!(&binding, Plan::Storage(binding) if binding.uas()));
                 for (number, alternate) in binding.settings(interface.number) {
@@ -365,9 +369,15 @@ pub(super) fn select_with_controller(
     // Unlike Realtek cfgselector, ASIX has no source-backed preconfiguration
     // silicon check. At equal supported coverage keep a usable CDC alternative
     // over an ASIX-only candidate; unrelated configurations still tie normally.
-    if !maximum.1 && finalists.iter().any(|candidate| candidate.3) {
-        finalists.retain(|candidate| !candidate.2 || candidate.3);
+    let cdc = finalists
+        .iter()
+        .map(|candidate| candidate.3)
+        .max()
+        .unwrap_or(0);
+    if !maximum.1 && cdc > 0 {
+        finalists.retain(|candidate| !candidate.2 || candidate.3 > 0);
     }
+    finalists.retain(|candidate| candidate.3 == 0 || candidate.3 == cdc);
     // Linux `usb_choose_configuration` takes the first of equal candidates.
     let best = finalists.first().map(|candidate| candidate.0);
     if maximum.0 == 0 && device.descriptor[4] == HUB_CLASS {

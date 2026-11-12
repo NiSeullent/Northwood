@@ -10,14 +10,13 @@
 //! compiler's own lock ([`run_job`]): a call that needs one is answered
 //! not ready, and its guest thread sleeps and calls again.
 use super::{
-    BOOT_CPU, Bound, Installed, PAGE, client, installed, look_again, pump_waiting,
+    BOOT_CPU, Bound, Installed, PAGE, client, installed, look_again,
     stack::{self, Stack},
 };
 use crate::{engine::host, output};
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::{
     ffi::{c_char, c_void},
-    hint,
     num::NonZeroU64,
     ptr::{self, NonNull},
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
@@ -36,6 +35,7 @@ use stela_drivers::gpu::metal::{
     timing::Totals,
     vulkan::physical::PciBusInfo,
 };
+use stela_engine::memory::system_ram::ExternalDmaLoan;
 use stela_linux::{
     client::Run,
     function::{dma_quarantine_status, quarantined_functions},
@@ -91,12 +91,7 @@ fn run(stack: u64, body: &mut dyn FnMut()) {
 }
 
 pub(super) fn relax() {
-    // What this waits for may be retiring a mapping, which waits for this.
-    crate::native_mmio::shootdown::service();
-    if host::processor() == BOOT_CPU.load(Ordering::Relaxed) {
-        pump_waiting();
-    }
-    hint::spin_loop();
+    client::relax();
 }
 
 /// A table of the texts a log line has shown, and a count of the distinct
@@ -855,24 +850,57 @@ unsafe extern "system" fn entry(
 }
 
 /// The host pages behind whole pages of guest RAM.
-fn guest_pages(ranges: &[MemoryRange]) -> Result<Vec<Run>, Error> {
+fn guest_pages(
+    ranges: &[MemoryRange],
+    loan: Option<&ExternalDmaLoan<'_>>,
+) -> Result<(Vec<Run>, u64), Error> {
     const NOT_RAM: Error = Error::Invalid("imported memory is whole pages of guest RAM");
+    // Linux stores each run's length in a 32-bit scatterlist entry.
+    const MAX_RUN: u64 = u32::MAX as u64 / PAGE * PAGE;
     let mut runs: Vec<Run> = Vec::new();
+    let mut total = 0u64;
     for range in ranges {
-        if !(range.address | range.bytes).is_multiple_of(PAGE) {
+        if !(range.address | range.bytes).is_multiple_of(PAGE)
+            || range.address.checked_add(range.bytes).is_none()
+        {
             return Err(NOT_RAM);
         }
-        let whole = host::guest_runs(range.address, range.bytes, |physical, bytes| {
-            match runs.last_mut() {
-                Some(last) if last.physical + last.bytes == physical => last.bytes += bytes,
-                _ => runs.push(Run { physical, bytes }),
-            }
-        });
-        if !whole {
-            return Err(NOT_RAM);
-        }
+        total = total.checked_add(range.bytes).ok_or(NOT_RAM)?;
     }
-    Ok(runs)
+    let mut valid = true;
+    let mut append = |mut physical: u64, mut bytes: u64| {
+        if !(physical | bytes).is_multiple_of(PAGE) || physical.checked_add(bytes).is_none() {
+            valid = false;
+            return;
+        }
+        while bytes != 0 {
+            let mut count = bytes.min(MAX_RUN);
+            if let Some(last) = runs.last_mut()
+                && last.physical + last.bytes == physical
+                && last.bytes < MAX_RUN
+            {
+                count = count.min(MAX_RUN - last.bytes);
+                last.bytes += count;
+            } else {
+                runs.push(Run {
+                    physical,
+                    bytes: count,
+                });
+            }
+            physical += count;
+            bytes -= count;
+        }
+    };
+    let whole = match loan {
+        Some(loan) => loan.visit_physical_runs(&mut append).is_ok(),
+        None => ranges
+            .iter()
+            .all(|range| host::guest_runs(range.address, range.bytes, &mut append)),
+    };
+    if !whole || !valid || total == 0 || u32::try_from(runs.len()).is_err() {
+        return Err(NOT_RAM);
+    }
+    Ok((runs, total))
 }
 
 /// Guest RAM the kext wired, for NVK to import. The GPU reaches it through
@@ -881,9 +909,29 @@ struct Exporter;
 
 impl MemoryExporter for Exporter {
     fn export(&self, ranges: &[MemoryRange]) -> Result<ExportedMemory, Error> {
-        let runs = guest_pages(ranges)?;
-        let (fd, pointer) = client::export(&runs).ok_or(Error::OutOfMemory)?;
-        let bytes = runs.iter().map(|run| run.bytes).sum();
+        let owner = host::guest_dma_owner();
+        let mut loan = owner
+            .as_ref()
+            .map(|ram| ram.prepare_external_dma(ranges))
+            .transpose()
+            .map_err(|_| Error::Invalid("imported guest RAM is unavailable"))?;
+        let (runs, bytes) = guest_pages(ranges, loan.as_ref())?;
+        let result = client::export(&runs, bytes, || {
+            if let Some(loan) = &mut loan {
+                loan.begin_publication();
+            }
+        });
+        let (fd, pointer) = match result {
+            Ok(export) => export,
+            Err(error) => {
+                if let (client::ExportFailure::Unpublished, Some(loan)) = (error, &mut loan) {
+                    // SAFETY: Linux received no runs. Either no CPU alias
+                    // was installed or every CPU acknowledged retirement.
+                    unsafe { loan.cancel_publication() };
+                }
+                return Err(Error::OutOfMemory);
+            }
+        };
         Ok(ExportedMemory { fd, pointer, bytes })
     }
 
