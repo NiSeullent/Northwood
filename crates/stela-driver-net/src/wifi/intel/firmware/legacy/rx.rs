@@ -113,15 +113,14 @@ impl Queue {
         let mut buffers = Vec::with_capacity(usize::from(POSTED));
         let empty = [0; BUFFER_BYTES];
         for (index, descriptor) in descriptors
-            .chunks_exact_mut(8)
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
             .take(POSTED.into())
             .enumerate()
         {
             let chunk = allocate(&empty, Direction::FromDevice)?;
-            descriptor.copy_from_slice(&receive::pre_ax210_mq_free(
-                chunk.region().address,
-                index as u16 + 1,
-            )?);
+            *descriptor = receive::pre_ax210_mq_free(chunk.region().address, index as u16 + 1)?;
             buffers.push(Buffer {
                 chunk,
                 consumed: false,

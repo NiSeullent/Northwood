@@ -782,8 +782,9 @@ pub fn read_for_write(
         return Err(PayloadError::Disk("the protective MBR is missing"));
     }
     let protected = last.min(u64::from(u32::MAX)) as u32;
-    let mut entries = mbr[446..510]
-        .chunks_exact(16)
+    let (entries, _) = mbr[446..510].as_chunks::<16>();
+    let mut entries = entries
+        .iter()
         .filter(|entry| entry.iter().any(|&byte| byte != 0));
     let protection = entries.next().is_some_and(|entry| {
         entry[0] == 0

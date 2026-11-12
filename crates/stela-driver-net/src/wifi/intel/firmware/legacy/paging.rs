@@ -100,18 +100,18 @@ impl Pages {
         let mut chunks = Vec::with_capacity(block_count + 1);
         let mut payload = [0; PAYLOAD_BYTES];
         let (header, addresses) = payload.split_at_mut(12);
-        for (word, value) in header.chunks_exact_mut(4).zip([
+        for (word, value) in header.as_chunks_mut::<4>().0.iter_mut().zip([
             FLAGS | last_pages as u32,
             BLOCK_SHIFT,
             block_count as u32,
         ]) {
-            word.copy_from_slice(&value.to_le_bytes());
+            *word = value.to_le_bytes();
         }
 
         let mut bytes = vec![0; BLOCK_BYTES];
         for ((data, size), word) in core::iter::once((layout.css, PAGE_BYTES))
             .chain(blocks.map(|data| (data, BLOCK_BYTES)))
-            .zip(addresses.chunks_exact_mut(4))
+            .zip(addresses.as_chunks_mut::<4>().0)
         {
             let buffer = &mut bytes[..size];
             buffer[..data.len()].copy_from_slice(data);
@@ -128,7 +128,7 @@ impl Pages {
                 return Err(Error::Address);
             }
             let page = u32::try_from(address >> PAGE_SHIFT).map_err(|_| Error::Address)?;
-            word.copy_from_slice(&page.to_le_bytes());
+            *word = page.to_le_bytes();
             chunks.push(chunk);
         }
         Ok(Self { chunks, payload })

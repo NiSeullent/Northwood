@@ -221,9 +221,9 @@ impl Nor {
                         BLOCK_SIZE
                     };
                     let base = (t.address % CAPACITY) & !(size - 1);
-                    let sectors =
-                        self.image.bytes_mut()[base..base + size].chunks_exact_mut(SECTOR_SIZE);
-                    for (index, sector) in sectors.enumerate() {
+                    let (sectors, _) =
+                        self.image.bytes_mut()[base..base + size].as_chunks_mut::<SECTOR_SIZE>();
+                    for (index, sector) in sectors.iter_mut().enumerate() {
                         if sector.iter().any(|&byte| byte != ERASED) {
                             sector.fill(ERASED);
                             self.dirty.insert(base / SECTOR_SIZE + index);

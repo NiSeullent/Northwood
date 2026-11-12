@@ -69,8 +69,7 @@ impl Download {
         );
         write_from(
             source,
-            volume,
-            layout,
+            &directory_in(volume, layout, &self.image.build),
             model,
             &self.image,
             &self.etag,
@@ -190,8 +189,7 @@ fn resumed(
 
 fn write_from(
     mut source: impl Read + Seek,
-    volume: &Path,
-    layout: VolumeLayout,
+    directory: &Path,
     model: &str,
     image: &restore::Image,
     etag: &str,
@@ -209,8 +207,7 @@ fn write_from(
         !sizes.is_empty() && sizes.len() <= MAX_PIECES,
         "invalid download size or piece size"
     );
-    let directory = directory_in(volume, layout, &image.build);
-    fs::create_dir_all(&directory)?;
+    fs::create_dir_all(directory)?;
     let manifest_path = directory.join(MANIFEST_FILE);
     if manifest_path.exists() {
         fs::remove_file(&manifest_path)?;
@@ -226,7 +223,7 @@ fn write_from(
     };
     let resume_path = directory.join(RESUME_FILE);
     let (mut pieces, mut piece_blocks) = resumed(
-        &directory,
+        directory,
         &record,
         &sizes,
         &mut whole_sha256,
@@ -244,7 +241,7 @@ fn write_from(
     let progress = crate::progress::Phase::bytes("Downloading macOS onto USB", total);
     progress.position(offset);
     for (index, &size) in sizes.iter().enumerate().skip(pieces.len()) {
-        let mut file = fs::File::create(partial_path(&directory, index))?;
+        let mut file = fs::File::create(partial_path(directory, index))?;
         let mut hashes = Hashes::default();
         stream(&mut source, size, |bytes| {
             file.write_all(bytes)?;
@@ -283,7 +280,7 @@ fn write_from(
     progress.finish();
     let mut completing = false;
     let inventory = (|| {
-        let joined = Joined::new(&directory, piece_bytes, total, &piece_blocks)?;
+        let joined = Joined::new(directory, piece_bytes, total, &piece_blocks)?;
         restore::payload::inventory_from(
             joined,
             restore::payload::VerifiedSource {
@@ -305,7 +302,7 @@ fn write_from(
         // promotion. A media failure still takes precedence and leaves the
         // same verified prefix promoted before that failure.
         let progress = crate::progress::Phase::bytes("Verifying USB", total);
-        promote(&directory, &pieces, |_, piece, partial| {
+        promote(directory, &pieces, |_, piece, partial| {
             ensure!(
                 hash_file(partial, piece.bytes, &progress)? == piece.sha256,
                 "USB data does not read back as written"
@@ -542,8 +539,7 @@ mod tests {
             publish_fresh(&volume, &image.build, |scratch| {
                 write_from(
                     io::Cursor::new(source),
-                    scratch,
-                    VolumeLayout::Legacy,
+                    &directory(scratch, &image.build),
                     model,
                     &image,
                     ETAG,
@@ -653,8 +649,7 @@ mod tests {
         let total = source.data.get_ref().len() as u64;
         write_from(
             source,
-            volume,
-            VolumeLayout::Legacy,
+            &directory(volume, &image.build),
             restore::payload::SYNTHETIC_MODEL,
             image,
             etag,
@@ -873,12 +868,11 @@ mod tests {
             url: "https://updates.cdn-apple.com/source.ipsw".into(),
             sha1: Some(hex::encode(Sha1::digest(&data))),
         };
-        let volume = temp.path();
+        let path = directory(temp.path(), &image.build);
         assert!(
             write_from(
                 io::Cursor::new(&data[..]),
-                volume,
-                VolumeLayout::Legacy,
+                &path,
                 restore::payload::SYNTHETIC_MODEL,
                 &image,
                 ETAG,
@@ -887,7 +881,6 @@ mod tests {
             )
             .is_err()
         );
-        let path = directory(volume, &image.build);
         for (index, part) in data.chunks(BLOCK).enumerate() {
             assert_eq!(fs::read(path.join(piece_name(index)))?, part);
             assert!(!partial_path(&path, index).exists());
@@ -902,8 +895,7 @@ mod tests {
                 data: &data,
                 partial: partial.clone(),
             },
-            &volume,
-            VolumeLayout::Legacy,
+            &path,
             restore::payload::SYNTHETIC_MODEL,
             &image,
             ETAG,
@@ -933,10 +925,10 @@ mod tests {
             sha1: Some(hex::encode(Sha1::digest(&bytes))),
         };
         let volume = temp.path().join("usb");
+        let written_dir = directory_in(&volume, VolumeLayout::Northwood, &image.build);
         let written = write_from(
             io::Cursor::new(&bytes[..]),
-            &volume,
-            VolumeLayout::Northwood,
+            &written_dir,
             restore::payload::SYNTHETIC_MODEL,
             &image,
             ETAG,
@@ -948,7 +940,6 @@ mod tests {
             written.wrote > 1,
             "the fixture must exercise joined-piece reads"
         );
-        let written_dir = directory_in(&volume, VolumeLayout::Northwood, &image.build);
         assert!(!directory(&volume, &image.build).exists());
         let manifest = fs::read(written_dir.join(MANIFEST_FILE))?;
         assert_eq!(written.manifest_sha256, stela_formats::sha256(&manifest));
@@ -995,8 +986,7 @@ mod tests {
             assert!(
                 write_from(
                     io::Cursor::new(&bad_bytes[..]),
-                    &bad,
-                    VolumeLayout::Legacy,
+                    &directory(&bad, &image.build),
                     restore::payload::SYNTHETIC_MODEL,
                     &image,
                     ETAG,

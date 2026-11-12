@@ -7,6 +7,10 @@ impl Namespace {
     /// of its aliases, including access from firmware and other hosts.
     /// Return the original route on refusal so its outstanding work and
     /// resources still have an owner.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error returns the original namespace and its owners without allocating"
+    )]
     pub fn into_exclusive(mut self) -> Result<ExclusiveNamespace, (Self, BlockError)> {
         if let Err(error) = self.claim_exclusive() {
             return Err((self, error));

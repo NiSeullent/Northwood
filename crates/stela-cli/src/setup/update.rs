@@ -271,8 +271,9 @@ pub(super) fn update_stela(
                 text,
                 "  {:<14} {} ({to_generation}), replaces {from_generation}",
                 kind.label(),
-                bundle::directory_of(
+                bundle::directory_of_in(
                     &record.volume,
+                    record.layout,
                     bundle::Identity {
                         kind,
                         build: &record.build,

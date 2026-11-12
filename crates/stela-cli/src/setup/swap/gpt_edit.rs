@@ -132,12 +132,9 @@ impl Snapshot {
         entry[32..40].copy_from_slice(&partition.first_lba.to_le_bytes());
         entry[40..48].copy_from_slice(&partition.last_lba.to_le_bytes());
         entry[48..56].copy_from_slice(&partition.attributes.to_le_bytes());
-        for (unit, field) in partition
-            .name
-            .encode_utf16()
-            .zip(entry[56..].chunks_exact_mut(2))
-        {
-            field.copy_from_slice(&unit.to_le_bytes());
+        let (name_fields, _) = entry[56..].as_chunks_mut::<2>();
+        for (unit, field) in partition.name.encode_utf16().zip(name_fields) {
+            *field = unit.to_le_bytes();
         }
 
         let crc = gpt::crc32(&entries);

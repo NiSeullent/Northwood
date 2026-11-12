@@ -165,8 +165,8 @@ impl Queue {
         let invalid = allocate(&INVALID_COMMAND)?;
         let invalid_tfd = command_tfd(invalid.region(), None)?;
         let mut descriptors = vec![0; RING_BYTES];
-        for slot in descriptors.chunks_exact_mut(TFD_BYTES) {
-            slot.copy_from_slice(&invalid_tfd);
+        for slot in descriptors.as_chunks_mut::<TFD_BYTES>().0 {
+            *slot = invalid_tfd;
         }
         let ring = allocate(&descriptors)?;
         let tb0 = allocate(&vec![0; usize::from(ENTRIES) * TB0_BYTES])?;

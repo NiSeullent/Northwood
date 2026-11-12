@@ -758,7 +758,7 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String
             .bundles
             .iter()
             .filter(|kept| kept.kind == bundle::Kind::Restore && kept.build == record.build)
-            .map(|kept| kept.directory(&record.volume))
+            .map(|kept| kept.directory_in(&record.volume, record.layout))
             .collect();
         let remote = record.active_medium().is_some_and(|medium| medium.remote);
         report.line(

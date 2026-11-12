@@ -40,6 +40,10 @@ impl<'a, Q: BootIo> RegularHandoff<'a, Q> {
 
     /// Allocate a new RFH generation in the same requester's DMA domain.
     /// Validation and allocation failures return the original handoff.
+    #[expect(
+        clippy::result_large_err,
+        reason = "return the stopped INIT handoff and precise error even when REGULAR preparation runs out of memory"
+    )]
     pub fn prepare_regular<'fw>(
         self,
         generation: u64,

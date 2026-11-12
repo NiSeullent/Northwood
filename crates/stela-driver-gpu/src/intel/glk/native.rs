@@ -82,6 +82,10 @@ impl<P: 'static> Uncore<P> {
     /// containment, powered D0 uncore, calibrated stable clock and CPU
     /// context valid through the operation, including any refusal. The
     /// stopped producer's engine-quiescence grant continues to hold.
+    #[expect(
+        clippy::result_large_err,
+        reason = "an attachment refusal retains the original platform owners without allocating"
+    )]
     pub unsafe fn attach(
         requester: StoppedRequester,
         bar: Bar,
@@ -113,6 +117,10 @@ impl<P: 'static> Uncore<P> {
 
     /// Observe one acquire/release handshake. The same owned transport is
     /// returned only after the domain ACKs both transitions.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a forcewake refusal retains the transport and its owners without allocating"
+    )]
     pub fn forcewake_cycle(self, domain: ForcewakeDomain) -> Result<Self, WakeRefusal<P>> {
         let clock = self.clock;
         // SAFETY: attach consumed the exclusive register, power and root
