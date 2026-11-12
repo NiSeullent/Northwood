@@ -17,8 +17,11 @@ pub mod assigned_topology;
 pub mod audio_check_samples;
 pub mod bluetooth_dsbr;
 pub mod boot_progress;
+pub mod bounded_spin;
 pub mod bundle;
+pub mod bundle_repair;
 pub mod chain_check;
+pub mod chosen_disk;
 #[cfg(all(feature = "config-validation", not(target_os = "uefi")))]
 pub mod config_validation;
 pub mod console_lines;
@@ -59,6 +62,7 @@ pub mod options;
 pub mod page_window;
 pub mod pager;
 pub mod paging_controls;
+pub mod panic_region;
 pub mod passthrough;
 pub mod pe;
 pub mod pm_timer;
@@ -80,7 +84,9 @@ pub mod topology;
 pub mod tsc;
 #[cfg(target_arch = "x86_64")]
 pub mod vtd;
+pub mod work_status;
 pub mod worker_bindings;
+pub mod writeback_placement;
 pub mod xstate;
 
 pub mod firmware_pci;

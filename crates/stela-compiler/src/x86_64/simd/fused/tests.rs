@@ -153,6 +153,7 @@ fn inputs(format: Format) -> Vec<u64> {
 fn scalar_fused_forms_match_fp_mul_add_in_every_control() {
     let targets = [TargetCpu::Baseline, TargetCpu::detect()];
     let mut completed_zero = [0usize; 2];
+    let mut completed_infinite = [0usize; 2];
     let mut cases = 0;
     for (index, &target) in targets.iter().enumerate() {
         for format in [Format::Single, Format::Double] {
@@ -179,7 +180,7 @@ fn scalar_fused_forms_match_fp_mul_add_in_every_control() {
                         let fpcr = rounding << FPCR_ROUNDING_SHIFT | flags;
                         for &addend in &values {
                             for &left in &values {
-                                for &right in &values[..8] {
+                                for &right in &values {
                                     for fpsr in [0, IXC] {
                                         let mut state = GuestState {
                                             fpcr,
@@ -234,6 +235,12 @@ fn scalar_fused_forms_match_fp_mul_add_in_every_control() {
                                         {
                                             completed_zero[index] += 1;
                                         }
+                                        let infinite = |bits: u64| {
+                                            bits & mask & (mask >> 1) == inputs(format)[10] & mask
+                                        };
+                                        if infinite(addend) || infinite(left) || infinite(right) {
+                                            completed_infinite[index] += 1;
+                                        }
                                     }
                                 }
                             }
@@ -247,6 +254,10 @@ fn scalar_fused_forms_match_fp_mul_add_in_every_control() {
     // Zero inputs no longer take the helper with IXC clear, on either host
     // recipe.
     for (target, completed) in targets.iter().zip(completed_zero) {
+        assert!(completed > 1000, "{target:?}: {completed}");
+    }
+    // Neither do exact infinite results of an infinite input.
+    for (target, completed) in targets.iter().zip(completed_infinite) {
         assert!(completed > 1000, "{target:?}: {completed}");
     }
 }
@@ -305,4 +316,112 @@ fn common_fused_multiply_adds_stay_in_the_block_with_ixc_clear() {
             }
         }
     }
+}
+
+/// Vector FMLA/FMLS (4S, 2S, 2D, and 2S by element) lane by lane against
+/// `FPMulAdd`: every completed block matches the reference in each lane and
+/// in FPSR, every other one exits with the state unchanged, and exact
+/// infinite lanes complete.
+#[test]
+fn vector_fused_forms_with_infinite_lanes_match_fp_mul_add() {
+    let registers = u32::from(M) << 16 | u32::from(N) << 5 | u32::from(D);
+    // (word, format, lanes, by element, operation)
+    let forms = [
+        (0x4e20_cc00, Format::Single, 4, false, FusedOperation::Add),
+        (
+            0x4ea0_cc00,
+            Format::Single,
+            4,
+            false,
+            FusedOperation::Subtract,
+        ),
+        (0x0e20_cc00, Format::Single, 2, false, FusedOperation::Add),
+        (0x4e60_cc00, Format::Double, 2, false, FusedOperation::Add),
+        (0x0f80_1000, Format::Single, 2, true, FusedOperation::Add),
+    ];
+    let mut completed_infinite = 0;
+    for target in [TargetCpu::Baseline, TargetCpu::detect()] {
+        for (base, format, lanes, indexed, operation) in forms {
+            let instruction = Decoder.lift(PC, base | registers).unwrap();
+            let fallthrough = GuestAddress(PC.0 + 4);
+            let code = crate::x86_64::block::emit_for_target(
+                core::slice::from_ref(&instruction),
+                None,
+                fallthrough,
+                target,
+                crate::x86_64::MemoryChecks::DEFAULT,
+            )
+            .x86_64_code;
+            let native = Native::new(&code);
+            let values = inputs(format);
+            let bits = if format == Format::Single { 32 } else { 64 };
+            let mask = if bits == 32 {
+                u64::from(u32::MAX)
+            } else {
+                u64::MAX
+            };
+            let lane = |vector: &[u64; 2], index: usize| {
+                let bit = index * bits;
+                (vector[bit / 64] >> (bit % 64)) & mask
+            };
+            let set = |vector: &mut [u64; 2], index: usize, value: u64| {
+                let bit = index * bits;
+                vector[bit / 64] &= !(mask << (bit % 64));
+                vector[bit / 64] |= value << (bit % 64);
+            };
+            for rounding in 0..4 {
+                for flags in [0, FPCR_FZ, FPCR_DN] {
+                    let fpcr = rounding << FPCR_ROUNDING_SHIFT | flags;
+                    for seed in 0..values.len() * values.len() * 3 {
+                        for fpsr in [0, IXC] {
+                            let mut state = GuestState {
+                                fpcr,
+                                fpsr,
+                                ..GuestState::default()
+                            };
+                            for index in 0..128 / bits {
+                                let pick = |salt: usize| {
+                                    values[(seed * (salt + 1)
+                                        + index * (salt + 5)
+                                        + salt * seed / 7)
+                                        % values.len()]
+                                };
+                                set(&mut state.v[usize::from(D)], index, pick(0));
+                                set(&mut state.v[usize::from(N)], index, pick(1));
+                                set(&mut state.v[usize::from(M)], index, pick(2));
+                            }
+                            let before = state.clone();
+                            let exit = native.run(&mut state);
+                            let case = (target, base, fpcr, fpsr, &before.v[3..6]);
+                            if exit.kind == ExitKind::FloatingPoint as u64 {
+                                assert_eq!(exit.pc, PC.0, "{case:x?}");
+                                assert_eq!(state, before, "{case:x?}");
+                                continue;
+                            }
+                            assert_eq!(exit.pc, fallthrough.0, "{case:x?}");
+                            let mut expected = before.clone();
+                            expected.v[usize::from(D)] = [0, 0];
+                            let mut infinite = false;
+                            for index in 0..lanes {
+                                let addend = lane(&before.v[usize::from(D)], index);
+                                let left = lane(&before.v[usize::from(N)], index);
+                                let right = lane(
+                                    &before.v[usize::from(M)],
+                                    if indexed { 0 } else { index },
+                                );
+                                let outcome =
+                                    evaluate(format, operation, fpcr, addend, left, right).unwrap();
+                                set(&mut expected.v[usize::from(D)], index, outcome.bits);
+                                expected.fpsr |= outcome.exceptions;
+                                infinite |= outcome.bits & (mask >> 1) == values[10];
+                            }
+                            assert_eq!(state, expected, "{case:x?}");
+                            completed_infinite += usize::from(infinite);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(completed_infinite > 100, "{completed_infinite}");
 }

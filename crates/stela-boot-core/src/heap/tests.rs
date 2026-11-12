@@ -849,3 +849,61 @@ fn concurrent_allocations_preserve_data_and_reclaim_live_bytes() {
     assert_eq!(heap.usage().carved, 0);
     assert_eq!(heap.usage().largest, ram.0.len());
 }
+
+/// The range of the heap the large-hook test watches, and what its hook
+/// heard there: live tracked bytes and the calls.
+static HOOKED_RANGE: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+static HOOKED_LIVE: AtomicUsize = AtomicUsize::new(0);
+static HOOKED_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn hooked(pointer: usize, bytes: usize, allocated: bool) {
+    let range = HOOKED_RANGE[0].load(Ordering::Relaxed)..HOOKED_RANGE[1].load(Ordering::Relaxed);
+    if !range.contains(&pointer) {
+        return;
+    }
+    HOOKED_CALLS.fetch_add(1, Ordering::Relaxed);
+    if allocated {
+        HOOKED_LIVE.fetch_add(bytes, Ordering::Relaxed);
+    } else {
+        HOOKED_LIVE.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn the_large_hook_hears_every_tracked_block_made_resized_and_freed() {
+    const BYTES: usize = 32 << 20;
+    let mut ram = std::vec![0u8; BYTES + 4096];
+    let start = ram.as_mut_ptr().addr().next_multiple_of(4096);
+    HOOKED_RANGE[0].store(start, Ordering::Relaxed);
+    HOOKED_RANGE[1].store(start + BYTES, Ordering::Relaxed);
+    set_large_hook(hooked);
+    let heap = Heap::new();
+    // SAFETY: exclusive test backing, kept through every exact free.
+    unsafe { heap.initialize(start as *mut u8, BYTES) };
+    let large = Layout::from_size_align(TRACKED_BYTES, 16).unwrap();
+    let below = Layout::from_size_align(TRACKED_BYTES - 16, 16).unwrap();
+    // SAFETY: valid layouts, each block freed once with its layout.
+    unsafe {
+        let small = heap.alloc(below);
+        assert_eq!(HOOKED_CALLS.load(Ordering::Relaxed), 0);
+        let block = heap.alloc(large);
+        assert_eq!(HOOKED_LIVE.load(Ordering::Relaxed), TRACKED_BYTES);
+        let grown = heap.realloc(block, large, 2 * TRACKED_BYTES);
+        assert!(!grown.is_null());
+        assert_eq!(HOOKED_LIVE.load(Ordering::Relaxed), 2 * TRACKED_BYTES);
+        let marked = heap.mark();
+        let peak_block = heap.alloc(large);
+        assert!(heap.marked_peak() >= marked + TRACKED_BYTES);
+        heap.dealloc(peak_block, large);
+        assert!(heap.marked_peak() >= marked + TRACKED_BYTES);
+        assert_eq!(heap.mark(), marked);
+        assert_eq!(heap.marked_peak(), marked);
+        heap.dealloc(
+            grown,
+            Layout::from_size_align(2 * TRACKED_BYTES, 16).unwrap(),
+        );
+        heap.dealloc(small, below);
+    }
+    assert_eq!(HOOKED_LIVE.load(Ordering::Relaxed), 0);
+    assert!(HOOKED_CALLS.load(Ordering::Relaxed) >= 5);
+}

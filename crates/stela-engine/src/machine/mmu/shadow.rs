@@ -152,10 +152,21 @@ pub struct Kept {
     halves: Vec<KeptHalf>,
     /// Switches so far, which order the halves for replacement.
     switches: u64,
+    /// Emptied entry lists whose storage the next switches reuse
+    /// ([`Kept::buffer`]), at most [`SPARE_BUFFERS`]: a switch allocates
+    /// none once the halves are full.
+    spare: Vec<Vec<(u64, usize, u64)>>,
 }
 
-/// The contexts whose lower halves [`Kept`] holds at most.
-pub const KEPT: usize = 8;
+/// The emptied entry lists [`Kept`] keeps for reuse at most.
+const SPARE_BUFFERS: usize = 2;
+
+/// The contexts whose lower halves [`Kept`] holds at most. A replaced half
+/// frees no frames (they return only when the lower half is emptied), and
+/// refilling a context that comes back allocates its tables again, so a
+/// replacement costs frames as well as fills: a desktop session rotates
+/// among dozens of processes, which eight halves missed half the time.
+pub const KEPT: usize = 32;
 
 /// One context's kept lower half.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +184,21 @@ impl Kept {
         Self {
             halves: Vec::new(),
             switches: 0,
+            spare: Vec::new(),
+        }
+    }
+
+    /// An empty list for the entries a switch detaches, with the storage of
+    /// one an earlier switch gave back when there is one.
+    pub fn buffer(&mut self) -> Vec<(u64, usize, u64)> {
+        self.spare.pop().unwrap_or_default()
+    }
+
+    /// Give back the storage of an entry list a switch is done with.
+    pub fn recycle(&mut self, mut entries: Vec<(u64, usize, u64)>) {
+        if self.spare.len() < SPARE_BUFFERS && entries.capacity() != 0 {
+            entries.clear();
+            self.spare.push(entries);
         }
     }
 
@@ -196,6 +222,7 @@ impl Kept {
             .position(|half| half.key == to)
             .map(|index| self.halves.swap_remove(index));
         if entries.is_empty() {
+            self.recycle(entries);
             return found;
         }
         let outgoing = KeptHalf {
@@ -210,7 +237,8 @@ impl Kept {
         if self.halves.len() == KEPT
             && let Some(oldest) = (0..self.halves.len()).min_by_key(|&i| self.halves[i].used)
         {
-            self.halves.swap_remove(oldest);
+            let evicted = self.halves.swap_remove(oldest);
+            self.recycle(evicted.entries);
         }
         self.halves.push(outgoing);
         found
@@ -242,7 +270,7 @@ impl Kept {
     ) -> usize {
         let reach = match everywhere {
             Everywhere::Addresses(reach) => reach,
-            Everywhere::NonGlobal | Everywhere::All => Reach::All,
+            Everywhere::NonGlobal(_) | Everywhere::All => Reach::All,
         };
         let before = self.halves.len();
         self.halves.retain_mut(|half| {
@@ -258,6 +286,40 @@ impl Kept {
         });
         before - self.halves.len()
     }
+
+    /// Apply a TLBI ASIDE1 of `asid` to the kept halves, whose contexts
+    /// share the TCR `tcr` (a change of TCR outside the lower half's own
+    /// fields empties the shadow): drop only a half that may hold a
+    /// non-global entry of `asid` ([`same_asid`]), and only if it holds a
+    /// non-global entry at all ([`Extents::private`]). ASIDE1 removes the
+    /// non-global entries of its ASID alone (Arm `TLBIMatch`): another
+    /// ASID's half, and a half of global entries alone, stay. Returns the
+    /// halves dropped.
+    pub fn drop_asid(&mut self, asid: u16, tcr: u64) -> usize {
+        let before = self.halves.len();
+        self.halves
+            .retain(|half| !(half.extents.private() && same_asid(half.key.0, tcr, asid)));
+        before - self.halves.len()
+    }
+}
+
+/// A TCR for [`Kept::drop_asid`] under which every ASID may match: TCR.A1
+/// set, so TTBR0 does not name the ASID.
+pub const UNKNOWN_ASIDS: u64 = 1 << 22;
+
+/// Whether the non-global entries a walk through TTBR0 value `ttbr0` made
+/// under TCR `tcr` may be of ASID `asid`: with TCR.A1 = 0 their ASID is
+/// TTBR0[63:48], compared on 16 bits with TCR.AS = 1 and on the low 8 bits
+/// otherwise (the TLBI's high 8 bits are then ignored); with TCR.A1 = 1 it
+/// is TTBR1's, which `ttbr0` does not tell, so any ASID may match.
+pub fn same_asid(ttbr0: u64, tcr: u64, asid: u16) -> bool {
+    const TCR_A1: u64 = 1 << 22;
+    const TCR_AS: u64 = 1 << 36;
+    if tcr & TCR_A1 != 0 {
+        return true;
+    }
+    let mask = if tcr & TCR_AS != 0 { 0xffff } else { 0xff };
+    ((ttbr0 >> 48) as u16 ^ asid) & mask == 0
 }
 
 #[cfg(test)]
@@ -439,10 +501,49 @@ mod tests {
         assert!(unmapped.is_empty());
         // A TLBI of an ASID's or of every entry drops the kept halves.
         assert_eq!(
-            kept.invalidate(Everywhere::NonGlobal, LOWER, 39, |_, _, _| {}),
+            kept.invalidate(Everywhere::NonGlobal(1), LOWER, 39, |_, _, _| {}),
             1
         );
         assert!(kept.is_empty());
+    }
+
+    /// TLBI ASIDE1 drops only the kept halves that hold a non-global entry
+    /// of its ASID; with TCR.A1 = 1 the ASID is unknown and any private
+    /// half goes.
+    #[test]
+    fn an_asid_tlbi_drops_only_its_asids_private_kept_halves() {
+        const TCR_A1: u64 = 1 << 22;
+        const TCR_AS: u64 = 1 << 36;
+        let key = |asid: u64| (asid << 48 | 0x8000_0000, 0x10);
+        let mut private = Extents::new();
+        private.record(0x1_0000_4000, 1 << 14, false);
+        let mut global = Extents::new();
+        global.record(0x1_8000_0000, 1 << 14, true);
+        let fill = |kept: &mut Kept| {
+            for (n, extents) in [(5, &private), (6, &private), (7, &global)] {
+                kept.switch(key(n), alloc::vec![(0x1000, 0, n)], extents.clone(), key(0));
+            }
+        };
+        let held = |kept: &Kept| {
+            let mut keys: Vec<u64> = kept.halves.iter().map(|half| half.key.0 >> 48).collect();
+            keys.sort_unstable();
+            keys
+        };
+        let mut kept = Kept::new();
+        fill(&mut kept);
+        assert_eq!(kept.drop_asid(5, 0), 1);
+        assert_eq!(held(&kept), [6, 7]);
+        // A global-only half stays for its own ASID too.
+        assert_eq!(kept.drop_asid(7, 0), 0);
+        // 8-bit ASIDs ignore the TLBI's high byte; 16-bit ones do not.
+        assert_eq!(kept.drop_asid(0x106, TCR_AS), 0);
+        assert_eq!(kept.drop_asid(0x106, 0), 1);
+        assert_eq!(held(&kept), [7]);
+        // TTBR1 names the ASID: every private half may hold it.
+        let mut kept = Kept::new();
+        fill(&mut kept);
+        assert_eq!(kept.drop_asid(9, TCR_A1), 2);
+        assert_eq!(held(&kept), [7]);
     }
 
     #[test]
@@ -474,6 +575,31 @@ mod tests {
     }
 
     #[test]
+    fn a_rotation_of_many_contexts_finds_every_half() {
+        // Two dozen processes taking turns, as a desktop session's do,
+        // each find their half again after the first round.
+        let mut kept = Kept::new();
+        let key = |n: u64| (n << 12, 0);
+        const CONTEXTS: u64 = 24;
+        const { assert!(CONTEXTS as usize <= KEPT) };
+        let mut found = 0;
+        for turn in 0..CONTEXTS * 4 {
+            let (from, to) = (turn % CONTEXTS, (turn + 1) % CONTEXTS);
+            let half = kept.switch(
+                key(from),
+                alloc::vec![(0x1000, 0, from + 1)],
+                Extents::new(),
+                key(to),
+            );
+            if let Some(half) = half {
+                assert_eq!(half.entries, [(0x1000, 0, to + 1)]);
+                found += 1;
+            }
+        }
+        assert_eq!(found, CONTEXTS * 4 - (CONTEXTS - 1));
+    }
+
+    #[test]
     fn switching_to_the_oldest_kept_half_reuses_it_when_full() {
         let mut kept = Kept::new();
         let key = |n: u64| (n << 12, 0);
@@ -500,5 +626,41 @@ mod tests {
                 .unwrap();
             assert_eq!(half.entries, [(0x1000, 0, to + 1)]);
         }
+    }
+
+    /// Entry lists given back, empty ones a switch did not keep and the
+    /// evicted ones, are handed out again with their storage, emptied, so a
+    /// steady stream of switches stops allocating.
+    #[test]
+    fn switches_reuse_the_storage_of_entry_lists_given_back() {
+        let mut kept = Kept::new();
+        let key = |n: u64| (n << 12, 0);
+        let mut empty = kept.buffer();
+        assert_eq!(empty.capacity(), 0, "nothing to reuse yet");
+        empty.reserve(4);
+        let storage = empty.as_ptr();
+        assert_eq!(kept.switch(key(0), empty, Extents::new(), key(1)), None);
+        let reused = kept.buffer();
+        assert!(reused.is_empty());
+        assert_eq!(reused.as_ptr(), storage, "the empty list's storage");
+        kept.recycle(reused);
+
+        // Fill the halves, then one more evicts the oldest: its list
+        // comes back for the next switch.
+        for n in 0..KEPT as u64 {
+            let mut entries = kept.buffer();
+            entries.push((0x1000, 0, n + 1));
+            kept.switch(key(n), entries, Extents::new(), key(99));
+        }
+        let mut entries = kept.buffer();
+        entries.push((0x1000, 0, 100));
+        kept.switch(key(KEPT as u64), entries, Extents::new(), key(99));
+        let evicted = kept.buffer();
+        assert!(evicted.is_empty() && evicted.capacity() != 0);
+        // At most `SPARE_BUFFERS` are kept.
+        for _ in 0..4 {
+            kept.recycle(alloc::vec![(0, 0, 0)]);
+        }
+        assert_eq!(kept.spare.len(), SPARE_BUFFERS);
     }
 }

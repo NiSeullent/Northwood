@@ -206,6 +206,8 @@ void stela_depth_stencil_record(id descriptor, StelaDepthStencilRecord *record);
 	/* The device's own heap this buffer was placed in, which the app never
 	 * sees; its place is given back once the GPU is past it. */
 	id _slab;
+	/* The IOSurface the buffer lies in, which its deallocator keeps. */
+	IOSurfaceRef _surface;
 }
 - (instancetype)initWithDevice:(StelaGPUDevice *)device
 		      response:(const StelaBufferResponse *)response

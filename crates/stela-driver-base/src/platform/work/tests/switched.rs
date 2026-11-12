@@ -494,6 +494,44 @@ fn timeout_quarantines_executor() {
     let retained = unsafe { Pin::new_unchecked(&*raw) };
     assert_eq!(retained.step(), Err(WorkError::Closed));
 }
+unsafe extern "C" fn counted(_: *mut c_void) {}
+#[test]
+fn step_counters_split_selection_body_and_empty_steps() {
+    let (executor, _, _, _) = setup();
+    let r = executor.runtime();
+    let counts = &super::super::step_counts::STEP_COUNTS;
+    let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+    let before = [
+        load(&counts.select),
+        load(&counts.body),
+        load(&counts.empty_steps),
+        load(&counts.scans),
+        load(&counts.locks),
+    ];
+    // SAFETY: counted is static and ignores its null context; the Executor
+    // keeps its pinned runtime and stacks through the job's completion.
+    unsafe {
+        r.queue
+            .execute(Kind::General, counted, core::ptr::null_mut())
+    }
+    .unwrap();
+    assert!(r.step().unwrap());
+    assert!(!r.step().unwrap());
+    let after = [
+        load(&counts.select),
+        load(&counts.body),
+        load(&counts.empty_steps),
+        load(&counts.scans),
+        load(&counts.locks),
+    ];
+    // Other tests share the process-wide counters, so only growth is exact.
+    for (before, after) in before.iter().zip(after) {
+        assert!(after > *before);
+    }
+    // SAFETY: This test has no asynchronous producers and calls on the dispatcher.
+    // Completed jobs/bindings permit retirement; pending continuations keep their owners.
+    unsafe { r.retire() }.unwrap();
+}
 // Switched-stack fixtures for the generic binding contract.
 // This is a hosted state/IRQ model, not a native Linux/C task producer.
 mod bound;

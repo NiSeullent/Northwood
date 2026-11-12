@@ -134,6 +134,7 @@ pub enum Constraint {
     VerifyDependency,
     PrebootSelection,
     UpgradeSelection,
+    BundleRepairSelection,
     RecoverySafeMode,
     DramAlignment,
     AudioHpetDependency,
@@ -270,6 +271,9 @@ impl Constraint {
                  choose a --preboot boot"
             }
             Self::UpgradeSelection => "--upgrade is neither a safe-mode boot nor a recoveryOS",
+            Self::BundleRepairSelection => {
+                "--bundle-repair is a macOS boot, neither an update nor a recoveryOS"
+            }
             Self::RecoverySafeMode => "a recoveryOS boot is not a safe-mode boot",
             Self::DramAlignment => "guest DRAM base must be 2 MiB aligned",
             Self::AudioHpetDependency => "--audio-own-hpet requires --audio-check",

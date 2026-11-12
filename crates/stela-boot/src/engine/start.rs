@@ -6,8 +6,7 @@ use crate::Result;
 use alloc::string::ToString;
 use stela_contracts::refuse;
 
-/// How long XNU's debugger cross-call waits for every PE (`debug-ack`).
-const DEBUG_ACK_SECONDS: u64 = 10;
+use stela_boot_core::guest_timeouts::DEBUG_ACK_SECONDS;
 
 /// The boot-args that scale XNU's lock timeouts for this host, each with a
 /// leading space. They assume the modeled chip's cores; a slower host's
@@ -44,7 +43,8 @@ fn from_disk(
     // stackshot: AppleM68Buttons' diagnostic chord (`stackshot-mask`, which
     // J473's tree leaves to the default, its one button). XNU's default is
     // 1,440,000 ticks (60 ms), short for PEs that answer at their next
-    // exit, so this gives 10 s. Machine timeout boot-args are in picoseconds
+    // exit, so this gives `DEBUG_ACK_SECONDS`, well inside the watchdog
+    // mechanism a panic arms (`guest_timeouts`). Machine timeout boot-args are in picoseconds
     // (osfmk/kern/startup.h), converted to ticks only when overridden.
     // System sleep is not modeled, so `noidle` stops the idle timer that
     // would ask for it.
@@ -71,17 +71,32 @@ fn from_disk(
         defaults.boot_args.push_str(" bt-transport-override=0");
     }
     defaults.boot_args.push_str(&lock_timeout_arguments(tsc_hz));
-    if options.maintenance_write {
+    // The automatic Metal plugin repair NVRAM asked for is the manual
+    // remedy's boot: single-user, filesystem protection off.
+    let maintenance_write = options.maintenance_write || options.bundle_repair;
+    let single_user = options.single_user || options.bundle_repair;
+    if maintenance_write {
         // CSR_ALLOW_UNRESTRICTED_FS; the kext grant and other policy bits stay separate.
         defaults.security.sip_bits |= 2;
         output::arguments(format_args!(
-            "MAINTENANCE filesystem protection disabled for this boot (--maintenance-write)\n"
+            "MAINTENANCE filesystem protection disabled for this boot ({})\n",
+            if options.maintenance_write {
+                "--maintenance-write"
+            } else {
+                "the automatic Metal plugin repair"
+            }
         ));
     }
-    if options.single_user {
+    if single_user {
         defaults.boot_args.push_str(" -s");
     }
-    gpu::single_user(options.single_user);
+    bundle_repair::boot(if options.bundle_repair {
+        stela_boot_core::bundle_repair::Boot::Repair
+    } else if options.single_user {
+        stela_boot_core::bundle_repair::Boot::SingleUser
+    } else {
+        stela_boot_core::bundle_repair::Boot::Normal
+    });
     let result = if options.upgrade {
         bundle::upgrade_from_disk(partition, options.boot_volume, &defaults)
     } else if let Some(kind) = options.recovery {
@@ -121,6 +136,7 @@ pub extern "sysv64" fn entry(handoff: u64) -> ! {
     // A single-user boot is a console, which draws through no GPU.
     if options.boots_macos()
         && !options.single_user
+        && !options.bundle_repair
         && let Some(reason) = gpu::no_metal_device()
     {
         output::fatal(format_args!("macOS cannot run without a GPU: {reason}"));
@@ -159,6 +175,14 @@ struct Started {
     native_processors: Option<&'static crate::native_smp::firmware::Capture>,
 }
 
+/// A driver starts on `device`: the boot log names it before the start
+/// begins, so a start that never ends leaves its culprit in the record the
+/// USB log receives when it resumes, and the screen's step shows it.
+fn device_starting(device: &str) {
+    output::arguments(format_args!("HOST DEVICE {device} start\n"));
+    crate::status::progress(device);
+}
+
 fn start(handoff: u64) -> Started {
     output::disable_firmware_console();
     // SAFETY: the first engine code; interrupts are off and nothing else runs.
@@ -177,6 +201,7 @@ fn start(handoff: u64) -> Started {
     // every native root for the complete engine lifetime.
     unsafe { crate::ALLOCATOR.initialize(heap as *mut u8, handoff.heap.bytes as usize) };
     crate::ALLOCATOR.reserve_tail(handoff.heap.bytes as usize / HEAP_RESERVE_SHARE);
+    super::large_blocks::install();
     // SAFETY: this loader-owned private seed is held in the shared physmap,
     // exclusively consumed here before any native service is published.
     if let Err(error) = unsafe { crate::random::initialize(handoff.random_seed) } {
@@ -202,9 +227,15 @@ fn start(handoff: u64) -> Started {
     // physmap; metadata and Arc are created in this active engine allocator.
     let host_firmware = unsafe { crate::host_firmware::after_ebs(&handoff.host_firmware) }
         .unwrap_or_else(|error| output::fatal(error));
+    // Before any user of the rate: this image's copy has not been found.
+    crate::firmware::adopt_tsc(
+        handoff.tsc_hz,
+        handoff.tsc_source,
+        handoff.tsc_tolerance_ppm,
+    );
     crate::status::set_clock(handoff.tsc_hz);
     stela_drivers::on_wait(crate::status::tick);
-    stela_drivers::on_work(crate::status::progress);
+    stela_drivers::on_work(device_starting);
     crate::status::take_screen(
         handoff
             .screen
@@ -323,7 +354,7 @@ fn open_host(
         acpi: host_acpi,
         mmio: native_mmio,
         remappers,
-        _work: kernel_work,
+        work: kernel_work,
         pci_ids,
     } = start_platform(handoff, &mut host_owner, options);
     options.northwood =
@@ -339,14 +370,27 @@ fn open_host(
     // medium partition also streams its remote image.
     let remote_image = options.install.is_some() && options.install_source.is_none();
     // macOS on the USB and Apple's answers to every signing request the
-    // install makes: the install needs no network, so none is opened.
+    // erase install makes: the install needs no network, so none is opened.
+    // An update sends other requests and needs the signing server.
     let offline = options.install.is_some()
-        && !remote_image
-        && restore::staged_answers(handoff).is_some_and(|set| set.complete());
+        && stela_runtime::restore::tss::staged::Use::of(
+            restore::staged_answers(handoff).as_ref(),
+            options.update_restore,
+            remote_image,
+        )
+        .offline();
     if offline {
         output::arguments(format_args!(
             "INSTALL OFFLINE macOS and Apple's signing answers are on the USB; no network is opened\n"
         ));
+        crate::status::info("Offline install: macOS and Apple's signing answers are on the USB");
+    } else if options.install.is_some() {
+        crate::status::info(match remote_image {
+            true => {
+                "Network install: macOS downloads and Apple's signing server is asked during the install"
+            }
+            false => "Network install: Apple's signing server is asked during the install",
+        });
     }
     let wants_network = (options.install.is_some() && !offline)
         || options.network_check.is_some()
@@ -366,7 +410,10 @@ fn open_host(
         host_acpi,
         &native_mmio,
         remappers,
-        kernel_work,
+        kernel_work
+            .as_ref()
+            .copied()
+            .map_err(alloc::string::String::as_str),
     );
     output::boot_stage("drivers-probed");
     remappers.report_faults();
@@ -613,6 +660,7 @@ fn open_storage(handoff: &'static Handoff, options: &Options, host: &mut OpenedH
         ));
         let opened = nor::HostNor::open(device);
         crate::status::done("");
+        bundle_repair::nvram(&opened.2.proxy);
         opened
     });
     let (host_nor, nor_image, nvram, sep_state, board_flash) = match nor {
@@ -943,6 +991,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             backing,
             sep_state,
             board_flash,
+            rtc_anchor: host_nor.as_ref().and_then(nor::HostNor::loaded_anchor),
             usb_disks,
             guest_mac: guest_network.as_ref().and_then(network::GuestNetwork::mac),
             guest_bluetooth: host_bluetooth.is_some(),
@@ -1365,8 +1414,9 @@ fn open_gpus(
     };
     let Some(mmio) = mmio else { return false };
     if let Err(error) = work.service_clock().and_then(|clock| clock.epoch()) {
-        crate::status::warn(&format!(
-            "the GPU requires an owned continuous HPET clock: {error:?}"
+        crate::status::warn(&stela_boot_core::work_status::gpu_without_clock(
+            crate::cpu::INVARIANT_TSC.present(),
+            &format!("{error:?}"),
         ));
         return false;
     }
@@ -1382,6 +1432,8 @@ fn open_gpus(
         Ok(None)
     };
     let firmware = firmware.clone();
+    // Named on the screen when no GPU starts; the claim takes `adapters`.
+    let found = adapters.clone();
     let claiming = host::rdtsc();
     let claimed = work.call_owned(60_000_000, move || {
         let services = services::Services::new(mmio, remappers, None, heap, tsc_hz, Vec::new())
@@ -1399,7 +1451,7 @@ fn open_gpus(
         Ok((_, refused, _)) => {
             // Each GPU that did not start, and why, or that there is none.
             match refused.split_first() {
-                None => crate::status::warn(&gpu_status::none()),
+                None => crate::status::warn(&gpu_status::none(&found)),
                 Some((first, rest)) => {
                     crate::status::warn(&gpu_status::refused(
                         &first.address,
@@ -1414,6 +1466,13 @@ fn open_gpus(
                         ));
                     }
                 }
+            }
+            // The display adapters Stela's GPU driver does not run, and why.
+            for adapter in found
+                .iter()
+                .filter(|adapter| adapter.vendor != stela_drivers::gpu::Vendor::Nvidia)
+            {
+                crate::status::info(&gpu_status::unused(adapter));
             }
             return false;
         }
@@ -1434,6 +1493,9 @@ fn open_gpus(
         #[cfg(any(feature = "nvk", feature = "pthread-runtime-probe"))]
         heap_bytes,
     };
+    // Store the claim's lines before Linux starts, so the USB keeps them
+    // even when the start never returns.
+    output::flush_log();
     let opening = host::rdtsc();
     let opened = gpu::open(machine, claimed);
     // `GPU START claim_ms=… linux_ms=… probe_ms=… total_ms=…`: claiming the
@@ -1454,7 +1516,10 @@ fn open_gpus(
             true
         }
         Err(error) => {
-            crate::status::warn(&format!("the GPU could not start: {error}"));
+            crate::status::warn(&stela_boot_core::gpu_status::failed(
+                &found,
+                &format!("{error}"),
+            ));
             false
         }
     }
@@ -1469,6 +1534,7 @@ struct Placement<'a> {
     backing: Option<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     sep_state: Option<stela_soc::machine::sep_state::Location>,
     board_flash: Option<nor::BoardFlash>,
+    rtc_anchor: Option<stela_soc::machine::RtcAnchor>,
     usb_disks: Vec<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     guest_mac: Option<stela_drivers::net::Mac>,
     guest_bluetooth: bool,
@@ -1556,6 +1622,7 @@ fn place_devices(
                 unix_seconds: wall.unix_seconds_at(host::rdtsc(), handoff.tsc_hz),
                 counter: now,
             }),
+            rtc_anchor: placement.rtc_anchor,
             backing: placement.backing,
             sep_state: placement.sep_state,
             sep_observe: options.sep_observe,
@@ -2179,6 +2246,7 @@ fn prepare_restore(
             signer,
             fdr_storage,
             network: proxy_network,
+            signing_network: matches!(host_network, Some(Ok(_))),
         },
     )
     .unwrap_or_else(|error| {
@@ -2214,6 +2282,7 @@ fn install_host(handoff: &'static Handoff, options: &Options, ram: &[RamRange]) 
         ram: ram.to_vec(),
         pool_physical: handoff.pool.physical,
         pool_bytes: partition.pool_bytes,
+        memory_profile: handoff.memory_profile,
         window_root: handoff.root,
         loader_tables: &handoff.native_loader_tables,
         code_virtual: layout::code(handoff.code.bytes),
@@ -2263,7 +2332,8 @@ struct Platform {
     pci_ids: Vec<(u16, u16)>,
     /// Affine runtime/source remain held through paused/quarantined frames.
     /// Its producer services require their own complete admission graph.
-    _work: Option<&'static kernel_work::KernelWork>,
+    /// Without it, the screen's reason why.
+    work: core::result::Result<&'static kernel_work::KernelWork, alloc::string::String>,
 }
 
 /// # Safety
@@ -2543,11 +2613,13 @@ fn start_platform(
             output::arguments(format_args!(
                 "NATIVE WORK owned stacks=32 foreground=verified services=unpublished\n"
             ));
-            Some(&*alloc::boxed::Box::leak(alloc::boxed::Box::new(work)))
+            Ok(&*alloc::boxed::Box::leak(alloc::boxed::Box::new(work)))
         }
+        // The record keeps this line until the USB log opens again, which
+        // the devices' start on the boot stack (`start_devices`) reaches.
         Err(error) => {
             output::arguments(format_args!("NATIVE WORK unavailable: {error}\n"));
-            None
+            Err(error.reason())
         }
     };
     let host_acpi = aml::HostAcpi::start(
@@ -2561,7 +2633,7 @@ fn start_platform(
         native_mmio,
         handoff.tsc_hz,
         prepared_sci,
-        work,
+        work.as_ref().ok().copied(),
     );
     crate::native_idle::install(
         host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
@@ -2571,7 +2643,7 @@ fn start_platform(
         mmio: native_mmio,
         remappers: alloc::boxed::Box::leak(alloc::boxed::Box::new(remappers)),
         pci_ids,
-        _work: work,
+        work,
     }
 }
 
@@ -2627,6 +2699,23 @@ fn wifi_network(
     })
 }
 
+/// The whole disk and USB start's bound, which only a stall outside every
+/// PCI function's own budget reaches.
+const DEVICES_START_US: u64 = 300_000_000;
+
+/// The fail line for a disk and USB start the owned call did not complete.
+fn devices_failed(error: &kernel_work::Error) -> alloc::string::String {
+    let timed_out = matches!(
+        error,
+        kernel_work::Error::Work(stela_drivers::platform::work::WorkError::TimedOut)
+    );
+    stela_boot_core::work_status::devices_failed(
+        timed_out,
+        DEVICES_START_US / 1_000_000,
+        &error.to_string(),
+    )
+}
+
 /// What the host devices are opened for.
 struct Wanted<'a> {
     firmware: Option<alloc::sync::Arc<stela_drivers::firmware::Catalog>>,
@@ -2662,7 +2751,7 @@ fn start_devices(
     host_acpi: Option<&'static aml::HostAcpi>,
     native_mmio: &Option<&'static crate::native_mmio::Source>,
     remappers: &'static remapping::Remappers,
-    kernel_work: Option<&'static kernel_work::KernelWork>,
+    kernel_work: core::result::Result<&'static kernel_work::KernelWork, &str>,
 ) -> HostDevices {
     let &Wanted {
         firmware: ref host_firmware,
@@ -2676,7 +2765,7 @@ fn start_devices(
     let mut host_usb = None;
     let mut host_bluetooth = None;
     let volume_log = handoff.volume_log;
-    let owned_swap = if handoff.storage.present && kernel_work.is_some() {
+    let owned_swap = if handoff.storage.present && kernel_work.is_ok() {
         super::swap::Probe::for_boot(
             handoff.memory_profile,
             options.northwood.as_ref().map(|config| &config.memory.swap),
@@ -2714,7 +2803,7 @@ fn start_devices(
             let mut storage_handoff = handoff
                 .storage
                 .handoff()
-                .unwrap_or_else(|| output::fatal("the loader found no storage controllers"));
+                .unwrap_or_else(|| output::fatal(stela_boot_core::work_status::NO_DEVICE_ACCESS));
             storage_handoff.firmware = host_firmware.clone();
             // Disks that can signal their completions wake the BSP, which
             // runs the engine's devices.
@@ -2725,6 +2814,12 @@ fn start_devices(
             if options.audio_check.is_some() {
                 // The audio check keeps the final slice even after shutdown.
                 storage_handoff.dma.end -= crate::audio_check::DMA_BYTES;
+            }
+            if let Err(reason) = kernel_work {
+                output::arguments(format_args!(
+                    "NATIVE WORK degraded: devices start on the boot stack, without ACPI methods or a GPU\n"
+                ));
+                crate::status::info(&stela_boot_core::work_status::foreground(reason));
             }
             crate::status::begin("Starting the PC's disks and USB devices");
             // Every admitted input is owned or a boot owner.
@@ -2749,9 +2844,12 @@ fn start_devices(
             let drivers = options.northwood.as_ref().map(|config| &config.drivers);
             let owned_drivers = drivers.cloned();
             let acpi_quirks = options.northwood.as_ref().map(|config| config.acpi.clone());
-            let work = kernel_work
-                .unwrap_or_else(|| output::fatal("native probe requires an owned continuation"));
-            let opened = work.call_owned(60_000_000, move || {
+            let boot_disk = handoff.boot_disk().map(alloc::string::String::from);
+            // Each PCI function's start has its own budget
+            // (`stela_drivers::probe::DEVICE_START_US`) and is given up past
+            // it; this whole bound only catches a stall outside every
+            // function's start, so it leaves room for several given up.
+            let open = move || {
                 let native = mmio.map(|mmio| {
                     services::Services::new(mmio, remappers, host_acpi, heap, tsc_hz, usb4_approved)
                         .with_hid_quirks(northwood::hid_quirks(acpi_quirks.as_ref()))
@@ -2759,8 +2857,10 @@ fn start_devices(
                 let targets: Vec<_> = owned_targets.iter().collect();
                 let policy = northwood::Policy::new(owned_drivers.as_ref());
                 // SAFETY: one admitted foreground task under the work
-                // dispatcher's loader-root/driver guard. Owned handoff, inputs
-                // and kept services survive completion or quarantine.
+                // dispatcher's loader-root/driver guard, or the boot stack
+                // under the same guard when no owned stack exists. Owned
+                // handoff, inputs and kept services survive completion or
+                // quarantine.
                 unsafe {
                     storage::open(
                         &storage_handoff,
@@ -2782,10 +2882,27 @@ fn start_devices(
                             wifi: owned_wifi.as_ref(),
                             policy: policy.pci(),
                             external,
+                            boot_disk: boot_disk.as_deref(),
                         },
                     )
                 }
-            });
+            };
+            let opened = match kernel_work {
+                Ok(work) => work
+                    .call_owned(DEVICES_START_US, open)
+                    .map_err(|error| devices_failed(&error)),
+                // Without owned stacks the start runs here, on the boot
+                // stack, under the same host-driver guard the owned call
+                // takes. Each function keeps its own start budget, whose
+                // waits are the drivers' own; only the whole bound, which
+                // needs a continuation to leave, is not there.
+                Err(_) => {
+                    // SAFETY: the loader's live root on the BSP, with no
+                    // driver guard held; nothing else runs the drivers.
+                    let _root = unsafe { storage::RestoreRoot::enter(root) };
+                    Ok(open())
+                }
+            };
             let storage::Opened {
                 services,
                 medium,
@@ -2803,9 +2920,7 @@ fn start_devices(
                 disks,
                 power,
             } = opened
-                .unwrap_or_else(|error| {
-                    Err(refuse!("native probe admission failed: {error}", %error))
-                })
+                .unwrap_or_else(|error| output::fatal(error))
                 .unwrap_or_else(|error| {
                     output::arguments(format_args!("host storage refusal: {error}\n"));
                     output::fatal(format_args!("host storage could not be opened: {error}"))
@@ -2830,6 +2945,15 @@ fn start_devices(
                     count(disks, "disk", "disks")
                 ),
             });
+            // The log first, as soon as its disk is open: it then holds every
+            // line since the engine started (`output::add_log`), and a stall
+            // or stop in the GPU's start below is kept on the USB.
+            if let Some(log) = log {
+                crate::log_file::resume(log);
+            }
+            if let (Some(device), Some(log)) = (data_log, volume_log) {
+                crate::log_file::resume_volume(device, log);
+            }
             if options.boots_macos() {
                 use northwood_config::GraphicsBackend;
 
@@ -2838,11 +2962,26 @@ fn start_devices(
                     .as_ref()
                     .map_or(GraphicsBackend::Auto, |config| config.graphics.backend);
                 match backend {
-                    GraphicsBackend::Auto | GraphicsBackend::NvModern => {
-                        if open_gpus(work, mmio, remappers, handoff, host_firmware, gpus, drivers) {
-                            gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
+                    GraphicsBackend::Auto | GraphicsBackend::NvModern => match kernel_work {
+                        Ok(work) => {
+                            if open_gpus(
+                                work,
+                                mmio,
+                                remappers,
+                                handoff,
+                                host_firmware,
+                                gpus,
+                                drivers,
+                            ) {
+                                gpu::serve(
+                                    handoff.screen.map_or((0, 0), |screen| screen.resolution()),
+                                );
+                            }
                         }
-                    }
+                        Err(reason) => crate::status::warn(
+                            &stela_boot_core::work_status::gpu_without_work(reason),
+                        ),
+                    },
                     GraphicsBackend::Gop => crate::status::info(
                         "Graphics/Backend=GOP selects the firmware framebuffer without Metal",
                     ),
@@ -2854,7 +2993,12 @@ fn start_devices(
                     }
                     GraphicsBackend::Northbridge => {
                         #[cfg(feature = "pthread-runtime-probe")]
-                        if let Some(window) = mmio.and_then(|mmio| mmio.window())
+                        if let Err(reason) = kernel_work {
+                            crate::status::warn(&stela_boot_core::work_status::gpu_without_work(
+                                reason,
+                            ));
+                        } else if let Ok(work) = kernel_work
+                            && let Some(window) = mmio.and_then(|mmio| mmio.window())
                             && let Ok(entropy) = crate::random::source()
                             && let Ok(random) = stela_linux::random::Seeded::from_entropy(&*entropy)
                         {
@@ -2887,12 +3031,6 @@ fn start_devices(
                 }
             }
             disks.profile_callbacks(options.profile);
-            if let Some(log) = log {
-                crate::log_file::resume(log);
-            }
-            if let (Some(device), Some(log)) = (data_log, volume_log) {
-                crate::log_file::resume_volume(device, log);
-            }
             if let Some(store) = store {
                 translations::set_partition(store);
             }

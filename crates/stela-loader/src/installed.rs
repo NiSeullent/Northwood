@@ -497,8 +497,13 @@ impl<R: ReadAt> Disk<'_, R> {
                 payload_type: im4p.payload_type,
                 description: im4p.description,
                 container_sha256: sha256(&file),
+                decoded_sha256: None,
                 manifest: parts.manifest.map(<[u8]>::to_vec),
             }
+        };
+        let decoded_sha256 = match decoded.decoded_sha256 {
+            Some(digest) => digest,
+            None => sha256(&decoded.bytes),
         };
         let source = Source {
             component: format!("Preboot {}", String::from_utf8_lossy(kind)),
@@ -507,7 +512,7 @@ impl<R: ReadAt> Disk<'_, R> {
             payload_type: decoded.payload_type,
             description: decoded.description,
             decoded_bytes: decoded.bytes.len() as u64,
-            decoded_sha256: sha256(&decoded.bytes),
+            decoded_sha256,
         };
         Ok((
             Decoded {
@@ -841,17 +846,20 @@ pub fn prepare_disk<R: ReadAt>(
     }
     let sep_firmware = preboot::sep_firmware(&mut *source)
         .within(|| refuse!("the SEP firmware"))?
-        .map(|(path, bytes)| Decoded {
-            source: Source {
-                component: "SEP firmware".into(),
-                member: path,
-                container_sha256: sha256(&bytes),
-                payload_type: "img4".into(),
-                description: "the iBootSystemContainer's SEP firmware".into(),
-                decoded_bytes: bytes.len() as u64,
-                decoded_sha256: sha256(&bytes),
-            },
-            bytes,
+        .map(|(path, bytes)| {
+            let digest = sha256(&bytes);
+            Decoded {
+                source: Source {
+                    component: "SEP firmware".into(),
+                    member: path,
+                    container_sha256: digest.clone(),
+                    payload_type: "img4".into(),
+                    description: "the iBootSystemContainer's SEP firmware".into(),
+                    decoded_bytes: bytes.len() as u64,
+                    decoded_sha256: digest,
+                },
+                bytes,
+            }
         });
     let mut found = Vec::new();
     let mut failures = Vec::new();

@@ -119,8 +119,9 @@ pub(super) fn emit(code: &mut Code, operand: &Operand) {
         store(code, operand.destination);
         return;
     }
-    if operand.width == Width::W32 {
-        // Required even when both shifts are absent (the full-width MOV alias).
+    if operand.width == Width::W32 && field_width == bits {
+        // A 32-bit shift clears the upper half, so only the full-width MOV
+        // alias, which emits no shift, needs the zero-extending move.
         code.asm().mov(Size::Dword, Rax, Rax);
     }
     // Move the source field to the operand's MSB, then extract it. Arithmetic
@@ -287,7 +288,7 @@ mod tests {
         let unsigned = code(Width::W32, Kind::Unsigned, 31, 0);
         assert_eq!(
             &unsigned[7..unsigned.len() - 7],
-            [0x89, 0xc0, 0xc1, 0xe0, 31, 0xc1, 0xe8, 31, 0xc1, 0xe0, 1]
+            [0xc1, 0xe0, 31, 0xc1, 0xe8, 31, 0xc1, 0xe0, 1]
         );
         let extraction = code(Width::X64, Kind::Unsigned, 8, 15);
         assert_eq!(

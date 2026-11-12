@@ -201,6 +201,10 @@ pub struct Changes {
     /// No MRS reads or traps differently after the write, so reads complete
     /// natively as they did: only what else derives from it goes.
     pub reads_kept: bool,
+    /// With `reads_kept`: the write changed only PAC's inputs at EL2 (APCTL,
+    /// the keys), which EL2 and its guarded level share whole, so records
+    /// of GENTER and GEXIT, between those two, stay.
+    pub pointer: bool,
     /// The write took a value whose effect this machine does not model
     /// (`impdef::Entry::unmodeled_effect`): what is missing, which the
     /// engine reports once.
@@ -960,6 +964,8 @@ impl Cpu {
         match self.apple(encoding)?.ok()? {
             Apple::SprrPerm(index) => Some(&self.apple.sprr_perm[index] as *const u64 as u64),
             Apple::SprrFields(which) => Some(&self.apple.sprr_fields[which] as *const u64 as u64),
+            // A read returns the level's word as stored (`Apple::read`).
+            Apple::ApControl(level) => Some(&self.apple.apctl[level] as *const u64 as u64),
             _ => None,
         }
     }
@@ -1023,12 +1029,20 @@ impl Cpu {
                 pmu.set_guarded_filter(value, physical, retired, context);
             }
         }
+        // A storage or scratch register a store takes in full
+        // (`impdef::Entry::stored_write`), such as XNU's thread keys, changes
+        // nothing derived, as native code's store of it assumes.
+        let stored = matches!(entry.class, impdef::Class::Storage | impdef::Class::Scratch)
+            && entry
+                .stored_write()
+                .is_some_and(|refused| value & refused == 0);
         match self.apple.impdef.write(entry, value) {
             Ok(()) => Outcome::Written(Changes {
                 unmodeled: entry.unmodeled_effect(value),
                 irq_steering: (entry.encoding == impdef::SIQ_CFG_EL1)
                     .then_some(value & SIQ_CFG_MODE == SIQ_CFG_NO_IRQ),
-                reads_kept: true,
+                stored,
+                reads_kept: !stored,
                 ..Changes::default()
             }),
             Err(reason) => Outcome::Refused(Refusal::UnsupportedSetting(reason)),
@@ -1295,11 +1309,19 @@ impl Apple {
                     );
                 }
                 apple.sprr_perm[index] = value;
-                changes.permissions = true;
+                // The value the register held changes no access.
+                if changed == 0 {
+                    changes.stored = true;
+                } else {
+                    changes.permissions = true;
+                }
             }
+            // The fields gate later SPRR_PERM writes, which the engine
+            // completes, and change no access (`mmu::sprr_unlocked`): nothing
+            // derived reads them, as their native stores already assume.
             Self::SprrFields(which) => {
                 apple.sprr_fields[which] = value;
-                changes.reads_kept = true;
+                changes.stored = true;
             }
             Self::GxfConfig(level) => {
                 if value & !(GXF_CONFIG_EN | GXF_CONFIG_LOCKS | GXF_CONFIG_EL1_LOCK) != 0 {
@@ -1340,14 +1362,17 @@ impl Apple {
             Self::ApControl(level) => {
                 apple.apctl[level] = value;
                 changes.reads_kept = true;
+                changes.pointer = true;
             }
             Self::KernelKey(index) => {
                 apple.kernel_key[index] = value;
                 changes.reads_kept = true;
+                changes.pointer = true;
             }
             Self::PointerKey(register) => {
                 apple.pointer_keys.write(register, value);
                 changes.reads_kept = true;
+                changes.pointer = true;
             }
             Self::VmsaLock => {
                 if value & !VMSA_LOCK_KNOWN != 0 {

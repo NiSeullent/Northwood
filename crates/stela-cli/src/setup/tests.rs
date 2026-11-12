@@ -8,6 +8,35 @@ use stela_soc_data::nor::nvram::Variables;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
+fn sparse_image(path: &Path, bytes: u64) {
+    let file = fs::File::create(path).unwrap();
+    #[cfg(windows)]
+    mark_sparse(&file);
+    file.set_len(bytes).unwrap();
+}
+
+#[cfg(windows)]
+fn mark_sparse(file: &fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_SPARSE};
+    let mut returned = 0u32;
+    // SAFETY: the handle is open for the file's lifetime, the control code
+    // takes no buffers, and `returned` outlives the call.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    assert!(ok != 0, "cannot mark the image sparse");
+}
+
 #[test]
 fn partitions_are_named_alone_or_by_device_path() {
     use clap::Parser as _;
@@ -52,7 +81,7 @@ pub(super) struct FakeHost {
 }
 
 impl FakeHost {
-    fn new(
+    pub(super) fn new(
         volumes: BTreeMap<PathBuf, (FileSystem, u64, Option<&'static str>)>,
         disks: Vec<Disk>,
     ) -> Self {
@@ -194,6 +223,14 @@ fn disk(id: &str, contents: &[(&str, Option<&Path>)]) -> Disk {
 }
 
 /// A `stela.efi` stand-in with this tree's mount interface.
+/// The host firmware marker of a stela.efi before the bundle, which reads
+/// exact per-PC files from the EFI partition.
+fn per_pc_marker() -> [u8; 21] {
+    let mut marker = stela_loader::host_firmware::MOUNT_CAPABILITY;
+    marker[20] = 3;
+    marker
+}
+
 fn efi_image(tag: &[u8]) -> Vec<u8> {
     let mut image = b"MZ".to_vec();
     image.extend_from_slice(tag);
@@ -301,6 +338,7 @@ fn command(f: &Fixture, usb: &Path) -> Request {
         dns: None,
         automatic_ipv4: false,
         automatic_dns: false,
+        output: None,
     }
 }
 
@@ -352,10 +390,30 @@ fn fake_remote_inventory(ipsw: &Path, model: &str) -> Result<restore::payload::I
     )
 }
 
+/// Tests reach no server, and search and write only a cache of their own.
+static TEST_CACHES: std::sync::LazyLock<[PathBuf; 1]> = std::sync::LazyLock::new(|| {
+    [tempfile::Builder::new()
+        .prefix("stela-test-cache-")
+        .tempdir()
+        .unwrap()
+        .keep()]
+});
+
+fn offline_recovery_size(_: &str, _: &str) -> Result<(u64, u64)> {
+    anyhow::bail!("offline")
+}
+
+fn offline_fetch_recovery(_: &Path, _: &str, _: &str) -> Result<PathBuf> {
+    panic!("tests never download")
+}
+
 fn environment(host: &FakeHost) -> Environment<'_> {
     Environment {
         host,
         download: None,
+        image_caches: &*TEST_CACHES,
+        recovery_size: &offline_recovery_size,
+        fetch_recovery: &offline_fetch_recovery,
         prepare_restore: &fake_prepare_restore,
         prepare_update: &fake_prepare_update,
         inventory: &fake_inventory,
@@ -510,7 +568,8 @@ fn setup_installs_from_the_usb_and_uninstall_restores_it() {
     host.nvidia_gpus.replace(vec![0x2c02, 0x2c05, 0x9999]);
     let plan = setup(&environment(host), dry).unwrap();
     host.nvidia_gpus.take();
-    assert!(plan.contains("GPU firmware   gb203\n"), "{plan}");
+    // No firmware follows this computer's GPUs; an unsupported one is a note.
+    assert!(!plan.contains("gb203"), "{plan}");
     assert!(plan.contains("NVIDIA GPU (device 9999)"), "{plan}");
     assert!(plan.contains("Dry run: nothing was changed."), "{plan}");
     assert!(plan.contains("ECID           0x"), "{plan}");
@@ -1046,7 +1105,7 @@ fn add_stick_ssd(f: &mut Fixture, identifier: &str, guid: &str) {
     });
     // Sparse, as large as the partition: the machine state is its tail.
     let path = f._dir.path().join(format!("{identifier}.img"));
-    fs::File::create(&path).unwrap().set_len(100 * GIB).unwrap();
+    sparse_image(&path, 100 * GIB);
     let info = PartitionInfo {
         identifier: identifier.into(),
         disk: "disk5".into(),
@@ -1137,17 +1196,30 @@ fn setup_erases_usb_and_refuses_internal_disk() {
     // Without an image, the USB is left as it was: no erase is tried.
     let mut no_image = command(&f, Path::new("disk5"));
     no_image.ipsw = None;
+    no_image.confirmed = true;
     let error = setup(&environment(&f.host), no_image)
         .unwrap_err()
         .to_string();
     assert!(error.contains("pass --ipsw"), "{error}");
+    // Without a terminal and without the model or size typed back, a USB
+    // is not erased.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let mut unasked = command(&f, Path::new("disk5"));
+        unasked.ipsw = None;
+        let error = setup(&environment(&f.host), unasked)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without a terminal"), "{error}");
+    }
 }
 
 #[test]
 fn preparation_preflights_signing_and_capacity() {
     let mut f = fixture(64 * GIB, true);
     let before = (snapshot(&f.esp), snapshot(&f.data));
-    let opted = command(&f, Path::new("disk5"));
+    // Confirmed, so the preflights run without a terminal to ask at.
+    let mut opted = command(&f, Path::new("disk5"));
+    opted.confirmed = true;
     let fail = |_: prepare::RamdiskOptions<'_>| bail!("signing service unavailable");
     let env = Environment {
         prepare_restore: &fail,
@@ -1163,7 +1235,8 @@ fn preparation_preflights_signing_and_capacity() {
         .find(|d| d.identifier == "disk5")
         .unwrap()
         .bytes = 1;
-    let opted = command(&f, Path::new("disk5"));
+    let mut opted = command(&f, Path::new("disk5"));
+    opted.confirmed = true;
     let error = setup(&environment(&f.host), opted).unwrap_err();
     assert!(
         error.to_string().contains("needs a USB of at least"),
@@ -1313,6 +1386,16 @@ fn install_reads_full_or_streamed_image() {
         "{install}"
     );
     assert!(!install.contains("--install-source"), "{install}");
+    // Status names where a streamed image comes from, not an empty partition.
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(
+        status.contains("(macOS ") && status.contains(", downloads during installation): intact"),
+        "{status}"
+    );
+    assert!(
+        status.contains(stela_runtime::restore::tss::network_reason(true)),
+        "{status}"
+    );
     // Repair makes it full: the IPSW in pieces on the USB.
     let switch = |image| {
         rerun(&f, |c| {
@@ -1345,6 +1428,7 @@ fn full_install_requires_system_image() {
         fs::File::open(&f.ipsw).unwrap(),
         restore::payload::SYNTHETIC_MODEL,
         &recovery,
+        "Copying boot files",
     )
     .unwrap();
     assert!(restore::payload::holds_system_image(&f.ipsw).unwrap());
@@ -2470,6 +2554,65 @@ fn status_notes_the_spare_the_first_boot_took_and_succeeds() {
 }
 
 #[test]
+fn status_notes_a_stale_chosen_disk_without_a_problem() {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    assert!(record(&f).installs[0].disk.is_chosen());
+    const GUID: &str = "5e1a0000-0000-4000-8000-0000000000c1";
+    f.host.serials.insert("disk0".into(), "HOSTDISK".into());
+    f.host.partitions.insert(
+        "disk0s2".into(),
+        (
+            PartitionInfo {
+                identifier: "disk0s2".into(),
+                disk: "disk0".into(),
+                guid: GUID.into(),
+                bytes: 100 * GIB,
+                content: "Apple_APFS".into(),
+                mount: None,
+                container: None,
+            },
+            f._dir.path().join("disk0s2.img"),
+        ),
+    );
+    let disk_cfg = f.esp.join("EFI/stela/disk.cfg");
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(!status.contains("chosen disk"), "{status}");
+    for (chosen, words) in [
+        (
+            "GONE:".to_owned() + GUID,
+            "no disk on this PC has the chosen serial",
+        ),
+        (
+            "HOSTDISK:5E1A0000-0000-4000-8000-0000000000c2".into(),
+            "no longer has the chosen partition",
+        ),
+    ] {
+        fs::write(&disk_cfg, format!("{chosen}\n")).unwrap();
+        let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+        assert!(status.contains("No problems found."), "{status}");
+        let note = status.lines().find(|line| line.contains(words)).unwrap();
+        assert!(note.trim_start().starts_with("note"), "{status}");
+        assert!(
+            note.contains("Install macOS will ask for a disk again"),
+            "{status}"
+        );
+    }
+    fs::write(
+        &disk_cfg,
+        format!("HOSTDISK:{}\n", GUID.to_ascii_uppercase()),
+    )
+    .unwrap();
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(
+        status.contains("the chosen disk is in this computer"),
+        "{status}"
+    );
+    assert!(!status.contains("will ask for a disk again"), "{status}");
+}
+
+#[test]
 fn cache_spare_failure_blocks_activation_until_retry() {
     let mut f = fixture(64 * GIB, false);
     add_stela(&mut f);
@@ -2636,18 +2779,13 @@ fn schema_update_rebuilds_bundles() {
     let mut image = b"MZstela-3".to_vec();
     image.extend_from_slice(&mount_interface::marker(newer));
     fs::write(&new, image).unwrap();
-    let update = |ipsw: bool| {
-        let mut command = command(&f, &f.esp);
-        command.ipsw = ipsw.then(|| f.ipsw.clone());
-        command.model = None;
-        command.action = Action::UpdateStela;
-        command.efi = Some(new.clone());
-        command.dispatch(&environment)
-    };
-    let error = update(false).unwrap_err().to_string();
-    assert!(error.contains(&format!("schema {next_schema}")), "{error}");
-    assert!(error.contains("--ipsw"), "{error}");
-    update(true).unwrap();
+    // The USB holds the image, which the update reads without --ipsw.
+    let mut command = command(&f, &f.esp);
+    command.ipsw = None;
+    command.model = None;
+    command.action = Action::UpdateStela;
+    command.efi = Some(new.clone());
+    command.dispatch(&environment).unwrap();
     let record2 = record(&f);
     assert_eq!(record2.bundle_schema, next_schema);
     let migrated = bundle_of(&f, ecid);
@@ -2702,10 +2840,12 @@ fn revision_update_rebuilds_bundles() {
     };
     // A later stela prepares revision 1, with the same stela.efi.
     let new = environment_at(&f.host, &newer, 1);
+    let cache = f._dir.path().join("cache");
     let run = |configure: &dyn Fn(&mut Request)| {
         let mut command = command(&f, &f.esp);
         command.ipsw = None;
         command.model = None;
+        command.download_dir = Some(cache.clone());
         configure(&mut command);
         command.dispatch(&new)
     };
@@ -2714,6 +2854,7 @@ fn revision_update_rebuilds_bundles() {
         status.contains("boot bundles are revision 0, and this stela prepares revision 1"),
         "{status}"
     );
+    assert!(!status.contains("--fetch"), "{status}");
     assert!(status.contains("stela setup update stela"), "{status}");
     // Other changes that prepare bundles wait for the update.
     let repair = run(&|c| {
@@ -2734,20 +2875,39 @@ fn revision_update_rebuilds_bundles() {
             c.dry_run = dry_run;
         })
     };
-    let refusal = update(false, false).unwrap_err().to_string();
-    assert!(
-        refusal.contains(&format!("schema {} revision 1", current().schema)),
-        "{refusal}"
-    );
-    assert!(refusal.contains("update stela --fetch --usb"), "{refusal}");
     let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    // With --ipsw, a dry run prepares from it; without, it names the USB's
+    // own copy of the image, which the update reads; neither downloads
+    // (this environment's downloads panic) nor changes anything.
     let plan = update(true, true).unwrap();
     assert!(!plan.contains("is already installed"), "{plan}");
+    assert!(plan.contains(&f.ipsw.display().to_string()), "{plan}");
+    for directory in directories(1) {
+        assert!(plan.contains(&directory.display().to_string()), "{plan}");
+    }
+    let plan = update(false, true).unwrap();
+    assert!(plan.contains("from this USB's copy of macOS"), "{plan}");
+    assert!(plan.contains("nothing is downloaded"), "{plan}");
     for directory in directories(1) {
         assert!(plan.contains(&directory.display().to_string()), "{plan}");
     }
     assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
-    update(true, false).unwrap();
+    // A copy that does not read back as written is refused before the USB
+    // changes.
+    let piece = medium::directory(&first.volume, &first.build).join("ipsw.000");
+    let good = fs::read(&piece).unwrap();
+    let mut bad = good.clone();
+    bad[0] ^= 1;
+    fs::write(&piece, &bad).unwrap();
+    let before_bad = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    let error = format!("{:#}", update(false, false).unwrap_err());
+    assert!(error.contains("reading "), "{error}");
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before_bad);
+    fs::write(&piece, &good).unwrap();
+    // The update itself needs no image and no network: the stick holds
+    // the image. What it read from the USB is not kept.
+    update(false, false).unwrap();
+    assert!(fs::read_dir(&cache).unwrap().next().is_none());
     let updated = record(&f);
     assert_eq!(updated.bundle_revision, 1);
     assert_eq!(updated.stela_version, first.stela_version);
@@ -2776,6 +2936,136 @@ fn revision_update_rebuilds_bundles() {
     })
     .unwrap();
     assert_eq!(record(&f).bundles, updated.bundles);
+}
+
+/// A setup at revision 0 whose install streams the image from Apple's
+/// servers, so the USB holds no copy of it, and the environment of a stela
+/// that prepares revision 1.
+fn network_setup(f: &mut Fixture, older: &[Box<Prepare>; 2]) {
+    add_stela(f);
+    let mut network = command(f, &stela_volume(f));
+    network.install_image = Some(InstallImage::Network);
+    setup(&environment_at(&f.host, older, 0), network).unwrap();
+    assert!(record(f).active_medium().unwrap().remote);
+}
+
+fn update_request(f: &Fixture, cache: &Path) -> Request {
+    let mut command = command(f, &stela_volume(f));
+    command.action = Action::UpdateStela;
+    command.ipsw = None;
+    command.model = None;
+    command.download_dir = Some(cache.to_path_buf());
+    // Another build than the setup's: every maintenance command works on
+    // the setup's own build.
+    command.build = "STELA2".into();
+    command
+}
+
+#[test]
+fn revision_update_without_any_image_fails_before_changing_anything() {
+    let mut f = fixture(64 * GIB, false);
+    let (older, newer) = (preparers(0), preparers(1));
+    network_setup(&mut f, &older);
+    let cache = f._dir.path().join("cache");
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    // No image, no cache, no network: refused with what to do, the USB
+    // as it was.
+    let error = update_request(&f, &cache)
+        .dispatch(&environment_at(&f.host, &newer, 1))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(&format!("schema {} revision 1", current().schema)),
+        "{error}"
+    );
+    assert!(error.contains("--ipsw FILE"), "{error}");
+    assert!(error.contains("streams the image"), "{error}");
+    assert!(error.contains(&cache.display().to_string()), "{error}");
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+}
+
+#[test]
+fn revision_update_uses_a_downloaded_image_in_any_cache() {
+    let mut f = fixture(64 * GIB, false);
+    let (older, newer) = (preparers(0), preparers(1));
+    network_setup(&mut f, &older);
+    // The boot archive an earlier run downloaded, in a cache other than
+    // --download-dir's, as root's is to a user's run.
+    let other = f._dir.path().join("root-cache");
+    fs::create_dir_all(&other).unwrap();
+    let archive = other.join(format!(
+        "Recovery_{}_{}.ipsw",
+        restore::payload::SYNTHETIC_BUILD,
+        restore::payload::SYNTHETIC_MODEL.replace(',', "_")
+    ));
+    restore::payload::trim(
+        fs::File::open(&f.ipsw).unwrap(),
+        restore::payload::SYNTHETIC_MODEL,
+        &archive,
+        "Copying boot files",
+    )
+    .unwrap();
+    let caches = [other.clone()];
+    let environment = Environment {
+        image_caches: &caches,
+        ..environment_at(&f.host, &newer, 1)
+    };
+    let cache = f._dir.path().join("cache");
+    let mut dry = update_request(&f, &cache);
+    dry.dry_run = true;
+    let plan = dry.dispatch(&environment).unwrap();
+    assert!(plan.contains(&archive.display().to_string()), "{plan}");
+    update_request(&f, &cache).dispatch(&environment).unwrap();
+    assert_eq!(record(&f).bundle_revision, 1);
+    assert!(archive.is_file());
+}
+
+#[test]
+fn revision_update_downloads_only_the_boot_files_saying_their_size() {
+    let mut f = fixture(64 * GIB, false);
+    let (older, newer) = (preparers(0), preparers(1));
+    network_setup(&mut f, &older);
+    let ipsw = f.ipsw.clone();
+    let fetched = std::cell::Cell::new(0);
+    let fetch = |directory: &Path, build: &str, model: &str| -> Result<PathBuf> {
+        fetched.set(fetched.get() + 1);
+        assert_eq!(build, restore::payload::SYNTHETIC_BUILD);
+        fs::create_dir_all(directory)?;
+        let path = directory.join(format!("Recovery_{build}_{}.ipsw", model.replace(',', "_")));
+        restore::payload::trim(fs::File::open(&ipsw)?, model, &path, "Copying boot files")?;
+        Ok(path)
+    };
+    let size = |build: &str, _: &str| -> Result<(u64, u64)> {
+        assert_eq!(build, restore::payload::SYNTHETIC_BUILD);
+        Ok((2_200_000_000, 27_000_000_000))
+    };
+    let environment = Environment {
+        recovery_size: &size,
+        fetch_recovery: &fetch,
+        ..environment_at(&f.host, &newer, 1)
+    };
+    let cache = f._dir.path().join("cache");
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    let mut dry = update_request(&f, &cache);
+    dry.dry_run = true;
+    let plan = dry.dispatch(&environment).unwrap();
+    assert!(plan.contains("download 2.2 GB of the macOS"), "{plan}");
+    assert!(plan.contains("27.0 GB"), "{plan}");
+    assert!(plan.contains("--ipsw FILE"), "{plan}");
+    assert_eq!(fetched.get(), 0, "a dry run downloads nothing");
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+    update_request(&f, &cache).dispatch(&environment).unwrap();
+    assert_eq!(fetched.get(), 1);
+    assert_eq!(record(&f).bundle_revision, 1);
+    // The next update finds that download and fetches nothing.
+    let newest = preparers(2);
+    let environment = Environment {
+        recovery_size: &size,
+        fetch_recovery: &fetch,
+        ..environment_at(&f.host, &newest, 2)
+    };
+    update_request(&f, &cache).dispatch(&environment).unwrap();
+    assert_eq!((fetched.get(), record(&f).bundle_revision), (1, 2));
 }
 
 #[test]
@@ -3519,6 +3809,28 @@ fn repair_restores_recorded_state() {
 }
 
 #[test]
+fn a_record_spells_a_path_one_way_however_it_was_built() {
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    setup(&environment(&f.host), installed_command(&f)).unwrap();
+    let path = f.esp.join(RECORD);
+    let written = fs::read(&path).unwrap();
+    // The same directory with the separator this system does not write, as
+    // joining `stela/boot` whole leaves it on Windows.
+    let mut made = record(&f);
+    let (own, other) = match std::path::MAIN_SEPARATOR {
+        '/' => ("/", "\\"),
+        _ => ("\\", "/"),
+    };
+    let below = made.bundle_directory.strip_prefix(&made.volume).unwrap();
+    let below = below.to_str().unwrap().replace(own, other);
+    assert!(below.contains(other), "{below}");
+    made.bundle_directory = format!("{}{other}{below}", made.volume.display()).into();
+    write_record(&f.esp, &made).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), written);
+}
+
+#[test]
 fn maintenance_writes_only_machine_state() {
     let mut f = fixture(64 * GIB, false);
     // An installed macOS: the Apple region holds the guest's own GPT,
@@ -3822,9 +4134,7 @@ fn add_split_disk(f: &mut Fixture, second: bool, head: &[u8]) {
         ("disk1", SERIAL, REGION, REGION_GUID)
     };
     let path = f._dir.path().join(format!("{identifier}.img"));
-    let file = fs::File::create(&path).unwrap();
-    file.set_len(SPLIT_BYTES).unwrap();
-    drop(file);
+    sparse_image(&path, SPLIT_BYTES);
     let info = PartitionInfo {
         identifier: identifier.into(),
         disk: disk.into(),
@@ -4386,7 +4696,23 @@ fn firmware_action_checks_capability_and_dry_run() {
                 .chain(options.iter().copied()),
         )
     };
-    assert!(parsed(&["--offline"]).is_err());
+    let complete_bundle = || {
+        let crate::Command::Setup(command) =
+            parsed(&["--offline", "--cache", cache.to_str().unwrap(), "--dry-run"])
+                .unwrap()
+                .command
+        else {
+            panic!("not a firmware setup command");
+        };
+        command.request().dispatch(&environment(&f.host))
+    };
+    // Selector-less offline mode requires a loader that reads the DATA bundle.
+    assert!(
+        complete_bundle()
+            .unwrap_err()
+            .to_string()
+            .contains("reads no firmware bundle")
+    );
     assert!(parsed(&["--profile", "unknown-model"]).is_err());
     let crate::Command::Setup(profile) = parsed(&[
         "--profile",
@@ -4405,6 +4731,16 @@ fn firmware_action_checks_capability_and_dry_run() {
     assert!(report.contains("3 exact firmware bindings"));
     assert!(report.contains("iwlwifi-9000-pu-b0-jf-b0-46.ucode"));
     assert_eq!(snapshot(&f.esp), before);
+    assert!(!cache.exists());
+
+    let mut image = efi_image(b"firmware-bundle-capable");
+    image.extend_from_slice(&stela_loader::host_firmware::MOUNT_CAPABILITY);
+    fs::write(f.esp.join(LOADER_PATH), image).unwrap();
+    let before = (snapshot(&f.esp), snapshot(&f.data));
+    let report = complete_bundle().unwrap();
+    assert!(report.contains(&firmware::bundle_summary()), "{report}");
+    assert!(report.contains("Dry run: nothing was changed."), "{report}");
+    assert_eq!((snapshot(&f.esp), snapshot(&f.data)), before);
     assert!(!cache.exists());
 }
 
@@ -4449,7 +4785,7 @@ fn legacy_operations_reject_oversized_firmware() {
     }
     let current = f._dir.path().join("firmware-v2.efi");
     let mut image = efi_image(b"firmware-v2");
-    image.extend_from_slice(&MOUNT_CAPABILITY);
+    image.extend_from_slice(&per_pc_marker());
     fs::write(&current, image).unwrap();
     rerun(&f, |c| {
         c.action = Action::UpdateStela;
@@ -4567,7 +4903,7 @@ fn host_firmware_publication_preserves_guest_bundles() {
     let firmware_before = snapshot(&f.esp.join(stela_loader::host_firmware::DIRECTORY));
     let new_efi = f._dir.path().join("firmware-test-update.efi");
     let mut image = efi_image(b"firmware-test-update");
-    image.extend_from_slice(&stela_loader::host_firmware::MOUNT_CAPABILITY);
+    image.extend_from_slice(&per_pc_marker());
     fs::write(&new_efi, image).unwrap();
     rerun(&f, |c| {
         c.action = Action::UpdateStela;
@@ -4814,22 +5150,38 @@ fn a_damaged_boot_log_is_not_taken_for_a_machine_that_never_booted() {
 }
 
 #[test]
-fn a_usb_made_without_an_nvidia_gpu_says_how_to_add_its_firmware() {
+fn a_usb_made_without_an_nvidia_gpu_needs_no_firmware_step() {
     let mut f = fixture(64 * GIB, false);
     add_installed_disk(&mut f, &[], &[]);
+    // The plan of a stela.efi that reads the bundle names the whole bundle,
+    // the same with or without a GPU on this computer.
+    let bundled = f._dir.path().join("bundled.efi");
+    let mut image = efi_image(b"bundled");
+    image.extend_from_slice(&stela_loader::host_firmware::MOUNT_CAPABILITY);
+    fs::write(&bundled, image).unwrap();
+    let mut lines = Vec::new();
+    for gpus in [vec![], vec![0x2c02]] {
+        f.host.nvidia_gpus.replace(gpus);
+        let mut dry = installed_command(&f);
+        dry.efi = Some(bundled.clone());
+        dry.dry_run = true;
+        let plan = setup(&environment(&f.host), dry).unwrap();
+        let line = plan
+            .lines()
+            .find(|line| line.starts_with("  firmware       "))
+            .unwrap_or_else(|| panic!("{plan}"))
+            .to_string();
+        lines.push(line);
+    }
+    assert_eq!(lines[0], lines[1]);
+    assert_eq!(
+        lines[0],
+        format!("  firmware       {}", firmware::bundle_summary())
+    );
     f.host.nvidia_gpus.borrow_mut().clear();
     let report = setup(&environment(&f.host), installed_command(&f)).unwrap();
-    assert!(
-        report.contains("this computer has no NVIDIA GPU Stela supports"),
-        "{report}"
-    );
-    assert!(
-        report.contains(&format!(
-            "`stela setup host-firmware fetch --gpu CHIP --usb {}`",
-            f.esp.display()
-        )),
-        "{report}"
-    );
+    assert!(!report.contains("NVIDIA"), "{report}");
+    assert!(!report.contains("host-firmware"), "{report}");
 }
 
 #[test]
@@ -4871,7 +5223,10 @@ fn status_and_repair_name_the_firmware_the_last_boot_asked_for() {
     setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
     let aware = f._dir.path().join("firmware-aware.efi");
     let mut image = efi_image(b"firmware-aware");
-    image.extend_from_slice(&MOUNT_CAPABILITY);
+    // A stela.efi before the bundle, which reads exact per-PC files.
+    let mut marker = MOUNT_CAPABILITY;
+    marker[20] = 3;
+    image.extend_from_slice(&marker);
     fs::write(&aware, image).unwrap();
     rerun(&f, |c| {
         c.action = Action::UpdateStela;
@@ -4979,6 +5334,25 @@ fn a_full_installer_with_every_signing_answer_says_the_install_needs_no_network(
         plan.contains(stela_runtime::restore::tss::network_reason(false)),
         "{plan}"
     );
+    // The written USB's status says the same.
+    setup(&staged, command(&f, &f.esp)).unwrap();
+    let mut status = command(&f, &f.esp);
+    status.ipsw = None;
+    status.model = None;
+    status.action = Action::Status;
+    let report = status.dispatch(&staged).unwrap();
+    assert!(report.contains(create::STATUS_OFFLINE), "{report}");
+}
+
+#[test]
+fn the_wizard_promises_no_network_only_once_the_answers_are_fetched() {
+    let full = create::expected_network_notes(true);
+    assert_eq!(full[0], create::FULL_BEFORE_NOTE);
+    assert!(!full.iter().any(|note| note == create::OFFLINE_NOTE));
+    assert_eq!(
+        create::expected_network_notes(false),
+        [stela_runtime::restore::tss::network_reason(true)]
+    );
 }
 
 #[test]
@@ -4989,4 +5363,311 @@ fn a_new_setup_puts_macos_on_a_usb_of_32_gb_or_more() {
     // A stick sold as 32 GB.
     assert_eq!(default_install_image(31_000_000_000), InstallImage::Full);
     assert_eq!(default_install_image(64 * GIB), InstallImage::Full);
+}
+
+#[test]
+fn a_usb_named_by_its_mounted_volume_gets_the_installer_its_size_allows() {
+    for (bytes, full) in [(16_000_000_000, false), (32_000_000_000, true)] {
+        let mut f = fixture(64 * GIB, false);
+        add_stela(&mut f);
+        for disk in f.host.disks.iter_mut().filter(|d| d.identifier == "disk5") {
+            disk.bytes = bytes;
+        }
+        let volume = stela_volume(&f);
+        let mut dry = command(&f, &volume);
+        dry.install_image = None;
+        dry.dry_run = true;
+        let plan = setup(&environment(&f.host), dry).unwrap();
+        assert_eq!(!plan.contains("file list only"), full, "{bytes}: {plan}");
+    }
+}
+
+#[test]
+fn the_no_network_promise_says_the_install_checks_the_answers_first() {
+    // Setup cannot run the install's dry run (it needs the install's own
+    // nonce and machine), so no message promises more than the check.
+    for message in [
+        create::OFFLINE_NOTE,
+        create::STATUS_OFFLINE,
+        create::FULL_BEFORE_NOTE,
+    ] {
+        assert!(!message.contains("needs no network"), "{message}");
+        assert!(message.contains("only if they do not fit"), "{message}");
+    }
+}
+
+#[test]
+fn boot_log_report_goes_to_the_output_file() {
+    use clap::Parser as _;
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("boot-log.txt");
+    let crate::Command::Setup(setup) = crate::Cli::try_parse_from([
+        "stela".as_ref(),
+        "setup".as_ref(),
+        "boot-log".as_ref(),
+        "--usb".as_ref(),
+        "/Volumes/EFI".as_ref(),
+        "-o".as_ref(),
+        output.as_os_str(),
+    ])
+    .unwrap()
+    .command
+    else {
+        panic!("not a setup");
+    };
+    let request = setup.request();
+    assert!(matches!(request.action, Action::BootLog));
+    assert_eq!(request.output.as_deref(), Some(output.as_path()));
+    save_report(&output, "=== STELA BOOT 1 ===\nline\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(&output).unwrap(),
+        "=== STELA BOOT 1 ===\nline\n"
+    );
+    assert!(save_report(&dir.path().join("no/such/file"), "").is_err());
+}
+
+#[test]
+fn boot_log_without_a_usb_reads_every_disk() {
+    use clap::Parser as _;
+    let parse = |words: &[&str]| {
+        crate::Cli::try_parse_from(["stela", "setup", "boot-log"].iter().chain(words)).map(|cli| {
+            match cli.command {
+                crate::Command::Setup(setup) => setup.request(),
+                _ => panic!("not a setup"),
+            }
+        })
+    };
+    let request = parse(&["-o", "log.txt"]).unwrap();
+    assert!(matches!(request.action, Action::BootLog));
+    assert!(request.usb.as_os_str().is_empty());
+    assert_eq!(request.output.as_deref(), Some(Path::new("log.txt")));
+    // An install is chosen on a setup's USB only.
+    assert!(parse(&["--install", "macOS"]).is_err());
+    let request = parse(&["--usb", "E:\\", "--install", "macOS"]).unwrap();
+    assert_eq!(request.usb, Path::new("E:\\"));
+    assert_eq!(request.install.as_deref(), Some("macOS"));
+}
+
+/// Partition `identifier` of its disk, backed by an image file holding
+/// `bytes`.
+fn raw_partition(host: &mut FakeHost, dir: &Path, identifier: &str, bytes: &[u8]) {
+    let path = dir.join(format!("{identifier}.img"));
+    fs::write(&path, bytes).unwrap();
+    let info = PartitionInfo {
+        identifier: identifier.into(),
+        disk: identifier[..5].into(),
+        guid: String::new(),
+        bytes: bytes.len() as u64,
+        content: String::new(),
+        mount: None,
+        container: None,
+    };
+    host.partitions.insert(identifier.into(), (info, path));
+}
+
+#[test]
+fn boot_log_scan_reads_the_usb_raw_before_the_system_disk() {
+    use crate::boot_log::tests::{fat_volume, region};
+    use stela_runtime::pc::boot_log::{OFFSET, PARTITION_BYTES};
+    let dir = tempfile::tempdir().unwrap();
+    let mounted = dir.path().join("STELA");
+    let mut host = FakeHost::new(
+        BTreeMap::new(),
+        vec![
+            disk("disk0", &[("Apple_APFS", None)]),
+            disk("disk5", &[("EFI", None), ("Apple_HFS", Some(&mounted))]),
+        ],
+    );
+    let mut state = vec![0u8; PARTITION_BYTES as usize];
+    state[OFFSET as usize..].copy_from_slice(&region(&["NOR persistent\n"]));
+    raw_partition(&mut host, dir.path(), "disk0s1", &state);
+    let usb_log = region(&["CHOICE 3 (Install macOS)\n"]);
+    raw_partition(
+        &mut host,
+        dir.path(),
+        "disk5s1",
+        &fat_volume(Some(&usb_log)),
+    );
+    // Its EFI partition is not mounted: the log is read through the disk.
+    let logs = crate::boot_log::scan(&host).unwrap();
+    let device = |number: u32| {
+        if cfg!(windows) {
+            format!("PhysicalDrive{number}")
+        } else {
+            format!("/dev/disk{number}")
+        }
+    };
+    let usb = format!(
+        "Disk disk5 (137.4 GB, {}, {})",
+        device(5),
+        mounted.display()
+    );
+    assert_eq!(
+        logs.len(),
+        1,
+        "the system disk waits while the USB has a log"
+    );
+    assert_eq!(
+        logs[0].0,
+        format!("{usb}: partition disk5s1, EFI/stela/boot.log")
+    );
+    assert_eq!(logs[0].1.boots, 1);
+    // A USB without a log: the system disk is read too.
+    raw_partition(&mut host, dir.path(), "disk5s1", &fat_volume(None));
+    let logs = crate::boot_log::scan(&host).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(
+        logs[0].0,
+        format!("Disk disk0 (137.4 GB, {}): partition disk0s1", device(0))
+    );
+    // No log anywhere names the disks, the ones that could not be read,
+    // and what to try.
+    fs::write(host.image("disk0s1").unwrap(), vec![0u8; 4096]).unwrap();
+    host.partitions.get_mut("disk5s1").unwrap().1 = dir.path().join("gone.img");
+    let error = format!("{:#}", crate::boot_log::scan(&host).unwrap_err());
+    assert!(
+        error.starts_with("no Stela boot log on this computer's disks."),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("Looked at:\n  {usb}\n  Disk disk0")),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("Could not read:\n  {usb}: ")),
+        "{error}"
+    );
+    assert!(
+        error.ends_with(&format!(
+            "Plug in the USB Stela booted from and run this again {} {}.",
+            if cfg!(windows) { "from" } else { "with" },
+            host::ADMIN
+        )),
+        "{error}"
+    );
+}
+
+#[test]
+fn setup_boot_log_reads_the_usb_raw_when_its_folder_cannot_be_read() {
+    use crate::boot_log::tests::{fat_volume, region};
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    setup(&environment(&f.host), installed_command(&f)).unwrap();
+    let dir = f._dir.path().to_path_buf();
+    let usb_log = region(&["CHOICE 3 (Install macOS)\n"]);
+    raw_partition(&mut f.host, &dir, "disk5s1", &fat_volume(Some(&usb_log)));
+    // The folder holds no log file the host lets setup read.
+    fs::remove_file(f.esp.join(efi::BOOT_LOG)).unwrap();
+    let text = rerun(&f, |c| c.action = Action::BootLog).unwrap();
+    assert!(
+        text.starts_with("Boot log on the USB (Disk disk5 (137.4 GB, "),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "partition disk5s1, EFI/stela/boot.log, read directly): Stela boot log: 1 boots"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("CHOICE 3 (Install macOS)\n"), "{text}");
+    // Without the record, the whole disk is read.
+    fs::remove_file(f.esp.join(RECORD)).unwrap();
+    let text = rerun(&f, |c| c.action = Action::BootLog).unwrap();
+    assert!(text.starts_with("The setup on "), "{text}");
+    assert!(
+        text.contains("so its disk was read directly.\n\n"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("=== STELA BOOT 1 ===\nCHOICE 3 (Install macOS)\n"),
+        "{text}"
+    );
+    // Other actions still need the record.
+    assert!(rerun(&f, |c| c.action = Action::Status).is_err());
+    // A USB without a log on it names both reasons.
+    raw_partition(&mut f.host, &dir, "disk5s1", &fat_volume(None));
+    let error = format!(
+        "{:#}",
+        rerun(&f, |c| c.action = Action::BootLog).unwrap_err()
+    );
+    assert!(error.contains("has no setup"), "{error}");
+    assert!(error.contains("nor does Disk disk5"), "{error}");
+}
+
+#[test]
+fn without_usb_the_one_disk_holding_a_setup_is_used_and_two_are_never_guessed() {
+    let dir = tempfile::tempdir().unwrap();
+    let volume = |name: &str, setup: Option<&str>| {
+        let path = dir.path().join(name);
+        fs::create_dir_all(&path).unwrap();
+        if let Some(inner) = setup {
+            fs::create_dir_all(path.join(inner).parent().unwrap()).unwrap();
+            if inner == RECORD {
+                fs::write(path.join(inner), b"{}").unwrap();
+            } else {
+                fs::create_dir_all(path.join(inner)).unwrap();
+            }
+        }
+        path
+    };
+    let system = volume("system", None);
+    let esp = volume("esp", Some(RECORD));
+    let data = volume("data", Some("stela/boot"));
+    let other = volume("other", Some("stela/boot"));
+    let host = |disks: Vec<Disk>| FakeHost::new(BTreeMap::new(), disks);
+    // None: the error says how to name one.
+    let error = choose_setup(&host(vec![disk("disk0", &[("Linux", Some(&system))])]))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no mounted volume"), "{error}");
+    assert!(error.contains("--usb"), "{error}");
+    // One: its EFI partition, which holds the record, over its data volume.
+    let one = host(vec![
+        disk("disk0", &[("Linux", Some(&system))]),
+        disk(
+            "disk5",
+            &[("Microsoft Basic Data", Some(&data)), ("EFI", Some(&esp))],
+        ),
+    ]);
+    assert_eq!(choose_setup(&one).unwrap(), esp);
+    // A USB whose EFI partition is not mounted is found by its data volume.
+    let data_only = host(vec![disk(
+        "disk5",
+        &[("EFI", None), ("Microsoft Basic Data", Some(&data))],
+    )]);
+    assert_eq!(choose_setup(&data_only).unwrap(), data);
+    // Two: both are listed and neither is used.
+    let two = host(vec![
+        disk("disk5", &[("EFI", Some(&esp))]),
+        disk("disk6", &[("Microsoft Basic Data", Some(&other))]),
+    ]);
+    let error = choose_setup(&two).unwrap_err().to_string();
+    assert!(error.starts_with("2 disks hold a Stela setup"), "{error}");
+    assert!(error.contains(&esp.display().to_string()), "{error}");
+    assert!(error.contains(&other.display().to_string()), "{error}");
+    assert!(error.contains("Name the one to use with --usb"), "{error}");
+}
+
+#[test]
+fn maintenance_commands_parse_without_usb() {
+    use clap::Parser as _;
+    for args in [
+        &["stela", "setup", "status"][..],
+        &["stela", "setup", "repair"],
+        &["stela", "setup", "update", "stela"],
+        &["stela", "setup", "update", "os"],
+        &["stela", "setup", "host-firmware", "fetch"],
+    ] {
+        let crate::Command::Setup(setup) = crate::Cli::try_parse_from(args)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+            .command
+        else {
+            panic!("not a setup");
+        };
+        let request = setup.request();
+        assert!(request.usb.as_os_str().is_empty(), "{args:?}");
+        assert!(finds_usb(&request.action), "{args:?}");
+    }
+    // Uninstall still names its USB.
+    assert!(crate::Cli::try_parse_from(["stela", "setup", "uninstall"]).is_err());
 }

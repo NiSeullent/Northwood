@@ -73,6 +73,22 @@ pub const MECHANISM: u64 = 0x4004;
 pub const CONFIGURATION: u64 = 0x4008;
 pub const POWER_OFF: u64 = 0x400c;
 
+/// One write to the watchdog mechanism: XNU arms it on its halt, restart
+/// and panic path, so the record dates the start of a reset that follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MechanismEvent {
+    /// The deadline armed, in system counter seconds; `None` disarms.
+    pub deadline: Option<u32>,
+    /// The system counter at the write.
+    pub at: u64,
+    /// The PE that wrote it.
+    pub cpu: usize,
+}
+
+/// The most mechanism writes kept between two reports; later ones are
+/// counted, not kept.
+const MECHANISM_LOG: usize = 8;
+
 enum PowerOff {
     Separate(u32),
     /// Both DT views name one physical flags word, not a copied value.
@@ -117,6 +133,10 @@ pub struct AppleWdt {
     panic_save: u32,
     /// The armed mechanism deadline, in seconds of the system counter.
     mechanism: Option<u32>,
+    /// Mechanism writes since the last [`AppleWdt::take_mechanism_log`].
+    mechanism_log: alloc::vec::Vec<MechanismEvent>,
+    /// Writes not kept since then, past [`MECHANISM_LOG`].
+    mechanism_dropped: u32,
     configuration: u32,
     power_off: PowerOff,
 }
@@ -138,10 +158,21 @@ impl AppleWdt {
             side: false,
             panic_save: 0,
             mechanism: None,
+            mechanism_log: alloc::vec::Vec::new(),
+            mechanism_dropped: 0,
             configuration: 0,
             power_off: PowerOff::Separate(0),
         }
     }
+    /// The mechanism writes since the last call, and how many more were
+    /// not kept.
+    pub fn take_mechanism_log(&mut self) -> (alloc::vec::Vec<MechanismEvent>, u32) {
+        (
+            core::mem::take(&mut self.mechanism_log),
+            core::mem::take(&mut self.mechanism_dropped),
+        )
+    }
+
     /// The optional DT side controls, separate from the timer window.
     pub fn with_side_controls(mut self) -> Self {
         self.side = true;
@@ -292,6 +323,15 @@ impl MmioDevice for AppleWdt {
             }
             if offset == MECHANISM {
                 self.mechanism = (value != 0).then_some(value as u32);
+                if self.mechanism_log.len() < MECHANISM_LOG {
+                    self.mechanism_log.push(MechanismEvent {
+                        deadline: self.mechanism,
+                        at: access.now,
+                        cpu: access.cpu,
+                    });
+                } else {
+                    self.mechanism_dropped = self.mechanism_dropped.saturating_add(1);
+                }
                 self.evaluate(access);
                 return Ok(());
             }
@@ -443,6 +483,24 @@ mod tests {
         assert_eq!(w.mechanism, Some(10));
         w.write(MECHANISM, Width::Word, 0, &mut a).unwrap();
         assert_eq!(w.mechanism, None);
+        let (log, dropped) = w.take_mechanism_log();
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            log,
+            [
+                MechanismEvent {
+                    deadline: Some(10),
+                    at: 0,
+                    cpu: 0
+                },
+                MechanismEvent {
+                    deadline: None,
+                    at: 0,
+                    cpu: 0
+                },
+            ]
+        );
+        assert_eq!(w.take_mechanism_log(), (alloc::vec::Vec::new(), 0));
         assert!(w.read(MECHANISM, Width::Word, &mut a).is_err());
         assert!(w.read(PANIC_SAVE, Width::Double, &mut a).is_err());
         assert!(w.read(PANIC_SAVE + 0x10, Width::Word, &mut a).is_err());
@@ -479,6 +537,28 @@ mod tests {
         assert!(trigger.write(0, Width::Word, 0x11, &mut a).is_err());
         assert!(trigger.read(0, Width::Double, &mut a).is_err());
         assert_eq!(trigger.read(0, Width::Word, &mut a), Ok(1));
+    }
+
+    #[test]
+    fn mechanism_writes_are_kept_up_to_the_log_bound_then_counted() {
+        let mut sink = InterruptLatch::new();
+        let mut w = AppleWdt::new(None, 0).with_side_controls();
+        for second in 1..=10u64 {
+            let mut a = Access::new(3, second * REFERENCE_HZ, &mut sink);
+            w.write(MECHANISM, Width::Word, second + 10, &mut a)
+                .unwrap();
+        }
+        let (log, dropped) = w.take_mechanism_log();
+        assert_eq!(log.len(), MECHANISM_LOG);
+        assert_eq!(dropped, 2);
+        assert_eq!(
+            log[0],
+            MechanismEvent {
+                deadline: Some(11),
+                at: REFERENCE_HZ,
+                cpu: 3
+            }
+        );
     }
 
     #[test]

@@ -109,10 +109,14 @@ fn boot_selection(options: &System) -> Result<(), Error> {
             || options.safe_boot
             || options.maintenance_write
             || options.single_user
+            || options.bundle_repair
             || options.upgrade
             || options.recovery.is_some())
     {
         return Err(Error::Constraint(Constraint::PrebootSelection));
+    }
+    if options.bundle_repair && (options.upgrade || options.recovery.is_some()) {
+        return Err(Error::Constraint(Constraint::BundleRepairSelection));
     }
     if options.upgrade && (options.recovery.is_some() || options.safe_boot) {
         return Err(Error::Constraint(Constraint::UpgradeSelection));

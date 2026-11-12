@@ -1131,74 +1131,11 @@ fn bytes(words: &[u32]) -> Vec<u8> {
 }
 
 #[test]
-fn terminal_half_division_shares_exact_consumption_analysis_and_emission() {
-    const NOP: u32 = 0xd503201f;
-    const UNSUPPORTED: u32 = 0xffffffff;
-    const HALF_OPERATIONS: [u32; 3] = [
-        0x1ee01800, // FDIV H0,H0,H0
-        0x2e403c00, // FDIV V0.4H,V0.4H,V0.4H
-        0x6e403c00, // FDIV V0.8H,V0.8H,V0.8H
-    ];
-    let base = GuestAddress(0x1000);
-    let helper_pc = GuestAddress(base.0 + size_of::<u32>() as u64);
-    let continuation = GuestAddress(helper_pc.0 + size_of::<u32>() as u64);
-    for operation in HALF_OPERATIONS {
-        for profile in [
-            BlockProfile::ORDINARY,
-            BlockProfile::new(Features::POINTER_AUTHENTICATION),
-            BlockProfile::new(Features::POINTER_AUTHENTICATION.union(Features::CLOCK)),
-            BlockProfile::new(Features::THREAD_REGISTERS.union(Features::AMX)),
-            BlockProfile::new(
-                Features::POINTER_AUTHENTICATION
-                    .union(Features::THREAD_REGISTERS)
-                    .union(Features::AMX),
-            ),
-            BlockProfile::new(Features::PROCESS_HELPERS.union(Features::AMX)),
-        ] {
-            let source = bytes(&[NOP, operation, UNSUPPORTED]);
-            let analysis = analyze_with_profile(&source, base, profile).unwrap();
-            let compiled = crate::testing::block_with(&source, base, profile).unwrap();
-            assert_eq!(analysis.source_bytes, 2 * size_of::<u32>());
-            assert_eq!(compiled.source_bytes, analysis.source_bytes);
-            assert_eq!(
-                source_bytes_with_profile(&source, base, profile).unwrap(),
-                analysis.source_bytes
-            );
-            assert_eq!(analysis.terminator_pc, Some(helper_pc));
-            assert_eq!(analysis.dynamic_edge, None);
-            assert_eq!(
-                analysis.static_successors,
-                [StaticSuccessor {
-                    kind: SuccessorKind::Fallthrough,
-                    target: continuation,
-                }]
-            );
-            assert_eq!(compiled.native.source_map.len(), 2);
-            assert_eq!(compiled.native.source_map[1].0, helper_pc);
-            let mut helper = vec![0x48, 0xb8]; // MOVABS RAX,original PC
-            helper.extend(helper_pc.0.to_le_bytes());
-            helper.push(0xba); // MOV EDX,FloatingPoint; RET
-            helper.extend((ExitKind::FloatingPoint as u32).to_le_bytes());
-            helper.extend([0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc]);
-            let offset = compiled.native.source_map[1].1;
-            assert_eq!(&compiled.native.x86_64_code[offset..], helper);
-            let suffix = &source[analysis.source_bytes..];
-            assert_eq!(
-                analyze_with_profile(suffix, continuation, profile)
-                    .unwrap_err()
-                    .pc,
-                continuation
-            );
-        }
-    }
-}
-
-#[test]
-fn terminal_half_division_completes_inline_only_with_the_host_instruction() {
+fn half_division_continues_its_block_on_every_target() {
     let base = GuestAddress(0x1000);
     let continuation = GuestAddress(base.0 + size_of::<u32>() as u64);
-    // FDIV V0.8H,V0.8H,V0.8H; the unsupported word stays outside the block.
-    let source = bytes(&[0x6e403c00, 0xffffffff]);
+    // FDIV V0.8H,V0.8H,V0.8H
+    let source = bytes(&[0x6e403c00]);
     let compile = |target| {
         crate::compile(
             &source,
@@ -1215,27 +1152,32 @@ fn terminal_half_division_completes_inline_only_with_the_host_instruction() {
         exit.extend([0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc]);
         exit
     };
-    let helper = compile(crate::TargetCpu::X86_64_V4);
-    assert_eq!(helper.source_bytes, size_of::<u32>());
-    assert!(
-        helper
-            .native
-            .x86_64_code
-            .ends_with(&exit(base, ExitKind::FloatingPoint))
-    );
-    let inline = compile(crate::TargetCpu::X86_64_V4.with_avx512fp16());
-    assert_eq!(inline.source_bytes, size_of::<u32>());
-    let code = &inline.native.x86_64_code;
-    assert!(code.ends_with(&exit(continuation, ExitKind::Fallthrough)));
-    assert!(
+    // VDIVPH XMM0,XMM0,XMM1 with EVEX.
+    let native = |code: &[u8]| {
         code.windows(4)
             .any(|window| window == [0x7c, 0x89, 0x5e, 0xc1])
-    );
+    };
     let helper_exit = exit(base, ExitKind::FloatingPoint);
-    assert!(
-        code.windows(helper_exit.len())
-            .any(|window| window == helper_exit)
-    );
+    for (target, half_instruction) in [
+        (crate::TargetCpu::Baseline, false),
+        (crate::TargetCpu::X86_64_V3, false),
+        (crate::TargetCpu::X86_64_V4, false),
+        (crate::TargetCpu::X86_64_V4.with_avx512fp16(), true),
+    ] {
+        let compiled = compile(target);
+        assert_eq!(compiled.source_bytes, size_of::<u32>());
+        let code = &compiled.native.x86_64_code;
+        assert!(
+            code.windows(helper_exit.len())
+                .any(|window| window == helper_exit)
+        );
+        assert_eq!(native(code), half_instruction);
+        let fallthrough = exit(continuation, ExitKind::Fallthrough);
+        assert!(
+            code.windows(fallthrough.len())
+                .any(|window| window == fallthrough)
+        );
+    }
 }
 
 #[test]
@@ -1247,6 +1189,7 @@ fn guarded_half_arithmetic_validates_its_inline_suffix_in_every_profile() {
         0x1ee02800, 0x1ee03800, 0x1ee00800, // scalar ADD/SUB/MUL
         0x0e401400, 0x0ec01400, 0x2e401c00, // four lanes
         0x4e401400, 0x4ec01400, 0x6e401c00, // eight lanes
+        0x1ee01800, 0x2e403c00, 0x6e403c00, // FDIV H, 4H, 8H
     ] {
         for profile in [
             BlockProfile::ORDINARY,

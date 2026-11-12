@@ -262,8 +262,64 @@ fn zero_flags(code: &mut Code, format: Format) {
     store_flags(code);
 }
 
-fn emit_flags(code: &mut Code, format: Format, left: u8, right: CompareSource, pc: GuestAddress) {
+/// Whether FCMP/FCMPE/FCCMP of S/D registers take [`quick_flags`]: not in
+/// the DIT profile, which keeps its reviewed classification.
+fn quick_flags_supported(format: Format, right: CompareSource, target: TargetCpu) -> bool {
+    format != Format::Half
+        && matches!(right, CompareSource::Register(_))
+        && !target.data_independent_timing()
+}
+
+/// With no trap enabled and FZ, FIZ and AH clear, UCOMIS orders every
+/// non-NaN pair (zeros of either sign, subnormals, infinities) as Arm does
+/// and Arm raises no flag: only an unordered pair (a NaN, whose
+/// IOC depends on FCMP or FCMPE and on signalling) needs the helper. UCOMIS
+/// may set MXCSR status bits (IE for an SNaN, DE for a subnormal), which
+/// nothing reads: every status reader installs a clean control first.
+/// Returns the branch, taken with UCOMIS's flags, to the flag mapping;
+/// every other control falls through to the full classification.
+fn quick_flags(
+    code: &mut Code,
+    format: Format,
+    left: u8,
+    right: u8,
+    helper: &mut Vec<usize>,
+) -> usize {
+    use crate::aarch64::floating::{FPCR_AH, FPCR_FIZ, FPCR_FZ};
+    test_control(
+        code,
+        FPCR_EXCEPTION_ENABLE_MASK | FPCR_FZ | FPCR_FIZ | FPCR_AH,
+    );
+    let other = branch(code, Condition::NotZero);
+    read_vector(code, left, LEFT_VECTOR);
+    read_vector(code, right, RIGHT_VECTOR);
+    if format == Format::Double {
+        code.asm().ucomisd(LEFT_VECTOR, Rm::Xmm(RIGHT_VECTOR));
+    } else {
+        code.asm().ucomiss(LEFT_VECTOR, Rm::Xmm(RIGHT_VECTOR));
+    }
+    helper.push(code.asm().jcc(Cond::P).offset());
+    let ordered = jump(code);
+    let full = code.len();
+    resolve(code, other, full);
+    ordered
+}
+
+fn emit_flags(
+    code: &mut Code,
+    format: Format,
+    left: u8,
+    right: CompareSource,
+    pc: GuestAddress,
+    target: TargetCpu,
+) {
     let mut helper = Vec::new();
+    let quick = match right {
+        CompareSource::Register(register) if quick_flags_supported(format, right, target) => {
+            Some(quick_flags(code, format, left, register, &mut helper))
+        }
+        _ => None,
+    };
     exception_guard(code, &mut helper);
     read_vector(code, left, LEFT_VECTOR);
     if let CompareSource::Register(right) = right {
@@ -285,6 +341,10 @@ fn emit_flags(code: &mut Code, format: Format, left: u8, right: CompareSource, p
         }
         // JMP and the unexecuted helper preserve the comparison flags.
         helper_section(code, &helper, pc);
+        if let Some(quick) = quick {
+            let mapping = code.len();
+            resolve(code, quick, mapping);
+        }
         ordered_flags(code, format == Format::Half);
     } else {
         scalar_zero_guard(code, format, LEFT_VECTOR, &mut helper);
@@ -296,16 +356,23 @@ fn emit_flags(code: &mut Code, format: Format, left: u8, right: CompareSource, p
 fn emit_conditional_flags(
     code: &mut Code,
     format: Format,
-    left: u8,
-    right: u8,
+    (left, right): (u8, u8),
     condition: u8,
     fallback: u8,
     pc: GuestAddress,
+    target: TargetCpu,
 ) {
     // A false condition bypasses numerical enables and every operand effect.
     let failed = super::super::condition_holds(code, condition, false)
         .map(|holds| code.asm().jcc(holds.negate()).offset());
-    emit_flags(code, format, left, CompareSource::Register(right), pc);
+    emit_flags(
+        code,
+        format,
+        left,
+        CompareSource::Register(right),
+        pc,
+        target,
+    );
     if let Some(failed) = failed {
         let completed = jump(code);
         let fallback_start = code.len();
@@ -581,14 +648,19 @@ fn emit_predicate(code: &mut Code, operand: &Operand, pc: GuestAddress) {
     commit_predicate(code, format, shape, destination, result, merge, zero);
 }
 
-pub(in crate::x86_64) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress) {
+pub(in crate::x86_64) fn emit(
+    code: &mut Code,
+    operand: &Operand,
+    pc: GuestAddress,
+    target: TargetCpu,
+) {
     match *operand {
         Operand::Flags {
             format,
             left,
             right,
             ..
-        } => emit_flags(code, format, left, right, pc),
+        } => emit_flags(code, format, left, right, pc, target),
         Operand::ConditionalFlags {
             format,
             left,
@@ -596,7 +668,7 @@ pub(in crate::x86_64) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddre
             condition,
             fallback,
             ..
-        } => emit_conditional_flags(code, format, left, right, condition, fallback, pc),
+        } => emit_conditional_flags(code, format, (left, right), condition, fallback, pc, target),
         Operand::Predicate { .. } => emit_predicate(code, operand, pc),
     }
 }

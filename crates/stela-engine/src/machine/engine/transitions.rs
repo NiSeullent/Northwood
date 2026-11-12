@@ -1,10 +1,12 @@
-//! Native GENTER and GEXIT (`x86_64::transition`): the record an engine-path
-//! transition leaves for the next native entry at its target, the thunks
-//! that complete the instructions from records, and what the engine takes
-//! back of a native run that made transitions.
+//! Native GENTER, GEXIT, SVC and ERET (`x86_64::transition`): the record an
+//! engine-path transition leaves for the next native entry at its target,
+//! the thunks that complete the instructions from records, and what the
+//! engine takes back of a native run that made transitions.
 use super::*;
 use crate::machine::cpu::Cpu;
-use stela_compiler::x86_64::transition::{GUARDED_ENTER, GUARDED_EXIT, KINDS, Record};
+use stela_compiler::x86_64::transition::{
+    EXCEPTION_RETURN, GUARDED_ENTER, GUARDED_EXIT, KINDS, Record, SUPERVISOR_CALL,
+};
 
 /// The SPSR bits a GEXIT record fixes: M[4:0], D, BTYPE, IL, SS, PAN, TCO
 /// and PACM. The rest are operands (NZCV, A, I, F, DIT, UAO, SSBS) or no
@@ -13,26 +15,40 @@ const EXIT_CHECKED: u64 = 0x1f | 1 << 9 | 3 << 10 | 3 << 20 | 1 << 22 | 1 << 25 
 /// Of those, the bits a record needs clear: BTYPE, IL, SS and PACM, which
 /// native code keeps clear.
 const EXIT_CLEAR: u64 = 3 << 10 | 3 << 20 | 1 << 35;
+/// The SPSR bits an ERET record fixes: all but the operands NZCV, A, I,
+/// F, DIT, UAO and SSBS, so the mode, D, PAN, BTYPE, IL, SS, TCO, PACM and
+/// whatever else SPSR holds are the record's.
+const RETURN_CHECKED: u64 = !(0xf << 28 | 7 << 6 | 1 << 24 | 1 << 23 | 1 << 12);
 const GENTER: u32 = 0x0020_1420;
 const GEXIT: u32 = 0x0020_1400;
+/// SVC #imm16 (imm16 in bits 20:5) and ERET.
+const SVC: u32 = 0xd400_0001;
+const SVC_IMMEDIATE: u32 = 0xffff << 5;
+const ERET: u32 = 0xd69f_03e0;
 
-/// The kind of native transition `word` makes, with GENTER's immediate.
-pub(super) fn transition_word(word: u32) -> Option<(usize, u8)> {
+/// The kind of native transition `word` makes, with GENTER's or SVC's
+/// immediate.
+pub(super) fn transition_word(word: u32) -> Option<(usize, u16)> {
     if word & !0x1f == GENTER {
-        Some((GUARDED_ENTER, (word & 0x1f) as u8))
+        Some((GUARDED_ENTER, (word & 0x1f) as u16))
     } else if word == GEXIT {
         Some((GUARDED_EXIT, 0))
+    } else if word & !SVC_IMMEDIATE == SVC {
+        Some((SUPERVISOR_CALL, ((word & SVC_IMMEDIATE) >> 5) as u16))
+    } else if word == ERET {
+        Some((EXCEPTION_RETURN, 0))
     } else {
         None
     }
 }
 
-/// Why GENTER or GEXIT took the engine path, as its thunk would have
-/// decided there ([`Machine::note_transition_miss`]): no record was ever made
+/// Why GENTER, GEXIT, SVC or ERET took the engine path, as its thunk would
+/// have decided there ([`Machine::note_transition_miss`]): no record was ever made
 /// from the state; one was, but the table's generation moved since; it was
 /// made for another frame or stack selection; a deadline was due or none
-/// was known (GEXIT); an interrupt notification came (GEXIT); the operands
-/// the record fixes differ; an interrupt waiting would be unmasked (GEXIT);
+/// was known (GEXIT, ERET); an interrupt notification came (GEXIT, ERET);
+/// the operands the record fixes differ, or the engine holds a monitor
+/// (ERET); an interrupt waiting would be unmasked (GEXIT, ERET);
 /// or the record held, so no thunk ran (none installed, the block ran in
 /// the engine, or the host's root moved).
 pub mod miss {
@@ -64,28 +80,45 @@ pub(super) struct Note {
     generation: u64,
     /// GENTER: the ASPSR it banked. GEXIT: ASPSR's guarded bit.
     aspsr: u64,
-    /// GEXIT: the SPSR it restored.
+    /// GEXIT and ERET: the SPSR it restored.
     spsr: u64,
     prediction: Option<PredictionContext>,
+    /// SVC and ERET between levels whose PAC key enables differ: the PAC
+    /// service's tag words before and after the engine reopened them, and
+    /// its generation.
+    pointer: Option<([PointerTags; 2], u64)>,
 }
+
+/// The PAC service's tag words (`PointerService::tags`).
+type PointerTags = [u64; x86_64_pointer::TAG_WORDS];
 
 /// What a transition starts from ([`Machine::transition_start`]).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Start {
     pstate: Pstate,
     prediction: Option<PredictionContext>,
+    watch: Watch,
+    pointer: PointerUse,
+    tags: PointerTags,
 }
 
+/// How PAC instructions act at a level: the four address keys' enables
+/// (`Machine::pointer_key_enables`) and whether EL2 traps them.
+type PointerUse = (u64, bool);
+
 impl<H: Host, D: Devices> Machine<H, D> {
-    /// GENTER (`kind` [`GUARDED_ENTER`]) or GEXIT is about to take the
-    /// engine path: count why ([`miss`]), in
-    /// [`Statistics::transition_misses`], GENTER's first. Only EL2's make
-    /// records, so only theirs count.
+    /// GENTER, GEXIT, SVC or ERET (`kind`) is about to take the engine
+    /// path: count why ([`miss`]) in [`Statistics::transition_misses`], by
+    /// kind. Only states that make records count: EL2 for all, and EL0 of
+    /// the host for SVC.
     pub(super) fn note_transition_miss(&mut self, kind: usize) {
-        if self.cpu.pstate.el != 2 {
+        let pstate = self.cpu.pstate;
+        let counted = pstate.el == 2
+            || kind == SUPERVISOR_CALL && pstate.el == 0 && !pstate.guarded && self.cpu.in_host();
+        if !counted {
             return;
         }
-        let exit = kind == GUARDED_EXIT;
+        let returning = matches!(kind, GUARDED_EXIT | EXCEPTION_RETURN);
         let table = &self.mirrors.transitions;
         let record = table.records[self.mirror_state()][kind];
         let frame = &self.cpu.state as *const GuestState as u64;
@@ -93,50 +126,60 @@ impl<H: Host, D: Devices> Machine<H, D> {
             miss::NEVER
         } else if record.generation != table.generation {
             miss::FORGOTTEN
-        } else if record.frame != frame || record.selected != u64::from(self.cpu.pstate.sp) {
+        } else if record.frame != frame || record.selected != u64::from(pstate.sp) {
             miss::FRAME
-        } else if exit
+        } else if returning
             && self.mirrors.lines_until != u64::MAX
             && (self.mirrors.lines_until == 0 || self.now() >= self.mirrors.lines_until)
         {
             miss::DEADLINE
-        } else if exit && self.chain.interrupt_moved() {
+        } else if returning && self.chain.interrupt_moved() {
             miss::EPOCH
-        } else if self.transition_operands_differ(&record, exit) {
+        } else if self.transition_operands_differ(&record, kind) {
             miss::CHECK
-        } else if exit && self.transition_unmasks() {
+        } else if returning && self.transition_unmasks(kind) {
             miss::INTERRUPT
         } else {
             miss::OTHER
         };
-        self.statistics.transition_misses[usize::from(exit)][reason] += 1;
+        self.statistics.transition_misses[kind][reason] += 1;
+    }
+
+    /// The SPSR a GEXIT or ERET of `kind` restores, with GEXIT's ASPSR.
+    fn returned_state(&self, kind: usize) -> Option<(u64, u64)> {
+        if kind == EXCEPTION_RETURN {
+            return Some((self.cpu.read(SystemRegister::SPSR_EL2), 0));
+        }
+        let bank = usize::from(self.cpu.pstate.el)
+            .checked_sub(1)
+            .and_then(|level| self.cpu.apple.guarded.get(level))?;
+        Some((bank.spsr, bank.aspsr))
     }
 
     /// Whether the operands `record` fixes differ from the PE's, as the
-    /// thunk checks them: GEXIT's ASPSR guarded bit and SPSR's fixed bits,
-    /// GENTER's PAN.
-    fn transition_operands_differ(&self, record: &Record, exit: bool) -> bool {
-        if !exit {
+    /// thunk checks them: GENTER's and SVC's PAN; GEXIT's ASPSR guarded bit
+    /// and SPSR's fixed bits; ERET's SPSR fixed bits, or a monitor the
+    /// engine holds (`Places::monitor`).
+    fn transition_operands_differ(&self, record: &Record, kind: usize) -> bool {
+        if matches!(kind, GUARDED_ENTER | SUPERVISOR_CALL) {
             return u64::from(self.cpu.pstate.pan) != record.check;
         }
-        let Some(bank) = usize::from(self.cpu.pstate.el)
-            .checked_sub(1)
-            .and_then(|level| self.cpu.apple.guarded.get(level))
-        else {
+        let Some((spsr, aspsr)) = self.returned_state(kind) else {
             return true;
         };
-        bank.aspsr & 1 != record.aspsr_value || bank.spsr & record.check_mask != record.check
+        let monitor = kind == EXCEPTION_RETURN
+            && (self.cpu.monitor.is_some() || self.cpu.has_canonical_memory());
+        let guarded = kind == GUARDED_EXIT && aspsr & 1 != record.aspsr_value;
+        monitor || guarded || spsr & record.check_mask != record.check
     }
 
-    /// Whether GEXIT would unmask an interrupt waiting at native entry.
-    fn transition_unmasks(&self) -> bool {
-        let Some(bank) = usize::from(self.cpu.pstate.el)
-            .checked_sub(1)
-            .and_then(|level| self.cpu.apple.guarded.get(level))
-        else {
+    /// Whether a GEXIT or ERET of `kind` would unmask an interrupt waiting
+    /// at native entry.
+    fn transition_unmasks(&self, kind: usize) -> bool {
+        let Some((spsr, _)) = self.returned_state(kind) else {
             return false;
         };
-        let masks = bank.spsr >> 6 & 3;
+        let masks = spsr >> 6 & 3;
         u64::from(self.cpu.state.pending) & 3 & !masks != 0
     }
 
@@ -144,25 +187,85 @@ impl<H: Host, D: Devices> Machine<H, D> {
         Start {
             pstate: self.cpu.pstate,
             prediction: self.prediction_context,
+            watch: self.watch,
+            pointer: self.pointer_use(),
+            tags: self.pointer.tags,
         }
     }
 
-    /// GENTER or GEXIT (`kind`) completed in the engine from `start`, with
-    /// the `spsr` and `aspsr` the note keeps. Only transitions at EL2, where
-    /// HACR traps none, with neither MTE (TCO stays) nor monitor tracing
-    /// (whose events native code would not report) make records.
+    /// PAC's behavior at the current level: native transitions keep the PAC
+    /// service, which the engine path reopens at the new level
+    /// (`Machine::reopen_pointers`), so both levels must agree. Above EL0,
+    /// APCTL's kernel-keys bit enables every key whatever SCTLR says.
+    fn pointer_use(&self) -> PointerUse {
+        use PointerAuthenticationKey::{Da, Db, Ia, Ib};
+        let keys = [Ia, Ib, Da, Db].into_iter().fold(0, |keys, key| {
+            keys | pointer_authentication::key_enable_bit(key)
+        });
+        (
+            self.pointer_key_enables() & keys,
+            self.pointer_authentication_trapped(),
+        )
+    }
+
+    /// GENTER, GEXIT, SVC or ERET (`kind`) completed in the engine from
+    /// `start`, with the `spsr` and `aspsr` the note keeps. Only transitions
+    /// with neither MTE (TCO stays) nor monitor tracing (whose events native
+    /// code would not report), and with PAC acting alike on both sides
+    /// ([`Self::pointer_use`]), make records: GENTER and GEXIT at EL2, where
+    /// HACR traps none; SVC and ERET between EL0 and EL2 of the host
+    /// (HCR_EL2.E2H and TGE: one translation regime, PAC keys and controls,
+    /// and no fine-grained trap of either) or within EL2, unguarded, with
+    /// the watchpoints the same on both sides and no single-step in
+    /// progress. ERET also needs the local monitor kept in the frame alone:
+    /// a PE with canonical memory (the home PE of a parallel board) clears
+    /// its reservation through the shared registry (`Cpu::exception_return`),
+    /// which native code cannot reach. An SVC leaves the monitor alone
+    /// (`Cpu::take`), so it makes records there too.
     pub(super) fn note_transition(&mut self, kind: usize, start: Start, spsr: u64, aspsr: u64) {
         self.statistics.engine_transitions[kind] += 1;
         let (from, to) = (start.pstate, self.cpu.pstate);
         let plain = |pstate: Pstate| !pstate.il && !pstate.ss && !pstate.pacm;
+        let levels = match kind {
+            GUARDED_ENTER | GUARDED_EXIT => from.el == 2 && to.el == 2,
+            _ => {
+                let host = |pstate: Pstate| {
+                    !pstate.guarded && (pstate.el == 2 || pstate.el == 0 && self.cpu.in_host())
+                };
+                host(from)
+                    && host(to)
+                    && self.cpu.in_host()
+                    && start.watch == self.watch
+                    && !self.cpu.step_advance
+                    && (kind == SUPERVISOR_CALL || !self.cpu.has_canonical_memory())
+                    && if kind == SUPERVISOR_CALL {
+                        to.el == 2
+                    } else {
+                        from.el == 2
+                    }
+            }
+        };
+        // Enables that differ are switched natively from a service with a
+        // tag word open (which the engine reopens whole, a function of its
+        // generation, enables and traps) to the tags it just reopened
+        // (`transition::check_pointer`).
+        let pointer = (start.pointer != self.pointer_use()
+            && matches!(kind, SUPERVISOR_CALL | EXCEPTION_RETURN)
+            && start.tags.iter().any(|&tag| tag != 0))
+        .then_some(([start.tags, self.pointer.tags], self.pointer.generation));
         let usable = !self.monitor_tracing
-            && from.el == 2
-            && to.el == 2
+            && levels
             && plain(from)
             && plain(to)
             && from.tco == to.tco
+            && start.pointer.1 == self.pointer_use().1
+            && (start.pointer == self.pointer_use() || pointer.is_some())
             && !self.cpu.mte()
-            && (kind == GUARDED_ENTER || spsr & EXIT_CLEAR == 0);
+            && match kind {
+                GUARDED_EXIT => spsr & EXIT_CLEAR == 0,
+                EXCEPTION_RETURN => spsr & EXIT_CLEAR == 0,
+                _ => true,
+            };
         self.transition_note = usable.then(|| Note {
             kind,
             from,
@@ -172,6 +275,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             aspsr,
             spsr,
             prediction: start.prediction,
+            pointer,
         });
     }
 
@@ -192,6 +296,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             || note.generation != self.mirrors.transitions.generation
             || note.prediction != self.prediction_context
             || to.btype != 0
+            || note.pointer.is_some_and(|([_, to], generation)| {
+                to != self.pointer.tags || generation != self.pointer.generation
+            })
         {
             return;
         }
@@ -219,23 +326,40 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.host.native_view(&before, &regime)
         };
         let at = |field: &u64| field as *const u64 as u64;
-        let bank = &self.cpu.apple.guarded[usize::from(to.el) - 1];
-        let (spsr, elr, esr, aspsr, enter) = (
-            at(&bank.spsr),
-            at(&bank.elr),
-            at(&bank.esr),
-            at(&bank.aspsr),
-            at(&bank.enter),
-        );
+        let guarded = matches!(note.kind, GUARDED_ENTER | GUARDED_EXIT);
+        let (spsr, elr, esr, aspsr, enter) = if guarded {
+            let bank = &self.cpu.apple.guarded[usize::from(to.el) - 1];
+            (
+                at(&bank.spsr),
+                at(&bank.elr),
+                at(&bank.esr),
+                at(&bank.aspsr),
+                at(&bank.enter),
+            )
+        } else {
+            // SVC and ERET reach EL2's registers alone (`Cpu::take` and
+            // `Cpu::exception_return` from or to EL2).
+            let address = |register| self.cpu.registers.address(register, 0);
+            let (Some(spsr), Some(elr), Some(esr)) = (
+                address(SystemRegister::SPSR_EL2),
+                address(SystemRegister::ELR_EL2),
+                address(SystemRegister::ESR_EL2),
+            ) else {
+                return;
+            };
+            (spsr, elr, esr, 0, 0)
+        };
         let scratch = at(&self.mirrors.transitions.records[from_state][note.kind].scratch);
+        let aspsr = if guarded { aspsr } else { scratch };
         let (sp_save, sp_load) = if Cpu::same_stack(from, to) {
             (scratch, scratch)
         } else {
             (self.cpu.stack_storage(from), self.cpu.stack_storage(to))
         };
         let salts = self.chain.salts();
-        let entering = note.kind == GUARDED_ENTER;
-        // GENTER's SPSR without its operands: the mode (and TCO, which stays).
+        let entering = matches!(note.kind, GUARDED_ENTER | SUPERVISOR_CALL);
+        // An entry's SPSR without its operands: the mode (and TCO, which
+        // stays).
         let fixed = Pstate {
             daif: 0,
             pan: false,
@@ -266,6 +390,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
             cell(DAIF_MIRROR)
         };
         let close = [cell(COUNTER_MIRRORS[0]), cell(COUNTER_MIRRORS[1]), daif];
+        // SVC: DIT stays, UAO clears, SSBS takes SCTLR_EL2.DSSBS
+        // (`exception::entry_pstate`), as the engine path just did.
+        let ssbs = PSTATE_FIELDS[2].1;
+        let fields_set = [0, 0, if to.ssbs { ssbs } else { 0 }];
+        if note.kind == SUPERVISOR_CALL && (to.uao || to.dit != from.dit) {
+            return;
+        }
+        // ERET: the tag the target loses in each half (`Cpu::branch_address`
+        // at the EL returned to).
+        const LOWER_TAGGED: u64 = 1 << 56;
+        const UPPER_TAGGED: u64 = 1 << 55;
+        let untag = [
+            u64::from(self.cpu.branch_address(LOWER_TAGGED) != LOWER_TAGGED),
+            u64::from(self.cpu.branch_address(UPPER_TAGGED) != UPPER_TAGGED),
+        ];
+        let (check_mask, check) = match note.kind {
+            GUARDED_ENTER | SUPERVISOR_CALL => (0, u64::from(from.pan)),
+            GUARDED_EXIT => (EXIT_CHECKED, note.spsr & EXIT_CHECKED),
+            _ => (RETURN_CHECKED, note.spsr & RETURN_CHECKED),
+        };
         let record = Record {
             generation: self.mirrors.transitions.generation,
             frame: &self.cpu.state as *const GuestState as u64,
@@ -281,15 +425,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
             elr,
             esr,
             aspsr,
-            target: if entering { enter } else { elr },
+            target: match note.kind {
+                GUARDED_ENTER => enter,
+                GUARDED_EXIT => elr,
+                // The record's own `vector`, set below.
+                _ => 0,
+            },
             aspsr_value: note.aspsr,
             spsr_fixed: if entering { fixed } else { 0 },
-            check_mask: if entering { 0 } else { EXIT_CHECKED },
-            check: if entering {
-                u64::from(from.pan)
-            } else {
-                note.spsr & EXIT_CHECKED
-            },
+            check_mask,
+            check,
             chain: u64::from(same || view.cr3 != 0),
             cr3: view.cr3,
             root_at: view.root_at,
@@ -298,10 +443,32 @@ impl<H: Host, D: Devices> Machine<H, D> {
             view_at: view.view_at,
             view: view.view,
             ac: view.ac,
+            vector: if note.kind == SUPERVISOR_CALL {
+                note.pc
+            } else {
+                0
+            },
+            pan: u64::from(to.pan),
+            fields_keep: [u64::MAX, 0, 0],
+            fields_set,
+            untag,
+            event: self.cpu.event_storage(),
             close,
             scratch: 0,
+            pointer_swap: u64::from(note.pointer.is_some()),
+            pointer_generation: note.pointer.map_or(0, |(_, generation)| generation),
+            pointer_from: note
+                .pointer
+                .map_or([0; x86_64_pointer::TAG_WORDS], |([from, _], _)| from),
+            pointer_to: note
+                .pointer
+                .map_or([0; x86_64_pointer::TAG_WORDS], |([_, to], _)| to),
         };
-        self.mirrors.transitions.records[from_state][note.kind] = record;
+        let slot = &mut self.mirrors.transitions.records[from_state][note.kind];
+        *slot = record;
+        if !guarded {
+            slot.target = at(&slot.vector);
+        }
     }
 
     /// Native code is entered with `budget` transfers in the PE's state,
@@ -338,21 +505,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// What an engine-path transition does after its own effects
     /// ([`Self::transitioned`]) for the `counts` native code made, the
     /// last block's `ending` instructions not yet retired. The PAC service
-    /// stays: records are made only where both states take the same keys,
-    /// version and controls (one EL). With counters that tell the levels
+    /// is native code's: records are made only where both states take the
+    /// same keys, version and controls, and where the key enables differ
+    /// (SVC, ERET) the thunk swaps the service's tag words to those the
+    /// engine path reopened (`transition::check_pointer`); traps agree at
+    /// both levels ([`Self::pointer_use`]). With counters that tell the levels
     /// apart a run ends at its first transition, so the counts before it
     /// stay the old level's.
     pub(super) fn adopt_transitions(&mut self, counts: [u64; KINDS], ending: u64) {
         for (total, count) in self.statistics.native_transitions.iter_mut().zip(counts) {
             *total += count;
         }
+        // An SVC takes an exception (`Machine::take`).
+        self.statistics.exceptions += counts[SUPERVISOR_CALL];
         self.cpu.retired += ending;
         self.forget_state_derived();
         self.cells_moved();
         self.cpu.retired -= ending;
     }
 
-    /// Install the thunk completing the GENTER or GEXIT `word` that ends
+    /// Install the thunk completing the GENTER, GEXIT, SVC or ERET `word` that ends
     /// block `code` (its bytes `native`) at `pc`; the address of its exit
     /// to the target, which may be linked.
     pub(super) fn complete_transition_natively(
@@ -367,15 +539,27 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if !chain::is_direct_exit(&native[site..], GuestAddress(pc), ExitKind::System) {
             return None;
         }
-        // GEXIT reads the count (`Places::lines_until`).
-        if kind == GUARDED_EXIT {
+        // GEXIT and ERET read the count (`Places::lines_until`).
+        if matches!(kind, GUARDED_EXIT | EXCEPTION_RETURN) {
             self.clock.native(self.host.tsc_counter()?);
         }
-        let thunk = if kind == GUARDED_ENTER {
-            let syndrome = u32::try_from(Cpu::guarded_enter_syndrome(immediate)).ok()?;
-            transition::guarded_enter_thunk(GuestAddress(pc), syndrome, &TRANSITIONS)
-        } else {
-            transition::guarded_exit_thunk(GuestAddress(pc), &TRANSITIONS)
+        let pc_at = GuestAddress(pc);
+        let thunk = match kind {
+            GUARDED_ENTER => {
+                let syndrome = Cpu::guarded_enter_syndrome(immediate as u8);
+                let syndrome = u32::try_from(syndrome).ok()?;
+                transition::guarded_enter_thunk(pc_at, syndrome, &TRANSITIONS)
+            }
+            GUARDED_EXIT => transition::guarded_exit_thunk(pc_at, &TRANSITIONS),
+            SUPERVISOR_CALL => {
+                let syndrome = crate::machine::exception::syndrome(
+                    crate::machine::exception::Class::SupervisorCall,
+                    u32::from(immediate),
+                );
+                let syndrome = u32::try_from(syndrome).ok()?;
+                transition::supervisor_call_thunk(pc_at, syndrome, &TRANSITIONS)
+            }
+            _ => transition::exception_return_thunk(pc_at, &TRANSITIONS),
         };
         self.install_stream = self.stream_at(code.0 as u64);
         let installed = self.install_native(&thunk.code, true).ok()?;
@@ -447,10 +631,13 @@ pub(super) mod tests {
         const PAGE: usize = 4096;
         machine.cpu.state.daif = u32::from(machine.cpu.pstate.daif);
         machine.mirrors.selected = u64::from(machine.cpu.pstate.sp);
+        machine.mirrors.monitor =
+            u64::from(machine.cpu.monitor.is_some() || machine.cpu.has_canonical_memory());
         let state = machine.mirror_state();
         machine.mirrors.transition(state);
         machine.mirrors.enter(machine.cpu.pstate);
         machine.cpu.state.pan = u64::from(machine.cpu.pstate.pan);
+        machine.enter_cycles();
         machine.cpu.state.anchors = machine.anchors();
         machine.cpu.state.lower_limit = machine.lower_limit();
         let code = stela_compiler::x86_64::pinned::entered(code);
@@ -534,13 +721,13 @@ pub(super) mod tests {
             machine.finish_transition(1);
             machine.system_instruction(GEXIT).unwrap();
             machine.finish_transition(1);
-            machine.statistics.transition_misses[1]
+            machine.statistics.transition_misses[GUARDED_EXIT]
         };
         let mut expected = [0; miss::REASONS];
         expected[miss::NEVER] += 1;
         assert_eq!(gexit(&mut machine), expected);
         assert_eq!(
-            machine.statistics.transition_misses[0][miss::NEVER],
+            machine.statistics.transition_misses[GUARDED_ENTER][miss::NEVER],
             1,
             "GENTER too"
         );
@@ -619,6 +806,153 @@ pub(super) mod tests {
         let exit = run_native(&mut native, &leave.code);
         assert_eq!(exit, (ENTER + 0x40, ExitKind::System as u64));
         assert_eq!(observed(&native), after_write);
+    }
+
+    /// A write of SPRR's field registers (`S3_6_C15_C3_0`), which SPTM
+    /// makes at every address-space switch, keeps the records: no access
+    /// and nothing derived reads them; as does a stored IMPLEMENTATION
+    /// DEFINED register's.
+    #[test]
+    fn stored_register_writes_keep_the_records() {
+        const MSR_SPRR_FIELDS_0: u32 = 0xd51e_f300; // msr s3_6_c15_c3_0, x0
+        let mut machine = gxf2();
+        machine.cpu.pc = BASE + 0x100;
+        for _ in 0..2 {
+            machine.system_instruction(GENTER_WORD).unwrap();
+            machine.finish_transition(1);
+            machine.system_instruction(GEXIT).unwrap();
+            machine.finish_transition(1);
+        }
+        let generation = machine.mirrors.transitions.generation;
+        assert_eq!(
+            machine.mirrors.transitions.records[2][GUARDED_ENTER].generation,
+            generation
+        );
+        for value in [0x40800, 0] {
+            machine.cpu.state.x[0] = value;
+            machine.system_instruction(MSR_SPRR_FIELDS_0).unwrap();
+            assert_eq!(machine.cpu.apple.sprr_fields[0], value);
+            assert_eq!(machine.mirrors.transitions.generation, generation);
+        }
+        // So does a write of an IMPLEMENTATION DEFINED register a store
+        // takes in full: XNU's thread keys at each thread switch.
+        const MSR_THREAD_KEY_0: u32 = 0xd51c_fdc6; // msr s3_4_c15_c13_6, x6
+        machine.cpu.state.x[6] = 0x1234_5678;
+        machine.system_instruction(MSR_THREAD_KEY_0).unwrap();
+        assert_eq!(machine.mirrors.transitions.generation, generation);
+    }
+
+    /// MSR APCTL_EL1, x0 (`S3_4_C15_C0_4`), which SPTM makes on entry and
+    /// exit and XNU at thread switches.
+    const MSR_APCTL: u32 = 0xd51c_f080;
+    /// APCTL's kernel-keys bit (`pointer_authentication::APCTL_KERNEL_KEYS`).
+    const KERNEL_KEYS: u64 = 1 << 4;
+
+    /// A write of PAC's inputs (APCTL, a key) keeps the GENTER and GEXIT
+    /// records, whose two sides share every PAC input, and drops the SVC and
+    /// ERET records, whose two levels' PAC use it may set apart.
+    #[test]
+    fn pointer_writes_keep_only_the_guarded_records() {
+        let mut machine = gxf2();
+        machine.cpu.pc = BASE + 0x100;
+        for _ in 0..2 {
+            machine.system_instruction(GENTER_WORD).unwrap();
+            machine.finish_transition(1);
+            machine.system_instruction(GEXIT).unwrap();
+            machine.finish_transition(1);
+            machine.cpu.pc = BASE + 0x100;
+        }
+        let table = &mut machine.mirrors.transitions;
+        let generation = table.generation;
+        assert_eq!(table.records[2][GUARDED_ENTER].generation, generation);
+        assert_eq!(table.records[6][GUARDED_EXIT].generation, generation);
+        // As an SVC from the host's EL0 and an ERET from EL2 would leave.
+        table.records[0][SUPERVISOR_CALL].generation = generation;
+        table.records[2][EXCEPTION_RETURN].generation = generation;
+        let holds = |machine: &Machine<FakeHost, NoDevices>, state: usize, kind: usize| {
+            let table = &machine.mirrors.transitions;
+            table.records[state][kind].generation == table.generation
+        };
+        machine.cpu.state.x[0] = KERNEL_KEYS;
+        machine.system_instruction(MSR_APCTL).unwrap();
+        assert_eq!(machine.cpu.apple.apctl[1], KERNEL_KEYS);
+        assert_ne!(machine.mirrors.transitions.generation, generation);
+        assert!(holds(&machine, 2, GUARDED_ENTER) && holds(&machine, 6, GUARDED_EXIT));
+        assert!(!holds(&machine, 0, SUPERVISOR_CALL) && !holds(&machine, 2, EXCEPTION_RETURN));
+        // An architectural key's write alike.
+        machine
+            .cpu
+            .registers
+            .set(SystemRegister::APIAKeyLo_EL1, 0, 0x5555);
+        machine.register_written(SystemRegister::APIAKeyLo_EL1);
+        assert!(holds(&machine, 2, GUARDED_ENTER) && holds(&machine, 6, GUARDED_EXIT));
+        // Any other derived change still drops them.
+        machine.derived_changed();
+        assert!(!holds(&machine, 2, GUARDED_ENTER) && !holds(&machine, 6, GUARDED_EXIT));
+    }
+
+    /// A native GENTER, an APCTL write at GL2 that turns the kernel keys
+    /// off, and a native GEXIT leave the PE, the PAC service included, as
+    /// the engine path does.
+    #[test]
+    fn native_guarded_transitions_around_an_apctl_write_match_the_engine_path() {
+        let pc = BASE + 0x100;
+        let (mut engine, mut native) = (gxf2(), gxf2());
+        for machine in [&mut engine, &mut native] {
+            machine.cpu.apple.apctl[1] = KERNEL_KEYS;
+            // EL2's own keys (S3_6_C15_C13_0 onward), every half known.
+            for index in 0..10u8 {
+                let encoding = Encoding::new(3, 6, 15, 13 + index / 8, index % 8);
+                let register = crate::machine::pointer_keys::Register::decode(encoding).unwrap();
+                machine
+                    .cpu
+                    .apple
+                    .pointer_keys
+                    .write(register, 0x1111 * u64::from(index + 1));
+            }
+            machine.derived_changed();
+            prepare(machine, pc);
+            for _ in 0..2 {
+                machine.system_instruction(GENTER_WORD).unwrap();
+                machine.finish_transition(1);
+                machine.system_instruction(GEXIT).unwrap();
+                machine.finish_transition(1);
+                machine.cpu.pc = pc;
+            }
+            prepare(machine, pc);
+            machine.revalidate_pointers();
+        }
+        native.mirrors.lines_until = u64::MAX;
+        let pointer = |machine: &Machine<FakeHost, NoDevices>| {
+            (machine.pointer.tags, machine.pointer.generation)
+        };
+        assert_eq!(pointer(&engine), pointer(&native));
+        assert!(native.pointer.tags.iter().any(|&tag| tag != 0), "keys open");
+        engine.system_instruction(GENTER_WORD).unwrap();
+        let syndrome = Cpu::guarded_enter_syndrome(3) as u32;
+        let enter = transition::guarded_enter_thunk(GuestAddress(pc), syndrome, &TRANSITIONS);
+        assert_eq!(
+            run_native(&mut native, &enter.code),
+            (ENTER, ExitKind::Return as u64)
+        );
+        for machine in [&mut engine, &mut native] {
+            machine.cpu.pc = ENTER;
+            machine.cpu.state.x[0] = 0;
+            machine.system_instruction(MSR_APCTL).unwrap();
+            assert_eq!(machine.cpu.apple.apctl[1], 0);
+            machine.cpu.pc = ENTER + 0x40;
+        }
+        assert_eq!(observed(&engine), observed(&native));
+        assert_eq!(pointer(&engine), pointer(&native));
+        engine.system_instruction(GEXIT).unwrap();
+        let leave = transition::guarded_exit_thunk(GuestAddress(ENTER + 0x40), &TRANSITIONS);
+        assert_eq!(
+            run_native(&mut native, &leave.code),
+            (pc + 4, ExitKind::Return as u64)
+        );
+        assert_eq!(observed(&engine), observed(&native));
+        assert_eq!(pointer(&engine), pointer(&native));
+        assert_eq!(native.statistics.native_transitions, [0, 0, 1, 1]);
     }
 
     /// Any change of what records depend on drops them; lookup contexts

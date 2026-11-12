@@ -33,4 +33,4 @@ On 2026-11-11, Stela `origin/main` was `502dbdd53`, an ancestor of `afb62c1dc`. 
 
 ## Build and tag policy
 
-Scheduled and manual runs upload the build artifacts to GitHub Actions. GitHub enables manual and scheduled triggers after the workflow exists on the default branch. The release publisher runs for a pushed `v*` tag, and the tag must match the `[workspace.package]` version. For a prerelease, set the full prerelease version in `Cargo.toml` and use the matching `v` tag. [GitHub Actions workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)
+Scheduled and manual runs upload build artifacts to GitHub Actions. Manual runs also check the resulting EFI with the synthetic QEMU memory fixture. GitHub enables these triggers after the workflow exists on the default branch. A pushed `v*` tag must match the `[workspace.package]` version. A pushed `diag-*` tag builds the diagnostic EFI, runs the memory fixture and publishes a prerelease. [GitHub Actions workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)

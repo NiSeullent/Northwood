@@ -57,8 +57,22 @@ fn print_stack() {
 /// # Safety
 /// `stack`'s page reads from `stack` on.
 pub(crate) unsafe fn print_stack_at(stack: *const u64) {
-    const PAGE: usize = 4096;
     const SHOWN: usize = 32;
+    let _ = write!(Serial, "STELA STACK");
+    // SAFETY: the caller's.
+    for offset in unsafe { image_offsets(stack) }.take(SHOWN) {
+        let _ = write!(Serial, " {offset:#x}");
+    }
+    let _ = writeln!(Serial);
+}
+
+/// The words from `stack` to the end of its page, at most 512, that lie in
+/// this image, as offsets from its base.
+///
+/// # Safety
+/// `stack`'s page reads from `stack` on.
+unsafe fn image_offsets(stack: *const u64) -> impl Iterator<Item = u64> {
+    const PAGE: usize = 4096;
     unsafe extern "C" {
         static __ImageBase: u8;
     }
@@ -74,16 +88,46 @@ pub(crate) unsafe fn print_stack_at(stack: *const u64) {
         )
     };
     let words = (PAGE - stack.addr() % PAGE) / 8;
-    let offsets = (0..words.min(512))
+    (0..words.min(512))
         // SAFETY: the caller's.
-        .map(|word| unsafe { stack.add(word).read() }.wrapping_sub(base))
-        .filter(|&offset| offset < bytes)
-        .take(SHOWN);
-    let _ = write!(Serial, "STELA STACK");
-    for offset in offsets {
-        let _ = write!(Serial, " {offset:#x}");
+        .map(move |word| unsafe { stack.add(word).read() }.wrapping_sub(base))
+        .filter(move |&offset| offset < bytes)
+}
+
+/// The first image offsets on a stack ([`print_stack_at`]'s), for a failure
+/// message: the screen and the boot log keep the message, not the port's
+/// detail.
+pub(crate) struct Callers {
+    offsets: [u64; Self::SHOWN],
+    count: usize,
+}
+
+impl Callers {
+    const SHOWN: usize = 10;
+
+    /// # Safety
+    /// `stack`'s page reads from `stack` on.
+    pub(crate) unsafe fn at(stack: *const u64) -> Self {
+        let mut callers = Self {
+            offsets: [0; Self::SHOWN],
+            count: 0,
+        };
+        // SAFETY: the caller's.
+        for offset in unsafe { image_offsets(stack) }.take(Self::SHOWN) {
+            callers.offsets[callers.count] = offset;
+            callers.count += 1;
+        }
+        callers
     }
-    let _ = writeln!(Serial);
+}
+
+impl core::fmt::Display for Callers {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (index, offset) in self.offsets[..self.count].iter().enumerate() {
+            write!(f, "{}{offset:#x}", if index == 0 { "" } else { " " })?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn panic(info: &PanicInfo<'_>) -> ! {

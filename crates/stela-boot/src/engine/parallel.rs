@@ -159,6 +159,9 @@ impl Pe {
         // This core's own allocations, which other PEs' leave alone.
         let own = || crate::ALLOCATOR.own().unwrap_or(0);
         let before = own();
+        if pe == 0 {
+            host::chain_check::host_branch(&mut owner.host());
+        }
         if step_timing {
             host::chain_check::run(pe, &mut owner.host());
         }

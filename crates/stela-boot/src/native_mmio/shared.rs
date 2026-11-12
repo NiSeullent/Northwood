@@ -693,7 +693,8 @@ impl Source {
         prefetchable: bool,
     ) -> Result<Resource, Error> {
         let wire = self.platform.wire();
-        let physical = self.bar_address(segment, address, bytes)
+        let physical = self
+            .bar_address(segment, address, bytes)
             .ok_or(Error::OutsideResource)?;
         let span = PhysicalSpan::new(physical, bytes)?;
         if !span.start().is_multiple_of(PAGE) || !span.bytes().is_multiple_of(PAGE) {
@@ -714,7 +715,11 @@ impl Source {
 
     /// Translate an observed BAR range without reserving or mapping it.
     fn bar_address(&self, segment: u16, address: u64, bytes: u64) -> Option<u64> {
-        let windows = self.platform.wire().roots().iter()
+        let windows = self
+            .platform
+            .wire()
+            .roots()
+            .iter()
             .filter(|root| root.space == 0)
             .map(|root| aperture::BusWindow {
                 segment: root.segment,

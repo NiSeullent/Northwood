@@ -591,6 +591,10 @@ impl Job {
                 break r;
             }
         };
+        // A source that ran out of the time it may wait reads on later.
+        if matches!(r, Poll::Ready(Err(Error::Pending))) {
+            return Poll::Pending;
+        }
         if matches!(r, Poll::Ready(Err(_))) {
             self.failed = true;
         }

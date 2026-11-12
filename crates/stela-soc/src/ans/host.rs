@@ -21,7 +21,10 @@
 //! read as zeros ([`super::namespace::Medium::deallocate`]), so a Deallocate
 //! completes at once and the disk hears of them in the background, as
 //! Linux's `fstrim` tells it in batches: [`Discards`] keeps them merged and
-//! sends a batch while no guest transfer runs. Discards never reorder past
+//! sends a batch once guest transfers have paused for [`DISCARD_QUIET`]: a
+//! disk runs a large deallocation for milliseconds, and a read queued behind
+//! it waits that long. A flush that waits for discards sends them at once.
+//! Discards never reorder past
 //! writes. A write takes its blocks back from those waiting and waits out a
 //! batch it overlaps, and a flush waits for all of them where the guest was
 //! told deallocated blocks stay zeros, as a controller's cache holds them.
@@ -41,6 +44,9 @@ const LOST_SIGNAL: u64 = 24_000;
 
 /// The commands of one background discard batch.
 const DISCARD_COMMANDS: usize = 8;
+/// How long guest transfers must have paused before a discard batch goes to
+/// the disk: 10 ms.
+const DISCARD_QUIET: u64 = 240_000;
 
 /// Deallocated blocks the disk has not heard of.
 #[derive(Default)]
@@ -55,6 +61,8 @@ struct Discards {
     /// Why the disk refused a batch. Discards are hints, so it hears no
     /// more; a flush has nothing to wait for.
     failed: Option<BlockError>,
+    /// When a guest transfer last started or completed, if one has.
+    active: Option<u64>,
 }
 
 impl Discards {
@@ -117,6 +125,16 @@ impl Discards {
 
     fn outstanding(&self) -> bool {
         !self.waiting.is_empty() || self.running.is_some()
+    }
+
+    /// When the next batch may go at counter `now`, at the earliest: at once
+    /// while a transfer waits for discards, else once guest transfers have
+    /// paused for [`DISCARD_QUIET`].
+    fn due(&self, now: u64) -> u64 {
+        match self.active {
+            Some(active) if self.held.is_empty() => active.saturating_add(DISCARD_QUIET),
+            _ => now,
+        }
     }
 }
 
@@ -210,6 +228,7 @@ impl HostDisk {
             self.discards.held.push((key, now, request));
             return None;
         }
+        self.discards.active = Some(now);
         let mut submission = match Submission::new(request, self.device.identity()) {
             Ok(submission) => submission,
             Err(error) => return Some(Err(error)),
@@ -234,17 +253,19 @@ impl HostDisk {
             let (key, started, _) = self.running.swap_remove(index);
             let took = now.saturating_sub(started);
             self.latency = (self.latency * 7 + took) / 8;
+            self.discards.active = Some(now);
             done.push((key, finished));
         }
-        self.advance_discards(&mut done);
+        self.advance_discards(&mut done, now);
         done
     }
 
-    /// Reap the running discard batch, start the next while no guest
-    /// transfer runs, and resubmit what no longer waits for one.
-    fn advance_discards(&mut self, done: &mut Vec<(u32, Finished)>) {
+    /// Reap the running discard batch, start the next once guest transfers
+    /// paused (`Discards::due`), and resubmit what no longer waits for one.
+    fn advance_discards(&mut self, done: &mut Vec<(u32, Finished)>, now: u64) {
         if self.discards.running.is_none()
             && self.running.is_empty()
+            && now >= self.discards.due(now)
             && let Some(limits) = self.identity().features.discard
         {
             let extents = self.discards.batch(limits.ranges.max(1) * DISCARD_COMMANDS);
@@ -324,6 +345,13 @@ impl HostDisk {
     /// `now`: half the latency after the oldest began, then more often; for
     /// a disk that signals them, only once a signal is overdue.
     pub(super) fn next_look(&self, now: u64) -> u64 {
+        // Only discards wait for the pause that sends them.
+        if self.running.is_empty() && self.discards.running.is_none() {
+            let due = self.discards.due(now);
+            if due > now {
+                return due;
+            }
+        }
         let oldest = self.running.iter().map(|(_, started, _)| *started).min();
         if self.device.signals() {
             let overdue = (self.latency * 4).max(LOST_SIGNAL);

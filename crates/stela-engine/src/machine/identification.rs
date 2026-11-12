@@ -55,6 +55,26 @@ pub enum Basis {
     /// atomic ([`TargetCpu::AtomicLoad16`]), which 16-byte-aligned X-register
     /// pairs compile to.
     Atomic16(&'static str),
+    /// An instruction feature whose samples compile everywhere, as
+    /// [`Basis::Instructions`], but which the field advertises only where the
+    /// host has the named native tier (`None`: no tier lowers it natively),
+    /// and why. Guest software that probes the field (the kernel derives its
+    /// `hw.optional.arm.FEAT_*` sysctls and commpage bits from it) then takes
+    /// its own fallback, which translates better than the feature's
+    /// emulation. Steering only advises: the PE still runs the feature's
+    /// instructions as the chip does, for code that uses them unprobed, so a
+    /// steered feature is never [`withheld`] and every field of the feature
+    /// reads absent with it ([`steered_off`]).
+    Steered(&'static [u32], Option<TargetCpu>, &'static str),
+}
+
+/// One steered feature's advertisement on a host target ([`steering`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Steering {
+    pub feature: &'static str,
+    pub advertised: bool,
+    /// The native tier the feature needs, or why it has none.
+    pub reason: &'static str,
 }
 
 /// The speculation guarantees the host gives guest code, which the
@@ -209,6 +229,16 @@ const MTE2: &str = "the engine keeps an Allocation Tag for each 16-byte granule 
 const PREDICTION_RESTRICTION: &str = "CFP, DVP, CPP and (FEAT_SPECRES2) COSP RCTX run their \
      generated accessors, with SCTLR_ELx.EnRCTX and HFGITR_EL2 traps, and complete with no \
      effect: the engine keeps no prediction state a later context could use";
+
+/// FEAT_BF16 has no native lowering on any host tier: BFDOT, BFMMLA and
+/// BFMLAL round to odd in SSE2 sequences of 100 to 400 instructions, and a
+/// zero or subnormal product input exits. Unadvertised, as on the M1, guest
+/// libraries keep their single-precision paths.
+const BF16_STEERING: &str = "no host tier lowers BF16 natively (AVX512-BF16 is unused)";
+/// FJCVTZS completes natively only for a normal input whose truncation fits
+/// 32 bits; minus zero, special and wrapping inputs exit. Unadvertised, a JIT
+/// truncates with FCVTZS and its own native wrap.
+const JSCVT_STEERING: &str = "FJCVTZS exits for minus zero, special and out-of-range inputs";
 
 /// Every ID register the table defines; all their other fields read 0.
 pub const REGISTERS: &[Encoding] = &[
@@ -742,7 +772,7 @@ pub const TABLE: &[Row] = &[
         12,
         1,
         "FEAT_JSCVT",
-        Basis::Instructions(&[0x1e7e_0020]),
+        Basis::Steered(&[0x1e7e_0020], None, JSCVT_STEERING),
     ),
     feature(
         ID_AA64ISAR1_EL1,
@@ -805,7 +835,7 @@ pub const TABLE: &[Row] = &[
         44,
         1,
         "FEAT_BF16",
-        Basis::Instructions(&[0x6e42_fc20]),
+        Basis::Steered(&[0x6e42_fc20], None, BF16_STEERING),
     ),
     feature(
         ID_AA64ISAR1_EL1,
@@ -1361,11 +1391,74 @@ fn has(chip: Chip, feature: &str) -> bool {
     }
 }
 
+fn compiles(samples: &[u32], target: TargetCpu) -> bool {
+    samples.iter().all(|word| {
+        CompilationPlan::new(
+            &word.to_le_bytes(),
+            GuestAddress(0x1000),
+            &stela_compiler::Options::new(BlockProfile::new(Features::SYSTEM_MODE), target),
+        )
+        .and_then(CompilationPlan::compile)
+        .is_ok()
+    })
+}
+
+/// Whether a [`Basis::Steered`] row advertises its feature on `target`.
+fn steered_holds(samples: &[u32], native: Option<TargetCpu>, target: TargetCpu) -> bool {
+    native.is_some_and(|tier| target.supports(tier)) && compiles(samples, target)
+}
+
+/// Whether `feature` is steered ([`Basis::Steered`]): its instructions stay
+/// admitted whatever its fields read.
+fn steered(feature: &str) -> bool {
+    TABLE
+        .iter()
+        .any(|row| row.feature == Some(feature) && matches!(row.basis, Basis::Steered(..)))
+}
+
+/// Whether a steered row of `feature` does not advertise it on `target`, so
+/// that every field of the feature reads absent: a field describing the
+/// feature's instructions within another feature (ID_AA64ZFR0_EL1.BF16 with
+/// FEAT_SME) never claims what the main field hides.
+fn steered_off(feature: &str, target: TargetCpu) -> bool {
+    TABLE.iter().any(|row| {
+        row.feature == Some(feature)
+            && matches!(row.basis, Basis::Steered(samples, native, _)
+                if !steered_holds(samples, native, target))
+    })
+}
+
+/// The steered features `chip` has and whether `target` advertises them,
+/// once per feature, in [`TABLE`] order: what the boot reports.
+pub fn steering(chip: Chip, target: TargetCpu) -> Vec<Steering> {
+    let mut steering: Vec<Steering> = Vec::new();
+    for row in TABLE {
+        let (Some(feature), Basis::Steered(_, _, reason)) = (row.feature, row.basis) else {
+            continue;
+        };
+        if has(chip, feature) && steering.iter().all(|known| known.feature != feature) {
+            steering.push(Steering {
+                feature,
+                advertised: !steered_off(feature, target),
+                reason,
+            });
+        }
+    }
+    steering
+}
+
 fn holds(row: &Row, chip: Chip, target: TargetCpu, el2: bool, speculation: Speculation) -> bool {
     if row.feature.is_some_and(|feature| !has(chip, feature)) {
         return false;
     }
+    if row
+        .feature
+        .is_some_and(|feature| steered_off(feature, target))
+    {
+        return false;
+    }
     match row.basis {
+        Basis::Steered(samples, native, _) => steered_holds(samples, native, target),
         Basis::Engine(holds, _) => holds,
         Basis::With(feature, _) => has(chip, feature),
         Basis::Host(_) => el2,
@@ -1374,15 +1467,7 @@ fn holds(row: &Row, chip: Chip, target: TargetCpu, el2: bool, speculation: Specu
         Basis::FaultingData(_) => speculation.faulting_data,
         Basis::GenericTimer(_) => super::timer::agt::present(chip),
         Basis::Atomic16(_) => target.supports(TargetCpu::AtomicLoad16),
-        Basis::Instructions(samples) => samples.iter().all(|word| {
-            CompilationPlan::new(
-                &word.to_le_bytes(),
-                GuestAddress(0x1000),
-                &stela_compiler::Options::new(BlockProfile::new(Features::SYSTEM_MODE), target),
-            )
-            .and_then(CompilationPlan::compile)
-            .is_ok()
-        }),
+        Basis::Instructions(samples) => compiles(samples, target),
     }
 }
 
@@ -1412,7 +1497,8 @@ fn engine_field(chip: Chip, register: Encoding, shift: u8) -> u64 {
 /// AdvSIMD feature when streaming is absent. A profile can withhold a feature
 /// by masking its field (a validation machine's memory tagging), or because
 /// the field's basis fails on this host. The PE treats it as absent, as a chip
-/// without it. A register `fixed` has no value for withholds nothing.
+/// without it. A register `fixed` has no value for withholds nothing. A
+/// steered feature ([`Basis::Steered`]) is never withheld.
 pub fn withheld(chip: Chip, fixed: &[(Encoding, u64)]) -> u64 {
     let mut withheld = 0;
     for feature in Feature::ALL.into_iter().filter(|feature| feature.on(chip)) {
@@ -1428,18 +1514,19 @@ pub fn withheld(chip: Chip, fixed: &[(Encoding, u64)]) -> u64 {
 /// TABLE's containing-feature dependencies are acyclic (checked below).
 fn presents_feature(chip: Chip, feature: &str, fixed: &[(Encoding, u64)]) -> bool {
     has(chip, feature)
-        && TABLE
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.feature == Some(feature))
-            .all(|(index, row)| {
-                if let Basis::With(containing, _) = row.basis
-                    && !presents_feature(chip, containing, fixed)
-                {
-                    return true;
-                }
-                presents(index, row, fixed)
-            })
+        && (steered(feature)
+            || TABLE
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.feature == Some(feature))
+                .all(|(index, row)| {
+                    if let Basis::With(containing, _) = row.basis
+                        && !presents_feature(chip, containing, fixed)
+                    {
+                        return true;
+                    }
+                    presents(index, row, fixed)
+                }))
 }
 
 /// Whether `fixed` presents `row` (at `index` in [`TABLE`]): its field

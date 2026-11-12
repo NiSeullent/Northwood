@@ -91,7 +91,8 @@ fn ordinary_matrix_and_bfloat_features_do_not_require_streaming() {
     const SMMLA: u32 = 0x4e9b_a781;
     const BFDOT: u32 = 0x6e42_fc20;
     let bit = |feature: Feature| 1u64 << feature as u64;
-    let ordinary = bit(Feature::FEAT_I8MM) | bit(Feature::FEAT_BF16);
+    // FEAT_BF16 is steered: never withheld, whatever its fields read.
+    let ordinary = bit(Feature::FEAT_I8MM);
     for chip in Chip::ALL {
         let mut fixed = derive(chip, TargetCpu::Baseline, true, Speculation::NONE);
         let mut missing_streaming_fields = fixed.clone();
@@ -143,10 +144,14 @@ fn ordinary_matrix_and_bfloat_features_do_not_require_streaming() {
         }
         let expected = if chip == Chip::AppleM1 { 0 } else { ordinary };
         assert_eq!(withheld(chip, &fixed) & ordinary, expected, "{chip:?}");
+        assert_eq!(withheld(chip, &fixed) & bit(Feature::FEAT_BF16), 0);
         let admission = chip.admit_table(withheld(chip, &fixed)).unwrap();
-        for word in [SMMLA, BFDOT] {
-            assert_eq!(admission.admit(word), 0, "{chip:?} {word:#x}");
-        }
+        assert_eq!(admission.admit(SMMLA), 0, "{chip:?}");
+        assert_eq!(
+            admission.admit(BFDOT),
+            if chip == Chip::AppleM1 { 0 } else { BFDOT },
+            "{chip:?}"
+        );
     }
 }
 
@@ -477,11 +482,14 @@ fn each_chip_advertises_only_its_own_features() {
         let value = values.iter().find(|(r, _)| *r == register).unwrap().1;
         (value >> shift) & 0xf
     };
-    // FGT and ECV (MMFR0), BF16 and I8MM (ISAR1) came with the M2.
+    // FGT and ECV (MMFR0) and I8MM (ISAR1) came with the M2, as did BF16,
+    // which is steered (no host tier lowers it natively) and reads 0.
+    for chip in Chip::ALL {
+        assert_eq!(field(chip, ID_AA64ISAR1_EL1, 44), 0, "{chip:?}");
+    }
     for (register, shift) in [
         (ID_AA64MMFR0_EL1, 56),
         (ID_AA64MMFR0_EL1, 60),
-        (ID_AA64ISAR1_EL1, 44),
         (ID_AA64ISAR1_EL1, 52),
     ] {
         assert_eq!(
@@ -626,17 +634,81 @@ fn the_sme_chips_advertise_streaming_sve_and_sme_by_feature() {
     // B16F32, F16F32, I8I32 0xf, I16I32 0b0101, F64F64, I16I64 0xf and
     // SMEver 1 on the M4; the M5 adds F16F16, B16B16 and SMEver 2
     // (FEAT_SME2p1), the M6 F8F32, F8F16 and LUTv2.
-    // ZFR0: SVEver 0, BF16 and I8MM, and B16B16 from the M5.
+    // ZFR0: SVEver 0, I8MM, and B16B16 from the M5; BF16 reads 0 with the
+    // steered FEAT_BF16.
     for (chip, sme, smfr0, zfr0) in [
         (Chip::AppleM1, 0, 0, 0),
         (Chip::AppleM2, 0, 0, 0),
         (Chip::AppleM3, 0, 0, 0),
-        (Chip::AppleM4, 2, 0x01f1_50ff_0000_0000, 0x1000_0010_0000),
-        (Chip::AppleM5, 2, 0x02f1_5cff_0000_0000, 0x1000_0110_0000),
-        (Chip::AppleM6, 2, 0x12f1_5fff_0000_0000, 0x1000_0110_0000),
+        (Chip::AppleM4, 2, 0x01f1_50ff_0000_0000, 0x1000_0000_0000),
+        (Chip::AppleM5, 2, 0x02f1_5cff_0000_0000, 0x1000_0100_0000),
+        (Chip::AppleM6, 2, 0x12f1_5fff_0000_0000, 0x1000_0100_0000),
     ] {
         assert_eq!(value(chip, ID_AA64PFR1_EL1) >> 24 & 0xf, sme, "{chip:?}");
         assert_eq!(value(chip, ID_AA64SMFR0_EL1), smfr0, "{chip:?}");
         assert_eq!(value(chip, ID_AA64ZFR0_EL1), zfr0, "{chip:?}");
     }
+}
+
+#[test]
+fn steered_features_follow_their_native_tier_and_stay_admitted() {
+    const BFDOT: u32 = 0x6e42_fc20;
+    let field = |chip, target, register, shift: u32| {
+        let values = derive(chip, target, true, Speculation::NONE);
+        values.iter().find(|(r, _)| *r == register).unwrap().1 >> shift & 0xf
+    };
+    let richest = TargetCpu::X86_64_V4
+        .with_avx512bf16()
+        .with_avx512fp16()
+        .with_sha()
+        .with_aes()
+        .with_pclmulqdq();
+    for target in [TargetCpu::X86_64_V2, TargetCpu::X86_64_V3, richest] {
+        // No host tier lowers BF16 natively, so no host advertises it.
+        assert_eq!(field(Chip::AppleM2, target, ID_AA64ISAR1_EL1, 44), 0);
+        assert_eq!(field(Chip::AppleM2, target, ID_AA64ISAR1_EL1, 12), 0);
+        assert_eq!(
+            steering(Chip::AppleM2, target),
+            [
+                Steering {
+                    feature: "FEAT_JSCVT",
+                    advertised: false,
+                    reason: JSCVT_STEERING,
+                },
+                Steering {
+                    feature: "FEAT_BF16",
+                    advertised: false,
+                    reason: BF16_STEERING,
+                },
+            ]
+        );
+        // The PE still runs BFDOT for code that uses it unprobed.
+        let fixed = derive(Chip::AppleM2, target, true, Speculation::NONE);
+        let withheld = withheld(Chip::AppleM2, &fixed);
+        assert_eq!(withheld & (1 << Feature::FEAT_BF16 as u64), 0);
+        assert_eq!(
+            Chip::AppleM2.admit_table(withheld).unwrap().admit(BFDOT),
+            BFDOT
+        );
+    }
+    // A chip without the feature reports no steering for it.
+    assert!(
+        steering(Chip::AppleM1, richest)
+            .iter()
+            .all(|entry| entry.feature != "FEAT_BF16")
+    );
+    // FJCVTZS still compiles and runs for code that uses it unprobed.
+    assert!(compiles(&[0x1e7e_0020], TargetCpu::X86_64_V2));
+    // A steered row with a native tier advertises only where the host has it.
+    assert!(!steered_holds(
+        &[BFDOT],
+        Some(TargetCpu::Avx512bf16),
+        TargetCpu::X86_64_V3
+    ));
+    assert!(steered_holds(
+        &[BFDOT],
+        Some(TargetCpu::Avx512bf16),
+        richest
+    ));
+    assert!(!steered_holds(&[BFDOT], None, richest));
 }

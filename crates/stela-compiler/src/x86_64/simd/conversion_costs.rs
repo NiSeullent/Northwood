@@ -47,11 +47,20 @@ const FORMS: &[(&str, u32, Lanes)] = &[
     ("scvtf 8h", 0x4e79_da00, Lanes::Word),
     ("ucvtf 4h", 0x2e79_da00, Lanes::Word),
     ("ucvtf h", 0x7e79_da00, Lanes::Word),
+    // FMUL V0.4S, V16.4S, V16.4S: the square of each lane.
+    ("fmul 4s", 0x6e30_de00, Lanes::Single),
+    ("fmul 2d", 0x6e70_de00, Lanes::Double),
 ];
 
-/// Input classes: a fractional magnitude in [1, 1024) of either sign, or
-/// zero, in every lane of V16.
-const INPUTS: &[(&str, f64)] = &[("+", 300.7), ("-", -300.7), ("0", 0.0)];
+/// Input classes: a fractional magnitude in [1, 1024) of either sign, zero,
+/// or a tiny value, in every lane of V16.
+const INPUTS: &[(&str, f64)] = &[
+    ("+", 300.7),
+    ("-", -300.7),
+    ("0", 0.0),
+    // Squares below the Single minimum normal.
+    ("t", 1.3e-20),
+];
 
 fn state(lanes: Lanes, value: f64) -> GuestState {
     let mut state = GuestState::default();

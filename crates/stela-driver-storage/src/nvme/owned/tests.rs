@@ -177,6 +177,8 @@ struct Model {
     fail_disable: bool,
     stuck_ready: bool,
     stuck_enable: bool,
+    /// CSTS.RDY never follows CC.EN: the controller never answers.
+    never_ready: bool,
     coherent: bool,
     events: Vec<&'static str>,
     commands: usize,
@@ -262,6 +264,7 @@ impl Model {
             fail_disable: false,
             stuck_ready: false,
             stuck_enable: false,
+            never_ready: false,
             coherent: true,
             events: Vec::new(),
             commands: 0,
@@ -766,7 +769,7 @@ unsafe impl Registers for Regs {
             return Err(register_error());
         }
         if offset == 0x1c {
-            return Ok(u32::from(m.enabled || m.stuck_ready)
+            return Ok(u32::from((m.enabled && !m.never_ready) || m.stuck_ready)
                 | u32::from(m.fatal) << 1
                 | if m.stopped { 8 } else { 0 });
         }
@@ -1109,6 +1112,36 @@ fn owned_bad_cqe_identity_never_reuses_dma() {
         assert!(f.model.lock().unwrap().released);
     }
 }
+/// A controller that never sets CSTS.RDY fails its attach at CAP.TO; with
+/// CAP.TO at its largest (127.5 s) a passed device start budget ends the
+/// attach at the budget instead.
+#[test]
+fn a_controller_that_never_becomes_ready_fails_within_its_bound() {
+    let _clock = crate::test_clock::virtualize();
+    let clock = Clock {
+        ticks_per_microsecond: 1000,
+    };
+    let f = Fixture::new();
+    f.model.lock().unwrap().never_ready = true;
+    let started = Clock::ticks();
+    assert!(matches!(f.attach(), Err(BlockError::Timeout)));
+    let took_us = (Clock::ticks() - started) / 1000;
+    assert!((500_000..2_000_000).contains(&took_us), "{took_us}");
+
+    let f = Fixture::new();
+    {
+        let mut m = f.model.lock().unwrap();
+        m.never_ready = true;
+        m.registers.insert(0, 15 | 255 << 24);
+    }
+    let budget = stela_driver_base::budget::Budget::start(clock, 20_000).unwrap();
+    let started = Clock::ticks();
+    assert!(matches!(f.attach(), Err(BlockError::Timeout)));
+    let took_us = (Clock::ticks() - started) / 1000;
+    assert!(took_us < 40_000, "{took_us}");
+    assert!(budget.expired().is_some());
+}
+
 #[test]
 fn owned_timeouts_abort_then_reset_contain_dma_and_retry_like_linux() {
     // An abort that completes the held write: it is retried, no reset.

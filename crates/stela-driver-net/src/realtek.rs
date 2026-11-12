@@ -281,7 +281,7 @@ impl Realtek {
             map_registers(handoff, bar, 0, bytes).map(|_| ())
         })?;
         admit_revision(function.device, pcie_link_control, revision)?;
-        if !revision.nbase() && device.read8(PHY_STATUS) & 0x80 != 0 {
+        if tbi_mode(revision, device.read8(PHY_STATUS)) {
             return Err(BlockError::Unsupported("Realtek TBI/fiber mode").into());
         }
         // rtl_alloc_irq keeps versions before 18 on INTx, which stays off.
@@ -486,6 +486,15 @@ fn prepare_pcie_link<C: ConfigSpace>(
         clock_request(function.config(), offset, false)?;
     }
     Ok(control)
+}
+
+/// Whether the chip runs its TBI (fiber) interface, which this driver does
+/// not: PHYstatus bit 7 says so only on the 8169 family, versions 02..06.
+/// Older Linux read it as TBI only there (`rtl_tbi_enabled`), and the pinned
+/// source has dropped TBI altogether. 8168 chips set the bit with their
+/// copper PHY (an ASUS board's RTL8111H does), so it is no refusal there.
+fn tbi_mode(revision: Revision, phy_status: u8) -> bool {
+    revision.version <= 6 && phy_status & TBI_ENABLE != 0
 }
 
 fn admit_revision(device: u16, pcie_control: Option<u16>, revision: Revision) -> Result<(), Error> {
@@ -739,20 +748,43 @@ impl Link for Realtek {
         self.signalled
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        self.receive_frame(<[u8]>::to_vec)
+    }
+    /// The stack's receive path: the frame is copied into its reused
+    /// buffer, so a received frame allocates nothing.
+    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
+        self.receive_frame(|bytes| {
+            frame.clear();
+            frame.extend_from_slice(bytes);
+        })
+        .map(|received| received.is_some())
+    }
+}
+
+impl Realtek {
+    /// The next good frame in the receive ring, passed to `take` while its
+    /// buffer is still held.
+    fn receive_frame<T>(
+        &mut self,
+        mut take: impl FnMut(&[u8]) -> T,
+    ) -> Result<Option<T>, LinkError> {
         self.update_link()?;
-        let frame = self.receive.receive();
-        if frame.is_some() || !self.signalled {
+        let frame = self.receive.receive_with(&mut take);
+        if frame.is_some() {
             return Ok(frame);
         }
-        // rtl8169_interrupt acknowledges the events it read, so the next
-        // frame or link change raises the vector again. A frame that
-        // arrived before the acknowledgement is in the ring.
+        // rtl8169_interrupt acknowledges every event it read (rtl_ack_events
+        // of the whole status), so the next frame or link change raises the
+        // vector again. Among them are the receive ring's exhaustion and the
+        // receive FIFO's overflow: an RTL8168H (XID 541) that had them left
+        // pending received nothing more after a download's first burst. A
+        // frame that arrived before the acknowledgement is in the ring.
         let hardware = Hardware::new(&self.device, &self.clock, self.revision, self.function);
-        if hardware.acknowledge(SIGNALLED_EVENTS) & LINK_CHANGE != 0 {
+        if hardware.acknowledge() & LINK_CHANGE != 0 {
             self.link.last_phy_poll = None;
             self.update_link()?;
         }
-        Ok(self.receive.receive())
+        Ok(self.receive.receive_with(take))
     }
 }
 

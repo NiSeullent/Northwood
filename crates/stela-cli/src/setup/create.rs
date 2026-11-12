@@ -524,8 +524,9 @@ pub(super) const SIGNING_NOTE: &str = "Apple's signing service (gs.apple.com) re
     the boot files, and the install asks only for what the USB lacks.";
 
 /// The full installer's promise, and its limit.
-pub(super) const OFFLINE_NOTE: &str = "Full installer: macOS is on the USB, the install needs \
-    no network.";
+pub(super) const OFFLINE_NOTE: &str = "Full installer: macOS and Apple's signing answers are \
+    on the USB. The install checks the answers before it changes a disk and needs a network only \
+    if they do not fit it.";
 /// What is not known yet about the installed system without a network.
 pub(super) const FIRST_START_NOTE: &str = "After the install, macOS may ask for a network the \
     first time it starts: whether Setup Assistant's activation finishes without one is not \
@@ -539,6 +540,39 @@ fn staged(directory: &Path) -> bool {
         .and_then(|bytes| stela_runtime::restore::tss::staged::Set::decode(&bytes).ok())
         .is_some_and(|set| set.complete())
 }
+
+/// The full installer's promise before setup has asked Apple: it holds only
+/// once every signing answer is on the USB.
+pub(super) const FULL_BEFORE_NOTE: &str = "Full installer: macOS goes on the USB; once Apple's \
+    signing answers are fetched, the install needs a network only if they do not fit it.";
+
+/// What the wizard says about the network before setup asks Apple; the plan
+/// says the final answer from the written bundles ([`network_notes`]).
+pub(super) fn expected_network_notes(full: bool) -> Vec<String> {
+    match full {
+        true => vec![FULL_BEFORE_NOTE.into(), FIRST_START_NOTE.into()],
+        false => vec![stela_runtime::restore::tss::network_reason(true).into()],
+    }
+}
+
+/// Whether an install needs no network: macOS on the USB and every restore
+/// bundle holding all of its signing answers.
+fn offline(remote: bool, restore_bundles: &[PathBuf]) -> bool {
+    !remote && !restore_bundles.is_empty() && restore_bundles.iter().all(|b| staged(b))
+}
+
+/// `status`'s install line: whether the active build's install needs a
+/// network, by the same test as the plan's ([`network_notes`]).
+pub(super) fn network_status(remote: bool, restore_bundles: &[PathBuf]) -> &'static str {
+    match offline(remote, restore_bundles) {
+        true => STATUS_OFFLINE,
+        false => stela_runtime::restore::tss::network_reason(remote),
+    }
+}
+
+/// `status`'s install line for a USB that installs without a network.
+pub(super) const STATUS_OFFLINE: &str = "macOS and every signing answer are on the USB; the \
+    install checks the answers before it starts and needs a network only if they do not fit";
 
 /// What the plan says about the network: none needed for the install with
 /// macOS and every signing answer on the USB, else why it is needed.
@@ -563,12 +597,12 @@ pub(super) struct Plan {
     /// The install medium.
     pub(super) install: InstallPlan,
     pub(super) notes: Vec<String>,
+    /// Per-chip firmware for EFI images that predate the data bundle.
+    gpu_chips: Vec<&'static str>,
     /// Optional USB swap request that could not fit after installer reservations.
     swap_note: Option<String>,
     /// The key file's passphrase, for `--wifi`.
     pub(super) wifi_passphrase: Option<String>,
-    /// The chips of this computer's NVIDIA GPUs, whose firmware setup adds.
-    pub(super) gpu_chips: Vec<&'static str>,
 }
 
 pub(super) fn plan(
@@ -842,28 +876,27 @@ pub(super) fn plan(
                 .map(|bundle| bundle.directory_in(&record.volume, layout)),
         )
         .collect();
-    let offline =
-        !remote && !restore_bundles.is_empty() && restore_bundles.iter().all(|b| staged(b));
-    notes.extend(network_notes(remote, offline));
+    notes.extend(network_notes(remote, offline(remote, &restore_bundles)));
     notes.push(SIGNING_NOTE.into());
     notes.extend(installed.notes.iter().cloned());
-    // The firmware of this computer's GPU; a USB made elsewhere gets none,
-    // which the PC's boot screen names, so say how to add it.
-    let (gpu_chips, gpu_notes) = firmware::host_chips(environment.host)?;
-    notes.extend(gpu_notes);
-    if gpu_chips.is_empty() {
-        notes.push(firmware::missing(&super::fix(
-            &command.usb,
-            "host-firmware fetch --gpu CHIP",
-        )));
-    }
-    if record.wifi.is_some() {
-        notes.extend(firmware::wifi_note(environment.host)?);
-    }
-    notes.extend(firmware::bluetooth_notes(
-        environment.host,
-        &super::fix(&command.usb, "repair"),
-    )?);
+    // Only a loader with the older per-PC firmware capability needs
+    // firmware selected from this computer's GPUs.
+    let gpu_chips = if stela_loader::host_firmware::supports_mount(&efi_image)
+        && !stela_loader::host_firmware::reads_bundle(&efi_image)
+    {
+        let (chips, host_notes) = firmware::host_chips(environment.host)?;
+        notes.extend(host_notes);
+        if chips.is_empty() {
+            notes.push(firmware::missing(&super::fix(
+                &esp,
+                "host-firmware fetch --gpu CHIP",
+            )));
+        }
+        chips
+    } else {
+        notes.extend(firmware::host_notes(environment.host)?);
+        Vec::new()
+    };
     Ok(Plan {
         record,
         ipsw,
@@ -873,9 +906,9 @@ pub(super) fn plan(
         installed,
         install,
         notes,
+        gpu_chips,
         swap_note,
         wifi_passphrase: command.wifi_passphrase.clone(),
-        gpu_chips,
     })
 }
 
@@ -889,8 +922,8 @@ pub(super) fn describe(plan: &Plan) -> Result<String> {
     )?;
     writeln!(text, "  restore image  {}", plan.ipsw.display())?;
     writeln!(text, "  EFI partition  {}", record.esp.display())?;
-    if !plan.gpu_chips.is_empty() {
-        writeln!(text, "  GPU firmware   {}", plan.gpu_chips.join(", "))?;
+    if stela_loader::host_firmware::reads_bundle(&plan.efi_image) {
+        writeln!(text, "  firmware       {}", firmware::bundle_summary())?;
     }
     let install = &record.installs[0];
     writeln!(
@@ -1069,17 +1102,38 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         }
         host.check_erase_access(&disk)?;
         let identity = wizard::Usb::from_disk(&found, host);
-        if !command.confirmed && std::io::stdin().is_terminal() {
+        // Without a terminal to ask at, the model or size typed back is the
+        // confirmation, so a mistyped disk name never erases another USB.
+        let typed_back = command
+            .confirm_disk
+            .as_deref()
+            .is_some_and(|typed| found.confirmed_by(typed));
+        if !command.confirmed && !typed_back {
+            ensure!(
+                std::io::stdin().is_terminal(),
+                "setup cannot ask before erasing {disk} ({}, {}) without a terminal; pass \
+                 --confirm-disk with its model or size to erase it",
+                found.name,
+                host::size_text(found.bytes)
+            );
             confirm_erase(host, &found)?;
         }
         // A new setup puts macOS on a USB large enough for it.
-        command
-            .install_image
-            .get_or_insert(super::default_install_image(found.bytes));
+        if command.install_image.is_none() {
+            command.install_image = Some(default_image(found.bytes, command.ipsw.as_deref())?);
+        }
         erase = Some((disk, found.name, found.bytes, identity));
     } else {
-        // Inspect the mounted installer's layout before downloading any files.
-        locate_esp(host, &command.usb)?;
+        // Inspect the existing layout before downloading any files. An
+        // interrupted setup keeps its recorded install image choice.
+        let esp = locate_esp(host, &command.usb)?;
+        if command.install_image.is_none()
+            && command.target.is_none()
+            && super::record::mutation_layout(&esp)?.is_none()
+        {
+            let capacity = usb_capacity(host, &command.usb)?;
+            command.install_image = Some(default_image(capacity, command.ipsw.as_deref())?);
+        }
     }
     // Downloaded boot archives are kept in one place until setup finishes,
     // so a setup run again after a stop reuses them, and removed once it
@@ -1126,6 +1180,21 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
     let efi_image = read_efi(environment, command.efi.as_ref().unwrap())?;
     if command.volume_swap_bytes.is_some() {
         check_volume_swap_efi(&efi_image)?;
+    }
+    if !command.dry_run {
+        // Keep a failed bundle download ahead of any USB change.
+        let volume = if erase.is_none() {
+            medium::locate(
+                host,
+                &locate_esp(host, &command.usb)?,
+                command.install_volume.as_deref(),
+            )
+            .ok()
+            .map(|(volume, _)| volume)
+        } else {
+            None
+        };
+        firmware::prefetch_bundle(&efi_image, volume.as_deref())?;
     }
     let mut early = None;
     if let Some((disk, _, capacity, _)) = &erase {
@@ -1220,6 +1289,34 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         super::fix(&command.usb, "uninstall")
     )?;
     Ok(report)
+}
+
+/// A new setup's installer for a USB of `capacity` bytes: macOS goes on a
+/// large enough USB (`super::default_install_image`), unless the local IPSW
+/// holds only the recovery members, which prepare the boot files alone.
+fn default_image(capacity: u64, ipsw: Option<&Path>) -> Result<InstallImage> {
+    let image = super::default_install_image(capacity);
+    match ipsw {
+        Some(ipsw)
+            if image == InstallImage::Full && !restore::payload::holds_system_image(ipsw)? =>
+        {
+            Ok(InstallImage::Network)
+        }
+        _ => Ok(image),
+    }
+}
+
+/// The bytes of the whole disk holding the mounted volume `usb`, as the
+/// host lists it; 0 when the host names no such disk.
+fn usb_capacity(host: &dyn Host, usb: &Path) -> Result<u64> {
+    let Some(disk) = host.volume(usb)?.disk else {
+        return Ok(0);
+    };
+    Ok(host
+        .disks()?
+        .into_iter()
+        .find(|listed| listed.identifier == disk)
+        .map_or(0, |listed| listed.bytes))
 }
 
 /// Ask before erasing `disk` at a terminal: a mistyped disk name would
@@ -1321,33 +1418,43 @@ pub(super) fn apply(environment: &Environment<'_>, plan: Plan) -> Result<()> {
     super::record::publish_with_image(&mut record, &plan.efi_image)?;
     record.complete = true;
     write_record(&esp, &record)?;
-    for chip in plan.gpu_chips {
-        let (destination, installed) =
-            firmware::publication_paths(&esp, record.layout, &plan.efi_image)?;
-        firmware::provision_from(
-            firmware::ProvisionOptions {
-                requirements: None,
-                gpu: Some(chip),
-                wifi: None,
-                profile: None,
-                offline: false,
-                destination: &destination,
-                cache: &super::cache_dir().join("firmware"),
-                dry_run: false,
-                mount_image: &plan.efi_image,
-            },
-            &installed,
+    if stela_loader::host_firmware::reads_bundle(&plan.efi_image) {
+        for note in firmware::provision_bundle(
+            environment.host,
+            &record.volume,
+            &esp,
+            &plan.efi_image,
         )
         .with_context(|| {
             format!(
-                "the USB is set up, but without {chip}'s GPU firmware, which macOS needs: add \
-                 it with {}",
-                super::fix(&esp, &format!("host-firmware fetch --gpu {chip}"))
+                "the USB is set up, but without its complete firmware bundle: add it with {}",
+                super::fix(&esp, "repair")
             )
-        })?;
-    }
-    if record.wifi.is_some() {
-        firmware::provision_wifi_in(environment.host, &esp, record.layout, &plan.efi_image)?;
+        })? {
+            eprintln!("Note: {note}");
+        }
+    } else if stela_loader::host_firmware::supports_mount(&plan.efi_image) {
+        for chip in plan.gpu_chips {
+            let (destination, installed) =
+                firmware::publication_paths(&esp, record.layout, &plan.efi_image)?;
+            firmware::provision_from(
+                firmware::ProvisionOptions {
+                    requirements: None,
+                    gpu: Some(chip),
+                    wifi: None,
+                    profile: None,
+                    offline: false,
+                    destination: &destination,
+                    cache: &super::cache_dir().join("firmware"),
+                    dry_run: false,
+                    mount_image: &plan.efi_image,
+                },
+                &installed,
+            )?;
+        }
+        if record.wifi.is_some() {
+            firmware::provision_wifi_in(environment.host, &esp, record.layout, &plan.efi_image)?;
+        }
     }
     Ok(())
 }

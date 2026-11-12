@@ -429,8 +429,10 @@ impl Progress {
                 let count = self.fill(reader, &mut input);
                 let inflater = self.inflater.as_mut().unwrap();
                 inflater.input = input;
-                inflater.start = 0;
+                // A failed fill consumed nothing: the same read later goes
+                // on from here.
                 inflater.filled = count?;
+                inflater.start = 0;
             }
             let more = self.remaining_input > 0;
             let inflater = self.inflater.as_mut().unwrap();
@@ -519,6 +521,65 @@ pub(crate) mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_failed_read_leaves_the_member_position_to_go_on_from() {
+        /// Every third read fails, as a source that ran out of time does.
+        struct Failing {
+            inner: Memory,
+            reads: usize,
+        }
+        impl ReadAt for Failing {
+            type Error = &'static str;
+            fn len(&self) -> u64 {
+                self.inner.len()
+            }
+            fn read_at(&mut self, offset: u64, bytes: &mut [u8]) -> Result<(), Self::Error> {
+                self.reads += 1;
+                if self.reads.is_multiple_of(3) {
+                    return Err("timed out");
+                }
+                self.inner.read_at(offset, bytes)
+            }
+        }
+        // Barely compressible, so the inflater refills its input many times.
+        let mut state = 0x9e37_79b9_u32;
+        let big: Vec<u8> = (0..700_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect();
+        for deflate in [false, true] {
+            let mut reader = Failing {
+                inner: Memory(archive(&[("m", &big, deflate)], false)),
+                reads: 0,
+            };
+            let archive = Archive::open(&mut reader.inner).unwrap();
+            let entry = archive.find("m").unwrap().clone();
+            let mut progress = loop {
+                if let Ok(progress) = archive.start_member(&mut reader, &entry) {
+                    break progress;
+                }
+            };
+            let mut out = Vec::new();
+            let mut buffer = vec![0u8; 50_000];
+            let mut failures = 0;
+            loop {
+                match archive.pump(&mut reader, &mut progress, &mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buffer[..n]),
+                    Err(_) => failures += 1,
+                }
+                assert!(failures < 1000);
+            }
+            assert!(failures > 0);
+            assert_eq!(progress.produced(), big.len() as u64);
+            assert!(out == big, "deflate={deflate}");
         }
     }
 

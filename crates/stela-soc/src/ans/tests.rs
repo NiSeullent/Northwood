@@ -65,6 +65,13 @@ impl Rig {
                 .write(offset, Width::Word, value, &mut access)
                 .unwrap();
         }
+        rig.enable();
+        rig
+    }
+    /// The driver's bring-up: admin queues, TCB bases, LINEAR and CC.EN.
+    fn enable(&mut self) {
+        let geometry = self.ans.geometry;
+        let mut access = Access::new(0, 0, &mut self.latch);
         for (offset, width, value) in [
             (
                 AQA,
@@ -78,9 +85,8 @@ impl Rig {
             (LINEAR, Width::Word, 1),
             (CC, Width::Word, u64::from(ENTRY_SIZES | ENABLE)),
         ] {
-            rig.ans.write(offset, width, value, &mut access).unwrap();
+            self.ans.write(offset, width, value, &mut access).unwrap();
         }
-        rig
     }
     fn read(&mut self, offset: u64) -> u64 {
         self.ans
@@ -1527,5 +1533,118 @@ fn read_lock_costs() {
         ns(times[0]),
         ns(times[1]),
         ns(times[2]),
+    );
+}
+
+/// The driver's clean shutdown: I/O queues deleted, then CC.SHN normal
+/// until CSTS.SHST reports it complete.
+fn shut_down(rig: &mut Rig) {
+    for (tag, opcode) in [(2, 0), (3, 4)] {
+        rig.submit(0, tag, opcode, 0, 0, [1, 0, 0, 0, 0, 0])
+            .unwrap();
+        rig.retire(0, tag);
+    }
+    rig.write(CC, u64::from(ENTRY_SIZES | ENABLE | 1 << 14))
+        .unwrap();
+    rig.run().unwrap();
+    assert_eq!(rig.read(CSTS), u64::from(READY | SHUTDOWN_COMPLETE));
+}
+
+#[test]
+fn a_clean_shutdown_powers_off_and_a_power_on_comes_up_as_at_boot() {
+    for handed_off in [false, true] {
+        let mut rig = Rig::new();
+        rig.ans.boot_linear = handed_off;
+        rig.io_queues();
+        shut_down(&mut rig);
+        let live = rig.ans.lifecycle;
+        let off = LifecycleState {
+            powered: false,
+            clocked: false,
+            ..live
+        };
+        rig.ans.check_lifecycle(off).unwrap();
+        rig.ans
+            .set_lifecycle(off, &mut Access::new(0, 0, &mut rig.latch));
+        // The off state reads back: the controller does not answer.
+        assert_eq!(rig.ans.lifecycle, off);
+        assert!(
+            rig.ans
+                .read(CSTS, Width::Word, &mut Access::new(0, 0, &mut rig.latch))
+                .is_err()
+        );
+        assert!(!rig.latch.is_asserted(Wire::Aic(IRQ)));
+        // Power returns to a controller as the boot chain hands it over:
+        // nothing the driver programmed survives.
+        rig.ans.check_lifecycle(live).unwrap();
+        rig.ans
+            .set_lifecycle(live, &mut Access::new(0, 0, &mut rig.latch));
+        assert_eq!(rig.read(CSTS), 0);
+        assert_eq!(rig.read(CC), 0);
+        assert_eq!(rig.read(LINEAR), u64::from(handed_off));
+        assert_eq!(rig.read(AQA), 0);
+        for queue in rig.ans.queues {
+            assert!(!queue.sq_enabled && !queue.cq_enabled && queue.sq == 0);
+        }
+        // The driver's normal bring-up then works as at boot.
+        rig.enable();
+        assert_eq!(rig.read(CSTS), u64::from(READY));
+        rig.submit(0, 0, 6, 0, DATA, [1, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(rig.bytes(CQ + 14, 2), [1, 0]);
+        rig.retire(0, 0);
+        rig.io_queues();
+        assert!(rig.ans.queues[1].sq_enabled && rig.ans.queues[1].cq_enabled);
+    }
+}
+
+#[test]
+fn power_loss_with_work_outstanding_or_before_the_shutdown_completes_is_refused() {
+    let mut rig = Rig::new();
+    let live = rig.ans.lifecycle;
+    let off = LifecycleState {
+        powered: false,
+        clocked: false,
+        ..live
+    };
+    // No shutdown notification at all.
+    let refusal = rig.ans.check_lifecycle(off).unwrap_err();
+    assert!(
+        refusal
+            .to_string()
+            .contains("shutdown notification completed")
+    );
+    // A notification that has not completed: an accepted command waits.
+    rig.write(ADMIN_SUBMIT, 1).unwrap();
+    rig.write(CC, u64::from(ENTRY_SIZES | ENABLE | 1 << 14))
+        .unwrap();
+    let refusal = rig.ans.check_lifecycle(off).unwrap_err();
+    assert!(
+        refusal
+            .to_string()
+            .contains("shutdown notification completed")
+    );
+    assert_eq!(rig.ans.pending.len(), 1);
+    // A completed shutdown with a command still owned.
+    rig.ans.status = READY | SHUTDOWN_COMPLETE;
+    rig.ans.shutdown = false;
+    let refusal = rig.ans.check_lifecycle(off).unwrap_err();
+    assert!(refusal.to_string().contains("outstanding"));
+    assert_eq!(rig.ans.pending.len(), 1);
+    // A retained power-down and a physical reset keep their own answers.
+    rig.ans
+        .check_lifecycle(LifecycleState {
+            retention: true,
+            ..off
+        })
+        .unwrap();
+    assert!(
+        rig.ans
+            .check_lifecycle(LifecycleState {
+                reset: true,
+                ..live
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("physical reset")
     );
 }

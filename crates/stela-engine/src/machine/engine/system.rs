@@ -197,10 +197,10 @@ fn implementation_defined_refusal(register: Register, value: u64) -> Option<&'st
 
 /// The MRS encoding of a register, from its generated accessor.
 pub(super) fn encoding_of(register: Register) -> Option<Encoding> {
-    let name = alloc::format!("MRS {}", register.name());
-    let accessor = ACCESSORS
-        .iter()
-        .find(|accessor| accessor.name == name && accessor.index.is_empty())?;
+    let name = register.name();
+    let accessor = ACCESSORS.iter().find(|accessor| {
+        accessor.name.strip_prefix("MRS ") == Some(name) && accessor.index.is_empty()
+    })?;
     let key = accessor.value;
     Some(Encoding::new(
         (key >> 14) as u8,
@@ -977,6 +977,9 @@ pub(super) fn identify(
     cpu.pmu = own
         .and_then(|identity| identity.clock)
         .and_then(|clock| Pmu::for_chip(profile.chip, clock, profile.counter_frequency));
+    cpu.aon = own
+        .and_then(|identity| identity.clock)
+        .and_then(|clock| crate::machine::aon::CoreActivity::new(clock, profile.counter_frequency));
     // The activity monitors count the board's core clock, or the counter's
     // frequency where the board gives none (`machine::amu`).
     cpu.amu = (cpu.registers.implemented(Feature::FEAT_AMUv1) == Ok(true)).then(|| {

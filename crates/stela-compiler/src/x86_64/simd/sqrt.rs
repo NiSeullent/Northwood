@@ -244,7 +244,8 @@ pub(in crate::x86_64) fn emit(
         };
         read_inputs(code, entry.xmm0, target, &[(input, operand.source, source)]);
         square_root(code, operand.format, operand.shape, source);
-        let rejected = sticky_result_check(code, operand.format, operand.shape, RESULT, true);
+        let rejected =
+            sticky_result_check(code, operand.format, operand.shape, RESULT, true, target);
         helper.push(rejected);
         if operand.shape == Shape::Vector64 {
             clear_scalar(code, Format::Double, RESULT);

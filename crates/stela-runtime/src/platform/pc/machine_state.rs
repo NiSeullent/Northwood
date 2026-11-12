@@ -17,8 +17,9 @@ use stela_drivers::block::{BlockDevice, BlockError, Shared, Window};
 
 /// The machine state kept at the end of the partition, before alignment.
 pub const MACHINE_STATE_BYTES: u64 = 16 << 20;
-// The tail always holds the whole layout, the boot log and board flash included.
-const _: () = assert!(MACHINE_STATE_BYTES >= super::board_flash::PARTITION_BYTES);
+// The tail always holds the whole layout, the boot log, board flash and RTC
+// anchor included.
+const _: () = assert!(MACHINE_STATE_BYTES >= super::rtc_anchor::PARTITION_BYTES);
 /// Where the machine state starts: a multiple of this from the partition's
 /// start, which also aligns it to every block size that divides it.
 pub const ALIGNMENT: u64 = 1 << 20;

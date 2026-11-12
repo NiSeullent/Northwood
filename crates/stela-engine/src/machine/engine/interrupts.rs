@@ -87,13 +87,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// write that could exit, and every step sets it again before native
     /// code runs.
     fn refresh_interrupt_status(&mut self, now: u64) {
-        let deadline = if self.cpu.pstate.el == 2 {
+        // EL0 of the host takes its interrupts at EL2 as EL2 does: a native
+        // ERET or GEXIT may unmask there too (`lines_until`). ISR_EL1 reads
+        // stay EL2's.
+        let pstate = self.cpu.pstate;
+        let host_user = pstate.el == 0 && !pstate.guarded && self.cpu.in_host();
+        let deadline = if pstate.el == 2 || host_user {
             self.lines_steady_until(now)
         } else {
             0
         };
         self.mirrors.interrupt_status = register_read::Cell {
-            readable: deadline,
+            readable: if pstate.el == 2 { deadline } else { 0 },
             value: self.chain.acknowledged_interrupt(),
         };
         self.mirrors.lines_until = deadline;
@@ -119,7 +124,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     .host
                     .native_timing_work_start(NativeTimingWork::DeviceLines);
                 let started = self.timing_start();
+                let generation = self.devices.generation();
                 let (lines, until) = self.devices.lines_and_deadline(pe, now);
+                // Its own call moved the count once (`Devices::generation`).
+                self.device_generation = generation.map(|generation| generation.wrapping_add(1));
                 let until = until.unwrap_or(u64::MAX);
                 self.statistics.line_queries += 1;
                 self.statistics.line_ticks += self.timing_since(started);
@@ -166,12 +174,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let retired = self.cpu.retired;
         let pmu_timed = self.cpu.pmu.as_ref().map(|monitor| monitor.timed());
         let amu_timed = self.cpu.amu.as_ref().map(|monitors| monitors.timed());
-        if pmu_timed.is_none() && amu_timed.is_none() {
+        let aon_controls = self
+            .cpu
+            .aon
+            .as_ref()
+            .map(|_| self.cpu.apple.impdef.aon_controls());
+        let aon_counting = self.cpu.aon.as_ref().is_some_and(|aon| aon.counting())
+            || aon_controls.is_some_and(|controls| controls.enabled);
+        if pmu_timed.is_none() && amu_timed.is_none() && !aon_counting {
             return;
         }
         // Without a cycle counter nothing counts time, so the count need not
         // be read.
-        let now = if pmu_timed == Some(true) || amu_timed == Some(true) {
+        let now = if pmu_timed == Some(true) || amu_timed == Some(true) || aon_counting {
             self.now()
         } else {
             0
@@ -181,6 +196,35 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         if let Some(monitors) = self.cpu.amu.as_mut() {
             monitors.sync(now, retired, context.waiting);
+        }
+        if let (Some(aon), Some(controls)) = (self.cpu.aon.as_mut(), aon_controls) {
+            aon.sync(now, retired, context.waiting, controls);
+            self.publish_core_counts();
+        }
+    }
+
+    /// Add the CLPC core performance counts since the last call to the
+    /// board's storage of each counter (`machine::aon`), which the PE's
+    /// native reads and other PEs' window loads read.
+    fn publish_core_counts(&mut self) {
+        let Some(aon) = self.cpu.aon.as_mut() else {
+            return;
+        };
+        let counts = aon.take();
+        for (count, encoding) in counts.into_iter().zip(crate::machine::impdef::AON_COUNTERS) {
+            if count == 0 {
+                continue;
+            }
+            let Some(address) = self.devices.register_storage(self.current, encoding) else {
+                continue;
+            };
+            // SAFETY: `Devices::register_storage` gives the address of the
+            // aligned 64-bit word the register reads, valid for the board's
+            // life (`LocalRegisters::storage`); the board keeps each counter
+            // as an atomic word (`platform::apple::core_counters`), which
+            // other PEs load concurrently, so it is accessed atomically.
+            let word = unsafe { core::sync::atomic::AtomicU64::from_ptr(address as *mut u64) };
+            word.fetch_add(count, core::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -316,7 +360,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The earliest count at which the running PE's timers signal: their
     /// own deadline, kept, held back while a busy PE has not had its share
     /// of work since the last timer interrupt (`clock::TIMER_WORK`).
+    /// The deadline is read from the registers' storage whenever
+    /// native code changed what it was computed from.
     pub(super) fn timer_deadline(&mut self) -> Option<u64> {
+        let registers = native_timer_registers(&self.cpu);
+        if registers != self.timer_registers {
+            self.timer_registers = registers;
+            self.timers = None;
+        }
         let deadline = *self
             .timers
             .get_or_insert_with(|| timer::deadline(&self.cpu));
@@ -476,5 +527,92 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn interrupt_pending_at(&mut self, now: u64) -> bool {
         let lines = self.lines_at(now);
         interrupt_pending(&self.cpu, lines)
+    }
+}
+
+/// The timer registers native code writes ([`TIMER_COMPARE`]), as the
+/// engine's cached timer deadline depends on them.
+fn native_timer_registers(cpu: &Cpu) -> [u64; 2] {
+    [
+        cpu.registers.get(SystemRegister::CNTHV_CVAL_EL2, 0),
+        cpu.registers.get(SystemRegister::CNTHV_CTL_EL2, 0),
+    ]
+}
+
+#[cfg(test)]
+mod core_count_tests {
+    use super::super::tests::{FakeHost, board};
+    use super::super::*;
+    use crate::machine::aon::{CYCLES, CoreActivity, INSTRUCTIONS};
+    use crate::machine::impdef;
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// A board whose PE's first two core performance counters are words
+    /// of its own, as `platform::apple::core_counters` keeps them.
+    struct Counters(Box<[AtomicU64; 2]>);
+
+    impl Devices for Counters {
+        fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+            Err(DeviceError::NoDevice)
+        }
+        fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+            Err(DeviceError::NoDevice)
+        }
+        fn lines(&mut self, _: usize, _: u64) -> Lines {
+            Lines::default()
+        }
+        fn register_storage(&mut self, _: usize, encoding: Encoding) -> Option<u64> {
+            let slot = impdef::AON_COUNTERS[..2]
+                .iter()
+                .position(|&counter| counter == encoding)?;
+            Some(self.0[slot].as_ptr() as u64)
+        }
+    }
+
+    fn write(machine: &mut Machine<FakeHost, Counters>, encoding: Encoding, value: u64) {
+        let entry = impdef::lookup(encoding, crate::machine::test_chip()).unwrap();
+        machine.cpu.apple.impdef.write(entry, value).unwrap();
+    }
+
+    #[test]
+    fn monitor_updates_add_core_counts_to_the_boards_counters() {
+        let counters = Counters(Box::new([AtomicU64::new(7), AtomicU64::new(0)]));
+        let mut machine = board(&[], counters, Vec::new());
+        machine.cpu.aon = CoreActivity::new(24_000_000 * 100, 24_000_000);
+        machine.sync_monitor();
+        let read = |machine: &Machine<FakeHost, Counters>| {
+            [
+                machine.devices.0[0].load(Relaxed),
+                machine.devices.0[1].load(Relaxed),
+            ]
+        };
+        assert_eq!(read(&machine), [7, 0], "nothing counts before the enable");
+        write(&mut machine, impdef::AON_SELECT_0, CYCLES);
+        write(&mut machine, impdef::AON_SELECT_1, INSTRUCTIONS);
+        write(&mut machine, impdef::AON_ENABLE, 1);
+        machine.host.now = 1000;
+        machine.cpu.retired = 50;
+        machine.sync_monitor();
+        let enabled = read(&machine);
+        machine.host.now = 2000;
+        machine.cpu.retired = 80;
+        machine.sync_monitor();
+        let later = read(&machine);
+        assert!(
+            later[0] > enabled[0],
+            "cycles grow with time: {enabled:?} {later:?}"
+        );
+        assert_eq!(later[1] - enabled[1], 30, "instructions as retired");
+        write(&mut machine, impdef::AON_ENABLE, 0);
+        machine.sync_monitor();
+        let stopped = read(&machine);
+        machine.host.now = 3000;
+        machine.cpu.retired = 90;
+        machine.sync_monitor();
+        assert_eq!(
+            read(&machine),
+            stopped,
+            "clearing the enable stops counting"
+        );
     }
 }

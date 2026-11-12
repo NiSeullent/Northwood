@@ -11,6 +11,7 @@ use core::fmt;
 use stela_drivers::net::LinkError;
 
 pub mod http;
+pub mod ranges;
 pub mod stack;
 pub mod tls;
 
@@ -73,6 +74,57 @@ impl NetError {
                 | Self::Truncated(_)
                 | Self::Status(408 | 429 | 500 | 502 | 503 | 504)
         )
+    }
+}
+
+/// Attempts per request, as the setup CLI makes them: with waits of 1, 2, 4
+/// and 8 s between them, a network that drops for about 15 s costs a pause.
+pub const ATTEMPTS: u32 = 5;
+
+/// One request's bounded retries on a caller's millisecond clock. It never
+/// waits: the caller asks [`Backoff::ready`] on each service step, so no
+/// processor stalls while the next attempt is due.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Backoff {
+    attempt: u32,
+    not_before_ms: u64,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Backoff {
+    pub const fn new() -> Self {
+        Self {
+            attempt: 1,
+            not_before_ms: 0,
+        }
+    }
+
+    /// The attempt that runs next, from 1.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Whether the next attempt may start at `now_ms`.
+    pub fn ready(&self, now_ms: u64) -> bool {
+        now_ms >= self.not_before_ms
+    }
+
+    /// The attempt failed with `error` at `now_ms`: the wait in milliseconds
+    /// before the next one, or `None` when `error` is not transient or the
+    /// attempts are spent.
+    pub fn failed(&mut self, error: &NetError, now_ms: u64) -> Option<u64> {
+        if !error.retryable() || self.attempt >= ATTEMPTS {
+            return None;
+        }
+        let wait = 1000 << (self.attempt - 1);
+        self.attempt += 1;
+        self.not_before_ms = now_ms.saturating_add(wait);
+        Some(wait)
     }
 }
 
@@ -199,5 +251,36 @@ mod pci_error_tests {
             NetError::Invalid("frame")
         );
         assert!(!NetError::Invalid("frame").retryable());
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn a_transient_failure_is_retried_four_times_with_doubling_waits() {
+        let mut backoff = Backoff::new();
+        assert!(backoff.ready(0));
+        let mut now = 100;
+        let mut waits = Vec::new();
+        while let Some(wait) = backoff.failed(&NetError::Reset, now) {
+            assert!(!backoff.ready(now + wait - 1));
+            assert!(backoff.ready(now + wait));
+            waits.push(wait);
+            now += wait;
+        }
+        assert_eq!(waits, [1000, 2000, 4000, 8000]);
+        assert_eq!(backoff.attempt(), ATTEMPTS);
+    }
+
+    #[test]
+    fn a_failure_that_needs_another_input_is_not_retried() {
+        let mut backoff = Backoff::new();
+        assert_eq!(backoff.failed(&NetError::Status(400), 0), None);
+        assert_eq!(backoff.failed(&NetError::Invalid("url"), 0), None);
+        assert_eq!(backoff.attempt(), 1);
+        assert_eq!(backoff.failed(&NetError::Status(503), 0), Some(1000));
     }
 }

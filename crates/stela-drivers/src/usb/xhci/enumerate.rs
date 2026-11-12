@@ -39,23 +39,31 @@ fn debounce_with_delay(
 /// Linux `hub_port_debounce` for several ports at once, as its hub threads
 /// debounce in parallel: every unsettled port is sampled at each step, so the
 /// whole set settles in one window. A port with no connection and no connect
-/// change at its first sample is empty, as Linux's `hub_activate` leaves
-/// such a port alone; its later connection arrives as a port change. Each
-/// result is the port's connection and the microseconds it took to settle.
+/// change is empty once it stays so for `settle_us` from the first sample:
+/// right after a controller reset a USB 3 link retrains and a USB 2 device
+/// signals its connection again, which Linux finds later as a port change.
+/// With `settle_us` 0 such a port is empty at its first sample. Each result
+/// is the port's connection and the microseconds it took to settle.
 fn debounce_ports_with_delay(
     count: usize,
+    settle_us: u64,
     mut sample: impl FnMut(usize) -> Result<(bool, bool), BlockError>,
     mut delay: impl FnMut() -> Result<(), BlockError>,
 ) -> Vec<Debounced> {
     let mut results: Vec<Option<Debounced>> = Vec::new();
+    // Each unsettled port, its debounce, and whether it has shown nothing yet.
     let mut pending = Vec::new();
     for port in 0..count {
         match sample(port) {
-            Ok((false, false)) => results.push(Some(Ok((false, 0)))),
+            Ok((false, false)) if settle_us == 0 => results.push(Some(Ok((false, 0)))),
+            Ok((false, false)) => {
+                pending.push((port, Debounce::default(), true));
+                results.push(None);
+            }
             Ok((connected, changed)) => {
                 let mut debounce = Debounce::default();
                 debounce.observe(connected, changed);
-                pending.push((port, debounce));
+                pending.push((port, debounce, false));
                 results.push(None);
             }
             Err(error) => results.push(Some(Err(error))),
@@ -69,17 +77,21 @@ fn debounce_ports_with_delay(
             delay().err()
         };
         if let Some(error) = stop {
-            for (port, _) in pending.drain(..) {
+            for (port, ..) in pending.drain(..) {
                 results[port] = Some(Err(error.clone()));
             }
             break;
         }
         total += DEBOUNCE_STEP_US;
-        pending.retain_mut(|(port, debounce)| {
+        pending.retain_mut(|(port, debounce, quiet)| {
             let settled = match sample(*port) {
-                Ok((connected, changed)) => debounce
-                    .observe(connected, changed)
-                    .map(|connected| Ok((connected, total))),
+                Ok((false, false)) if *quiet => (total >= settle_us).then_some(Ok((false, total))),
+                Ok((connected, changed)) => {
+                    *quiet = false;
+                    debounce
+                        .observe(connected, changed)
+                        .map(|connected| Ok((connected, total)))
+                }
                 Err(error) => Some(Err(error)),
             };
             let done = settled.is_some();
@@ -401,6 +413,7 @@ impl Controller {
         minimum.check()?;
         let settled = debounce_ports_with_delay(
             usize::from(self.max_ports),
+            CONNECT_SETTLE_US,
             |index| Ok(self.sample_root(index as u8 + 1)),
             || minimum.wait_us(DEBOUNCE_STEP_US),
         );

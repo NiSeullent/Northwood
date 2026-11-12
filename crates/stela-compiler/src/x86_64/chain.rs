@@ -324,6 +324,10 @@ pub struct LookupEntry {
     pub targets: u32,
 }
 
+/// An ITLB entry's `block` when the walk of its page ended in a global leaf
+/// ([`LookupEntry::global_page`]).
+pub const ITLB_GLOBAL: u32 = 1;
+
 /// The bits of an entry's last word that hold its targets.
 pub const META_TARGETS: u32 = 0xff;
 /// Set in an entry's last word while a writer changes the entry: a reader
@@ -534,6 +538,21 @@ impl LookupEntry {
             block: 0,
             targets: 0,
         }
+    }
+
+    /// [`Self::page`] for a page whose walk ended in a global leaf (nG=0):
+    /// one that a TLBI by VA of any ASID reaches (Arm `TLBIMatch`). Probes
+    /// read no ITLB entry's `block`, so it holds the mark.
+    pub const fn global_page(page: u64, context: u64, key: u64) -> Self {
+        Self {
+            block: ITLB_GLOBAL,
+            ..Self::page(page, context, key)
+        }
+    }
+
+    /// Whether this ITLB entry was made by [`Self::global_page`].
+    pub const fn is_global_page(&self) -> bool {
+        self.block & ITLB_GLOBAL != 0
     }
 
     /// Whether this ITLB entry is one of `pages` in a context of `salts`.

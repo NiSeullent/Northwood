@@ -529,6 +529,20 @@ fn block_io(handle: Handle) -> Option<ScopedProtocol<BlockIO>> {
     .ok()
 }
 
+/// Where the firmware found the disk Stela started from: its controller's
+/// PCI address and the path below it (`pci_io::disk_location`).
+pub(crate) fn boot_disk_location() -> Option<String> {
+    let image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()).ok()?;
+    let device = image.device()?;
+    let location = crate::pci_io::disk_location(device)?;
+    // The firmware's logical block size: Stela's driver must read the same
+    // one, or the stick's GPT is not where it looks.
+    Some(match block_io(device) {
+        Some(io) => format!("{location} block={}", io.media().block_size()),
+        None => location,
+    })
+}
+
 /// The device path of the whole disk Stela started from.
 fn boot_disk() -> Option<String> {
     let image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()).ok()?;

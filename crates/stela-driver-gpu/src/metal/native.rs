@@ -3294,13 +3294,18 @@ impl Backend for NativeBackend {
         // The Metal completion poll already observed this timeline. Free the
         // prefix it proves complete so the next submission need not query it
         // again just to free these command buffers.
+        self.timeline_passed(semaphore, value);
+        Ok(value)
+    }
+
+    fn timeline_passed(&mut self, semaphore: Semaphore, value: u64) {
+        let timeline = handle(semaphore.0);
         let ready = self
             .in_flight
             .iter()
             .take_while(|entry| entry.timeline == timeline && entry.value <= value)
             .count();
         self.free_completed(ready);
-        Ok(value)
     }
 
     fn signal_semaphore(&mut self, semaphore: Semaphore, value: u64) -> Result<()> {

@@ -53,6 +53,10 @@ pub struct Packet<R: Registers, D: Delay> {
     restartable: bool,
     geometry: Geometry,
     receive_filter: ReceiveFilter,
+    /// The last received frame. The stack's path swaps it with its own
+    /// buffer, so steady-state receive allocates nothing, and a failed
+    /// receive never touches the caller's buffer.
+    received: Vec<u8>,
 }
 impl<R: Registers, D: Delay> Packet<R, D> {
     /// Attach an exclusively owned stopped requester, with real NVM
@@ -100,6 +104,7 @@ impl<R: Registers, D: Delay> Packet<R, D> {
             restartable: false,
             geometry: Geometry::of(super::Asic::Bcm5720),
             receive_filter: ReceiveFilter::default(),
+            received: Vec::new(),
         };
         let result = (|| {
             let board = value.hardware.packet_prepare()?;
@@ -369,14 +374,19 @@ impl<R: Registers, D: Delay> Packet<R, D> {
         self.tx_producer = (self.tx_producer + 1) % TX;
         self.hardware.tx_producer(self.tx_producer)
     }
-    fn receive_inner(&mut self) -> Result<Option<Vec<u8>>, Error> {
+    /// Whether a frame arrived; it is left in `self.received`.
+    fn receive_inner(&mut self) -> Result<bool, Error> {
         let producer = self.poll()?;
         // A finite pass drops damaged frames without blocking on new traffic.
         for _ in 0..self.geometry.returns {
             if self.rx_consumer == producer {
-                return Ok(None);
+                return Ok(false);
             }
-            let (_, frame) = self.memory.as_mut().unwrap().receive(self.rx_consumer)?;
+            let (_, frame) = self
+                .memory
+                .as_mut()
+                .unwrap()
+                .receive(self.rx_consumer, &mut self.received)?;
             // The next spare producer slot must really be CPU-owned; the
             // memory layer refuses an out-of-order return which violates it.
             self.memory.as_mut().unwrap().offer(self.rx_producer)?;
@@ -384,11 +394,25 @@ impl<R: Registers, D: Delay> Packet<R, D> {
             self.hardware.rx_producer(self.rx_producer)?;
             self.rx_consumer = (self.rx_consumer + 1) % self.geometry.returns;
             self.hardware.rx_consumer(self.rx_consumer)?;
-            if frame.is_some() {
-                return Ok(frame);
+            if frame {
+                return Ok(true);
             }
         }
         Err(Error::RingCorrupt)
+    }
+    /// Runs one receive; `Ok(true)` leaves the frame in `self.received`.
+    fn receive_checked(&mut self) -> Result<bool, LinkError> {
+        if !self.carrier() {
+            return if let Some(error) = self.failure {
+                Err(error.into_link())
+            } else {
+                Ok(false)
+            };
+        }
+        self.receive_inner().map_err(|error| {
+            self.fault(error);
+            error.into_link()
+        })
     }
 }
 impl<R: Registers, D: Delay> Link for Packet<R, D> {
@@ -436,20 +460,18 @@ impl<R: Registers, D: Delay> Link for Packet<R, D> {
         }
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
-        if !self.carrier() {
-            return if let Some(error) = self.failure {
-                Err(error.into_link())
-            } else {
-                Ok(None)
-            };
+        Ok(self
+            .receive_checked()?
+            .then(|| core::mem::take(&mut self.received)))
+    }
+    /// The stack's path: the received frame and the caller's buffer trade
+    /// places, so a received frame allocates nothing once both have grown.
+    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
+        let received = self.receive_checked()?;
+        if received {
+            core::mem::swap(frame, &mut self.received);
         }
-        match self.receive_inner() {
-            Ok(frame) => Ok(frame),
-            Err(error) => {
-                self.fault(error);
-                Err(error.into_link())
-            }
-        }
+        Ok(received)
     }
 }
 #[cfg(test)]

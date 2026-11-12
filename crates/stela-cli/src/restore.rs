@@ -207,6 +207,24 @@ pub fn select(images: &[Image], build: Option<&str>, model: Option<&str>) -> Res
 struct Partial {
     image: Image,
     total_bytes: Option<u64>,
+    /// The object's strong ETag, else its Last-Modified date, as the first
+    /// answer named it: a resumed request sends it as `If-Range`, so a
+    /// changed object answers whole and the download restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validator: Option<String>,
+}
+
+/// The validator [`Partial`] keeps from an answer's headers.
+fn validator(headers: &header::HeaderMap) -> Option<String> {
+    let value = |name| {
+        headers
+            .get(name)
+            .and_then(|value: &header::HeaderValue| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    value(header::ETAG)
+        .filter(|etag| !etag.starts_with("W/"))
+        .or_else(|| value(header::LAST_MODIFIED))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -269,7 +287,23 @@ pub fn fetch_recovery(image: &Image, model: &str, output: &Path) -> Result<u64> 
         apple_url(&url),
         "image must be hosted on Apple's HTTPS servers"
     );
-    payload::trim(remote::Remote::open(client()?, &image.url)?, model, output)
+    payload::trim(
+        remote::Remote::open(client()?, &image.url)?,
+        model,
+        output,
+        "Downloading boot files",
+    )
+}
+
+/// The bytes [`fetch_recovery`] would copy of `image` for `model`, and the
+/// whole image's, from its ZIP directory read by byte ranges.
+pub fn recovery_size(image: &Image, model: &str) -> Result<(u64, u64)> {
+    let url = Url::parse(&image.url)?;
+    ensure!(
+        apple_url(&url),
+        "image must be hosted on Apple's HTTPS servers"
+    );
+    payload::recovery_bytes(remote::Remote::open(client()?, &image.url)?, model)
 }
 
 /// The restore inventory of `image` for `model` that `stela.efi` streams
@@ -364,6 +398,7 @@ fn download_with_client(image: &Image, output: &Path, client: &Client) -> Result
     let metadata = sidecar(output, ".part.json");
     let mut offset = 0;
     let mut previous_total = None;
+    let mut previous_validator = None;
     if part.exists() {
         // A partial download resumes only as the same catalog entry and
         // within its size; any other is removed and the download restarts.
@@ -375,10 +410,12 @@ fn download_with_client(image: &Image, output: &Path, client: &Client) -> Result
                 previous
                     .total_bytes
                     .is_none_or(|total| bytes <= total)
-                    .then_some((bytes, previous.total_bytes))
+                    .then_some((bytes, previous.total_bytes, previous.validator))
             });
         match resumable {
-            Some((bytes, total)) => (offset, previous_total) = (bytes, total),
+            Some((bytes, total, validator)) => {
+                (offset, previous_total, previous_validator) = (bytes, total, validator)
+            }
             None => remove_partial(&part, &metadata)?,
         }
         if offset > 0 && previous_total == Some(offset) {
@@ -390,12 +427,16 @@ fn download_with_client(image: &Image, output: &Path, client: &Client) -> Result
         let request = client
             .get(&image.url)
             .header(header::ACCEPT_ENCODING, "identity");
-        match offset {
-            0 => request,
-            _ => request.header(header::RANGE, format!("bytes={offset}-")),
+        match (offset, &previous_validator) {
+            (0, _) => request,
+            (_, None) => request.header(header::RANGE, format!("bytes={offset}-")),
+            (_, Some(validator)) => request
+                .header(header::RANGE, format!("bytes={offset}-"))
+                .header(header::IF_RANGE, validator),
         }
     })?
     .error_for_status()?;
+    let answered = validator(response.headers());
     let total;
     if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
         total = Some(range_total(
@@ -406,11 +447,17 @@ fn download_with_client(image: &Image, output: &Path, client: &Client) -> Result
                 .to_str()?,
             offset,
         )?);
-        if previous_total.is_some() && total != previous_total {
+        if (previous_total.is_some() && total != previous_total)
+            || (previous_validator.is_some()
+                && answered.is_some()
+                && answered != previous_validator)
+        {
+            // Another object than the partial's, though the server sent a
+            // range of it: start over from its first byte.
+            drop(response);
             remove_partial(&part, &metadata)?;
-            bail!(
-                "the image's size changed on Apple's server; run setup again to download it anew"
-            );
+            eprintln!("note: the image changed on Apple's server; downloading it anew");
+            return download_with_client(image, output, client);
         }
         if let Some(length) = response.content_length() {
             ensure!(
@@ -433,6 +480,7 @@ fn download_with_client(image: &Image, output: &Path, client: &Client) -> Result
         &Partial {
             image: image.clone(),
             total_bytes: total,
+            validator: answered,
         },
     )?;
     let mut file = OpenOptions::new()
@@ -630,6 +678,7 @@ mod tests {
             &Partial {
                 image: image.clone(),
                 total_bytes: Some(10),
+                validator: None,
             },
         )?;
         let receipt = download_with_client(&image, &out, &Client::new())?;
@@ -662,6 +711,7 @@ mod tests {
             &Partial {
                 image: image.clone(),
                 total_bytes: Some(8),
+                validator: None,
             },
         )?;
         let receipt = download_with_client(&image, &out, &Client::new())?;
@@ -691,6 +741,7 @@ mod tests {
                     ..image.clone()
                 },
                 total_bytes: Some(10),
+                validator: None,
             },
         )?;
         download_with_client(&image, &out, &Client::new())?;
@@ -722,6 +773,7 @@ mod tests {
                 &Partial {
                     image: image.clone(),
                     total_bytes: None,
+                    validator: None,
                 },
             )?;
             let result = download_with_client(&image, &out, &Client::new());
@@ -737,6 +789,57 @@ mod tests {
             }
             server.join().unwrap();
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_resumed_request_names_the_object_and_a_changed_one_restarts() -> Result<()> {
+        // The object changed: the server answers `If-Range` with all of it.
+        let (url, server) = serve(
+            "HTTP/1.1 200 OK\r\nETag: \"new\"\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc"
+                .into(),
+        );
+        let image = Image {
+            version: "test".into(),
+            build: "TEST".into(),
+            models: vec![],
+            url,
+            sha1: Some(hex::encode(sha1::Sha1::digest(b"abc"))),
+        };
+        let dir = tempfile::tempdir()?;
+        let out = dir.path().join("test.ipsw");
+        std::fs::write(sidecar(&out, ".part"), b"01")?;
+        stela_engine::write_json(
+            &sidecar(&out, ".part.json"),
+            &Partial {
+                image: image.clone(),
+                total_bytes: Some(10),
+                validator: Some("\"old\"".into()),
+            },
+        )?;
+        download_with_client(&image, &out, &Client::new())?;
+        assert_eq!(std::fs::read(&out)?, b"abc");
+        let request = server.join().unwrap().to_lowercase();
+        assert!(request.contains("range: bytes=2-"), "{request}");
+        assert!(request.contains("if-range: \"old\""), "{request}");
+        // The answer's validator is kept for the next resume, a strong
+        // ETag before Last-Modified.
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::LAST_MODIFIED,
+            "Tue, 10 Nov 2026 00:00:00 GMT".parse()?,
+        );
+        assert_eq!(
+            validator(&headers).as_deref(),
+            Some("Tue, 10 Nov 2026 00:00:00 GMT")
+        );
+        headers.insert(header::ETAG, "W/\"weak\"".parse()?);
+        assert_eq!(
+            validator(&headers).as_deref(),
+            Some("Tue, 10 Nov 2026 00:00:00 GMT")
+        );
+        headers.insert(header::ETAG, "\"strong\"".parse()?);
+        assert_eq!(validator(&headers).as_deref(), Some("\"strong\""));
         Ok(())
     }
 }

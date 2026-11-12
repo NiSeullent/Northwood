@@ -209,6 +209,24 @@ impl Setup<'_> {
         Ticket::booted(self.ap_ticket.to_vec(), self.restore, self.ecid).map(|(_, nonces)| nonces)
     }
 
+    /// Whether `response` is an answer the install accepts for a request of
+    /// `kind`, checked as the install checks it.
+    fn validate(&self, kind: Kind, response: &[u8], nonces: &Nonces) -> Result<()> {
+        match kind {
+            Kind::RecoveryRoot => {
+                Ticket::personalized(ticket(response)?, self.restore, self.ecid, Some(nonces))
+                    .map(drop)
+            }
+            Kind::Cryptex => match answer(response, "Cryptex1,Ticket")?.is_empty() {
+                true => Err(Error::Invalid("Apple's Cryptex1 ticket is empty")),
+                false => Ok(()),
+            },
+            Kind::RecoveryPolicy => {
+                Ticket::personalized(ticket(response)?, self.restore, self.ecid, None).map(drop)
+            }
+        }
+    }
+
     /// The exact bodies of the three requests, built by the functions the
     /// install's restore host uses.
     pub fn requests(&self) -> Result<Vec<Request>> {
@@ -253,24 +271,7 @@ impl Setup<'_> {
             let response = transport
                 .exchange(HOST, PATH, &HEADERS, CONTENT_TYPE, &request.body)?
                 .ok_or(Error::Pending)?;
-            match request.kind {
-                Kind::RecoveryRoot => {
-                    Ticket::personalized(
-                        ticket(&response)?,
-                        self.restore,
-                        self.ecid,
-                        Some(&nonces),
-                    )?;
-                }
-                Kind::Cryptex => {
-                    if answer(&response, "Cryptex1,Ticket")?.is_empty() {
-                        return Err(Error::Invalid("Apple's Cryptex1 ticket is empty"));
-                    }
-                }
-                Kind::RecoveryPolicy => {
-                    Ticket::personalized(ticket(&response)?, self.restore, self.ecid, None)?;
-                }
-            }
+            self.validate(request.kind, &response, &nonces)?;
             set.insert(request.kind, &request.body, response)?;
         }
         Ok(set)
@@ -302,6 +303,36 @@ impl Set {
             && Kind::ALL
                 .iter()
                 .all(|kind| self.answers.values().any(|(k, _)| k == kind))
+    }
+
+    /// Dry run of an install's signing requests before it changes a disk:
+    /// the set was staged for this SEP policy nonce, and every body `setup`
+    /// builds has a stored answer of its kind that opens as the install
+    /// opens it. Returns the first request that fails, and why.
+    pub fn check(&self, setup: &Setup<'_>) -> core::result::Result<(), (Kind, Error)> {
+        if self.policy_nonce.as_ref() != Some(setup.policy_nonce) {
+            return Err((
+                Kind::RecoveryPolicy,
+                Error::Invalid("the staged recoveryOS policy nonce differs"),
+            ));
+        }
+        let nonces = setup.nonces().map_err(|e| (Kind::RecoveryRoot, e))?;
+        for request in setup.requests().map_err(|e| (Kind::RecoveryRoot, e))? {
+            let (kind, response) = self.answer(&request.body).ok_or((
+                request.kind,
+                Error::Invalid("no staged answer for this request"),
+            ))?;
+            if kind != request.kind {
+                return Err((
+                    request.kind,
+                    Error::Invalid("staged answer of another kind"),
+                ));
+            }
+            setup
+                .validate(kind, response, &nonces)
+                .map_err(|e| (kind, e))?;
+        }
+        Ok(())
     }
 
     /// The stored answer to `body`, and its kind.
@@ -364,6 +395,43 @@ impl Set {
             set.answers.insert(digest.into(), (kind, response));
         }
         Ok(set)
+    }
+}
+
+/// What a boot does with the staged answers on its USB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Use {
+    /// No complete set: Apple's signing server answers over the network.
+    Network,
+    /// A complete set for an erase install whose image downloads: checked
+    /// before the guest starts, with the network open for the image.
+    Checked,
+    /// A complete set for an erase install from the USB's image: checked
+    /// before the guest starts, and no network is opened.
+    Offline,
+    /// An update: the set holds the erase install's requests, which an
+    /// update does not send, so it needs the signing server.
+    Update,
+}
+
+impl Use {
+    pub fn of(set: Option<&Set>, update: bool, remote_image: bool) -> Self {
+        match (set.is_some_and(Set::complete), update, remote_image) {
+            (false, _, _) => Self::Network,
+            (true, true, _) => Self::Update,
+            (true, false, true) => Self::Checked,
+            (true, false, false) => Self::Offline,
+        }
+    }
+
+    /// Whether the install opens no network.
+    pub fn offline(self) -> bool {
+        self == Self::Offline
+    }
+
+    /// Whether the set's dry run ([`Set::check`]) runs before the guest.
+    pub fn checks(self) -> bool {
+        matches!(self, Self::Checked | Self::Offline)
     }
 }
 

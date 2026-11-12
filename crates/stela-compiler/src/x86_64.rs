@@ -162,6 +162,7 @@ mod top_byte;
 pub use top_byte::TopByte;
 pub mod mirrored_read;
 mod unprivileged;
+pub(crate) mod vector_cache;
 pub mod zero_block;
 
 /// The System instructions a system-mode block ending in one completes

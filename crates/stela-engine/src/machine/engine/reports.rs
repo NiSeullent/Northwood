@@ -28,6 +28,31 @@ pub enum Event {
     },
 }
 
+/// Where a PE is, for a report of a wait on it
+/// ([`RequirementKind::MaintenanceOverrun`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeState {
+    /// In its run loop: an exit, a native slice or a wait for the devices'
+    /// lock.
+    Running,
+    /// Waiting in the engine, on another PE's broadcast or a stop.
+    Parked,
+    /// Outside its run loop or asleep.
+    Outside,
+    Unknown,
+}
+
+impl fmt::Display for PeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Running => "running",
+            Self::Parked => "parked",
+            Self::Outside => "outside",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
 /// A requirement this engine does not implement, with where it was met.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requirement {
@@ -92,6 +117,17 @@ pub enum RequirementKind {
     NativeRamServiceBusy,
     /// A registered RAM service excluded a promoted device site's walk.
     DeviceSiteRamServiceBusy,
+    /// Other PEs had not applied posted TLB or code maintenance after the
+    /// reported bound: `pe`, one of the `unapplied` PEs, in `state`
+    /// ([`super::parallel::Hub::waiting_state`]), was still short of mail
+    /// `serial` after `ticks` of the system count. The wait goes on.
+    MaintenanceOverrun {
+        pe: usize,
+        serial: u64,
+        unapplied: u32,
+        state: PeState,
+        ticks: u64,
+    },
 }
 
 impl fmt::Display for Requirement {
@@ -183,6 +219,17 @@ impl fmt::Display for Requirement {
             RequirementKind::DeviceSiteRamServiceBusy => {
                 f.write_str("promoted device site: registered RAM memory service busy")?
             }
+            RequirementKind::MaintenanceOverrun {
+                pe,
+                serial,
+                unapplied,
+                state,
+                ticks,
+            } => write!(
+                f,
+                "maintenance overrun: PE {pe} ({state}) has not applied mail {serial} after \
+                 {ticks} counter ticks ({unapplied} PEs waited on); still waiting"
+            )?,
         }
         if let Some(syndrome) = self.syndrome {
             write!(f, " esr={syndrome:#x}")?;
@@ -403,13 +450,16 @@ pub(super) enum StoreSource {
     Pack,
     /// Compiled by another PE of this boot and installed here.
     Shared,
+    /// Relocated from an entry proven during this boot, compiled at
+    /// another address of the same page content ([`super::rebase`]).
+    Rebased,
 }
 
 impl StoreSource {
-    pub(super) const COUNT: usize = 4;
+    pub(super) const COUNT: usize = 5;
 }
 
-const _: () = assert!(StoreSource::Shared as usize + 1 == StoreSource::COUNT);
+const _: () = assert!(StoreSource::Rebased as usize + 1 == StoreSource::COUNT);
 
 /// Why the ITLB lacked a page it then took ([`Statistics::itlb_misses`]): a
 /// fill of another page took its entry's place, a TLBI by VA dropped it,
@@ -586,9 +636,9 @@ pub struct Statistics {
     pub native_transitions: [u64; transition::KINDS],
     /// Those the engine completed, by the same kinds.
     pub engine_transitions: [u64; transition::KINDS],
-    /// Why GENTER, then GEXIT, at EL2 took the engine path, by
-    /// `transitions::miss` reason.
-    pub transition_misses: [[u64; super::transitions::miss::REASONS]; 2],
+    /// Why GENTER, GEXIT, SVC and ERET took the engine path, by kind
+    /// (`x86_64::transition`) and `transitions::miss` reason.
+    pub transition_misses: [[u64; super::transitions::miss::REASONS]; transition::KINDS],
     /// AMX moves completed inside blocks (`x86_64::amx_transfer`) and by
     /// the engine's service.
     pub amx_moves: [u64; 2],
@@ -645,6 +695,13 @@ pub struct Statistics {
     /// granule sends.
     pub sleep_ticks: u64,
     pub spin_ticks: u64,
+    /// Of `sleep_ticks`, those from the timer's arming to the wake in the
+    /// host halt itself, past the halt-poll (`poll_for_wake`): the rest of
+    /// `sleep_ticks` the host core spun.
+    pub halt_ticks: u64,
+    /// Of `waits`, WFEs completed inside their exit by a short bounded spin
+    /// (`processors::Machine::short_event_wait`), without a scheduler pass.
+    pub short_waits: u64,
     /// With every PE on a core of its own: maintenance this PE broadcast,
     /// device accesses it forwarded to the home machine, and the counter
     /// ticks it spent waiting on other PEs for those or parked while the
@@ -720,6 +777,8 @@ impl core::ops::AddAssign for Statistics {
             degraded,
             sleep_ticks,
             spin_ticks,
+            halt_ticks,
+            short_waits,
             broadcasts,
             forwards,
             sync_ticks,
@@ -847,6 +906,8 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.degraded, degraded),
             (&mut self.sleep_ticks, sleep_ticks),
             (&mut self.spin_ticks, spin_ticks),
+            (&mut self.halt_ticks, halt_ticks),
+            (&mut self.short_waits, short_waits),
             (&mut self.broadcasts, broadcasts),
             (&mut self.forwards, forwards),
             (&mut self.sync_ticks, sync_ticks),
@@ -990,7 +1051,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let blocks = &self.code.blocks;
         let words = &mut walk.words;
         walk.slots.step(blocks, more, |slot| {
-            let record = blocks.record(slot);
+            // A slot just given may have no record yet.
+            let Some(record) = blocks.try_record(slot) else {
+                return;
+            };
             let taken = record.taken.load(Ordering::Relaxed);
             if taken != 0
                 && record.live()
@@ -1024,6 +1088,39 @@ impl<H: Host, D: Devices> Machine<H, D> {
 mod walk_tests {
     use super::super::tests::{BASE, machine};
     use super::*;
+
+    /// A slot another PE was just given, whose record chunk it has not
+    /// allocated yet, is counted among the given slots: the walks pass it
+    /// by (build 69 stopped 20 s into boot at `record()` in the heartbeat's
+    /// exit walk).
+    #[test]
+    fn the_walks_pass_a_given_slot_that_has_no_record_yet() {
+        const RET: u32 = 0xd65f_03c0;
+        let mut machine = machine(&[RET]);
+        assert!(matches!(
+            machine.fetch_block(BASE, false),
+            Ok(Fetched::Block(_))
+        ));
+        let (grace, _) = machine.grace();
+        // Slots of the first record chunk have records once one of them
+        // took its block; the first slot of the next has none.
+        let bare = loop {
+            let slot = machine
+                .code
+                .blocks
+                .take_without_record(grace)
+                .expect("a slot");
+            if machine.code.blocks.try_record(slot).is_none() {
+                break slot;
+            }
+        };
+        assert!(bare < machine.code.blocks.len());
+        let mut walk = ExitWordsWalk::default();
+        while !machine.exit_words_step(&mut walk, || true) {}
+        let mut walk = FootprintWalk::default();
+        while !machine.footprint_step(&mut walk, || true) {}
+        assert!(!machine.board_slot(bare).live);
+    }
 
     /// The walks in steps of one chunk each give what the walks of every
     /// block at once give.

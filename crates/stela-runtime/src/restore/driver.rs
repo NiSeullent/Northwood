@@ -60,6 +60,10 @@ pub struct Driver<R, H> {
     jobs: Vec<Transfer<H>>,
     /// A control message received and not yet answered ([`Self::work`]).
     received: Option<Value>,
+    /// The handshake reached StartRestore and the store is not prepared
+    /// yet: [`Self::work`] prepares it and sends the message, without
+    /// answering the HardwareInfo reply a second time.
+    starting: bool,
     failure: Option<Error>,
     complete: bool,
 }
@@ -78,6 +82,7 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
             handshake: Handshake::Type,
             jobs: Vec::new(),
             received: None,
+            starting: false,
             failure: None,
             complete: false,
         })
@@ -132,6 +137,16 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
         if self.failure.is_some() || self.complete {
             return;
         }
+        if self.starting {
+            // A read that is not answered yet keeps the start for the next
+            // call; no message is taken before StartRestore is queued.
+            match self.start() {
+                Ok(()) => self.starting = false,
+                Err(Error::Pending) => {}
+                Err(error) => self.failure = Some(error),
+            }
+            return;
+        }
         if let Some(message) = self.received.take() {
             match self.answer(&message) {
                 Ok(()) => {}
@@ -139,6 +154,15 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
                 Err(error) => self.failure = Some(error),
             }
         }
+    }
+
+    /// Prepare the store and queue StartRestore. `Error::Pending` leaves
+    /// nothing queued and may be repeated.
+    fn start(&mut self) -> Result<()> {
+        self.answers.store.prepare()?;
+        let message = self.session.start_for(&self.answers, self.route)?;
+        self.frame.queue(&message, false)?;
+        Ok(())
     }
 
     fn answer(&mut self, message: &Value) -> Result<()> {
@@ -159,8 +183,16 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
                 }
                 Handshake::Hardware => {
                     self.handshake = Handshake::Started;
-                    self.answers.store.prepare()?;
-                    self.session.start_for(&self.answers, self.route)?
+                    self.starting = true;
+                    return match self.start() {
+                        Ok(()) => {
+                            self.starting = false;
+                            Ok(())
+                        }
+                        // The reply is answered; `work` continues the start.
+                        Err(Error::Pending) => Ok(()),
+                        Err(error) => Err(error),
+                    };
                 }
                 Handshake::Started => {
                     return Err(Error::Invalid("unexpected ready session"));
@@ -313,12 +345,18 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
             {
                 continue;
             }
-            if let Err(e) = transfer.job.prefetch(&mut self.answers.store, chunks) {
-                self.failure = Some(super::refuse(
-                    refuse!("transfer failed: {e}", ?e),
-                    &transfer.job.request,
-                ));
-                return;
+            match transfer.job.prefetch(&mut self.answers.store, chunks) {
+                Ok(()) => {}
+                // The source ran out of the time it may wait: the next
+                // prefetch reads on from what arrived meanwhile.
+                Err(Error::Pending) => return,
+                Err(e) => {
+                    self.failure = Some(super::refuse(
+                        refuse!("transfer failed: {e}", ?e),
+                        &transfer.job.request,
+                    ));
+                    return;
+                }
             }
         }
     }

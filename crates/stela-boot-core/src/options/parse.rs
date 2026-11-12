@@ -296,6 +296,7 @@ impl ParseState<'_> {
                 }
             }
             boot_selection::SAFE_BOOT_OPTION => options.safe_boot = true,
+            boot_selection::BUNDLE_REPAIR_OPTION => options.bundle_repair = true,
             boot_selection::BOOT_COMMAND_OPTION => {
                 let value = number(value().ok_or(Error::MissingBootCommand)?)?;
                 let value = u8::try_from(value).map_err(|_| Error::BootCommandByte)?;

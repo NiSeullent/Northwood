@@ -5,11 +5,15 @@ use core::sync::atomic::{AtomicU8, Ordering};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
     Orderly = 1,
-    Forced = 2,
+    /// Stop the guest and restart the PC, which boots the next choice
+    /// NVRAM records at the stop.
+    Restart = 2,
+    Forced = 3,
 }
 
 /// A request remains pending across service installation and other processors'
-/// service turns. A forced request always takes precedence over an orderly one.
+/// service turns. A forced request always takes precedence over an orderly one,
+/// and over a restart, whose NVRAM record the stop still stores.
 #[derive(Default)]
 pub struct Requests(AtomicU8);
 
@@ -34,7 +38,8 @@ impl Requests {
         }
         match self.0.swap(0, Ordering::AcqRel) {
             1 => Some(Mode::Orderly),
-            2 => Some(Mode::Forced),
+            2 => Some(Mode::Restart),
+            3 => Some(Mode::Forced),
             _ => None,
         }
     }
@@ -78,6 +83,19 @@ mod tests {
         requests.request(Mode::Orderly);
         requests.request(Mode::Forced);
         requests.request(Mode::Orderly);
+        assert_eq!(requests.take(true), Some(Mode::Forced));
+        assert_eq!(requests.take(true), None);
+    }
+
+    #[test]
+    fn a_restart_outranks_an_orderly_request_and_yields_to_a_forced_one() {
+        let requests = Requests::new();
+        requests.request(Mode::Orderly);
+        requests.request(Mode::Restart);
+        assert_eq!(requests.take(true), Some(Mode::Restart));
+        requests.request(Mode::Restart);
+        requests.request(Mode::Forced);
+        requests.request(Mode::Restart);
         assert_eq!(requests.take(true), Some(Mode::Forced));
         assert_eq!(requests.take(true), None);
     }

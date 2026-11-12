@@ -35,6 +35,11 @@
 //! `fs_rewrap_key` (0x2d22f50) sends flags 0, `fs_rewrap_ekwk` (0x2d50820)
 //! 0x200 and `fs_migrate_media_key_to_class` (0x2d4ffa0) 0x40, the last with
 //! no parameters: the key stays and its wrapping moves to the new class.
+//! `fs_rewrap_ek` (26B123 0xfffffe0009d6f6b4), which APFS's `icp_clone_ek`
+//! sends when a write splits a cloned file's extents, fills the two blobs
+//! with the old and new ephemeral keys, the classes with theirs, and sends
+//! flags 0x100: the wrapped EK moves from the old EKWK to the new. APFS
+//! panics ("cannot rewrap ek") when that fails.
 //!
 //! **Scalable keys.** APFS gives a file an EK, its file key, wrapped by an
 //! EKWK, wrapped under the protection class (`new_skey` 0x491a7d0), with
@@ -257,18 +262,25 @@ impl VolumeKeys {
         let parameters = fields.blob()?;
         let (_handle, _new_handle) = (fields.word()?, fields.word()?);
         let (old, new) = (fields.word()?, fields.word()?);
-        if first != 0 || !fields.blob()?.is_empty() || !fields.blob()?.is_empty() {
-            return Err(refuse!("SEP rewrap request's other keys are not modeled"));
-        }
+        let (ephemeral, new_ephemeral) = (fields.blob()?, fields.blob()?);
         let wrapped = fields.blob()?;
         let request = fields.word()?;
         let (_context, _new_context) = (fields.blob()?, fields.blob()?);
         fields.end()?;
-        if new == 0 {
+        let scalable = request == SCALABLE;
+        let ephemerals = [ephemeral, new_ephemeral].map(|key| !key.is_empty());
+        if first != 0 || ephemerals != [scalable; 2] {
+            return Err(refuse!("SEP rewrap request's other keys are not modeled"));
+        }
+        if new == 0 && !scalable {
             return Err(refuse!("SEP rewrap names no new class"));
         }
         let mut reply = Reply::default();
         match request {
+            SCALABLE => {
+                let key = unwrap_ek(&*self.open_ephemeral(ephemeral)?, wrapped)?;
+                reply.blob(&wrap_ek(&*self.open_ephemeral(new_ephemeral)?, &key));
+            }
             REWRAP_MEDIA_KEY => reply.blob(&self.rewrap_media_key(old, new, wrapped)?),
             0 | REWRAP_EKWK => {
                 let classes = self.class_keys(volume(parameters)?)?;

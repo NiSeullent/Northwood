@@ -169,6 +169,10 @@ impl Asm<'_> {
             (false, false),
             "VEX cannot encode APX registers"
         );
+        if let Rm::Xmm(_) = rm {
+            // Register-register VEX forms here are vector instructions.
+            self.guard_vector(reg);
+        }
         let Vex { map, pp, w, l } = prefix;
         let (x, b) = rm.extensions();
         let r = reg & 8 != 0;
@@ -199,6 +203,7 @@ impl Asm<'_> {
             (false, false),
             "APX extended memory addressing requires its dedicated EVEX form"
         );
+        self.guard_vector(reg);
         let Evex {
             map,
             pp,

@@ -529,12 +529,13 @@ fn contexts_made_anew_walk_again_their_predecessors_pages() {
     assert_eq!(machine.statistics.itlb[0], misses);
 }
 
-/// A TLBI by VA and ASID of a lower-half page between global pages (a
-/// process's own page inside the shared library cache's span) reaches only
-/// that ASID's contexts; one of a page fetched through a global leaf
-/// reaches every context, as a global entry matches every ASID.
+/// A TLBI by VA and ASID of a lower-half page reaches that ASID's entries
+/// and, in every context, the entries whose walk ended in a global leaf,
+/// as a global entry matches every ASID (Arm `TLBIMatch`). Another ASID's
+/// non-global entry of the same page stays, even inside the span of global
+/// pages (a process's own copy of a shared library page).
 #[test]
-fn a_tlbi_by_va_and_asid_reaches_every_context_only_at_a_global_leaf() {
+fn a_tlbi_by_va_and_asid_reaches_other_asids_only_at_their_global_entries() {
     const LOW: u64 = 0x1_8000_0000;
     const HIGH: u64 = 0x2_8000_0000;
     const OWN: u64 = 0x2_0000_0000;
@@ -543,25 +544,38 @@ fn a_tlbi_by_va_and_asid_reaches_every_context_only_at_a_global_leaf() {
     let ttbr0 = machine.cpu.read(SystemRegister::TTBR0_EL1);
     let mine = context_of(&mut machine, el, ttbr0 + 0x10_0000, 5)[0];
     let other = context_of(&mut machine, el, ttbr0 + 0x20_0000, 6)[0];
+    let third = context_of(&mut machine, el, ttbr0 + 0x30_0000, 7)[0];
     machine.fetched_through(0, LOW, 0x4000, true);
     machine.fetched_through(0, HIGH, 0x4000, true);
     machine.fetched_through(0, OWN, 0x4000, false);
-    for page in [LOW, OWN] {
-        for context in [mine, other] {
-            put(&mut machine, page, context);
-        }
-    }
-    let tlbi = |machine: &mut Machine<FakeHost, NoDevices>, page: u64| {
-        let reach = Reach::Containing(page);
-        machine.tlb_maintained(reach, Everywhere::Addresses(reach), Some(5));
+    let put_global = |machine: &mut Machine<FakeHost, NoDevices>, page: u64, context: u64| {
+        let slot = machine.itlb.page_slot(page, context);
+        let entry = chain::LookupEntry::global_page(page, context, 1);
+        machine.itlb.insert(slot, entry);
     };
-    tlbi(&mut machine, OWN);
+    for context in [mine, other] {
+        put(&mut machine, OWN, context);
+        put_global(&mut machine, LOW, context);
+    }
+    // The third process maps LOW privately (nG=1).
+    put(&mut machine, LOW, third);
+    let tlbi = |machine: &mut Machine<FakeHost, NoDevices>, page: u64, asid: Option<u16>| {
+        let reach = Reach::Containing(page);
+        machine.tlb_maintained(reach, Everywhere::Addresses(reach), asid);
+    };
+    tlbi(&mut machine, OWN, Some(5));
     assert!(!held(&machine, OWN, mine));
     assert!(held(&machine, OWN, other));
-    tlbi(&mut machine, LOW);
+    tlbi(&mut machine, LOW, Some(5));
     assert!(!held(&machine, LOW, mine));
     assert!(!held(&machine, LOW, other));
-    // Forgetting the lower half's contexts forgets its global leaves.
-    machine.forget_spaces(0..=0, 3);
-    assert_eq!(machine.global_sizes, 0);
+    assert!(held(&machine, LOW, third));
+    // Its own ASID reaches its private entry.
+    tlbi(&mut machine, LOW, Some(7));
+    assert!(!held(&machine, LOW, third));
+    // A TLBI by VA of all ASIDs reaches every context's entry.
+    put(&mut machine, OWN, mine);
+    tlbi(&mut machine, OWN, None);
+    assert!(!held(&machine, OWN, mine));
+    assert!(!held(&machine, OWN, other));
 }

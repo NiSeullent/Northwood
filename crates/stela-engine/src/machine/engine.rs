@@ -14,7 +14,7 @@ use compilation::{PENDING_EXITS, PendingExits};
 use mirrors::*;
 use reports::*;
 pub use reports::{
-    DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, Occupancy,
+    DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, Occupancy, PeState,
     Requirement, RequirementKind, Reset, Statistics, Stop, Surveyed, Suspension, TRACE_HITS,
     TraceHit, WATCH_HITS, WatchHit,
 };
@@ -67,9 +67,11 @@ pub use parallel::{
     LockTimes, MaterializedSource, ParallelAdmissionError, SharedDevices, SourceObservation,
     SourcePhase,
 };
+pub use rebase::RebaseCounts;
 pub use stela_contracts::dma::{DmaError, TransferFault};
 mod pointer;
 mod prepare;
+mod rebase;
 pub use device_read::{CanonicalDeviceMemory, ConsumedScalar, DeviceReadRequest, DeviceReadShape};
 pub use device_write::{
     CanonicalDeviceWrite, CanonicalWriteMemory, ConsumedWrite, DeviceWriteRequest, DeviceWriteShape,
@@ -183,6 +185,9 @@ const FIRST_WINDOW_BYTES: usize = 32 * INSTRUCTION as usize;
 const FETCH_CACHE: usize = 1024;
 /// Bits in each half's filter of the leaves fetched through.
 const FETCHED_LEAVES: usize = 1 << 21;
+/// The set words of a half's filter of the leaves fetched through that a
+/// clear zeroes one by one; past them it zeroes the whole filter.
+const FETCHED_WORDS: usize = 4096;
 /// The leaves of one size a TLBI is checked against one by one; one that
 /// reaches more counts as reaching what was fetched.
 const SCANNED_LEAVES: u64 = 1 << 16;
@@ -326,17 +331,21 @@ impl Watch {
 }
 
 /// The guest context branch predictions must not cross (FEAT_CSV2): the
-/// translation regime, its table bases (with the ASID one carries),
-/// CONTEXTIDR_ELx and VTTBR_EL2 (the VMID). A change of any of these is a
-/// guest context switch, at which the engine has the host isolate its
-/// predictions ([`Host::isolate_predictions`]). An exception or return
-/// that keeps them, between EL0 and EL1 of one address space, is not one.
+/// translation regime, its table bases (with the ASID one carries) and
+/// VTTBR_EL2 (the VMID). A change of any of these is a guest context
+/// switch, at which the engine has the host isolate its predictions
+/// ([`Host::isolate_predictions`]). An exception or return that keeps
+/// them, between EL0 and EL1 of one address space, is not one.
+/// CONTEXTIDR_ELx is not part of it: Arm's hardware-described context is
+/// the Security state, Exception level, ASID and VMID (and SCXTNUM_ELx,
+/// which this machine holds without distinguishing contexts), and a
+/// kernel that writes CONTEXTIDR at every thread switch within one address
+/// space gets no isolation from the chip there either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PredictionContext {
     pub host: bool,
     pub ttbr0: u64,
     pub ttbr1: u64,
-    pub contextidr: u64,
     pub vttbr: u64,
 }
 
@@ -344,24 +353,15 @@ impl PredictionContext {
     fn of(cpu: &Cpu) -> Self {
         use crate::machine::cpu::TranslationRegime;
         let host = cpu.regime() == TranslationRegime::El20;
-        let (ttbr0, ttbr1, contextidr) = if host {
-            (
-                SystemRegister::TTBR0_EL2,
-                SystemRegister::TTBR1_EL2,
-                SystemRegister::CONTEXTIDR_EL2,
-            )
+        let (ttbr0, ttbr1) = if host {
+            (SystemRegister::TTBR0_EL2, SystemRegister::TTBR1_EL2)
         } else {
-            (
-                SystemRegister::TTBR0_EL1,
-                SystemRegister::TTBR1_EL1,
-                SystemRegister::CONTEXTIDR_EL1,
-            )
+            (SystemRegister::TTBR0_EL1, SystemRegister::TTBR1_EL1)
         };
         Self {
             host,
             ttbr0: cpu.read(ttbr0),
             ttbr1: cpu.read(ttbr1),
-            contextidr: cpu.read(contextidr),
             vttbr: cpu.read(SystemRegister::VTTBR_EL2),
         }
     }
@@ -604,6 +604,8 @@ struct FetchEntry {
     physical: u64,
     /// FEAT_BTI's guarded page (Arm `InGuardedPage`).
     guarded: bool,
+    /// The walk ended in a global leaf (nG=0).
+    global: bool,
     el: u8,
     epoch: FetchEpoch,
 }
@@ -653,9 +655,6 @@ impl<T> core::ops::Deref for Padded<T> {
 const RECENT: usize = 4;
 /// `Machine::lower_globals` with no such fetch.
 const NO_GLOBALS: (u64, u64) = (u64::MAX, 0);
-/// The bits of [`Machine::global_leaves`]: 32 KiB, which the few thousand
-/// global leaves (a shared library cache's) fill to about 2%.
-const GLOBAL_LEAVES: usize = 1 << 18;
 
 /// The translation inputs besides TTBR0 and the SPRR permissions that a
 /// PE's contexts name at once ([`Machine::context_frames`]).
@@ -880,18 +879,16 @@ pub struct Machine<H: Host, D: Devices> {
     /// The first and last addresses of the lower half fetched through a
     /// global page since its contexts were last forgotten, or [`NO_GLOBALS`].
     lower_globals: (u64, u64),
-    /// A filter of the lower half's leaves fetched through global
-    /// translations since its contexts were last forgotten, a bit per hash
-    /// ([`GLOBAL_LEAVES`]), and their sizes, a bit per power of two: a TLBI
-    /// by VA and ASID of any other leaf reaches that ASID's contexts alone,
-    /// however wide `lower_globals` is. Allocated at the first such fetch.
-    global_leaves: Vec<u64>,
-    global_sizes: u64,
     /// A filter of the leaves each half fetched through since its contexts
     /// were last forgotten: a TLBI of any other leaf reaches no lookup entry
     /// and no cached fetch, as most by far do not. Each half allocates
     /// its filter at its first recorded fetch.
     fetched_leaves: [Vec<u64>; 2],
+    /// The words of each half's `fetched_leaves` that a fetch set since it
+    /// was last cleared, up to [`FETCHED_WORDS`], or None past that: a
+    /// clear zeroes these alone instead of the whole filter, which a
+    /// TLBI VMALLE1 would otherwise write at every address space switch.
+    fetched_words: [Option<Vec<u32>>; 2],
     /// The registers of the stored cells, in the order of the cells, which
     /// the board's machines share ([`numbering`]).
     stored_reads: Arc<numbering::Registry<Encoding>>,
@@ -937,6 +934,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// The earliest physical count at which a timer signals FIQ; `None` when
     /// a System register write may have changed it.
     timers: Option<Option<u64>>,
+    /// CNTHV_CVAL_EL2 and CNTHV_CTL_EL2 as [`Self::timers`] was computed
+    /// from: native timer writes store there
+    /// (`x86_64::register_read::timer_thunk`), so a change forgets it.
+    timer_registers: [u64; 2],
     /// The EL FP/SIMD traps to, if any; `None` when a System register write
     /// or an EL change may have changed it.
     floating_point: Option<Option<u8>>,
@@ -962,6 +963,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// the running one's or a waiting one's, are then its latched pins
     /// (`Devices::pins`).
     device_lines: Option<(Lines, u64, usize)>,
+    /// The devices' [`Devices::generation`] right after the call that gave
+    /// `device_lines`' deadline.
+    device_generation: Option<u64>,
     /// The PAC context, the memo of results and the key tag words, which
     /// native code reads and completes misses through (`pointer`).
     pointer: alloc::boxed::Box<pointer::PointerService>,
@@ -1005,6 +1009,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// The latest serial of the maintenance this PE posted to each other PE
     /// and has not yet seen applied, which its next DSB waits for.
     posted: Vec<(usize, u64)>,
+    /// The emptied buffer of the last mail this PE read, which the next read
+    /// leaves in its inbox so neither side allocates per mail.
+    mail_spare: Vec<parallel::Maintenance>,
     /// The direct exit within its page the last native run left by, when
     /// its target had no block to link to: the block, the target and the
     /// exit's word. The next fetch, if it is the target's, links it
@@ -1354,6 +1361,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             private_fetches: [false; 2],
             lower_globals: NO_GLOBALS,
             fetched_leaves: [Vec::new(), Vec::new()],
+            fetched_words: [Some(Vec::new()), Some(Vec::new())],
             stored_reads: numbering.stored_reads,
             stored_writes: numbering.stored_writes,
             code_posted: None,
@@ -1367,13 +1375,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             fill_log: Vec::new(),
             fill_next: 0,
             pending_refills: BTreeMap::new(),
-            global_leaves: Vec::new(),
-            global_sizes: 0,
             refills: Vec::new(),
             applying_mail: false,
             profile_missing: Vec::new(),
             lookup: super::system::Lookup::new(),
             timers: None,
+            timer_registers: [0; 2],
             floating_point: None,
             memory_checks: None,
             native_system: None,
@@ -1381,6 +1388,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             event_sample: None,
             debug: None,
             device_lines: None,
+            device_generation: None,
             pointer: alloc::boxed::Box::new(pointer::PointerService::new()),
             mirrors: alloc::boxed::Box::default(),
             admit_table,
@@ -1399,6 +1407,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             forwarded_power: Vec::new(),
             deferred_code: Vec::new(),
             posted: Vec::new(),
+            mail_spare: Vec::new(),
             direct_exit: None,
             publishing_target: None,
             outgoing: Vec::new(),

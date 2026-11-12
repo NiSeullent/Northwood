@@ -849,3 +849,50 @@ impl core::fmt::Display for CaptureFailure {
         }
     }
 }
+
+/// Where the firmware found the disk behind `handle`: its controller's PCI
+/// address and the device path nodes below the controller up to the
+/// partition, such as `0000:0b:00.3 USB(0x3,0x0)`. Identifiers a node may
+/// carry (a USB serial number, an NVMe EUI-64) are left out.
+pub(crate) fn disk_location(handle: Handle) -> Option<alloc::string::String> {
+    use alloc::string::ToString;
+    use uefi::proto::device_path::text::{AllowShortcuts, DisplayOnly};
+    let path = get_protocol::<DevicePath>(handle).ok()?;
+    let mut remaining = &*path;
+    let controller = boot::locate_device_path::<PciIo>(&mut remaining).ok()?;
+    let address = get_protocol::<PciIo>(controller).ok()?.address().ok()?;
+    let below = remaining
+        .to_string16(DisplayOnly(false), AllowShortcuts(false))
+        .ok()
+        .map(|text| text.to_string())
+        .unwrap_or_default();
+    Some(alloc::format!("{address} {}", plain_nodes(&below)))
+}
+
+/// The device path nodes of `text` before the partition, without any
+/// identifier a node carries beyond its bus position and IDs.
+fn plain_nodes(text: &str) -> alloc::string::String {
+    let mut kept = Vec::new();
+    for node in text.split('/') {
+        if node.starts_with("HD(") || node.starts_with("CDROM(") {
+            break;
+        }
+        let arguments = |count: usize| {
+            let (name, rest) = node.split_once('(').unwrap_or((node, ""));
+            let rest = rest.trim_end_matches(')');
+            let first: Vec<&str> = rest.split(',').take(count).collect();
+            alloc::format!("{name}({})", first.join(","))
+        };
+        if node.starts_with("UsbWwid(") {
+            kept.push(arguments(2));
+        } else if node.starts_with("NVMe(") {
+            kept.push(arguments(1));
+        } else if ["USB(", "UsbClass(", "Sata(", "Scsi(", "SD(", "eMMC("]
+            .iter()
+            .any(|prefix| node.starts_with(prefix))
+        {
+            kept.push(alloc::string::String::from(node));
+        }
+    }
+    kept.join("/")
+}

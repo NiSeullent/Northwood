@@ -65,7 +65,16 @@ where
     };
     input.hash.update(&prefix[..prefix_end]);
     input.buffer.extend_from_slice(initial);
-    let Some(bytes) = lzfse::decode_bounded(|part| input.read(part), end - start, expected)? else {
+    // The decoded bytes are hashed frame by frame as they are written, not
+    // in a second pass over the whole image (115 MB for a kernel).
+    let mut decoded = Sha256::new();
+    let Some(bytes) = lzfse::decode_bounded_observed(
+        |part| input.read(part),
+        end - start,
+        expected,
+        |frame| decoded.update(frame),
+    )?
+    else {
         return Ok(None);
     };
     require!(
@@ -78,6 +87,7 @@ where
         description: header.description,
         bytes,
         container_sha256: hex::encode(input.hash.finalize()),
+        decoded_sha256: Some(hex::encode(decoded.finalize())),
         manifest: manifest.map(<[u8]>::to_vec),
     }))
 }
@@ -202,6 +212,11 @@ mod tests {
             assert_eq!(streamed.description, original.description);
             assert_eq!(streamed.manifest.as_deref(), parts.manifest);
             assert_eq!(streamed.container_sha256, stela_formats::sha256(&file));
+            // Taken while decoding, the same as a pass over the output.
+            assert_eq!(
+                streamed.decoded_sha256.as_deref(),
+                Some(stela_formats::sha256(&plaintext).as_str())
+            );
         }
         Ok(())
     }

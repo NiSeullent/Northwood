@@ -23,8 +23,11 @@
 //! is named by that partition, and every command addresses the tail
 //! (`installed::state_area`).
 use super::{
-    Environment, Record, Request, check_installed_efi, ecid::Ecid, host::bytes_text, installed,
-    machines, record::read_inspection_record,
+    Environment, Record, Request, check_installed_efi,
+    ecid::Ecid,
+    host::{Disk, Host, bytes_text},
+    installed, machines,
+    record::read_inspection_record,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -198,19 +201,33 @@ pub(super) fn reset_nvram(
 /// writes from its first line, then the install's on its machine-state
 /// partition; either may be missing.
 pub(super) fn boot_log(environment: &Environment<'_>, command: &Request) -> Result<String> {
-    let (record, _, _) = read_inspection_record(environment, &command.usb)?;
-    let usb = usb_log(&record.esp, false).map(|(path, log)| {
-        let mut text = format!(
-            "Boot log on the USB ({}): {}",
-            path.display(),
-            crate::boot_log::summary(&log)
-        );
-        text.push_str(&String::from_utf8_lossy(&log.stream));
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text
-    });
+    let (record, _, _) = match read_inspection_record(environment, &command.usb) {
+        Ok(record) => record,
+        Err(error) => return raw_boot_log(environment.host, &command.usb, &error),
+    };
+    let usb = usb_log(&record.esp, false)
+        .map(|(path, log)| shown(&format!("Boot log on the USB ({})", path.display()), &log))
+        .or_else(|error| {
+            // Reading the same file through raw FAT32 helps when the host
+            // cannot open it. Preserve format errors from a readable ring.
+            if error.downcast_ref::<std::io::Error>().is_none() {
+                return Err(error);
+            }
+            [record.esp.as_path(), command.usb.as_path()]
+                .into_iter()
+                .find_map(|usb| usb_disk(environment.host, usb))
+                .context("its disk is not known")
+                .and_then(|disk| {
+                    let logs = crate::boot_log::disk_logs(environment.host, &disk)?.usb;
+                    ensure!(
+                        !logs.is_empty(),
+                        "{} holds no USB boot log",
+                        crate::boot_log::describe(&disk)
+                    );
+                    Ok(raw_text(&disk, logs, "Boot log on the USB"))
+                })
+                .with_context(|| format!("{error:#}"))
+        });
     let install = install_log(environment, &record, command);
     let complete = match (usb, install) {
         (Ok(usb), Ok(install)) => Ok(format!("{usb}\n{install}")),
@@ -288,6 +305,58 @@ fn read_usb_log(path: PathBuf, require_output: bool) -> Result<(PathBuf, boot_lo
         path.display()
     );
     Ok((path, log))
+}
+
+/// `log` after a line naming it `title` and saying what it holds.
+fn shown(title: &str, log: &boot_log::Log) -> String {
+    let mut text = format!("{title}: {}", crate::boot_log::summary(log));
+    text.push_str(&String::from_utf8_lossy(&log.stream));
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// `logs`, read directly from `disk`, each named `title` with its place.
+fn raw_text(disk: &Disk, logs: Vec<(String, boot_log::Log)>, title: &str) -> String {
+    let disk = crate::boot_log::describe(disk);
+    logs.iter()
+        .map(|(place, log)| shown(&format!("{title} ({disk}, {place}, read directly)"), log))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The whole disk `usb` names, or the disk of the volume mounted there.
+fn usb_disk(host: &dyn Host, usb: &Path) -> Option<Disk> {
+    let identifier = match host.whole_disk(usb) {
+        Ok(Some(identifier)) => identifier,
+        _ => host.volume(usb).ok()?.disk?,
+    };
+    host.disks()
+        .ok()?
+        .into_iter()
+        .find(|disk| disk.identifier == identifier)
+}
+
+/// `boot-log` for a USB whose setup record cannot be read (`why`): every
+/// log on its disk, read directly, which needs neither the record nor a
+/// mounted EFI partition.
+pub(super) fn raw_boot_log(host: &dyn Host, usb: &Path, why: &anyhow::Error) -> Result<String> {
+    let disk = usb_disk(host, usb)
+        .with_context(|| format!("{why:#}; nor is the disk of {} known", usb.display()))?;
+    let logs = crate::boot_log::disk_logs(host, &disk)
+        .with_context(|| format!("{why:#}; nor can its disk be read directly"))?
+        .all();
+    ensure!(
+        !logs.is_empty(),
+        "{why:#}; nor does {} hold a Stela boot log",
+        crate::boot_log::describe(&disk)
+    );
+    Ok(format!(
+        "The setup on {} cannot be read ({why:#}), so its disk was read directly.\n\n{}",
+        usb.display(),
+        raw_text(&disk, logs, "Boot log")
+    ))
 }
 
 fn install_log(

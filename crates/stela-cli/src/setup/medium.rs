@@ -42,6 +42,7 @@ use {
 };
 
 pub(super) mod download;
+pub(super) mod image;
 
 /// Bytes read at a time: a whole number of hash blocks.
 const BUFFER: usize = 64 * HASH_BLOCK_BYTES as usize;
@@ -82,9 +83,8 @@ impl Medium {
             matches!(build.next(), Some(Component::Normal(_)))
                 && build.next().is_none()
                 && directory.starts_with(&self.volume)
-                && directory
-                    .parent()
-                    .is_some_and(|p| p == self.volume.join(self.layout.data_path(DATA_INSTALL))),
+                && directory.parent().is_some_and(|p| p
+                    == super::join_slashed(&self.volume, &self.layout.data_path(DATA_INSTALL))),
             "the setup record names an unexpected install medium {}",
             directory.display()
         );
@@ -178,7 +178,7 @@ fn install_path(layout: VolumeLayout, build: &str) -> String {
 }
 
 pub(super) fn directory_in(volume: &Path, layout: VolumeLayout, build: &str) -> PathBuf {
-    volume.join(install_path(layout, build))
+    super::join_slashed(volume, &install_path(layout, build))
 }
 
 /// The USB's FAT32 data partition, which holds the boot bundles, the install
@@ -416,6 +416,7 @@ fn read_piece(
     })?;
     if let Some(out) = out {
         out.sync_all()?;
+        crate::progress::drop_cached(&out);
     }
     Ok(())
 }

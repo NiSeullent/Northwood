@@ -98,59 +98,86 @@ fn words(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
     chunks.iter().copied().map(u32::from_le_bytes)
 }
 
+/// The words of the index and low-bit sections a page can need.
+const INDEX_WORDS: usize = PAGE_WORDS / INDICES_PER_WORD;
+const LOW_WORDS: usize = PAGE_WORDS.div_ceil(LOW_PER_WORD);
+/// The most words a compressible page's data can take.
+const MAX_STREAM_WORDS: usize = MAX_COMPRESSED_BYTES / WORD_BYTES;
+/// The low bit of each 2-bit tag in a tag word.
+const PAIR_LOW: u32 = 0x5555_5555;
+
+/// Write `word` little-endian at word offset `at` of `data`.
+fn put(data: &mut [u8], at: usize, word: u32) {
+    data[at * WORD_BYTES..(at + 1) * WORD_BYTES].copy_from_slice(&word.to_le_bytes());
+}
+
+/// One pass over the page with one allocation: tags pack straight into
+/// their words, whole words go to their final place in the output, and
+/// indices and low bits pack into fixed buffers. The size only grows, so
+/// the pass stops once the page cannot fit.
 pub fn compress(page: &[u8; PAGE_BYTES]) -> Compressed {
-    let mut input = words(page);
-    let first = input.next().expect("a page has words");
-    if input.all(|word| word == first) {
+    let (input, _) = page.as_chunks::<WORD_BYTES>();
+    let first = input[0];
+    if input.iter().all(|word| *word == first) {
         return Compressed::SingleValue;
     }
+    let mut data = alloc::vec![0u8; MAX_COMPRESSED_BYTES];
+    let mut tags = [0u32; TAG_WORDS];
+    let mut indices = [0u32; INDEX_WORDS];
+    let mut low = [0u32; LOW_WORDS];
     let mut dictionary = [0u32; DICTIONARY_ENTRIES];
-    let mut tags = [Tag::Zero; PAGE_WORDS];
-    let mut whole = Vec::new();
-    let mut indices = Vec::new();
-    let mut low = Vec::new();
-    for (tag, word) in tags.iter_mut().zip(words(page)) {
+    let (mut whole, mut indexed, mut partial) = (0usize, 0usize, 0usize);
+    for (position, bytes) in input.iter().enumerate() {
+        let word = u32::from_le_bytes(*bytes);
         if word == 0 {
             continue;
         }
         let entry = index(word);
         let current = dictionary[entry];
-        *tag = if current == word {
-            indices.push(entry as u32);
+        dictionary[entry] = word;
+        let tag = if current == word {
+            indices[indexed / INDICES_PER_WORD] |= (entry as u32) << index_shift(indexed);
+            indexed += 1;
             Tag::Exact
         } else if current >> LOW_BITS == word >> LOW_BITS {
-            indices.push(entry as u32);
-            low.push(word & LOW_MASK);
+            indices[indexed / INDICES_PER_WORD] |= (entry as u32) << index_shift(indexed);
+            indexed += 1;
+            low[partial / LOW_PER_WORD] |= (word & LOW_MASK) << low_shift(partial);
+            partial += 1;
             Tag::Partial
         } else {
-            whole.push(word);
+            let at = WHOLE_START + whole;
+            if at >= MAX_STREAM_WORDS {
+                return Compressed::Incompressible;
+            }
+            put(&mut data, at, word);
+            whole += 1;
             Tag::Whole
         };
-        dictionary[entry] = word;
+        tags[position / TAGS_PER_WORD] |= (tag as u32) << tag_shift(position);
     }
-    let indices_start = WHOLE_START + whole.len();
-    let low_start = indices_start + indices.len().div_ceil(INDICES_PER_WORD);
-    let end = low_start + low.len().div_ceil(LOW_PER_WORD);
+    let indices_start = WHOLE_START + whole;
+    let index_words = indexed.div_ceil(INDICES_PER_WORD);
+    let low_start = indices_start + index_words;
+    let low_words = partial.div_ceil(LOW_PER_WORD);
+    let end = low_start + low_words;
     let bytes = (end * WORD_BYTES).next_multiple_of(UNIT_BYTES);
     if bytes > MAX_COMPRESSED_BYTES {
         return Compressed::Incompressible;
     }
-    let mut stream = alloc::vec![0u32; end];
-    stream[0] = indices_start as u32;
-    stream[1] = low_start as u32;
-    stream[2] = end as u32;
-    for (position, &tag) in tags.iter().enumerate() {
-        stream[HEADER_WORDS + position / TAGS_PER_WORD] |= (tag as u32) << tag_shift(position);
+    put(&mut data, 0, indices_start as u32);
+    put(&mut data, 1, low_start as u32);
+    put(&mut data, 2, end as u32);
+    for (i, &word) in tags.iter().enumerate() {
+        put(&mut data, HEADER_WORDS + i, word);
     }
-    stream[WHOLE_START..indices_start].copy_from_slice(&whole);
-    for (position, &entry) in indices.iter().enumerate() {
-        stream[indices_start + position / INDICES_PER_WORD] |= entry << index_shift(position);
+    for (i, &word) in indices[..index_words].iter().enumerate() {
+        put(&mut data, indices_start + i, word);
     }
-    for (position, &bits) in low.iter().enumerate() {
-        stream[low_start + position / LOW_PER_WORD] |= bits << low_shift(position);
+    for (i, &word) in low[..low_words].iter().enumerate() {
+        put(&mut data, low_start + i, word);
     }
-    let mut data: Vec<u8> = stream.iter().flat_map(|word| word.to_le_bytes()).collect();
-    data.resize(bytes, 0);
+    data.truncate(bytes);
     Compressed::Data(data)
 }
 
@@ -192,43 +219,45 @@ pub fn compressed_length(header: &[u8; HEADER_BYTES]) -> Option<usize> {
 /// imply.
 pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
     let [indices_start, low_start, end] = sections(data)?;
-    let stream: Vec<u32> = words(data.get(..end * WORD_BYTES)?).collect();
-    let tag = |position: usize| {
-        Tag::from_bits(stream[HEADER_WORDS + position / TAGS_PER_WORD] >> tag_shift(position))
-    };
-    let count = |wanted: &[Tag]| {
-        (0..PAGE_WORDS)
-            .filter(|&p| wanted.contains(&tag(p)))
-            .count()
-    };
-    let partial = count(&[Tag::Partial]);
-    if count(&[Tag::Whole]) != indices_start - WHOLE_START
-        || count(&[Tag::Partial, Tag::Exact]).div_ceil(INDICES_PER_WORD)
-            != low_start - indices_start
-        || partial.div_ceil(LOW_PER_WORD) != end - low_start
+    let (stream, _) = data.get(..end * WORD_BYTES)?.as_chunks::<WORD_BYTES>();
+    let at = |i: usize| u32::from_le_bytes(stream[i]);
+    // Count each kind 16 tags at a time from a tag's low and high bits.
+    let (mut whole_count, mut partial_count, mut indexed_count) = (0, 0, 0);
+    for i in HEADER_WORDS..WHOLE_START {
+        let tags = at(i);
+        let (low_bit, high_bit) = (tags & PAIR_LOW, tags >> 1 & PAIR_LOW);
+        whole_count += (high_bit & !low_bit).count_ones() as usize;
+        partial_count += (low_bit & !high_bit).count_ones() as usize;
+        indexed_count += low_bit.count_ones() as usize;
+    }
+    if whole_count != indices_start - WHOLE_START
+        || indexed_count.div_ceil(INDICES_PER_WORD) != low_start - indices_start
+        || partial_count.div_ceil(LOW_PER_WORD) != end - low_start
     {
         return None;
     }
     let mut dictionary = [0u32; DICTIONARY_ENTRIES];
     let (mut whole, mut indices, mut low) = (WHOLE_START, 0, 0);
-    let mut page = Vec::with_capacity(PAGE_BYTES);
-    for position in 0..PAGE_WORDS {
-        let word = match tag(position) {
-            Tag::Zero => 0,
+    let mut page = alloc::vec![0u8; PAGE_BYTES];
+    let (out, _) = page.as_chunks_mut::<WORD_BYTES>();
+    for (position, out) in out.iter_mut().enumerate() {
+        let tags = at(HEADER_WORDS + position / TAGS_PER_WORD);
+        let word = match Tag::from_bits(tags >> tag_shift(position)) {
+            Tag::Zero => continue,
             Tag::Whole => {
-                let word = stream[whole];
+                let word = at(whole);
                 whole += 1;
                 dictionary[index(word)] = word;
                 word
             }
             kind @ (Tag::Exact | Tag::Partial) => {
-                let entry = (stream[indices_start + indices / INDICES_PER_WORD]
-                    >> index_shift(indices)) as usize
+                let entry = (at(indices_start + indices / INDICES_PER_WORD) >> index_shift(indices))
+                    as usize
                     % DICTIONARY_ENTRIES;
                 indices += 1;
                 let mut word = dictionary[entry];
                 if kind == Tag::Partial {
-                    let bits = stream[low_start + low / LOW_PER_WORD] >> low_shift(low) & LOW_MASK;
+                    let bits = at(low_start + low / LOW_PER_WORD) >> low_shift(low) & LOW_MASK;
                     low += 1;
                     word = word & !LOW_MASK | bits;
                     dictionary[entry] = word;
@@ -236,7 +265,7 @@ pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
                 word
             }
         };
-        page.extend_from_slice(&word.to_le_bytes());
+        *out = word.to_le_bytes();
     }
     Some(page)
 }
@@ -245,6 +274,251 @@ pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use alloc::boxed::Box;
+
+    /// The first implementation, kept as the reference the fast one must
+    /// match bit for bit.
+    mod reference {
+        use super::super::*;
+
+        fn words(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
+            let (chunks, _) = bytes.as_chunks::<WORD_BYTES>();
+            chunks.iter().copied().map(u32::from_le_bytes)
+        }
+
+        pub fn compress(page: &[u8; PAGE_BYTES]) -> Compressed {
+            let mut input = words(page);
+            let first = input.next().expect("a page has words");
+            if input.all(|word| word == first) {
+                return Compressed::SingleValue;
+            }
+            let mut dictionary = [0u32; DICTIONARY_ENTRIES];
+            let mut tags = [Tag::Zero; PAGE_WORDS];
+            let mut whole = Vec::new();
+            let mut indices = Vec::new();
+            let mut low = Vec::new();
+            for (tag, word) in tags.iter_mut().zip(words(page)) {
+                if word == 0 {
+                    continue;
+                }
+                let entry = index(word);
+                let current = dictionary[entry];
+                *tag = if current == word {
+                    indices.push(entry as u32);
+                    Tag::Exact
+                } else if current >> LOW_BITS == word >> LOW_BITS {
+                    indices.push(entry as u32);
+                    low.push(word & LOW_MASK);
+                    Tag::Partial
+                } else {
+                    whole.push(word);
+                    Tag::Whole
+                };
+                dictionary[entry] = word;
+            }
+            let indices_start = WHOLE_START + whole.len();
+            let low_start = indices_start + indices.len().div_ceil(INDICES_PER_WORD);
+            let end = low_start + low.len().div_ceil(LOW_PER_WORD);
+            let bytes = (end * WORD_BYTES).next_multiple_of(UNIT_BYTES);
+            if bytes > MAX_COMPRESSED_BYTES {
+                return Compressed::Incompressible;
+            }
+            let mut stream = alloc::vec![0u32; end];
+            stream[0] = indices_start as u32;
+            stream[1] = low_start as u32;
+            stream[2] = end as u32;
+            for (position, &tag) in tags.iter().enumerate() {
+                stream[HEADER_WORDS + position / TAGS_PER_WORD] |=
+                    (tag as u32) << tag_shift(position);
+            }
+            stream[WHOLE_START..indices_start].copy_from_slice(&whole);
+            for (position, &entry) in indices.iter().enumerate() {
+                stream[indices_start + position / INDICES_PER_WORD] |=
+                    entry << index_shift(position);
+            }
+            for (position, &bits) in low.iter().enumerate() {
+                stream[low_start + position / LOW_PER_WORD] |= bits << low_shift(position);
+            }
+            let mut data: Vec<u8> = stream.iter().flat_map(|word| word.to_le_bytes()).collect();
+            data.resize(bytes, 0);
+            Compressed::Data(data)
+        }
+
+        pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
+            let [indices_start, low_start, end] = sections(data)?;
+            let stream: Vec<u32> = words(data.get(..end * WORD_BYTES)?).collect();
+            let tag = |position: usize| {
+                Tag::from_bits(
+                    stream[HEADER_WORDS + position / TAGS_PER_WORD] >> tag_shift(position),
+                )
+            };
+            let count = |wanted: &[Tag]| {
+                (0..PAGE_WORDS)
+                    .filter(|&p| wanted.contains(&tag(p)))
+                    .count()
+            };
+            let partial = count(&[Tag::Partial]);
+            if count(&[Tag::Whole]) != indices_start - WHOLE_START
+                || count(&[Tag::Partial, Tag::Exact]).div_ceil(INDICES_PER_WORD)
+                    != low_start - indices_start
+                || partial.div_ceil(LOW_PER_WORD) != end - low_start
+            {
+                return None;
+            }
+            let mut dictionary = [0u32; DICTIONARY_ENTRIES];
+            let (mut whole, mut indices, mut low) = (WHOLE_START, 0, 0);
+            let mut page = Vec::with_capacity(PAGE_BYTES);
+            for position in 0..PAGE_WORDS {
+                let word = match tag(position) {
+                    Tag::Zero => 0,
+                    Tag::Whole => {
+                        let word = stream[whole];
+                        whole += 1;
+                        dictionary[index(word)] = word;
+                        word
+                    }
+                    kind @ (Tag::Exact | Tag::Partial) => {
+                        let entry = (stream[indices_start + indices / INDICES_PER_WORD]
+                            >> index_shift(indices)) as usize
+                            % DICTIONARY_ENTRIES;
+                        indices += 1;
+                        let mut word = dictionary[entry];
+                        if kind == Tag::Partial {
+                            let bits =
+                                stream[low_start + low / LOW_PER_WORD] >> low_shift(low) & LOW_MASK;
+                            low += 1;
+                            word = word & !LOW_MASK | bits;
+                            dictionary[entry] = word;
+                        }
+                        word
+                    }
+                };
+                page.extend_from_slice(&word.to_le_bytes());
+            }
+            Some(page)
+        }
+    }
+
+    /// Pages of every kind the compressor sees, from `seed`.
+    fn sample_pages(seed: u64) -> Vec<Box<[u8; PAGE_BYTES]>> {
+        let mut next = noise(seed);
+        let mut fill = |kind: usize| -> Vec<u32> {
+            (0..PAGE_WORDS)
+                .map(|i| match kind {
+                    0 => 0,
+                    1 => next(),
+                    2 => [0x1234_5678, 0, 0xffff_0000][i % 3],
+                    // Text: printable bytes from a small alphabet.
+                    3 => u32::from_le_bytes(core::array::from_fn(|_| {
+                        b" etaoinshrdlu\n"[(next() % 14) as usize]
+                    })),
+                    // Pointers into a few regions with small offsets.
+                    4 => 0xfffffe00u32.wrapping_add((next() % 4) << 20 | (next() & 0xfff)),
+                    // Mostly zero with partial matches and some noise.
+                    5 => match next() % 8 {
+                        0..=3 => 0,
+                        4 | 5 => 0x4000_0000 | next() & 0x3ff,
+                        6 => next(),
+                        _ => 0x4000_0000,
+                    },
+                    // Random words except a compressible tail.
+                    6 => {
+                        if i < 3000 {
+                            next() | 1 << 31
+                        } else {
+                            0
+                        }
+                    }
+                    _ => i as u32,
+                })
+                .collect()
+        };
+        (0..8)
+            .map(|kind| {
+                let values = fill(kind);
+                page_of(|i| values[i])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fast_codec_matches_the_reference_bit_for_bit() {
+        for seed in 1..40 {
+            for page in sample_pages(seed) {
+                let compressed = compress(&page);
+                assert_eq!(compressed, reference::compress(&page));
+                for length in [PAGE_BYTES, 1088, 13, 0] {
+                    let bytes = &page[..length];
+                    let bitwise: u32 = bytes.iter().map(|byte| byte.count_ones()).sum();
+                    assert_eq!(super::super::population(bytes), bitwise);
+                    let (chunks, _) = page.as_chunks::<8>();
+                    let (baseline, tier) = super::super::popcnt::both(chunks);
+                    assert_eq!(tier.unwrap_or(baseline), baseline);
+                }
+                if let Compressed::Data(data) = &compressed {
+                    assert_eq!(decompress(data), reference::decompress(data));
+                    assert_eq!(decompress(data).as_deref(), Some(&page[..]));
+                    // Corrupted streams: every header word and a tag word.
+                    let mut next = noise(seed);
+                    for _ in 0..16 {
+                        let mut bad = data.clone();
+                        let at = (next() as usize % 6) * 4 + (next() as usize % 4);
+                        bad[at] ^= 1 << (next() % 8);
+                        assert_eq!(decompress(&bad), reference::decompress(&bad));
+                        let short = &data[..data.len() - UNIT_BYTES];
+                        assert_eq!(decompress(short), reference::decompress(short));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_codec_timing_against_the_reference() {
+        let pages = sample_pages(99);
+        let time = |run: &dyn Fn()| {
+            let start = std::time::Instant::now();
+            for _ in 0..50 {
+                run();
+            }
+            start.elapsed().as_nanos() / (50 * pages.len() as u128)
+        };
+        let fast = time(&|| pages.iter().for_each(|page| drop(compress(page))));
+        let slow = time(&|| {
+            pages
+                .iter()
+                .for_each(|page| drop(reference::compress(page)))
+        });
+        let data: Vec<Vec<u8>> = pages
+            .iter()
+            .filter_map(|page| match compress(page) {
+                Compressed::Data(data) => Some(data),
+                _ => None,
+            })
+            .collect();
+        let time_d = |run: &dyn Fn(&[u8]) -> Option<Vec<u8>>| {
+            let start = std::time::Instant::now();
+            for _ in 0..50 {
+                data.iter().for_each(|data| drop(run(data)));
+            }
+            start.elapsed().as_nanos() / (50 * data.len() as u128)
+        };
+        let fast_d = time_d(&decompress);
+        let slow_d = time_d(&reference::decompress);
+        let bytewise = time(&|| {
+            pages.iter().for_each(|page| {
+                core::hint::black_box(page.iter().map(|byte| byte.count_ones()).sum::<u32>());
+            })
+        });
+        let counted = time(&|| {
+            pages.iter().for_each(|page| {
+                core::hint::black_box(super::super::population(core::hint::black_box(&page[..])));
+            })
+        });
+        std::println!(
+            "WKdm ns/page: compress {slow} -> {fast}, decompress {slow_d} -> {fast_d}, \
+             population {bytewise} -> {counted}"
+        );
+    }
 
     fn page_of(words: impl Fn(usize) -> u32) -> Box<[u8; PAGE_BYTES]> {
         let bytes: Vec<u8> = (0..PAGE_WORDS)

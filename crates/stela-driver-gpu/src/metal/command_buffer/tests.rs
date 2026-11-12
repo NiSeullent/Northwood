@@ -4552,3 +4552,62 @@ fn storage_draws_of_a_3d_plane_run_on_its_copy() {
     let back = copies[1].2;
     assert_eq!((back.src_offset, back.dst_offset), ([0; 3], [0, 0, 2]));
 }
+
+/// A set call that binds the value already bound keeps the uploaded table;
+/// any changed value, offset-only changes included, makes it upload again,
+/// and a new encoder's empty bindings always upload.
+#[test]
+fn table_rebind_of_the_bound_value_keeps_the_upload() {
+    let buffer = BufferRef {
+        buffer: Buffer(7),
+        offset: 0,
+        address: 0x1_0000,
+        length: 256,
+    };
+    let table = Slot::from(Stage::Vertex).index();
+    let uploaded = |bindings: &mut Bindings| bindings.tables[table].address = Some(0x40);
+    let clean = |bindings: &Bindings| bindings.tables[table].address.is_some();
+    let mut bindings = Bindings::default();
+    bindings
+        .set_buffer(Stage::Vertex, Some(buffer), 16, 0)
+        .unwrap();
+    bindings
+        .set_texture(Stage::Vertex, ResourceId(3), 1)
+        .unwrap();
+    bindings
+        .set_sampler(Stage::Vertex, ResourceId(5), 2)
+        .unwrap();
+    assert!(!clean(&bindings));
+    uploaded(&mut bindings);
+    bindings
+        .set_buffer(Stage::Vertex, Some(buffer), 16, 0)
+        .unwrap();
+    bindings.set_buffer_offset(Stage::Vertex, 16, 0).unwrap();
+    bindings
+        .set_texture(Stage::Vertex, ResourceId(3), 1)
+        .unwrap();
+    bindings
+        .set_sampler(Stage::Vertex, ResourceId(5), 2)
+        .unwrap();
+    assert!(
+        clean(&bindings),
+        "rebinding the bound values keeps the table"
+    );
+    let changes: [fn(&mut Bindings); 4] = [
+        |b| b.set_buffer_offset(Stage::Vertex, 32, 0).unwrap(),
+        |b| b.set_buffer(Stage::Vertex, None, 0, 0).unwrap(),
+        |b| b.set_texture(Stage::Vertex, ResourceId(4), 1).unwrap(),
+        |b| b.set_sampler(Stage::Vertex, ResourceId(6), 2).unwrap(),
+    ];
+    for change in changes {
+        uploaded(&mut bindings);
+        change(&mut bindings);
+        assert!(!clean(&bindings), "a changed value uploads the table again");
+    }
+    uploaded(&mut bindings);
+    bindings.reset();
+    bindings
+        .set_texture(Stage::Vertex, ResourceId::default(), 1)
+        .unwrap();
+    assert!(!clean(&bindings), "a new encoder's table always uploads");
+}

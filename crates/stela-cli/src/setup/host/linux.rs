@@ -3,9 +3,7 @@
 //! `udisksctl` mounts and unmounts where it runs, `mount` and `umount`
 //! otherwise. Partitions are read and written through `/dev`, and a USB is
 //! erased by writing setup's own layout to its whole disk.
-use super::{
-    Bus, Cpu, Disk, DiskFacts, FileSystem, Host, Partition, PartitionInfo, UsbBluetooth, Volume,
-};
+use super::{Bus, Cpu, Disk, DiskFacts, FileSystem, Host, Partition, PartitionInfo, Volume};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer};
 use std::{
@@ -247,62 +245,7 @@ fn pci_devices(class: u32) -> Result<Vec<(u16, u16)>> {
     Ok(devices)
 }
 
-/// The USB Bluetooth controllers under sysfs directory `devices`
-/// (`/sys/bus/usb/devices`): each device whose interface 0, named
-/// `BUS-PORT:CONFIG.0`, carries the HCI class or Broadcom's vendor one.
-fn usb_bluetooth_in(devices: &Path) -> Result<Vec<UsbBluetooth>> {
-    let field = |path: &Path, name: &str| {
-        fs::read_to_string(path.join(name))
-            .ok()
-            .map(|text| text.trim().to_ascii_lowercase())
-    };
-    let id = |path: &Path, name: &str| {
-        field(path, name).and_then(|text| u16::from_str_radix(&text, 16).ok())
-    };
-    let mut found = Vec::new();
-    let Ok(entries) = fs::read_dir(devices) else {
-        return Ok(found);
-    };
-    for entry in entries {
-        let interface = entry?.path();
-        let Some((device, _)) = interface
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.split_once(':'))
-        else {
-            continue;
-        };
-        let vendor_interface = match (
-            field(&interface, "bInterfaceNumber").as_deref(),
-            field(&interface, "bInterfaceClass").as_deref(),
-            field(&interface, "bInterfaceSubClass").as_deref(),
-            field(&interface, "bInterfaceProtocol").as_deref(),
-        ) {
-            (Some("00"), Some("e0"), Some("01"), Some("01")) => false,
-            (Some("00"), Some("ff"), Some("01"), Some("01")) => true,
-            _ => continue,
-        };
-        let device = devices.join(device);
-        if let (Some(vendor), Some(product)) = (id(&device, "idVendor"), id(&device, "idProduct")) {
-            let controller = UsbBluetooth {
-                vendor,
-                product,
-                vendor_interface,
-            };
-            if !found.contains(&controller) {
-                found.push(controller);
-            }
-        }
-    }
-    found.sort_by_key(|c| (c.vendor, c.product, c.vendor_interface));
-    Ok(found)
-}
-
 impl Host for System {
-    fn bluetooth_controllers(&self) -> Result<Vec<UsbBluetooth>> {
-        usb_bluetooth_in(Path::new("/sys/bus/usb/devices"))
-    }
-
     fn nvidia_gpus(&self) -> Result<Vec<u16>> {
         // Base class 3 is a display controller; an NVIDIA GPU's audio
         // function is not one.
@@ -314,7 +257,7 @@ impl Host for System {
     }
 
     fn network_adapters(&self) -> Result<Vec<(u16, u16)>> {
-        // Base class 2 is a network controller, wired or wireless.
+        // PCI base class 2 includes wired and wireless controllers.
         pci_devices(2)
     }
 
@@ -635,73 +578,6 @@ impl Host for System {
 mod tests {
     use super::super::Removal;
     use super::*;
-
-    #[test]
-    fn sysfs_lists_usb_bluetooth_controllers_by_interface_zero() {
-        let root = tempfile::tempdir().unwrap();
-        let write = |dir: &str, fields: &[(&str, &str)]| {
-            let dir = root.path().join(dir);
-            fs::create_dir_all(&dir).unwrap();
-            for (name, value) in fields {
-                fs::write(dir.join(name), format!("{value}\n")).unwrap();
-            }
-        };
-        let hci = |number| {
-            [
-                ("bInterfaceNumber", number),
-                ("bInterfaceClass", "e0"),
-                ("bInterfaceSubClass", "01"),
-                ("bInterfaceProtocol", "01"),
-            ]
-        };
-        // A MediaTek combo's controller, with its SCO interface 1.
-        write("1-11", &[("idVendor", "13d3"), ("idProduct", "3602")]);
-        write("1-11:1.0", &hci("00"));
-        write("1-11:1.1", &hci("01"));
-        // A Broadcom module on its vendor-class interface.
-        write("1-4", &[("idVendor", "0a5c"), ("idProduct", "21E8")]);
-        write(
-            "1-4:1.0",
-            &[
-                ("bInterfaceNumber", "00"),
-                ("bInterfaceClass", "ff"),
-                ("bInterfaceSubClass", "01"),
-                ("bInterfaceProtocol", "01"),
-            ],
-        );
-        // A keyboard, and a hub without interfaces of its own.
-        write("1-10", &[("idVendor", "046d"), ("idProduct", "c539")]);
-        write(
-            "1-10:1.0",
-            &[
-                ("bInterfaceNumber", "00"),
-                ("bInterfaceClass", "03"),
-                ("bInterfaceSubClass", "01"),
-                ("bInterfaceProtocol", "01"),
-            ],
-        );
-        write("usb1", &[("idVendor", "1d6b"), ("idProduct", "0002")]);
-        assert_eq!(
-            usb_bluetooth_in(root.path()).unwrap(),
-            [
-                UsbBluetooth {
-                    vendor: 0x0a5c,
-                    product: 0x21e8,
-                    vendor_interface: true,
-                },
-                UsbBluetooth {
-                    vendor: 0x13d3,
-                    product: 0x3602,
-                    vendor_interface: false,
-                },
-            ]
-        );
-        assert!(
-            usb_bluetooth_in(&root.path().join("absent"))
-                .unwrap()
-                .is_empty()
-        );
-    }
 
     #[test]
     fn lsblk_old_and_new_formats_name_esps_and_removable_disks() {

@@ -74,6 +74,85 @@ impl Chip {
     pub fn from_boot0(boot0: u32) -> Option<&'static Chip> {
         Self::find(((boot0 >> 20) & 0x1ff) as u16)
     }
+
+    /// nouveau gives this chipset a devinit subdev whose post waits for the
+    /// GPU's own firmware boot (`tu102_devinit_post`, also `ga100_devinit`):
+    /// Turing, Ampere and Ada. Their VBIOS is read (`nvkm_bios_new`) before
+    /// that wait. Hopper and Blackwell have neither subdev; FSP boots them.
+    pub fn waits_for_firmware_boot(&self) -> bool {
+        matches!(self.architecture, Turing | Ampere | Ada)
+    }
+}
+
+/// The firmware boot ("GFW boot") a Turing-to-Ada GPU's own falcon runs
+/// after every reset: devinit from the VBIOS, which also places the VBIOS
+/// image the PRAMIN shadow reads. nouveau waits for it in
+/// `nvkm/subdev/devinit/tu102.c` `tu102_devinit_wait`, after the VBIOS read,
+/// which is safe on Linux only because nothing reset the GPU since power-on.
+/// Stela resets the function first, so it waits here, before nouveau runs.
+pub mod firmware_boot {
+    /// `NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK`: bit 0 set once
+    /// the progress register below may be read.
+    pub const PRIV_LEVEL_MASK: usize = 0x11_8128;
+    /// `NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT`: bits 7:0 are the
+    /// progress, [`COMPLETED`] when devinit has finished.
+    pub const PROGRESS: usize = 0x11_8234;
+    pub const COMPLETED: u32 = 0xff;
+    /// nouveau's bound: `50 + 2000` polls, each after `usleep_range(1000,
+    /// 2000)`, so at least 2.05 s.
+    pub const POLLS: u32 = 2051;
+    pub const POLL_MICROS: u64 = 1000;
+
+    /// What the two registers last held.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Reading {
+        pub priv_level_mask: u32,
+        pub progress: u32,
+        /// Polls taken, at most [`POLLS`].
+        pub polls: u32,
+    }
+
+    impl Reading {
+        pub fn completed(&self) -> bool {
+            self.priv_level_mask & 1 != 0 && self.progress & 0xff == COMPLETED
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Error<E> {
+        /// A register read or the timer failed.
+        Access(E),
+        /// The firmware boot did not complete within nouveau's bound.
+        Timeout(Reading),
+    }
+
+    /// Poll `read` (a BAR0 register read) until the firmware boot completes,
+    /// sleeping `sleep` microseconds between polls, at most [`POLLS`] times.
+    pub fn wait<E>(
+        mut read: impl FnMut(usize) -> Result<u32, E>,
+        mut sleep: impl FnMut(u64) -> Result<(), E>,
+    ) -> Result<Reading, Error<E>> {
+        let mut reading = Reading {
+            priv_level_mask: 0,
+            progress: 0,
+            polls: 0,
+        };
+        loop {
+            reading.polls += 1;
+            reading.priv_level_mask = read(PRIV_LEVEL_MASK).map_err(Error::Access)?;
+            // As nouveau: the progress is only meaningful once readable.
+            if reading.priv_level_mask & 1 != 0 {
+                reading.progress = read(PROGRESS).map_err(Error::Access)?;
+            }
+            if reading.completed() {
+                return Ok(reading);
+            }
+            if reading.polls >= POLLS {
+                return Err(Error::Timeout(reading));
+            }
+            sleep(POLL_MICROS).map_err(Error::Access)?;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -89,5 +168,91 @@ mod tests {
         }
         assert_eq!(Chip::from_boot0(u32::MAX), None);
         assert_eq!(Chip::from_boot0(0), None);
+    }
+
+    #[test]
+    fn only_the_chips_nouveau_posts_wait_for_their_firmware_boot() {
+        let waits = |chipset| Chip::find(chipset).unwrap().waits_for_firmware_boot();
+        // TU117 (GTX 16), GA104 (RTX 30), AD107 (RTX 4060).
+        assert!(waits(0x167) && waits(0x174) && waits(0x197));
+        // GH100 and GB203 (RTX 5080) have no devinit subdev.
+        assert!(!waits(0x180) && !waits(0x1b3));
+    }
+
+    #[test]
+    fn the_firmware_boot_wait_reads_progress_only_once_readable() {
+        use firmware_boot::*;
+        let mut reads = alloc::vec::Vec::new();
+        let poll = core::cell::Cell::new(0);
+        let mut slept = 0;
+        let reading = wait::<()>(
+            |offset| {
+                reads.push(offset);
+                Ok(match offset {
+                    PRIV_LEVEL_MASK if poll.get() < 2 => 0,
+                    PRIV_LEVEL_MASK => 1,
+                    PROGRESS if poll.get() < 4 => 0x7f,
+                    _ => 0x1ff,
+                })
+            },
+            |micros| {
+                assert_eq!(micros, POLL_MICROS);
+                poll.set(poll.get() + 1);
+                slept += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(slept, 4);
+        assert_eq!(
+            reading,
+            Reading {
+                priv_level_mask: 1,
+                progress: 0x1ff,
+                polls: 5
+            }
+        );
+        // Two locked polls read the mask alone.
+        assert_eq!(
+            reads[..3],
+            [PRIV_LEVEL_MASK, PRIV_LEVEL_MASK, PRIV_LEVEL_MASK]
+        );
+        assert_eq!(reads.len(), 2 + 3 * 2);
+    }
+
+    #[test]
+    fn the_firmware_boot_wait_ends_at_nouveaus_bound_with_what_it_read() {
+        use firmware_boot::*;
+        let mut slept = 0u32;
+        let error = wait::<()>(
+            |offset| Ok(if offset == PRIV_LEVEL_MASK { 1 } else { 0x42 }),
+            |_| {
+                slept += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            Error::Timeout(Reading {
+                priv_level_mask: 1,
+                progress: 0x42,
+                polls: POLLS
+            })
+        );
+        assert_eq!(slept, POLLS - 1);
+        // A failed read ends it at once.
+        let mut sleeps = 0;
+        assert_eq!(
+            wait(
+                |_| Err::<u32, _>("bar"),
+                |_| {
+                    sleeps += 1;
+                    Ok(())
+                }
+            ),
+            Err(Error::Access("bar"))
+        );
+        assert_eq!(sleeps, 0);
     }
 }

@@ -35,8 +35,9 @@ fn equal_opcode(lane: u8) -> Host {
         _ => unreachable!(),
     }
 }
-fn select_minmax(code: &mut Code, lane: u8, signed: bool, maximum: bool, target: TargetCpu) {
-    let native = match (signed, maximum, lane) {
+/// The host min/max of `lane`-byte lanes, which may need SSE4.1.
+fn native_minmax(lane: u8, signed: bool, maximum: bool) -> Host {
+    match (signed, maximum, lane) {
         (false, false, 1) => Host::MinUnsignedByte,
         (false, true, 1) => Host::MaxUnsignedByte,
         (true, false, 2) => Host::MinSignedWord,
@@ -50,7 +51,11 @@ fn select_minmax(code: &mut Code, lane: u8, signed: bool, maximum: bool, target:
         (false, false, 4) => Host::MinUnsignedDword,
         (false, true, 4) => Host::MaxUnsignedDword,
         _ => unreachable!("allocated min/max lane"),
-    };
+    }
+}
+
+fn select_minmax(code: &mut Code, lane: u8, signed: bool, maximum: bool, target: TargetCpu) {
+    let native = native_minmax(lane, signed, maximum);
     if target >= native.requires() {
         native.register(code, 0, 1, target);
         return;
@@ -387,6 +392,33 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, target: TargetCpu) {
         ) && vector_extensions::leading_supported(lane_bytes, target))
     {
         code.asm().vzeroupper();
+    }
+    if let Kind::Combine {
+        operation: operation @ (Combine::Minimum { .. } | Combine::Maximum { .. }),
+        shape: Shape::Lanes,
+    } = kind
+        && lane_bytes <= 4
+    {
+        let (signed, maximum) = match operation {
+            Combine::Minimum { signed } => (signed, false),
+            Combine::Maximum { signed } => (signed, true),
+            _ => unreachable!(),
+        };
+        let native = native_minmax(lane_bytes, signed, maximum);
+        if target >= native.requires() {
+            // One PMIN/PMAX from the sources where they are.
+            let left = super::vector_source(code, left, 0);
+            let right = super::vector_source(code, right, 1);
+            if bytes == 16 {
+                let destination = super::vector_destination(code, destination, 0);
+                super::binary(code, native, destination, left, right, true, target);
+            } else {
+                super::three::three(code, native, 0, left, right, target);
+                let destination = super::vector_destination(code, destination, 0);
+                super::finish_from(code, destination, 0, 8);
+            }
+            return;
+        }
     }
     if !matches!(
         kind,

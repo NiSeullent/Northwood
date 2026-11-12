@@ -105,6 +105,17 @@ pub fn system_key(word: u32) -> u32 {
     }
 }
 
+/// Whether [`SystemExits`] key `key` is a floating-point exit's word, which
+/// the engine charges by the whole word next to the System keys; no System
+/// key decodes as numerical FP.
+pub fn numerical_key(key: u32) -> bool {
+    key != DEVICE_SITE_KEY
+        && matches!(
+            stela_compiler::aarch64::FloatingPointOperation::decode(key),
+            Some(Ok(_))
+        )
+}
+
 /// A short name of [`system_key`] `key` for reports: the accessor's for
 /// MRS, MSR, SYS and SYSL (`MRS_TPIDR_EL1`, `TLBI_VAE1IS`), else the
 /// operation's kind and the key (`Exception.ExceptionReturn:0xd69f03e0`).
@@ -112,6 +123,11 @@ pub fn system_key_name(key: u32) -> alloc::string::String {
     use stela_compiler::aarch64::system::registers::{self, Direction};
     if key == DEVICE_SITE_KEY {
         return "device-site".into();
+    }
+    if let Some(Ok(operation)) = stela_compiler::aarch64::FloatingPointOperation::decode(key) {
+        let debug = alloc::format!("{operation:?}");
+        let kind = debug.split(['(', ' ', '{']).next().unwrap_or("FP");
+        return alloc::format!("{kind}:{key:#010x}");
     }
     let word = if key >> 24 == 0xd5 { key | 0x1f } else { key };
     let access = registers::decode(word)
@@ -178,16 +194,84 @@ impl SystemExit {
 
 /// System exits by [`system_key`] since they were last taken, under step
 /// timing: an open-addressed table, with the keys past its size in `other`;
-/// and the device accesses the engine completed.
+/// the device accesses the engine completed; and the floating-point exits
+/// by what their completion found ([`FloatingReason`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemExits {
     pub entries: [SystemExit; SYSTEM_KEYS],
     pub other: SystemExit,
     pub devices: DeviceExits,
+    pub floating: [u64; FloatingReason::COUNT],
 }
 
-/// The keys [`SystemExits`] holds apart.
-pub const SYSTEM_KEYS: usize = 128;
+/// What the software completion of a floating-point exit found, which names
+/// the guard that sent it there: an enabled trap (FPCR's enables, which every
+/// recipe sends to the helper), the first fresh FPSR flag in Arm's order
+/// (invalid: NaN or invalid operation; divide by zero; overflow; underflow: a
+/// tiny result; input denormal flushed), inexact alone, no flag (exact: a
+/// signed zero, an infinity, a quiet NaN, a subnormal input or result that
+/// was exact, or a form without an inline recipe), and apart from those, how
+/// many ran with FZ, FZ16, FIZ, AH or DN set (`Mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatingReason {
+    Trap,
+    Invalid,
+    Divide,
+    Overflow,
+    Underflow,
+    Denormal,
+    Inexact,
+    Exact,
+    Mode,
+}
+
+impl FloatingReason {
+    pub const COUNT: usize = Self::Mode as usize + 1;
+    pub const NAMES: [&'static str; Self::COUNT] = [
+        "trap",
+        "invalid",
+        "divide",
+        "overflow",
+        "underflow",
+        "denormal",
+        "inexact",
+        "exact",
+        "mode",
+    ];
+
+    /// The reason of a completion with fresh cumulative flags `fresh`
+    /// (FPSR's bit layout) that trapped (`trapped`) or not under `fpcr`.
+    pub fn of(fpcr: u32, fresh: u32, trapped: bool) -> Self {
+        use stela_compiler::aarch64::floating::FPCR_EXCEPTION_ENABLE_MASK;
+        const FLAGS: [(u32, FloatingReason); 6] = [
+            (1 << 0, FloatingReason::Invalid),
+            (1 << 1, FloatingReason::Divide),
+            (1 << 2, FloatingReason::Overflow),
+            (1 << 3, FloatingReason::Underflow),
+            (1 << 7, FloatingReason::Denormal),
+            (1 << 4, FloatingReason::Inexact),
+        ];
+        if trapped || fpcr & FPCR_EXCEPTION_ENABLE_MASK != 0 {
+            return Self::Trap;
+        }
+        FLAGS
+            .iter()
+            .find(|(flag, _)| fresh & flag != 0)
+            .map_or(Self::Exact, |&(_, reason)| reason)
+    }
+
+    /// Whether `fpcr` selects a flushing or alternative mode.
+    pub fn moded(fpcr: u32) -> bool {
+        use stela_compiler::aarch64::floating::{FPCR_AH, FPCR_DN, FPCR_FIZ, FPCR_FZ, FPCR_FZ16};
+        fpcr & (FPCR_FZ | FPCR_FZ16 | FPCR_FIZ | FPCR_AH | FPCR_DN) != 0
+    }
+}
+
+/// The keys [`SystemExits`] holds apart. The report merges every PE's into
+/// one table each beat, and a process spawn alone exits on well over 128
+/// keys machine-wide: with 128 the costliest of them landed in `other`
+/// (12-18 ms of exit time per spawn, unnamed).
+pub const SYSTEM_KEYS: usize = 512;
 
 impl Default for SystemExits {
     fn default() -> Self {
@@ -195,6 +279,7 @@ impl Default for SystemExits {
             entries: [SystemExit::default(); SYSTEM_KEYS],
             other: SystemExit::default(),
             devices: DeviceExits::default(),
+            floating: [0; FloatingReason::COUNT],
         }
     }
 }
@@ -224,6 +309,9 @@ impl SystemExits {
         let other = exits.other;
         self.other.add(other.count, other.ticks, other.closes);
         self.devices.merge(&exits.devices);
+        for (count, more) in self.floating.iter_mut().zip(exits.floating) {
+            *count += more;
+        }
     }
 
     /// The keys with exits.
@@ -232,7 +320,10 @@ impl SystemExits {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.other.count == 0 && self.counted().next().is_none() && self.devices.is_empty()
+        self.other.count == 0
+            && self.counted().next().is_none()
+            && self.devices.is_empty()
+            && self.floating.iter().all(|&count| count == 0)
     }
 }
 
@@ -1059,6 +1150,77 @@ mod tests {
         assert_eq!((key(0xd538_d080).count, key(0xd538_d080).closes), (1, 0));
         assert_eq!((key(0xd518_c000).count, key(0xd518_c000).closes), (1, 1));
         assert!(machine.take_system_exits().is_empty());
+    }
+
+    /// A floating-point exit is charged to its whole word, which the report
+    /// tells from System keys, and stays out of the System words.
+    #[test]
+    fn a_floating_point_exit_is_charged_to_its_word() {
+        use super::super::tests::BASE;
+        const FADD_S0_S1_S2: u32 = 0x1e22_2820;
+        const FCVTNU_8H: u32 = 0x6e79_aa67;
+        let mut machine = super::super::tests::machine(&[FADD_S0_S1_S2]);
+        machine.set_step_timing(true);
+        // FP/SIMD enabled at EL1 (CPACR_EL1.FPEN).
+        machine
+            .cpu
+            .registers
+            .set(crate::machine::system::Register::CPACR_EL1, 0, 0b11 << 20);
+        machine.host.exits.push(super::super::NativeExit::Exit {
+            next_pc: BASE,
+            kind: stela_compiler::block::ExitKind::FloatingPoint as u64,
+        });
+        machine.step().unwrap();
+        assert_eq!(machine.cpu.pc, BASE + 4);
+        let slot = stela_compiler::block::ExitKind::FloatingPoint as usize;
+        assert_eq!(machine.step_timing().unwrap().exits[slot].0, 1);
+        let exits = machine.take_system_exits();
+        let exit = *exits
+            .counted()
+            .find(|exit| exit.key == FADD_S0_S1_S2)
+            .unwrap();
+        assert_eq!(exit.count, 1);
+        assert!(numerical_key(FADD_S0_S1_S2) && numerical_key(FCVTNU_8H));
+        assert!(!numerical_key(0xd538_d080) && !numerical_key(DEVICE_SITE_KEY));
+        assert!(system_key_name(FCVTNU_8H).ends_with(":0x6e79aa67"));
+        assert!(!machine.system_words().contains_key(&FADD_S0_S1_S2));
+        // Zeros add exactly: no fresh flag.
+        assert_eq!(exits.floating[FloatingReason::Exact as usize], 1);
+        assert_eq!(exits.floating.iter().sum::<u64>(), 1);
+    }
+
+    /// The reason counter keeps FPSR as the completion leaves it: earlier
+    /// flags stay, fresh ones are added, and the first fresh one names it.
+    #[test]
+    fn a_floating_point_exit_reason_keeps_fpsr() {
+        use super::super::tests::BASE;
+        const FDIV_S0_S1_S2: u32 = 0x1e22_1820;
+        const INEXACT: u32 = 1 << 4;
+        let mut machine = super::super::tests::machine(&[FDIV_S0_S1_S2]);
+        machine.set_step_timing(true);
+        machine
+            .cpu
+            .registers
+            .set(crate::machine::system::Register::CPACR_EL1, 0, 0b11 << 20);
+        machine.cpu.state.fpsr = INEXACT;
+        // 1 / 0: divide by zero.
+        machine.cpu.state.v[1] = [0x3f80_0000, 0];
+        machine.host.exits.push(super::super::NativeExit::Exit {
+            next_pc: BASE,
+            kind: stela_compiler::block::ExitKind::FloatingPoint as u64,
+        });
+        machine.step().unwrap();
+        assert_eq!(machine.cpu.state.fpsr, INEXACT | 1 << 1);
+        assert_eq!(machine.cpu.state.v[0][0], 0x7f80_0000);
+        let exits = machine.take_system_exits();
+        assert_eq!(exits.floating[FloatingReason::Divide as usize], 1);
+        assert_eq!(FloatingReason::of(0, 0x11, false), FloatingReason::Invalid);
+        assert_eq!(FloatingReason::of(1 << 8, 0, false), FloatingReason::Trap);
+        assert_eq!(
+            FloatingReason::of(0, 0x18, false),
+            FloatingReason::Underflow
+        );
+        assert_eq!(FloatingReason::of(0, 0x10, false), FloatingReason::Inexact);
     }
 
     /// Busy phases go to the guest level they were charged at, the kernel

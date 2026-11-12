@@ -311,4 +311,48 @@ mod tests {
         assert_eq!(conflict, Err(MemoryError::CacheAttributeUnavailable));
         assert_eq!(observation.attempts, 0);
     }
+
+    /// Intel desktop layouts: WB default with a UC PCI hole (common on
+    /// Alder/Raptor Lake boards), and a UC default whose WB ranges stop
+    /// short of the top of a 96 GiB memory (DDR5 48 GiB modules).
+    #[test]
+    fn intel_desktop_mtrr_layouts_decide_exactly() {
+        let hole = Policy {
+            enabled: true,
+            caches_enabled: true,
+            default_kind: WRITE_BACK,
+            physical_bits: 39,
+        };
+        let uc = |range: Range<u64>| Variable { range, kind: 0 };
+        let wb = |range: Range<u64>| Variable {
+            range,
+            kind: WRITE_BACK,
+        };
+        let pci = [uc(0x8000_0000..0x1_0000_0000)];
+        assert!(check_policy(&hole, 0x1_0000_0000, 32 << 20, &pci).is_ok());
+        assert!(check_policy(&hole, 0x7000_0000, 32 << 20, &pci).is_ok());
+        assert!(check_policy(&hole, 0x7ff0_0000, 2 << 20, &pci).is_err());
+        let short = Policy {
+            default_kind: 0,
+            ..hole
+        };
+        let cover = [
+            wb(0..64 << 30),
+            wb(64 << 30..80 << 30),
+            uc(0x8000_0000..0x1_0000_0000),
+        ];
+        assert!(check_policy(&short, 40 << 30, 32 << 20, &cover).is_ok());
+        assert!(check_policy(&short, (64 << 30) - (16 << 20), 32 << 20, &cover).is_ok());
+        assert!(check_policy(&short, 88 << 30, 32 << 20, &cover).is_err());
+        assert!(check_policy(&short, (80 << 30) - (16 << 20), 32 << 20, &cover).is_err());
+        // WT over WB is WT, never WB.
+        let mixed = [
+            wb(0..64 << 30),
+            Variable {
+                range: 8 << 30..9 << 30,
+                kind: 4,
+            },
+        ];
+        assert!(check_policy(&short, 8 << 30, 4096, &mixed).is_err());
+    }
 }

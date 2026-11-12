@@ -40,6 +40,10 @@ pub struct DmaBuffer {
 enum BufferMemory {
     // Compatibility with RegionAllocator's explicitly unsafe identity contract.
     Identity(u64),
+    // A RegionAllocator whose CPU view of bus address `bus` is at
+    // `bus + offset` (wrapping), such as the engine's physmap, which every
+    // engine page-table root maps.
+    Window { bus: u64, offset: u64 },
     Domain(triomphe::Arc<allocator::Allocation>),
 }
 
@@ -58,6 +62,7 @@ impl DmaBuffer {
     pub fn bus_address(&self) -> u64 {
         match &self.memory {
             BufferMemory::Identity(address) => *address,
+            BufferMemory::Window { bus, .. } => *bus,
             BufferMemory::Domain(allocation) => allocation.bus_address(),
         }
     }
@@ -79,6 +84,7 @@ impl DmaBuffer {
     pub fn as_ptr(&self) -> *mut u8 {
         match &self.memory {
             BufferMemory::Identity(address) => *address as *mut u8,
+            BufferMemory::Window { bus, offset } => bus.wrapping_add(*offset) as *mut u8,
             BufferMemory::Domain(allocation) => allocation.cpu_address(self.bytes),
         }
     }
@@ -214,6 +220,9 @@ pub struct RegionAllocator {
     untouched: Vec<Range<u64>>,
     /// The released ranges, sorted, disjoint and never adjacent.
     free: Vec<Range<u64>>,
+    /// What is added to a bus address to reach its CPU view: zero for
+    /// identity-mapped memory.
+    offset: u64,
 }
 
 /// Why [`RegionAllocator::release`] refused a buffer, which it hands back.
@@ -226,14 +235,46 @@ impl RegionAllocator {
     /// `region` must be RAM that only this allocator hands out, mapped
     /// writable at the same address, and reachable by every device's DMA.
     pub unsafe fn new(region: Range<u64>) -> Self {
+        // SAFETY: forwarded; an identity view is offset zero.
+        unsafe { Self::with_cpu_offset(region, 0) }
+    }
+
+    /// An allocator whose buffers the CPU reaches at their bus address plus
+    /// `offset` (wrapping), not at the bus address itself: memory mapped
+    /// through a window that every page-table root of its users keeps,
+    /// rather than an identity map only some roots keep.
+    ///
+    /// # Safety
+    ///
+    /// `region` must be RAM that only this allocator hands out, reachable
+    /// by every device's DMA at those addresses, and mapped writable at
+    /// `address + offset` for every `address` in it, in every context that
+    /// uses a buffer.
+    pub unsafe fn with_cpu_offset(region: Range<u64>, offset: u64) -> Self {
         let mut allocator = Self {
             regions: Vec::new(),
             untouched: Vec::new(),
             free: Vec::new(),
+            offset,
         };
         // SAFETY: forwarded.
         unsafe { allocator.add(region) };
         allocator
+    }
+
+    /// An allocator over all of `buffer`, whose buffers keep its CPU view:
+    /// a driver's own arena carved from a buffer another allocator gave.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` is kept for as long as this allocator's buffers are used,
+    /// and nothing else uses its memory.
+    pub unsafe fn within(buffer: &DmaBuffer) -> Self {
+        let bus = buffer.bus_address();
+        let offset = (buffer.as_ptr() as u64).wrapping_sub(bus);
+        // SAFETY: a live DMA buffer, contiguous in bus and CPU addresses,
+        // whose exclusive use the caller passes on.
+        unsafe { Self::with_cpu_offset(bus..bus + buffer.len() as u64, offset) }
     }
 
     /// Grow by `region`. An empty region or one that overlaps a region
@@ -284,8 +325,10 @@ impl RegionAllocator {
     /// device was told to forget it (its slot disabled, its queue deleted or
     /// its controller halted). No copy of its CPU pointer is used again.
     pub unsafe fn release(&mut self, buffer: DmaBuffer) -> Result<(), ReleaseRefused> {
-        let BufferMemory::Identity(start) = buffer.memory else {
-            return Err(ReleaseRefused(buffer));
+        let start = match buffer.memory {
+            BufferMemory::Identity(start) if self.offset == 0 => start,
+            BufferMemory::Window { bus, offset } if offset == self.offset && offset != 0 => bus,
+            _ => return Err(ReleaseRefused(buffer)),
         };
         let Some(end) = start.checked_add(buffer.bytes as u64) else {
             return Err(ReleaseRefused(buffer));
@@ -361,10 +404,11 @@ impl DmaAllocator for RegionAllocator {
             range.start = start + bytes64;
             start
         };
-        let mut buffer = DmaBuffer {
-            memory: BufferMemory::Identity(start),
-            bytes,
+        let memory = match self.offset {
+            0 => BufferMemory::Identity(start),
+            offset => BufferMemory::Window { bus: start, offset },
         };
+        let mut buffer = DmaBuffer { memory, bytes };
         buffer.bytes_mut().fill(0);
         Ok(buffer)
     }
@@ -581,5 +625,70 @@ mod tests {
                 .is_err()
         );
         assert_eq!(backing, original);
+    }
+
+    /// A window allocator's buffers carry bus addresses for the device and
+    /// reach memory only through the CPU view; an identity allocator never
+    /// takes one of them back, nor the reverse.
+    #[test]
+    fn a_window_allocator_reaches_memory_only_through_its_cpu_view() {
+        const OFFSET: u64 = 0x1000_0000_0000;
+        let mut backing: Vec<u64> = vec![u64::MAX; 1024];
+        let cpu = backing.as_mut_ptr() as u64;
+        let bus = cpu.wrapping_sub(OFFSET);
+        // SAFETY: the vector outlives the allocator and nothing else uses it;
+        // the bus addresses are never dereferenced.
+        let mut allocator = unsafe { RegionAllocator::with_cpu_offset(bus..bus + 8192, OFFSET) };
+        let mut buffer = allocator.allocate(64, 64).unwrap();
+        assert_eq!(buffer.bus_address() % 64, 0);
+        assert!((bus..bus + 8192).contains(&buffer.bus_address()));
+        assert_eq!(
+            buffer.as_ptr() as u64,
+            buffer.bus_address().wrapping_add(OFFSET)
+        );
+        assert!(buffer.bytes().iter().all(|byte| *byte == 0));
+        buffer.write(4, 0x5a5a_1234u32);
+        assert_eq!(buffer.read::<u32>(4), 0x5a5a_1234);
+        let mut identity_backing: Vec<u64> = vec![0; 1024];
+        let (_, mut identity) = region(&mut identity_backing);
+        // SAFETY: refused before any effect.
+        let buffer = unsafe { identity.release(buffer) }.unwrap_err().0;
+        let other = identity.allocate(64, 64).unwrap();
+        // SAFETY: refused before any effect.
+        assert!(unsafe { allocator.release(other) }.is_err());
+        let total = allocator.remaining();
+        // SAFETY: no device was given the buffer.
+        unsafe { allocator.release(buffer) }.unwrap();
+        assert_eq!(allocator.remaining(), total + 64);
+    }
+
+    /// An arena carved from a window buffer keeps that buffer's CPU view.
+    #[test]
+    fn an_arena_within_a_buffer_keeps_its_cpu_view() {
+        const OFFSET: u64 = 0x2000_0000_0000;
+        let mut backing: Vec<u64> = vec![0; 2048];
+        let cpu = backing.as_mut_ptr() as u64;
+        let bus = cpu.wrapping_sub(OFFSET);
+        // SAFETY: as in the test above.
+        let mut outer = unsafe { RegionAllocator::with_cpu_offset(bus..bus + 16384, OFFSET) };
+        let arena = outer.allocate(4096, 4096).unwrap();
+        // SAFETY: the arena is kept below and used by nothing else.
+        let mut inner = unsafe { RegionAllocator::within(&arena) };
+        let mut piece = inner.allocate(128, 64).unwrap();
+        assert!(piece.bus_address() >= arena.bus_address());
+        assert_eq!(
+            piece.as_ptr() as u64,
+            piece.bus_address().wrapping_add(OFFSET)
+        );
+        piece.write(0, 7u64);
+        let at = (piece.bus_address() - arena.bus_address()) as usize;
+        assert_eq!(arena.read::<u64>(at), 7);
+        let mut identity_backing: Vec<u64> = vec![0; 512];
+        let (_, mut identity) = region(&mut identity_backing);
+        let plain = identity.allocate(512, 64).unwrap();
+        let start = plain.bus_address();
+        // SAFETY: as above.
+        let mut nested = unsafe { RegionAllocator::within(&plain) };
+        assert_eq!(nested.allocate(8, 8).unwrap().as_ptr() as u64, start);
     }
 }

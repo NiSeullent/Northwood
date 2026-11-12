@@ -342,7 +342,12 @@ fn receive_drops_errors_oversize_and_entire_fragment_chains() {
     fixture.inject(2, 60, RX_DONE | RX_EOP, 1, 3); // bad FCS
     fixture.inject(3, 4096, RX_DONE | RX_EOP, 0, 4); // don't slice out of bounds
     fixture.inject(4, 60, RX_DONE | RX_EOP, 0, 5);
-    assert_eq!(fixture.net.receive().unwrap(), Some(vec![5; 60]));
+    // The stack's reused buffer takes only the good frame, in place.
+    let mut reused = Vec::with_capacity(MAX_FRAME);
+    let storage = reused.as_ptr();
+    assert_eq!(fixture.net.receive_reusing(&mut reused), Ok(true));
+    assert_eq!(reused, vec![5; 60]);
+    assert_eq!(reused.as_ptr(), storage);
     assert_eq!(fixture.net.receive.next, 5);
     // The tail waits for a batch, or for the ring to run dry.
     assert_eq!(fixture.registers[RDT / 4], (DESCRIPTORS - 1) as u32);

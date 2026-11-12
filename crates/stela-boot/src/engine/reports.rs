@@ -222,6 +222,9 @@ pub(super) struct WordsDiff {
     words: BTreeMap<u32, u64>,
     after: Option<u32>,
     top: Vec<(u64, u32)>,
+    /// Whether `words` came from a walk of the blocks: without `--profile`
+    /// the beat skips it ([`Self::unwalked`]).
+    walked: bool,
 }
 
 impl WordsDiff {
@@ -231,6 +234,18 @@ impl WordsDiff {
             words,
             after: None,
             top: Vec::new(),
+            walked: true,
+        }
+    }
+
+    /// No walk this beat: `last` is [`ExitsSeen::words`], kept as it is, so
+    /// no word shows a change and the next walk compares with the last one.
+    pub(super) fn unwalked(last: BTreeMap<u32, u64>) -> Self {
+        Self {
+            words: last,
+            after: None,
+            top: Vec::new(),
+            walked: false,
         }
     }
 }
@@ -241,6 +256,9 @@ impl ExitsSeen {
     /// `more` every 256 words; whether every word was compared.
     pub(super) fn diff_step(&self, diff: &mut WordsDiff, mut more: impl FnMut() -> bool) -> bool {
         use core::ops::Bound::{Excluded, Unbounded};
+        if !diff.walked {
+            return true;
+        }
         let start = diff.after.map_or(Unbounded, Excluded);
         let mut last = self.words.range((start, Unbounded)).peekable();
         for (compared, (&word, &count)) in diff.words.range((start, Unbounded)).enumerate() {
@@ -288,7 +306,12 @@ impl ExitsSeen {
             statistics.table_base_changes,
             statistics.code_invalidations,
         ];
-        let WordsDiff { words, mut top, .. } = diff;
+        let WordsDiff {
+            words,
+            mut top,
+            walked,
+            ..
+        } = diff;
         // Only the shown words in order; the rest only add to the share.
         if top.len() > SHOWN {
             top.select_nth_unstable_by(SHOWN, |a, b| b.cmp(a));
@@ -333,6 +356,11 @@ impl ExitsSeen {
         for (index, (now, last)) in transitions.iter().zip(&self.transitions).enumerate() {
             let separator = if index == 0 { " native=" } else { "," };
             output::arguments(format_args!("{separator}{}", now - last));
+        }
+        if !walked {
+            // The walk of every block for the exits by word runs with
+            // `--profile` only.
+            output::arguments(format_args!(" words=profile-only"));
         }
         // The share of the exits by word the shown words make up.
         let counted: u64 = top.iter().map(|&(count, _)| count).sum();
@@ -486,6 +514,56 @@ pub(super) fn stack_report<H: Host>(machine: &mut Machine<H, parallel::Board>) {
     text_report(machine);
 }
 
+/// The format strings another PE's stack points to, from its last
+/// materialized SP up: a PE inside `panic` keeps the panic's format and
+/// arguments in its frames even when the console never prints them (a PE
+/// that never answers the debugger cross-call holds it back). Only words
+/// that point to at least 12 printable characters with a `%` are shown,
+/// three per PE from 128 words.
+pub(super) fn stack_text_report<H: Host>(
+    machine: &mut Machine<H, parallel::Board>,
+    pe: usize,
+    sp: u64,
+) {
+    const WORDS: u64 = 128;
+    const SHOWN: usize = 3;
+    const LIMIT: usize = 160;
+    let mut shown = 0;
+    for word in 0..WORDS {
+        let mut value = [0u8; 8];
+        if !machine.read_virtual(sp.wrapping_add(word * 8), &mut value) {
+            break;
+        }
+        let address = u64::from_le_bytes(value);
+        if address >> 48 != 0xffff {
+            continue;
+        }
+        let mut text = Vec::new();
+        'read: while text.len() < LIMIT {
+            let mut byte = [0u8; 1];
+            if !machine.read_virtual(address.wrapping_add(text.len() as u64), &mut byte) {
+                break;
+            }
+            let byte = byte[0];
+            if byte == 0 || !(byte.is_ascii_graphic() || b" \t\n".contains(&byte)) {
+                break 'read;
+            }
+            text.push(byte);
+        }
+        if text.len() >= 12 && text.contains(&b'%') {
+            let text = core::str::from_utf8(&text).expect("ASCII");
+            output::arguments(format_args!(
+                "PE {pe} STACK TEXT sp+{:#x} {address:#x}: {text:?}\n",
+                word * 8
+            ));
+            shown += 1;
+            if shown == SHOWN {
+                break;
+            }
+        }
+    }
+}
+
 /// The text a general-purpose register points to, when it reads as at least
 /// eight printable characters: a guest's panic message often sits in one at
 /// a stop, while the console that would print it is off.
@@ -529,6 +607,9 @@ pub(super) struct Drained {
     pub(super) smc: Vec<stela_soc::machine::SmcWriteLog>,
     pub(super) display: Vec<stela_soc::machine::DisplayLog>,
     pub(super) power: Vec<stela_soc::machine::PowerLog>,
+    /// The watchdog mechanism's arms and disarms, and how many more were
+    /// not kept.
+    pub(super) watchdog: (Vec<stela_soc::wdt::MechanismEvent>, u32),
 }
 
 impl Drained {
@@ -561,9 +642,61 @@ impl Drained {
             smc: core::iter::from_fn(|| devices.take_smc_log()).collect(),
             display: core::iter::from_fn(|| devices.take_display_log()).collect(),
             power: core::iter::from_fn(|| devices.take_power_log()).collect(),
+            watchdog: devices.take_watchdog_mechanism_log(),
         }
     }
 }
+
+/// One line per watchdog mechanism write: XNU arms it on its halt, restart
+/// and panic path, so the arm dates the start of a reset that follows. The
+/// writing PE's pc and lr are its last materialized ones, close to the write
+/// but not exact.
+pub(super) fn watchdog_report<H: Host>(
+    machine: &Machine<H, parallel::Board>,
+    (events, dropped): (Vec<stela_soc::wdt::MechanismEvent>, u32),
+) {
+    let hub = machine.devices.hub();
+    for event in events {
+        let (pc, lr) = hub
+            .source_observation(event.cpu)
+            .map_or((0, 0), |observed| (observed.source.pc, observed.source.lr));
+        // XNU moves the deadline forward every few seconds while it is well; only
+        // an arm whose margin differs from the last one is news.
+        if let Some(seconds) = event.deadline {
+            let margin = u64::from(seconds)
+                .wrapping_mul(COUNTER_HZ)
+                .wrapping_sub(event.at)
+                / COUNTER_HZ;
+            if WATCHDOG_MARGIN
+                .swap(margin, Ordering::Relaxed)
+                .abs_diff(margin)
+                <= 1
+            {
+                continue;
+            }
+        } else {
+            WATCHDOG_MARGIN.store(u64::MAX, Ordering::Relaxed);
+        }
+        match event.deadline {
+            Some(seconds) => output::arguments(format_args!(
+                "WDT MECHANISM armed deadline_s={seconds} counter={} pe={} source_pc={pc:#x} source_lr={lr:#x}\n",
+                event.at, event.cpu
+            )),
+            None => output::arguments(format_args!(
+                "WDT MECHANISM disarmed counter={} pe={} source_pc={pc:#x} source_lr={lr:#x}\n",
+                event.at, event.cpu
+            )),
+        }
+    }
+    if dropped > 0 {
+        output::arguments(format_args!("WDT MECHANISM writes_not_kept={dropped}\n"));
+    }
+}
+
+/// The margin in seconds of the last reported watchdog arm.
+static WATCHDOG_MARGIN: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The guest counter's rate.
+const COUNTER_HZ: u64 = 24_000_000;
 
 /// The distinct unsupported operations `UNMODELED` lines have reported.
 pub(super) static UNMODELED_REPORTED: AtomicU64 = AtomicU64::new(0);

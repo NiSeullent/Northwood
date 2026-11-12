@@ -16,7 +16,7 @@ mod usb;
 pub use transfer_times::{PartTime, TRANSFER_PARTS};
 
 use crate::Result;
-pub use crate::pmu::RtcEpoch;
+pub use crate::pmu::{RtcAnchor, RtcEpoch};
 use crate::usb::{
     Function, Speed,
     ecm::Ecm,
@@ -221,6 +221,8 @@ pub struct AppleDevices {
     /// by PE number.
     core_counters: Vec<Option<DeviceId>>,
     pc_samplers: Vec<(usize, u64, DeviceId)>,
+    /// The SoC watchdogs, whose mechanism writes the reports show.
+    watchdogs: Vec<DeviceId>,
     starts: Vec<Start>,
     selects: Vec<SelectWire>,
     /// The AP GPIO bank's base and the board nets on its input pins.
@@ -243,6 +245,12 @@ pub struct AppleDevices {
     rtc_clock: Option<pmu::RtcClock>,
     /// Every PMU's oscillator, the RTC's among them.
     pmu_clocks: Vec<pmu::RtcClock>,
+    /// The host's wall time and the machine state's anchor this boot's
+    /// upcount started from, for the anchors it keeps (`rtc_anchor`).
+    rtc_origin: Option<(
+        Option<stela_soc_data::pmu::WallClock>,
+        Option<pmu::RtcAnchor>,
+    )>,
     /// The latest count a board entry was given, and the entry; the first
     /// entry given an earlier count, with it, for the stop it causes.
     time_seen: Cell<(u64, &'static str)>,
@@ -260,6 +268,13 @@ pub struct AppleDevices {
     /// DMA the current transfer runs ([`Devices::settle_write`]).
     last_write: Vec<Option<(u64, u8)>>,
     writer: Option<(u64, u8)>,
+    /// Devices that start no DMA and reach no master's registers (the
+    /// console UART): a write to one runs the masters' steps only when
+    /// their DMA is due or every [`QUIET_WRITES`] writes
+    /// ([`Self::quiet_write`]).
+    quiet: Vec<DeviceId>,
+    /// Writes to [`Self::quiet`] devices since the masters last ran.
+    quiet_streak: u32,
     /// Whether DMA data copies are left to [`Devices::take_unlocked`].
     defer_dma: bool,
     /// The displays' composes left since the last
@@ -662,6 +677,7 @@ impl AppleDevices {
             reset_vectors: Vec::new(),
             core_counters: Vec::new(),
             pc_samplers: Vec::new(),
+            watchdogs: Vec::new(),
             starts: Vec::new(),
             selects: Vec::new(),
             gpio: None,
@@ -679,6 +695,7 @@ impl AppleDevices {
             sleep: sleep::SocSleep::for_boot_processor(boot_processor),
             rtc_clock: None,
             pmu_clocks: Vec::new(),
+            rtc_origin: None,
             time_seen: Cell::new((0, "start")),
             time_regression: Cell::new(None),
             inline_keys: crate::inline_key::Engine::default(),
@@ -687,6 +704,8 @@ impl AppleDevices {
             passive: crate::passive::PassiveMap::default(),
             last_write: Vec::new(),
             writer: None,
+            quiet: Vec::new(),
+            quiet_streak: 0,
             defer_dma: false,
             composes: Vec::new(),
         }
@@ -727,6 +746,14 @@ impl AppleDevices {
         self.nor
             .and_then(|id| self.bus.device_mut::<Spi>(id))
             .map(Spi::take_profile)
+    }
+
+    /// A copy of the NOR image as the guest left it, for the host to change
+    /// NVRAM once the guest has stopped.
+    pub fn nor_image(&mut self) -> Option<stela_soc_data::nor::Image> {
+        self.nor
+            .and_then(|id| self.bus.device_mut::<Spi>(id))
+            .map(|spi| spi.image().clone())
     }
 
     /// Drain the `sks`/`pnon`/`scrd` traffic the SEP observed this run under
@@ -1368,6 +1395,47 @@ impl Devices for AppleDevices {
         memory: &mut dyn Memory,
         now: u64,
     ) -> Result<(), DeviceError> {
+        self.transfer_with(cpu, memory, now, true)
+    }
+
+    /// As the default, with the transfer knowing PE `cpu`'s write: a USB
+    /// master that write did not reach runs its schedule only when it has
+    /// work ([`AppleDevices::usb_due`]); the home machine's transfers run
+    /// it whatever, as before.
+    fn settle_write(
+        &mut self,
+        cpu: usize,
+        now: u64,
+        memory: &mut dyn stela_engine::machine::engine::LockedMemory,
+    ) -> stela_engine::machine::engine::Settled {
+        self.writer = self.last_write.get_mut(cpu).and_then(Option::take);
+        let lock = self.memory_lock();
+        let masters = !self.quiet_write(now);
+        let transfer = self.transfer_with(cpu, memory.under(lock), now, masters);
+        self.writer = None;
+        stela_engine::machine::engine::Settled {
+            transfer,
+            lock,
+            call: self.take_call(cpu),
+            after: self.memory_lock(),
+        }
+    }
+}
+
+/// The most writes to [`AppleDevices::quiet`] devices in a row whose
+/// transfer leaves the masters' steps out: a console line's worth of bytes.
+const QUIET_WRITES: u32 = 16;
+
+impl AppleDevices {
+    /// A transfer ([`Devices::transfer`]): its entry, each master's DMA step
+    /// when `masters`, and the wires it settles.
+    fn transfer_with(
+        &mut self,
+        cpu: usize,
+        memory: &mut dyn Memory,
+        now: u64,
+        masters: bool,
+    ) -> Result<(), DeviceError> {
         let mut lap = self.transfer_times.lap();
         self.observe_time(now, "transfer");
         self.publish_rtc_time(now)?;
@@ -1376,7 +1444,7 @@ impl Devices for AppleDevices {
         // A master's refused work stops only that master: the others and the
         // devices' timers go on, and the first refusal is what is reported.
         let mut results = [const { Ok(()) }; 7];
-        for (index, result) in results.iter_mut().enumerate() {
+        for (index, result) in results.iter_mut().enumerate().filter(|_| masters) {
             *result = match index {
                 0 => self.transfer_pmp(cpu, memory, now),
                 1 => self.transfer_aes(cpu, memory, now),
@@ -1393,30 +1461,25 @@ impl Devices for AppleDevices {
         results.into_iter().find(Result::is_err).unwrap_or(settled)
     }
 
-    /// As the default, with the transfer knowing PE `cpu`'s write: a USB
-    /// master that write did not reach runs its schedule only when it has
-    /// work ([`AppleDevices::usb_due`]); the home machine's transfers run
-    /// it whatever, as before.
-    fn settle_write(
-        &mut self,
-        cpu: usize,
-        now: u64,
-        memory: &mut dyn stela_engine::machine::engine::LockedMemory,
-    ) -> stela_engine::machine::engine::Settled {
-        self.writer = self.last_write.get_mut(cpu).and_then(Option::take);
-        let lock = self.memory_lock();
-        let transfer = self.transfer(cpu, memory.under(lock), now);
-        self.writer = None;
-        stela_engine::machine::engine::Settled {
-            transfer,
-            lock,
-            call: self.take_call(cpu),
-            after: self.memory_lock(),
-        }
+    /// Whether the write being settled ([`Self::writer`]) went to a
+    /// [`Self::quiet`] device while no master's DMA is due at `now`, so the
+    /// masters' steps can wait: the write changed no master's state, and work
+    /// a master has pending is what its DMA deadline names, as for a guest
+    /// that only reads. The masters still run every [`QUIET_WRITES`] such
+    /// writes, so a long run of console output never holds them back longer.
+    fn quiet_write(&mut self, now: u64) -> bool {
+        let quiet = !self.quiet.is_empty()
+            && self.quiet_streak < QUIET_WRITES
+            && self.writer.is_some_and(|(physical, bytes)| {
+                Width::from_bytes(u64::from(bytes))
+                    .and_then(|width| self.bus.route(physical, width).ok())
+                    .is_some_and(|(device, _)| self.quiet.contains(&device))
+            })
+            && self.dma_deadline().is_none_or(|due| due > now);
+        self.quiet_streak = if quiet { self.quiet_streak + 1 } else { 0 };
+        quiet
     }
-}
 
-impl AppleDevices {
     fn transfer_pmp(
         &mut self,
         cpu: usize,

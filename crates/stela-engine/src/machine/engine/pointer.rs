@@ -101,6 +101,9 @@ pub(super) struct PointerService {
     /// [`SERVICE`]'s address, which blocks completing PAC instructions
     /// inside themselves call through (`x86_64::pointer::inline`).
     routine: u64,
+    /// Results computed since boot (the cipher ran): each is a memo miss,
+    /// of a block, a thunk or an engine exit.
+    pub(super) fills: u64,
 }
 
 /// The routine a thunk calls on a memo miss.
@@ -136,6 +139,7 @@ impl PointerService {
             tags: [0; pointer::TAG_WORDS],
             strips: [pointer::strip::Cell::default(); 2],
             routine: SERVICE as usize as u64,
+            fills: 0,
         }
     }
 
@@ -311,6 +315,7 @@ impl PointerService {
             return Some(result);
         }
         let context = self.context.as_ref()?;
+        self.fills += 1;
         let result = match operation {
             PointerOperation::Sign => Ok((context.sign(key, pointer, modifier).ok()?, true)),
             PointerOperation::Authenticate { combined } => {
@@ -343,6 +348,7 @@ impl PointerService {
     pub(super) fn generic_code(&mut self, data: u64, modifier: u64) -> Option<u64> {
         let key = pointer::GENERIC_KEY;
         let code = self.context.as_ref()?.generic_code(data, modifier).ok()?;
+        self.fills += 1;
         let tag = self.native_tag(key);
         let memo = self.memo.as_mut().expect("memo for open tag");
         memo[pointer::slot(data, modifier)] = pointer::MemoEntry {
@@ -517,6 +523,28 @@ mod tests {
         other.reopen_generic(false);
         assert_ne!(other.anchors().1, 0);
         assert_ne!(other.anchors().1, memo);
+    }
+
+    #[test]
+    fn fills_count_each_computed_result_once() {
+        use stela_contracts::pauth::Key;
+
+        let mut service = Box::new(PointerService::new());
+        service.open(inputs(pauth::Version::Classic, 25 | 25 << 16));
+        assert_eq!(service.fills, 0);
+        let signed = service
+            .result(PointerOperation::Sign, Key::Ib, 0x1000, 0x20)
+            .unwrap();
+        assert_eq!(service.fills, 1);
+        // A remembered signing, and the authentication its signing filled.
+        service.result(PointerOperation::Sign, Key::Ib, 0x1000, 0x20);
+        let (pointer, _) = signed.unwrap();
+        let authenticate = PointerOperation::Authenticate { combined: false };
+        service.result(authenticate, Key::Ib, pointer, 0x20);
+        assert_eq!(service.fills, 1);
+        service.result(PointerOperation::Sign, Key::Ib, 0x2000, 0x20);
+        service.generic_code(3, 4).unwrap();
+        assert_eq!(service.fills, 3);
     }
 
     #[test]

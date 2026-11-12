@@ -75,6 +75,8 @@ pub(crate) struct Hardware {
     /// An unanswered command keeps CRCR.CRR set; aborts are ignored, so a
     /// timeout finds the host dead.
     stuck: Option<u64>,
+    /// The controller ignores its command doorbell and never runs the ring.
+    pub deaf: bool,
     pub fault: Fault,
     pub hang_next: bool,
     pub device_task: bool,
@@ -704,7 +706,9 @@ impl Registers for Model {
         assert!(!s.trap_mmio, "retained stale consumer reached native MMIO");
         s.accesses += 1;
         if offset == 0x1000 {
-            s.command();
+            if !s.deaf {
+                s.command();
+            }
         } else if (0x1004..0x1100).contains(&offset) {
             let slot = ((offset - 0x1000) / 4) as u8;
             let dci = (value & 31) as u8;
@@ -878,6 +882,7 @@ fn fixture_profile_peer(
         accesses: 0,
         trap_mmio: false,
         stuck: None,
+        deaf: false,
         fault: Fault::None,
         hang_next: false,
         device_task: false,
@@ -995,6 +1000,39 @@ fn prepared(
     }
     (shared, device, endpoints, hardware, dma)
 }
+/// A controller that stops running its command ring ends the command in two
+/// command timeouts, one restart included, and is then dead; under a passed
+/// device start budget the same command ends at once.
+#[test]
+fn a_controller_that_never_runs_its_command_ring_times_out_and_dies() {
+    let mut memory = vec![0u64; 262_144];
+    let (shared, _device, hardware, _dma) = fixture(&mut memory, HIGH_SPEED, 32, 4);
+    hardware.borrow_mut().deaf = true;
+    let started = Clock::ticks();
+    let result = shared.borrow_mut().command(0, 0, ENABLE_SLOT << 10);
+    let took = Clock::ticks() - started;
+    assert!(matches!(result, Err(BlockError::Timeout)), "{result:?}");
+    assert!(
+        (2 * COMMAND_US..2 * COMMAND_US + HALT_US + 1_000_000).contains(&took),
+        "{took}"
+    );
+    assert!(matches!(shared.borrow().hardware, hardware::State::Died));
+
+    let mut memory = vec![0u64; 262_144];
+    let (shared, _device, hardware, _dma) = fixture(&mut memory, HIGH_SPEED, 32, 4);
+    hardware.borrow_mut().deaf = true;
+    let clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    let budget = stela_driver_base::budget::Budget::start(clock, 100_000).unwrap();
+    let started = Clock::ticks();
+    let result = shared.borrow_mut().command(0, 0, ENABLE_SLOT << 10);
+    let took = Clock::ticks() - started;
+    assert!(matches!(result, Err(BlockError::Timeout)), "{result:?}");
+    assert!(took < 100_000 + HALT_US + 10_000, "{took}");
+    assert!(budget.expired().unwrap().at.is_some());
+}
+
 #[test]
 fn reset_requires_every_retirement_ack_then_physical_reset_and_fresh_slot() {
     for speed in [HIGH_SPEED, SUPER_SPEED] {

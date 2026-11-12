@@ -238,9 +238,7 @@ impl StatusNotifications {
         shared.borrow_mut().device(id)?;
         let arena = dma.allocate(65536, 65536)?;
         // SAFETY: exclusively reserved live boot memory, never rewound.
-        let allocator = unsafe {
-            RegionAllocator::new(arena.physical()..arena.physical() + arena.len() as u64)
-        };
+        let allocator = unsafe { RegionAllocator::within(&arena) };
         let bytes = usize::from(plan.endpoint.max_packet);
         // One ordinary TD cannot cross a 64 KiB boundary. A power-of-two
         // alignment at least the bounded packet size proves that for any DMA

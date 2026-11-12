@@ -113,6 +113,7 @@ fn exact_lazy_qualification_replaces_portable_bank_with_only_minted_rows() {
         context,
         page: BASE,
         preparation,
+        kept: None,
     });
     let mut owner = {
         let entry = record.find(0, &context).unwrap();
@@ -131,6 +132,48 @@ fn exact_lazy_qualification_replaces_portable_bank_with_only_minted_rows() {
     assert_eq!(owner.qualification_attempts, 1);
     assert_eq!(&owner.qualify(BASE, None).unwrap().rows(), expected);
     assert_eq!(owner.qualification_attempts, 1);
+}
+
+/// An entry proven during the boot qualifies from itself, at the page it
+/// was rebased to: the rows of the block compiled at that page.
+#[test]
+fn a_kept_entry_qualifies_at_its_new_page_without_a_record() {
+    let preparation = Arc::new(prepare::test_preparation());
+    let source: Vec<u8> = [0x1000_0040u32, 0xf940_0043, 0xd400_0001]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let key = Digest([7; 32]);
+    let context = preparation.context(BASE);
+    let moved = BASE + 0x5_4000;
+    let at = |page| {
+        Offer::compile(
+            key,
+            page,
+            page,
+            context,
+            source.clone(),
+            preparation.clone(),
+        )
+        .unwrap()
+    };
+    let entry = Arc::new(at(BASE).prove().unwrap());
+    let expected = at(moved).block().fault_recovery.clone();
+    assert!(!expected.is_empty());
+    let origin = Arc::new(StoredOrigin {
+        key,
+        context,
+        page: moved,
+        preparation: preparation.clone(),
+        kept: Some(Arc::clone(&entry)),
+    });
+    let mut relocated = crate::translations::Relocated::default();
+    assert!(entry.relocate(moved, &source, &mut relocated));
+    assert_eq!(relocated.code, at(moved).block().native.x86_64_code);
+    let mut owner = Template::stored(&entry, &relocated, origin).installed();
+    // No pack record is looked up for it.
+    assert_eq!(owner.stored_key(), None);
+    assert_eq!(&owner.qualify(moved, None).unwrap().rows(), &expected);
 }
 
 #[test]

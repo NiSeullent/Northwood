@@ -4,21 +4,37 @@ use crate::x86_64::asm::{Alu, Code, Gpr, Rm, Size};
 use alloc::vec;
 use alloc::vec::Vec;
 mod half;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux")
+))]
+mod half_tests;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux")
+))]
+mod tiny_tests;
 use super::super::isa::ShiftOpcode;
 use super::numerical::{
-    ArithmeticOpcode, ColdSplit, Condition, EXPONENT_VECTOR, Entry, INPUT_MINIMUM_EXPONENT, Input,
-    LEFT_VECTOR, RESULT_MINIMUM_EXPONENT, RIGHT_VECTOR, SINGLE_EXPONENT_BIAS_BITS, ZeroProduct,
-    branch, clear_high_qword, clear_scalar, commit_inexact, emit_opcode, environment,
-    exponent_range, jump, prepare_vector_input_range, prepare_vector_result_range, read_inputs,
-    read_numerical_right, read_numerical_vector, reject_other_status, resolve, restore_environment,
+    ArithmeticOpcode, ColdSplit, Condition, EXPONENT_VECTOR, Entry, FPSR_UNDERFLOW,
+    INPUT_MINIMUM_EXPONENT, Input, LEFT_VECTOR, RESULT_MINIMUM_EXPONENT, RIGHT_VECTOR,
+    SINGLE_EXPONENT_BIAS_BITS, ZeroProduct, branch, clear_high_qword, clear_scalar, commit_inexact,
+    commit_inexact_underflow, emit_opcode, environment, exponent_range, fpsr_has, jump,
+    nonfinite_lane, prepare_vector_input_range, prepare_vector_result_range, read_inputs,
+    read_numerical_right, read_numerical_vector, reject_other_status,
+    reject_other_status_but_underflow, resolve, restore_environment, scalar_ordered_range,
     scalar_range_or_zero, sticky_inexact, sticky_result_check, test_control, vector_exponent_range,
-    vector_normal_or_zero_range, zero_product_check,
+    vector_normal_or_zero_range, vector_ordered_range, zero_product_check,
 };
 use super::{Host, commit, packed, read_vector, shuffle};
 use crate::{
     GuestAddress, TargetCpu,
     aarch64::{
-        floating::{BinaryOperation, FPCR_EXCEPTION_ENABLE_MASK, FPCR_NEP, Format},
+        floating::{
+            BinaryOperation, FPCR_AH, FPCR_EXCEPTION_ENABLE_MASK, FPCR_FZ, FPCR_NEP, Format,
+        },
         simd::arithmetic::{Inputs, Operand, Shape},
     },
     block::ExitKind,
@@ -107,6 +123,9 @@ fn prepare_inputs(code: &mut Code, operand: &Operand) -> u8 {
                 shuffle(code, RIGHT_VECTOR, RIGHT_VECTOR, lanes);
             } else {
                 read_numerical_right(code, operand.format, operand.shape, right, Some(right_lane));
+                // Inactive lanes multiply zeros, so an infinite element
+                // raises no host invalid there.
+                packed(code, Host::MoveQword, RIGHT_VECTOR, RIGHT_VECTOR);
             }
             RIGHT_VECTOR
         }
@@ -128,7 +147,7 @@ fn prepare_inputs(code: &mut Code, operand: &Operand) -> u8 {
     }
 }
 
-/// FNMUL/FABD transform the rounded result. Only finite normal or zero results reach
+/// FNMUL/FABD transform the rounded result. Only normal, zero or infinite results reach
 /// this point, so AH's NaN sign policy stays on the exact helper path.
 fn result_sign(code: &mut Code, operand: &Operand) {
     let negate = match operand.operation {
@@ -223,7 +242,13 @@ fn zero_product(operation: BinaryOperation) -> bool {
 }
 
 /// The full path's status checks distinguish exact zeros from underflowed
-/// nonzero results. Division keeps its existing conservative domain.
+/// nonzero results, and infinite results of an infinite input from
+/// overflow: the host raises overflow for the latter, and invalid for
+/// infinity times zero (FMULX's two included) and infinity minus infinity,
+/// which `reject_other_status` sends to the helper. Neither side raises
+/// status for an infinity with a finite, non-subnormal operand, and its
+/// result is the same infinity in every rounding mode, FZ and AH. Division
+/// keeps its existing conservative domain.
 fn accepts_zero(operation: BinaryOperation) -> bool {
     match operation {
         BinaryOperation::Add
@@ -236,15 +261,15 @@ fn accepts_zero(operation: BinaryOperation) -> bool {
     }
 }
 
-/// A scalar FDIV's zero dividend over a normal divisor: the quotient is
+/// An FDIV lane's zero dividend over a normal divisor: the quotient is
 /// an exact signed zero, with no status, whatever FPCR holds. Code divides
-/// zero often (a ratio or an animation's progress at its start), and each
-/// one would otherwise leave compiled code. A zero quotient from a normal
+/// zero often (a ratio, a normalized silent sample or transparent pixel, an
+/// animation's progress at its start), and each one would otherwise leave
+/// compiled code. A zero quotient from a normal
 /// dividend underflowed, which the host's status rejects; the divisor's
 /// range check still sends a zero or infinite divisor to the helper.
 fn zero_quotient(operand: &Operand) -> bool {
     operand.operation == BinaryOperation::Divide
-        && operand.shape == Shape::Scalar
         && matches!(operand.inputs, Inputs::Elementwise { .. })
 }
 
@@ -300,6 +325,7 @@ fn sticky_path(code: &mut Code, operand: &Operand, entry: Entry, target: TargetC
         operand.shape,
         LEFT_VECTOR,
         exact_tiny(operand.operation),
+        target,
     );
     let resume = code.len();
     result_sign(code, operand);
@@ -312,9 +338,10 @@ fn sticky_path(code: &mut Code, operand: &Operand, entry: Entry, target: TargetC
     let inline_end = code.checkpoint();
     let done = jump(code);
     let cold = code.checkpoint();
-    if zero_quotient(operand) {
-        // A zero quotient may be exact: the full path tells, from the
-        // dividend, rather than the helper.
+    if !zero_product(operand.operation) {
+        // A zero quotient may be exact, and an infinite sum or difference
+        // of an infinite input is: the full path tells, from its inputs
+        // and the host's status, rather than the helper.
         let mut full = full;
         full.push(rejected);
         return StickyPath {
@@ -327,19 +354,34 @@ fn sticky_path(code: &mut Code, operand: &Operand, entry: Entry, target: TargetC
         };
     }
     let mut crossing = vec![rejected];
-    if !zero_product(operand.operation) {
-        return StickyPath {
-            full,
-            helper: vec![rejected],
-            done,
-            cold,
-            inline_end,
-            crossing,
-        };
-    }
     let check = code.len();
     resolve(code, rejected, check);
-    let helper = zero_product_check(
+    // With FPSR.UFC set too, a tiny or zero product adds no status, and its
+    // value is the host's: the entry MXCSR flushes nothing. Only a NaN or
+    // infinite lane needs more: the full path, which applies Arm's NaN
+    // selection, DN and IOC. (The zero-product check cannot take it: its
+    // accepted-lane mask is the one the nonfinite test has just replaced.)
+    let known = fpsr_has(code, FPSR_UNDERFLOW);
+    let unknown = jump(code);
+    let finite_check = code.len();
+    resolve(code, known, finite_check);
+    let nonfinite = nonfinite_lane(
+        code,
+        operand.format,
+        operand.shape,
+        LEFT_VECTOR,
+        EXPONENT_VECTOR,
+    );
+    let finite = jump(code);
+    resolve(code, finite, resume);
+    crossing.push(finite);
+    let zero_check = code.len();
+    resolve(code, unknown, zero_check);
+    // Other rejected products take the full path, which completes tiny
+    // results ([`tiny_product_status`]).
+    let mut full = full;
+    full.push(nonfinite);
+    full.extend(zero_product_check(
         code,
         &ZeroProduct {
             format: operand.format,
@@ -350,15 +392,38 @@ fn sticky_path(code: &mut Code, operand: &Operand, entry: Entry, target: TargetC
         },
         resume,
         &mut crossing,
-    );
+    ));
     StickyPath {
         full,
-        helper,
+        helper: vec![],
         done,
         cold,
         inline_end,
         crossing,
     }
+}
+
+/// The full path's status of a product ([`zero_product`]) under FPCR.FZ and
+/// AH zero, when it is not `None`: results below the minimum normal
+/// complete as the host computed them (no FTZ in the environment), with
+/// MXCSR underflow as FPSR.UFC: SSE, like Arm with AH zero, detects
+/// tininess before rounding and, with underflow masked, reports it for an
+/// inexact tiny result (measured: the minimum normal times 1 - 2^-24 rounds
+/// to the minimum normal with PE and UE). Returns the branches to the
+/// success path; `helper` receives the others. With FZ or AH set (AH
+/// detects tininess after rounding), the caller's checks follow.
+fn tiny_product_status(
+    code: &mut Code,
+    operand: &Operand,
+    helper: &mut Vec<usize>,
+) -> Option<(Vec<usize>, usize)> {
+    if !zero_product(operand.operation) {
+        return None;
+    }
+    test_control(code, FPCR_FZ | FPCR_AH);
+    let strict = branch(code, Condition::NotZero);
+    helper.push(reject_other_status_but_underflow(code));
+    Some((vec![jump(code)], strict))
 }
 
 /// A sticky path's open branches ([`sticky_path`]).
@@ -395,7 +460,14 @@ fn emit_scalar(
     helper.push(branch(code, Condition::NotZero));
     let right = prepare_inputs(code, operand);
     for source in [LEFT_VECTOR, right] {
-        if accepts_zero(operand.operation) || (source == LEFT_VECTOR && zero_quotient(operand)) {
+        if accepts_zero(operand.operation) {
+            helper.push(scalar_ordered_range(
+                code,
+                operand.format,
+                source,
+                INPUT_MINIMUM_EXPONENT,
+            ));
+        } else if source == LEFT_VECTOR && zero_quotient(operand) {
             helper.push(scalar_range_or_zero(
                 code,
                 operand.format,
@@ -417,8 +489,21 @@ fn emit_scalar(
     );
     restore_environment(code);
     // Caller environment and stack are restored before every branch from here.
+    let tiny = tiny_product_status(code, operand, &mut helper);
+    if let Some((_, strict)) = &tiny {
+        let strict_start = code.len();
+        resolve(code, *strict, strict_start);
+    }
     helper.push(reject_other_status(code));
-    let success = if accepts_zero(operand.operation) || zero_quotient(operand) {
+    let success = if accepts_zero(operand.operation) {
+        helper.push(scalar_ordered_range(
+            code,
+            operand.format,
+            LEFT_VECTOR,
+            RESULT_MINIMUM_EXPONENT,
+        ));
+        jump(code)
+    } else if zero_quotient(operand) {
         helper.push(scalar_range_or_zero(
             code,
             operand.format,
@@ -437,8 +522,7 @@ fn emit_scalar(
         resolve(code, patch, helper_start);
     }
     resolve(code, success, success_start);
-
-    commit_inexact(code);
+    commit_status(code, success_start, tiny);
     result_sign(code, operand);
     if matches!(operand.inputs, Inputs::PairwiseScalar { .. }) {
         clear_scalar(code, operand.format, LEFT_VECTOR);
@@ -451,6 +535,20 @@ fn emit_scalar(
     }
     commit(code, operand.destination, LEFT_VECTOR);
     finish(code, sticky, full, operand)
+}
+
+/// Resolve the tiny-product successes ([`tiny_product_status`]) to
+/// `success_start`, and commit the status of the full path.
+fn commit_status(code: &mut Code, success_start: usize, tiny: Option<(Vec<usize>, usize)>) {
+    match tiny {
+        Some((successes, _)) => {
+            for patch in successes {
+                resolve(code, patch, success_start);
+            }
+            commit_inexact_underflow(code);
+        }
+        None => commit_inexact(code),
+    }
 }
 
 /// Resolve the jump past the full path, which ends here.
@@ -482,6 +580,14 @@ fn emit_vector(
     prepare_vector_input_range(code, operand.format);
     for source in [LEFT_VECTOR, right] {
         if accepts_zero(operand.operation) {
+            vector_ordered_range(
+                code,
+                operand.format,
+                operand.shape,
+                source,
+                ZERO_RANGE_SCRATCH,
+            );
+        } else if source == LEFT_VECTOR && zero_quotient(operand) {
             vector_normal_or_zero_range(
                 code,
                 operand.format,
@@ -515,9 +621,22 @@ fn emit_vector(
         right,
     );
     restore_environment(code);
+    let tiny = tiny_product_status(code, operand, &mut helper);
+    if let Some((_, strict)) = &tiny {
+        let strict_start = code.len();
+        resolve(code, *strict, strict_start);
+    }
     helper.push(reject_other_status(code));
     prepare_vector_result_range(code);
     if accepts_zero(operand.operation) {
+        vector_ordered_range(
+            code,
+            operand.format,
+            operand.shape,
+            LEFT_VECTOR,
+            ZERO_RANGE_SCRATCH,
+        );
+    } else if zero_quotient(operand) {
         vector_normal_or_zero_range(
             code,
             operand.format,
@@ -536,7 +655,7 @@ fn emit_vector(
         resolve(code, patch, helper_start);
     }
     resolve(code, success, success_start);
-    commit_inexact(code);
+    commit_status(code, success_start, tiny);
     result_sign(code, operand);
     if operand.shape == Shape::Vector64 {
         clear_high_qword(code, 0);
@@ -545,8 +664,9 @@ fn emit_vector(
     finish(code, sticky, full, operand)
 }
 
-pub(super) fn always_exits(operand: &Operand) -> bool {
-    operand.format == Format::Half && operand.operation == BinaryOperation::Divide
+/// No binary form ends its block: Half division runs the lane recipe.
+pub(super) fn always_exits(_operand: &Operand) -> bool {
+    false
 }
 
 /// The S/D forms return their [`ColdSplit`].
@@ -557,10 +677,7 @@ pub(in crate::x86_64) fn emit(
     target: TargetCpu,
     entry: Entry,
 ) -> Option<ColdSplit> {
-    if always_exits(operand) && !crate::x86_64::asm::vector_extensions::half_supported(target) {
-        super::super::block::direct_exit(code, pc, ExitKind::FloatingPoint);
-        None
-    } else if operand.format == Format::Half {
+    if operand.format == Format::Half {
         half::emit(code, operand, pc, target);
         None
     } else if operand.shape == Shape::Scalar {
@@ -592,6 +709,9 @@ mod tests {
             0x4e42_1420, // fadd v0.8h, v1.8h, v2.8h
             0x4ec2_1420, // fsub v0.8h, v1.8h, v2.8h
             0x6e42_1c20, // fmul v0.8h, v1.8h, v2.8h
+            0x1ee2_1820, // fdiv h0, h1, h2
+            0x2e42_3c20, // fdiv v0.4h, v1.4h, v2.4h
+            0x6e42_3c20, // fdiv v0.8h, v1.8h, v2.8h
         ] {
             let bytes: Vec<u8> = [word, RET]
                 .iter()
@@ -609,15 +729,6 @@ mod tests {
             assert_eq!(block.source_bytes, bytes.len());
             assert_eq!(block.native.source_map.len(), 2);
             assert_eq!(block.native.source_map[1].0, GuestAddress(0x1004));
-        }
-        for word in [0x1ee2_1820u32, 0x2e42_3c20, 0x6e42_3c20] {
-            let bytes: Vec<u8> = [word, RET]
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect();
-            let block = crate::testing::block(&bytes, GuestAddress(0x1000)).unwrap();
-            assert_eq!(block.source_bytes, size_of::<u32>());
-            assert_eq!(block.native.source_map, [(GuestAddress(0x1000), 0)]);
         }
     }
 }

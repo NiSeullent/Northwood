@@ -635,16 +635,26 @@ impl Host for BareHost<'_> {
             let bounds = state.half_range(LOWER);
             let entry_bits = 12 + 9 * layout::top_level();
             let pool = &state.pool;
-            let dropped =
-                state
+            // Kept halves share the current controls' TCR outside the lower
+            // half's fields; without a regime the ASIDs are unknown.
+            let tcr = state
+                .regime
+                .map_or(mmu::shadow::UNKNOWN_ASIDS, |regime| regime.controls.tcr);
+            let dropped = match everywhere {
+                Everywhere::NonGlobal(asid) => state.kept.drop_asid(asid, tcr),
+                _ => state
                     .kept
                     .invalidate(everywhere, bounds, entry_bits, |entry, first, last| {
                         tables::unmap_under(pool, entry, first, last)
-                    });
+                    }),
+            };
             state.kept_dropped += dropped as u64;
         }
         if reach == Reach::All {
-            return state.reset_shadow(Cause::Maintained);
+            return match everywhere {
+                Everywhere::NonGlobal(_) => state.drop_non_global(),
+                _ => state.reset_shadow(Cause::Maintained),
+            };
         }
         state.tlb.clear();
         // Most maintenance addresses reach a single extent, without a

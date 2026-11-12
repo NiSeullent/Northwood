@@ -8,7 +8,9 @@ use crate::output;
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use stela_drivers::firmware::{Error, Image, Provider, Requirement};
-use stela_loader::host_firmware::{recipes, requirements::RecordingProvider};
+use stela_loader::host_firmware::{
+    bundle::BundleProvider, recipes, requirements::RecordingProvider,
+};
 
 /// What the screen says once a driver found a file missing that setup has
 /// a pinned source for.
@@ -26,10 +28,12 @@ pub struct Requests {
 }
 
 impl Requests {
-    /// Record every request to `inner` for the rest of the boot.
+    /// Record every request to `inner` for the rest of the boot. A request
+    /// with no exact binding gets the bundle file its recipe pins.
     pub fn new(inner: &'static dyn Provider) -> &'static Self {
+        let bundle: &'static BundleProvider = Box::leak(Box::new(BundleProvider::new(inner)));
         Box::leak(Box::new(Self {
-            recorder: RecordingProvider::new(inner),
+            recorder: RecordingProvider::new(bundle),
             reported: AtomicUsize::new(0),
             fixable: AtomicBool::new(false),
         }))

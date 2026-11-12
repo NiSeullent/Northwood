@@ -417,6 +417,11 @@ pub trait Backend {
     fn query_results(&mut self, pool: QueryPool, first: u32, results: &mut [u64]) -> Result<bool>;
 
     fn semaphore_value(&mut self, semaphore: Semaphore) -> Result<u64>;
+    /// Every submission signaling `semaphore` at `value` or less is known
+    /// done without asking the driver (the completion poll read it
+    /// elsewhere): the backend may recycle what those held, as after a
+    /// [`Self::semaphore_value`] that answered `value`.
+    fn timeline_passed(&mut self, _semaphore: Semaphore, _value: u64) {}
     /// The failure of a submission the driver refused while keeping the
     /// device, named by `value` on `semaphore`, which it still signaled
     /// after its waits; taken once. `None` for every other submission.

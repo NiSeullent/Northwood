@@ -3,7 +3,8 @@
 //! ([`ui`]), the entries that can start now, then the PC firmware's own
 //! boot entries (`firmware::entries`), with one highlighted. A macOS entry
 //! is left out until a macOS is installed or while Install macOS has not
-//! prepared its SSD, and Install macOS once it has (`selection::ready`). Up and Down move the
+//! prepared its SSD or the disk it chose is gone (`chosen_disk::Stale`),
+//! and Install macOS once it has (`selection::ready`). Up and Down move the
 //! highlight, Enter starts the highlighted entry, and an entry's key (`1`-`9`,
 //! then `a`-`z`) starts it at once; a firmware entry restarts the PC into it.
 //! Diagnostics builds add a hardware report after the existing choices.
@@ -237,6 +238,8 @@ struct Menu<'a> {
     glance: bool,
     /// Why the last firmware entry chosen did not start.
     notice: Option<&'static str>,
+    /// Why the machine can only be set up, shown while nothing else is.
+    held: Option<&'a str>,
 }
 
 impl<'a> Menu<'a> {
@@ -279,6 +282,7 @@ impl<'a> Menu<'a> {
             let left_out = match (kind, readiness[n]) {
                 (ChoiceKind::Mac, Readiness::NotInstalled) => Some("no macOS is installed"),
                 (ChoiceKind::Mac, Readiness::Unprepared) => Some("its SSD is not prepared"),
+                (ChoiceKind::Mac, Readiness::Stale(stale)) => Some(stale.reason()),
                 // Install macOS that chooses its disk is always offered.
                 (ChoiceKind::Setup, _)
                     if !unchosen(entry.options.as_bytes())
@@ -351,6 +355,7 @@ impl<'a> Menu<'a> {
             items,
             selected,
             notice: None,
+            held,
         }
     }
 
@@ -390,15 +395,21 @@ impl<'a> Menu<'a> {
             canvas.text(left + 20, y + 8, self.name(item), 1, ui::TEXT);
             y += ROW;
         }
-        let (status, colour) = match (self.notice, self.countdown) {
-            (Some(notice), _) => (String::from(notice), ui::ORANGE),
-            (None, Some(seconds)) => (
+        let (status, colour) = match (self.notice, self.countdown, self.held) {
+            (Some(notice), _, _) => (String::from(notice), ui::ORANGE),
+            (None, Some(seconds), _) => (
                 format!("{} in {seconds}", self.name(&self.items[0])),
                 ui::DIM,
             ),
-            (None, None) => return,
+            (None, None, Some(held)) => (String::from(held), ui::DIM),
+            (None, None, None) => return,
         };
-        canvas.text_centred(width / 2, height - 56, &status, 1, colour);
+        // A status of two lines raises its first line by one row.
+        let lines = status.lines().count();
+        for (n, line) in status.lines().enumerate() {
+            let y = height.saturating_sub(56 + (lines - 1 - n) * 24);
+            canvas.text_centred(width / 2, y, line, 1, colour);
+        }
     }
 
     /// The chosen item; `None` without console input.

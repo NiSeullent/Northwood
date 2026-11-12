@@ -104,8 +104,8 @@ def check_path(root, relative, added, ports):
         lines = [source.readline().rstrip("\n") for _ in range(25)]
     headers = [match[1] for line in lines if (match := HEADER.match(line))]
     if not added:
-        # The upstream tree contains source files without SPDX headers. The
-        # diff check only applies the new-source compatibility policy to adds.
+        # Existing sources can lack a header, including unchanged files
+        # inherited from the explicitly supplied upstream commit.
         if any(RESTRICTED.match(token) for header in headers for token in TOKEN.findall(header)):
             return ["restricted or unclassified SPDX identifier in first-party source"]
         return []
@@ -145,10 +145,50 @@ def git_paths(*arguments):
     return {item.decode(errors="surrogateescape") for item in output.split(b"\0") if item}
 
 
+def unchanged_upstream_paths(root, upstream_ref, added):
+    """Find additions whose tracked and working contents match the upstream path."""
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "--verify", "--end-of-options", f"{upstream_ref}^{{commit}}"],
+        cwd=root,
+    ).decode().strip()
+    tree = subprocess.check_output(["git", "ls-tree", "-r", "-z", revision], cwd=root)
+    regular_modes = {b"100644", b"100755"}
+    upstream_blobs = {}
+    for record in tree.split(b"\0"):
+        if record:
+            info, path = record.split(b"\t", 1)
+            mode, kind, oid = info.split()
+            if mode in regular_modes and kind == b"blob":
+                upstream_blobs[path] = oid
+
+    index = subprocess.check_output(["git", "ls-files", "--stage", "-z"], cwd=root)
+    unchanged = set()
+    for record in index.split(b"\0"):
+        if not record:
+            continue
+        info, path = record.split(b"\t", 1)
+        mode, oid, stage = info.split()
+        if stage != b"0" or mode not in regular_modes or oid != upstream_blobs.get(path):
+            continue
+        relative = path.decode(errors="surrogateescape")
+        if relative not in added:
+            continue
+        working = root / relative
+        if not working.is_file() or working.is_symlink():
+            continue
+        working_oid = subprocess.check_output(
+            ["git", "hash-object", "--no-filters", "--", relative], cwd=root
+        ).strip()
+        if working_oid == oid:
+            unchanged.add(relative)
+    return unchanged
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base", help="base commit to compare with the checked-out source")
     parser.add_argument("--include-untracked", action="store_true", help="include local untracked files")
+    parser.add_argument("--upstream-ref", help="trusted upstream commit or ref to compare inherited paths")
     args = parser.parse_args()
     root = Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip())
     added = git_paths("diff", "--name-only", "--no-renames", "--diff-filter=A", args.base)
@@ -156,9 +196,10 @@ def main():
     if args.include_untracked:
         added |= git_paths("ls-files", "--others", "--exclude-standard")
     _, _, ports = (root / "NOTICE").read_text(encoding="utf-8").partition("Ported sources")
+    inherited = unchanged_upstream_paths(root, args.upstream_ref, added) if args.upstream_ref else set()
     failed = False
     for relative in sorted(added | changed):
-        for error in check_path(root, relative, relative in added, ports):
+        for error in check_path(root, relative, relative in added and relative not in inherited, ports):
             print(f"{relative!r}: {error}", file=sys.stderr)
             failed = True
     return int(failed)

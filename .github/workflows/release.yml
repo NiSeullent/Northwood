@@ -47,9 +47,11 @@ env:
     Install:
 
     1. Unpack the archive for your system.
-    2. Run sudo ./northwood setup on Linux or macOS. On Windows, run northwood.exe setup or open stela.exe for the setup wizard.
+    2. Run sudo ./northwood setup on Linux or macOS. On Windows, run northwood.exe setup or double-click stela.exe for the setup wizard.
     3. Choose the USB stick, the macOS version and the Mac model, then confirm. Setup erases the USB stick.
     4. Boot the PC from the USB stick.
+
+    To update an existing USB stick, plug it in and run sudo ./northwood setup update stela (Linux, macOS) or northwood.exe setup update stela (Windows).
 
     You are responsible for following Apple's software license agreement and terms of use.
 

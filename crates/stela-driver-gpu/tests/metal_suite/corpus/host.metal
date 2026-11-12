@@ -39,6 +39,14 @@ kernel void surface_invert(texture2d<float, access::read> src [[texture(0)]],
     dst.write(float4(1.0f - v.rgb, v.a), p);
 }
 
+// Adds `add` to each word of a buffer over an IOSurface, in place.
+kernel void surface_buffer_add(device uint *words [[buffer(0)]],
+                               constant uint &add [[buffer(1)]],
+                               uint i [[thread_position_in_grid]])
+{
+    words[i] += add;
+}
+
 // Luma with the chroma pair of each 2x2 block, as bytes of one word.
 kernel void surface_planes(texture2d<float, access::read> luma [[texture(0)]],
                            texture2d<float, access::read> chroma [[texture(1)]],

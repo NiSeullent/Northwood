@@ -8,6 +8,9 @@ use alloc::{format, vec::Vec};
 use stela_driver_core::firmware::{Requirement, Target};
 
 pub const LINUX_FIRMWARE: &str = "https://gitlab.com/kernel-firmware/linux-firmware";
+/// The same repository on git.kernel.org, which holds every pinned commit.
+pub const LINUX_FIRMWARE_KERNEL_ORG: &str =
+    "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git";
 pub const REALTEK_REVISION: &str = "add225168d0d1ba4c174d5eb15272b53de01ad5a";
 pub const INTEL_RSA_REVISION: &str = "711d3297bac870af42088a467459a0634c1970ca";
 pub const WIFI_FIRMWARE_REVISION: &str = "59f9fc2ef8d1e312d2a613d4e1ffad2ff31a0a01";
@@ -55,6 +58,24 @@ impl Artifact {
             format!("{}/-/raw/{}/{}", self.source, self.revision, self.member)
         }
     }
+    /// Every source of the member at the pinned revision, the one to try
+    /// first first: linux-firmware's git.kernel.org repository, then its
+    /// GitLab mirror, whose unauthenticated traffic has an hourly per-IP
+    /// limit. The pinned hash is checked whichever answers.
+    pub fn urls(&self) -> Vec<alloc::string::String> {
+        if self.source == LINUX_FIRMWARE {
+            alloc::vec![
+                format!(
+                    "{LINUX_FIRMWARE_KERNEL_ORG}/plain/{}?id={}",
+                    self.member, self.revision
+                ),
+                self.url(),
+            ]
+        } else {
+            alloc::vec![self.url()]
+        }
+    }
+
     pub fn verify(&self, bytes: &[u8]) -> Result<(), Error> {
         use stela_crypto::{Sha256, digest::Digest};
         self.check_digest(bytes.len(), || Sha256::digest(bytes).into())
@@ -1370,6 +1391,33 @@ mod tests {
             LICENSE.url(),
             format!("{LINUX_FIRMWARE}/-/raw/{REALTEK_REVISION}/LICENSE.r8169")
         );
+        // linux-firmware members come from git.kernel.org first, GitLab
+        // second; every recipe of the catalog but the regulatory database
+        // has both.
+        assert_eq!(
+            LICENSE.urls(),
+            [
+                format!(
+                    "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/LICENSE.r8169?id={REALTEK_REVISION}"
+                ),
+                LICENSE.url()
+            ]
+        );
+        assert_eq!(artifact.urls(), [artifact.url()]);
+        for recipe in super::super::bundle::recipes() {
+            let sources = recipe.image.urls().len();
+            assert_eq!(
+                sources,
+                if recipe.image.source == WIRELESS_REGDB {
+                    1
+                } else {
+                    2
+                },
+                "{}",
+                recipe.image.member
+            );
+            assert_eq!(recipe.license.urls().len(), sources);
+        }
         let value = serde_json::json!({"schema":1,"complete":true,"requirements":[{
             "name":"regulatory.db", "target":{"driver":"wifi-regulatory","hardware":"wireless-regdb","revision":"v20","board":null},"minimum_bytes":8
         }]});

@@ -396,3 +396,73 @@ fn unregistered_native_inventory_is_never_a_stopped_conversion_receipt() {
     );
     assert!(!machine.cpu.has_canonical_memory());
 }
+/// The home PE of a parallel board holds canonical memory. Its SVCs from
+/// EL0 of the host make records and complete natively, leaving the
+/// canonical reservation and event endpoint alone as `Cpu::take` does; its
+/// ERETs make none, since the reservation they clear lives in the shared
+/// registry native code cannot reach, and a reservation taken before the
+/// SVC still answers the store-exclusive after it.
+#[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn a_pe_with_canonical_memory_completes_svc_natively_and_eret_in_the_engine() {
+    use super::super::mirrors::TRANSITIONS;
+    use super::super::transitions::tests::run_native;
+    use crate::machine::engine::{ExitKind, GuestAddress, Pstate};
+    use crate::machine::exception::{Class, syndrome};
+    use stela_compiler::x86_64::transition::{self, EXCEPTION_RETURN, SUPERVISOR_CALL};
+    const VECTORS: u64 = 0x8000;
+    const USER: u64 = 0x9000;
+    const ERET: u32 = 0xd69f_03e0;
+    const SVC: u32 = 0xd400_0001 | 0x80 << 5;
+    let (mut machine, ram, events) = machine();
+    machine
+        .install_shared_memory_for_processors(Arc::clone(&ram), &events)
+        .unwrap();
+    machine.cpu.pstate = Pstate::reset(2);
+    let registers = &mut machine.cpu.registers;
+    registers.set(Register::HCR_EL2, 0, 1 << 34 | 1 << 27);
+    registers.set(Register::VBAR_EL2, 0, VECTORS);
+    machine.sync_regime();
+    let eret = |machine: &mut Machine<FakeHost, NoDevices>| {
+        machine.cpu.pc = 0x8800;
+        let registers = &mut machine.cpu.registers;
+        registers.set(Register::SPSR_EL2, 0, 0);
+        registers.set(Register::ELR_EL2, 0, USER);
+        machine.system_instruction(ERET).unwrap();
+        assert_eq!((machine.cpu.pc, machine.cpu.pstate.el), (USER, 0));
+    };
+    for _ in 0..2 {
+        eret(&mut machine);
+        machine.finish_transition(1);
+        machine.system_instruction(SVC).unwrap();
+        machine.finish_transition(1);
+        assert_eq!(
+            (machine.cpu.pc, machine.cpu.pstate.el),
+            (VECTORS + 0x400, 2)
+        );
+    }
+    let table = &machine.mirrors.transitions;
+    assert_eq!(
+        table.records[0][SUPERVISOR_CALL].generation,
+        table.generation
+    );
+    assert_eq!(table.records[2][EXCEPTION_RETURN].generation, 0);
+    // Back at EL0, a reservation open across a native SVC.
+    eret(&mut machine);
+    assert!(machine.cpu.consume_event());
+    transfer(&mut machine.cpu, ExclusiveOperation::Load);
+    let svc = transition::supervisor_call_thunk(
+        GuestAddress(USER),
+        syndrome(Class::SupervisorCall, 0x80) as u32,
+        &TRANSITIONS,
+    );
+    let exit = run_native(&mut machine, &svc.code);
+    assert_eq!(exit, (VECTORS + 0x400, ExitKind::Return as u64));
+    assert_eq!(machine.cpu.pstate.el, 2);
+    assert_eq!(machine.statistics.native_transitions[SUPERVISOR_CALL], 1);
+    assert!(!machine.cpu.event_is_set());
+    assert_eq!(
+        transfer(&mut machine.cpu, ExclusiveOperation::Store).status,
+        0
+    );
+}

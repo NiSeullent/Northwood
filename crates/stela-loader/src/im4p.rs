@@ -264,6 +264,8 @@ pub(crate) struct DecodedImage {
     pub(crate) description: String,
     pub(crate) bytes: Vec<u8>,
     pub(crate) container_sha256: String,
+    /// The digest of `bytes`, when the decoder took it as it wrote them.
+    pub(crate) decoded_sha256: Option<String>,
     pub(crate) manifest: Option<Vec<u8>>,
 }
 

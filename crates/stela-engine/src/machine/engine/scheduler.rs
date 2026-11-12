@@ -204,7 +204,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let fetching = self.timing_start();
         let fetched = self.fetch_block(pc, single);
         self.timing_charge(step_timing::Phase::Fetch, fetching);
-        let index = match fetched? {
+        let fetched = fetched?;
+        // Between blocks a broadcast does not wait for this PE
+        // (`Hub::applied`): mail that came meanwhile is read first, and the
+        // block fetched again.
+        let Some(hub) = self.parallel.clone() else {
+            return self.act_on(fetched, pc, single, pacm);
+        };
+        if !hub.enter_active(self.current) {
+            return Ok(());
+        }
+        let step = self.act_on(fetched, pc, single, pacm);
+        hub.leave_active(self.current);
+        step
+    }
+
+    /// Run the block a fetch found, or take its exception or checked
+    /// instruction.
+    fn act_on(&mut self, fetched: Fetched, pc: u64, single: bool, pacm: bool) -> Step {
+        let index = match fetched {
             Fetched::Block(index) => index,
             Fetched::Exception(exception) => {
                 self.cpu.step_advance = false;
@@ -297,10 +315,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.chain.begin(index, budget);
         self.cpu.state.daif = u32::from(self.cpu.pstate.daif);
         self.mirrors.selected = u64::from(self.cpu.pstate.sp);
+        self.mirrors.monitor =
+            u64::from(self.cpu.monitor.is_some() || self.cpu.has_canonical_memory());
         self.mirrors.transition(self.mirror_state());
         self.mirrors.enter(self.cpu.pstate);
         self.cpu.state.pan = u64::from(self.cpu.pstate.pan);
         self.enter_amx_cell();
+        self.enter_cycles();
         self.cpu.state.anchors = self.anchors();
         self.cpu.state.lower_limit = self.lower_limit();
         let entered = self.timing_start();
@@ -436,6 +457,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
                         slot = step_timing::DEVICE_SITE_SLOT;
                     }
                     self.timed_word = Some(word);
+                } else if kind == ExitKind::FloatingPoint as u64 && self.step_timing.is_some() {
+                    // Charged by word apart from System keys
+                    // (`step_timing::numerical_key`).
+                    self.timed_word = Some(self.timed_system_word(last, next_pc));
                 }
                 let exited = self.exit(last, next_pc, kind);
                 if exited.is_ok() {

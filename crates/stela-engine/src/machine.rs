@@ -4,6 +4,7 @@
 //! [`Host`].
 pub mod amu;
 pub mod amx;
+pub mod aon;
 mod capabilities;
 pub mod cpu;
 pub mod ctrr;
@@ -32,7 +33,7 @@ pub(crate) use engine::test_preparation;
 pub use engine::{
     ConsumedPair, Description, DeviceError, DeviceRegister, Devices, Event, FaultCause, Host,
     InstallError, Machine, NativeCode, NativeExit, NativeFault, NativeFaultOrigin, NativeView,
-    NoDevices, Offer, PeerState, Preparation, Prepared, Refused, Regime, Requirement,
+    NoDevices, Offer, PeState, PeerState, Preparation, Prepared, Refused, Regime, Requirement,
     RequirementKind, Reset, StaleCode, StaleOrigin, Statistics, Stop, Transition, Translations,
     window,
 };

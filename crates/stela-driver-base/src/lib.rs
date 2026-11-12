@@ -16,6 +16,7 @@ use core::{
 };
 
 pub mod block;
+pub mod budget;
 pub mod bus;
 pub mod entropy;
 pub mod input_observation;
@@ -298,13 +299,15 @@ impl Clock {
         mut ready: impl FnMut() -> bool,
         mut counter: impl FnMut() -> u64,
         mut relax: impl FnMut(),
+        at: &'static core::panic::Location<'static>,
     ) -> Result<bool, ClockError> {
         let deadline = self.deadline_with(microseconds, &mut counter)?;
         loop {
             if ready() {
                 return Ok(true);
             }
-            if deadline.passed_at(counter()) {
+            let now = counter();
+            if deadline.passed_at(now) || budget::passed_at(now, at) {
                 return Ok(ready());
             }
             relax();
@@ -313,12 +316,15 @@ impl Clock {
 
     /// Poll until ready or elapsed timeout, keeping the final observation at
     /// expiry. Invalid timing fails before invoking the device predicate.
+    /// A passed device start [`budget`] ends it as a timeout.
+    #[track_caller]
     pub fn try_wait(
         &self,
         microseconds: u64,
         ready: impl FnMut() -> bool,
     ) -> Result<bool, ClockError> {
-        self.wait_with(microseconds, ready, Self::ticks, Self::relax)
+        let at = core::panic::Location::caller();
+        self.wait_with(microseconds, ready, Self::ticks, Self::relax, at)
     }
 
     /// Poll using validated timing. Invalid requests panic explicitly; they
@@ -349,8 +355,11 @@ impl Deadline {
         let elapsed = counter.wrapping_sub(self.start) as i64;
         elapsed >= 0 && elapsed as u64 >= self.ticks
     }
+    /// [`Self::passed_at`] now, or a passed device start [`budget`].
+    #[track_caller]
     pub fn passed(&self) -> bool {
-        self.passed_at(Clock::ticks())
+        let now = Clock::ticks();
+        self.passed_at(now) || budget::passed_at(now, core::panic::Location::caller())
     }
 }
 
@@ -527,7 +536,8 @@ mod tests {
                         polls == 3
                     },
                     || next.next().expect("poll hung past expiry"),
-                    || {}
+                    || {},
+                    core::panic::Location::caller()
                 ),
                 Ok(true)
             );
@@ -553,7 +563,8 @@ mod tests {
                     us,
                     || panic!("device predicate on invalid timing"),
                     || panic!("counter origin on invalid timing"),
-                    || panic!("wait hook on invalid timing")
+                    || panic!("wait hook on invalid timing"),
+                    core::panic::Location::caller()
                 ),
                 Err(error)
             );
@@ -587,6 +598,7 @@ mod tests {
                 },
                 || 77,
                 || panic!("no relaxation at zero timeout"),
+                core::panic::Location::caller(),
             )
             .unwrap();
         assert!(ready, "final expiry observation remains part of the API");
@@ -609,6 +621,7 @@ mod tests {
                 || {
                     relaxations += 1;
                 },
+                core::panic::Location::caller(),
             )
             .unwrap();
         assert!(!ready);

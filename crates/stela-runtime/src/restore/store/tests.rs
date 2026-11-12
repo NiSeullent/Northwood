@@ -434,3 +434,160 @@ fn interleaved_deflated_members_resume_without_replaying_prefixes() {
         "resumed {resumed}, replayed {replayed}"
     );
 }
+
+#[test]
+fn a_read_whose_source_ran_out_of_time_is_pending_and_goes_on_later() {
+    /// A network source bounded for its caller: its next `stalls` reads
+    /// run out of time; `broken` fails every read for another reason.
+    struct Stalling {
+        source: Memory,
+        stalls: usize,
+        broken: bool,
+        blocked: bool,
+    }
+    impl ReadAt for Stalling {
+        type Error = &'static str;
+
+        fn len(&self) -> u64 {
+            self.source.len()
+        }
+
+        fn read_at(
+            &mut self,
+            offset: u64,
+            buffer: &mut [u8],
+        ) -> core::result::Result<(), Self::Error> {
+            if self.stalls > 0 {
+                self.stalls -= 1;
+                self.blocked = true;
+                return Err("the read's time ran out");
+            }
+            if self.broken {
+                return Err("connection refused");
+            }
+            self.source.read_at(offset, buffer)
+        }
+
+        fn blocked(&mut self) -> bool {
+            core::mem::take(&mut self.blocked)
+        }
+    }
+
+    let data: Vec<u8> = (0..3 * BLOCK_BYTES).map(|n| (n % 251) as u8).collect();
+    for deflate in [false, true] {
+        let (source, manifest) = parts(&data, deflate, &[], &[], ERASE);
+        let reader = Stalling {
+            source,
+            stalls: 0,
+            broken: false,
+            blocked: false,
+        };
+        let mut store = Store::open(reader, manifest, 0).unwrap();
+        store.prepare().unwrap();
+        store.reader.stalls = 2;
+        for _ in 0..2 {
+            assert!(matches!(
+                store.read_at("os.dmg", 5, BLOCK_BYTES),
+                Err(Error::Pending)
+            ));
+        }
+        assert_eq!(
+            store.read_at("os.dmg", 5, BLOCK_BYTES).unwrap(),
+            data[5..5 + BLOCK_BYTES]
+        );
+        // Any other failure stays the payload's refusal.
+        store.cursors.0.clear();
+        store.reader.broken = true;
+        let error = store.read_at("os.dmg", 2 * BLOCK_BYTES as u64, 16);
+        assert!(matches!(error, Err(Error::Payload(_))), "{error:?}");
+    }
+}
+
+#[test]
+fn a_scan_a_pending_read_stops_goes_on_without_reading_again() {
+    /// Every third read runs out of time; counts the bytes it serves.
+    struct Stalling {
+        source: Memory,
+        reads: usize,
+        served: u64,
+        blocked: bool,
+        /// Reads are bounded once the store is open.
+        bounded: bool,
+    }
+    impl ReadAt for Stalling {
+        type Error = &'static str;
+
+        fn len(&self) -> u64 {
+            self.source.len()
+        }
+
+        fn read_at(
+            &mut self,
+            offset: u64,
+            buffer: &mut [u8],
+        ) -> core::result::Result<(), Self::Error> {
+            self.reads += 1;
+            if self.bounded && self.reads.is_multiple_of(3) {
+                self.blocked = true;
+                return Err("the read's time ran out");
+            }
+            self.served += buffer.len() as u64;
+            self.source.read_at(offset, buffer)
+        }
+
+        fn blocked(&mut self) -> bool {
+            core::mem::take(&mut self.blocked)
+        }
+    }
+
+    // Barely compressible, so a deflate member refills its input often.
+    let mut state = 0x2545_f491_u32;
+    let data: Vec<u8> = (0..16 * BLOCK_BYTES + 777)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8
+        })
+        .collect();
+    for deflate in [false, true] {
+        let mut clean = fixture(&data, deflate);
+        clean.prepare().unwrap();
+        let (source, manifest) = parts(&data, deflate, &[], &[], ERASE);
+        let archive = source.len();
+        let reader = Stalling {
+            source,
+            reads: 0,
+            served: 0,
+            blocked: false,
+            bounded: false,
+        };
+        let mut store = Store::open(reader, manifest, 0).unwrap();
+        store.reader.served = 0;
+        store.reader.bounded = true;
+        let mut pending = 0;
+        loop {
+            match store.prepare() {
+                Ok(()) => break,
+                Err(Error::Pending) => pending += 1,
+                Err(error) => panic!("deflate={deflate}: {error:?}"),
+            }
+            assert!(pending < 10_000);
+        }
+        assert!(pending > 2, "deflate={deflate}");
+        // Each byte is read once, plus member headers.
+        assert!(
+            store.reader.served < archive + 64 * 1024,
+            "deflate={deflate}: served {} of {archive}",
+            store.reader.served
+        );
+        assert_eq!(
+            store.verified["os.dmg"].blocks,
+            clean.verified["os.dmg"].blocks
+        );
+        assert_eq!(
+            store.digest384("os.dmg").unwrap(),
+            clean.digest384("os.dmg").unwrap()
+        );
+    }
+}

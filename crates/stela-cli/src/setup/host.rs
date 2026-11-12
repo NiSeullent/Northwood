@@ -219,16 +219,6 @@ pub(crate) struct Cpu {
     pub(crate) entropy: bool,
 }
 
-/// A USB Bluetooth controller: its vendor and product IDs, and whether its
-/// interface 0 is of vendor class FF/01/01, as Broadcom PatchRAM modules'
-/// are, rather than the standard HCI class E0/01/01.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct UsbBluetooth {
-    pub(crate) vendor: u16,
-    pub(crate) product: u16,
-    pub(crate) vendor_interface: bool,
-}
-
 pub(crate) trait Host {
     fn volume(&self, path: &Path) -> Result<Volume>;
     /// Physical whole disks; empty where the host cannot list them.
@@ -254,8 +244,7 @@ pub(crate) trait Host {
     fn nvidia_gpus(&self) -> Result<Vec<u16>> {
         Ok(Vec::new())
     }
-    /// The PCI vendor and device IDs of this computer's network adapters;
-    /// empty where the host cannot list them.
+    /// PCI vendor and device IDs for legacy per-PC firmware provisioning.
     fn network_adapters(&self) -> Result<Vec<(u16, u16)>> {
         Ok(Vec::new())
     }
@@ -263,11 +252,6 @@ pub(crate) trait Host {
     /// that a USB taken out after setup holds what setup wrote.
     fn flush(&self, _path: &Path) -> Result<()> {
         Ok(())
-    }
-    /// This computer's USB Bluetooth controllers; empty where the host
-    /// cannot list them.
-    fn bluetooth_controllers(&self) -> Result<Vec<UsbBluetooth>> {
-        Ok(Vec::new())
     }
     /// Check write access before downloading or signing for a whole USB.
     fn check_erase_access(&self, _disk: &str) -> Result<()> {

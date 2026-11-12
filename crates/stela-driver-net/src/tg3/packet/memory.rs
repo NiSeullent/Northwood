@@ -185,7 +185,13 @@ impl Memory {
         }
         Ok(())
     }
-    pub(super) fn receive(&mut self, index: usize) -> Result<(usize, Option<Vec<u8>>), Error> {
+    /// Takes return descriptor `index`: its packet slot, and whether a good
+    /// frame was copied into `frame` (left unchanged otherwise).
+    pub(super) fn receive(
+        &mut self,
+        index: usize,
+        frame: &mut Vec<u8>,
+    ) -> Result<(usize, bool), Error> {
         let at = index * RX_DESCRIPTOR_BYTES;
         // Producer publication orders all BD words before status. The host
         // mailbox prevents reuse; coherent reads do not invalidate a live line.
@@ -214,18 +220,18 @@ impl Memory {
         let length = length - 4; // device includes the Ethernet FCS.
         if error & RX_ERRORS != 0 || kind & RX_ERROR != 0 || !(HEADER..=MAX_FRAME).contains(&length)
         {
-            return Ok((slot, None));
+            return Ok((slot, false));
         }
-        let mut frame = Vec::new();
-        frame
-            .try_reserve_exact(length)
-            .map_err(|_| Error::Memory(MemoryError::OutOfMemory))?;
         let source = self.buffers[RX_DATA].cpu.address(slot * BUFFER, length)?;
+        frame
+            .try_reserve(length.saturating_sub(frame.len()))
+            .map_err(|_| Error::Memory(MemoryError::OutOfMemory))?;
+        frame.clear();
         for i in 0..length {
             // SAFETY: completed and bounds checked RX page.
             frame.push(unsafe { source.as_ptr().add(i).read_volatile() });
         }
-        Ok((slot, Some(frame)))
+        Ok((slot, true))
     }
     pub(super) fn offer(&mut self, slot: usize) -> Result<(), Error> {
         if slot >= self.geometry.rx || self.active_rx[slot] {

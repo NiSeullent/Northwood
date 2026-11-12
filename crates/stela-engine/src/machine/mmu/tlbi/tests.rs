@@ -97,7 +97,7 @@ fn everywhere_names_va_forms_by_address_of_any_regime_or_asid() {
     );
     assert_eq!(
         everywhere(TlbiKind::ASID, Named::EL10, 9 << 48),
-        Everywhere::NonGlobal
+        Everywhere::NonGlobal(9)
     );
     assert_eq!(everywhere(TlbiKind::VMALL, Named::EL10, 0), Everywhere::All);
     assert_eq!(everywhere(TlbiKind::ALL, Named::EL2, 0), Everywhere::All);

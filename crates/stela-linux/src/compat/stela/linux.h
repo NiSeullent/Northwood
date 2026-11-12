@@ -139,6 +139,9 @@ bool stela_linux_try_enter(const struct stela_linux_owner *owner);
 void stela_linux_exit(void);
 /* Checked quiescence in the serialized context, not a native IRQ witness. */
 bool stela_linux_quiescent(void);
+/* Runs irq_work a workqueue worker raised in process context, from a
+ * quiescent task (its cond_resched after the item, or its park). */
+void stela_linux_irq_work_run_owed(void);
 /* Explicit original rcu_barrier on a retained source process; it may sleep.
  * Joins already queued callbacks, not future descendants. Caller first stops
  * producers and joins each last-callback lifetime. Never a scheduler/exit hook. */

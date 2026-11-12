@@ -52,11 +52,42 @@ impl Allocation {
             return Err(AllocationError::InvalidSize(bytes));
         }
         let count = usize::try_from(bytes / PAGE).map_err(|_| AllocationError::PageCount(bytes))?;
-        let page = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, count)
-            .map_err(|error| AllocationError::Firmware(error.status()))?;
+        // The engine runs its stacks only in write-back memory; firmware
+        // whose MTRRs leave some RAM otherwise gets the pages taken again.
+        // SAFETY: the loader runs at CPL0 on the BSP, as the processor
+        // capture's own observation of it does.
+        let types = unsafe { crate::native_smp::firmware::observe_boxed() }
+            .ok()
+            .and_then(|snapshot| {
+                crate::native_smp::memory_types::Image::from_snapshot(&snapshot).ok()
+            });
+        let placed = stela_boot_core::writeback_placement::place(
+            || {
+                boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, count)
+                    .map(|page| page.as_ptr() as u64)
+                    .map_err(|error| AllocationError::Firmware(error.status()))
+            },
+            |base| Some(types.as_ref()?.writeback_ram(base, bytes).is_ok()),
+        )?;
+        for base in &placed.rejected {
+            // SAFETY: these pages were allocated just above and never used.
+            let _ = unsafe {
+                boot::free_pages(
+                    core::ptr::NonNull::new(*base as *mut u8).expect("allocated pages"),
+                    count,
+                )
+            };
+        }
+        if !placed.rejected.is_empty() || placed.writeback == Some(false) {
+            crate::output::arguments(format_args!(
+                "TASK MEMORY write-back={:?} after {} allocations in non-write-back memory\n",
+                placed.writeback,
+                placed.rejected.len() + usize::from(placed.writeback == Some(false)),
+            ));
+        }
         Ok(Self {
             region: Region {
-                physical: page.as_ptr() as u64,
+                physical: placed.base,
                 bytes,
             },
             claimed: AtomicBool::new(false),

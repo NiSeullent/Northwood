@@ -15,6 +15,11 @@ fn hub(pes: usize) -> (Arc<Hub>, Arc<AtomicUsize>) {
     for pe in 0..pes {
         hub.set_live(pe, true);
     }
+    // Every PE but the first, which a test's machine may be, runs a block
+    // (`Hub::enter_active`): a broadcast waits for it.
+    for pe in 1..pes {
+        assert!(hub.enter_active(pe));
+    }
     (hub, kicks)
 }
 
@@ -606,6 +611,65 @@ fn a_completion_wait_answers_the_host_each_turn() {
     assert_eq!(machine.host.relaxes, 3);
 }
 
+/// A wait for a PE that does not apply posted maintenance past its bound
+/// is reported once, naming that PE and where it is, and goes on: it ends
+/// normally once the PE applies the maintenance.
+#[test]
+fn a_completion_wait_past_its_bound_is_reported_once_and_goes_on() {
+    let (hub, _) = hub(2);
+    let mut machine = first_of_two(&[], &hub);
+    machine.post(Maintenance::Code(Some(0x4000)));
+    machine.send_outgoing();
+    let limit = machine.profile.counter_frequency / super::MAINTENANCE_WAIT_DIVISOR;
+    // Each turn reads the counter a step later: the bound passes at about
+    // the eighth turn, and PE 1 applies at the 40th.
+    machine.host.counter_step = limit / 8;
+    let other = Arc::clone(&hub);
+    machine.host.on_relax = Some(Box::new(move |turns| {
+        if turns == 40 {
+            let mail = other.take(1).expect("posted mail");
+            other.acknowledge(1, mail.serial);
+        }
+    }));
+    let degraded = machine.statistics.degraded;
+    machine.complete_maintenance().unwrap();
+    assert_eq!(machine.host.relaxes, 40, "waited until PE 1 applied");
+    assert!(machine.posted.is_empty());
+    assert_eq!(machine.statistics.degraded, degraded + 1);
+    let reports = machine.take_unmodeled();
+    assert_eq!(reports.len(), 1, "once: {reports:?}");
+    let RequirementKind::MaintenanceOverrun {
+        pe,
+        serial,
+        unapplied,
+        state,
+        ticks,
+    } = reports[0].kind
+    else {
+        panic!("expected a maintenance overrun, got {:?}", reports[0].kind);
+    };
+    assert_eq!(
+        (pe, serial, unapplied, state),
+        (1, 1, 1, super::super::PeState::Running)
+    );
+    assert!((limit..2 * limit).contains(&ticks), "{ticks} of {limit}");
+    assert!(
+        reports[0]
+            .to_string()
+            .contains("maintenance overrun: PE 1 (running)")
+    );
+
+    // A wait within its bound reports nothing.
+    machine.host.on_relax = None;
+    machine.host.counter_step = 0;
+    machine.post(Maintenance::Code(Some(0x8000)));
+    machine.send_outgoing();
+    let mail = hub.take(1).expect("posted mail");
+    hub.acknowledge(1, mail.serial);
+    machine.complete_maintenance().unwrap();
+    assert!(machine.take_unmodeled().is_empty());
+}
+
 #[test]
 fn maintenance_waits_for_the_dsb_and_reaches_a_pe_in_one_piece_of_mail() {
     let (hub, _) = hub(2);
@@ -626,10 +690,13 @@ fn maintenance_waits_for_the_dsb_and_reaches_a_pe_in_one_piece_of_mail() {
 fn a_broadcast_passes_by_a_pe_outside_its_run() {
     let (hub, _) = hub(2);
     let mut machine = first_of_two(&[], &hub);
+    // PE 0 runs a block.
+    assert!(hub.enter_active(0));
     let posted = hub.broadcast(1, &[Maintenance::Code(None)]);
     assert!(!hub.applied(&mut posted.clone()));
     machine.outside_run(|_| assert!(hub.applied(&mut posted.clone())));
     assert!(!hub.applied(&mut posted.clone()));
+    hub.leave_active(0);
 }
 
 #[test]
@@ -1166,6 +1233,54 @@ impl Kick for Ticks {
     fn ticks(&self) -> u64 {
         self.0.fetch_add(1, Ordering::SeqCst) as u64
     }
+}
+
+/// Counts the host work releases of the devices' lock run
+/// ([`Kick::released`]).
+struct Releases(Arc<AtomicUsize>);
+impl Kick for Releases {
+    fn kick(&self, _pe: usize) {}
+    fn released(&self) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+}
+
+/// The host work a release of the devices' lock leaves runs only on a PE
+/// outside its run loop or asleep, where no broadcast waits for it: one
+/// inside its loop, or a call that names no PE, leaves it for later, so a
+/// slow host device never keeps a running PE from its mail.
+#[test]
+fn released_host_work_runs_only_outside_the_run_loop() {
+    let released = Arc::new(AtomicUsize::new(0));
+    let hub = Hub::new(2, Releases(Arc::clone(&released)));
+    for pe in 0..2 {
+        hub.set_live(pe, true);
+    }
+    let home = SharedDevices::new(Signalling::default(), Arc::clone(&hub));
+    released.store(0, Ordering::SeqCst);
+    let mut worker = home.worker();
+
+    // Inside its run loop: the access takes the lock and leaves the work.
+    worker.write(1, 0, 4, 0, 0).unwrap();
+    assert_eq!(released.load(Ordering::SeqCst), 0, "inside the run loop");
+    // A call that names no PE leaves it too.
+    home.with(|_| ());
+    assert_eq!(released.load(Ordering::SeqCst), 0, "no PE named");
+
+    // Outside its run loop, as a device site's access runs, it does it.
+    hub.set_outside(1, true);
+    worker.write(1, 0, 4, 0, 0).unwrap();
+    assert_eq!(released.load(Ordering::SeqCst), 1, "outside");
+    hub.set_outside(1, false);
+
+    // Asleep, as a halted PE serving the host, it does it.
+    hub.inboxes[1].sleeping.store(true, Ordering::SeqCst);
+    worker.write(1, 0, 4, 0, 0).unwrap();
+    assert_eq!(released.load(Ordering::SeqCst), 2, "asleep");
+    hub.inboxes[1].sleeping.store(false, Ordering::SeqCst);
+    worker.write(1, 0, 4, 0, 0).unwrap();
+    assert_eq!(released.load(Ordering::SeqCst), 2, "inside again");
 }
 
 /// What follows a write, [`Devices::settle_write`]: the lock, the DMA
@@ -2391,4 +2506,342 @@ fn a_pe_that_joins_the_board_takes_stamps_of_its_table() {
     let mut cache = shared.cache();
     assert_eq!(control.cells, cache.targets.stamped_cells());
     assert!(cache.targets.holds_stamps(control.stamps));
+}
+
+/// A WFE of a PE that is not home ends inside the scheduler's entry when
+/// its next own wake is within the halt-poll: at its event stream edge, or
+/// earlier on another PE's SEV, with mail that came during the spin read
+/// before the guest runs again. A wake past the poll, and the home PE,
+/// take the wait passes.
+#[test]
+fn a_short_wfe_completes_in_its_exit_without_the_wait_passes() {
+    use super::super::tests::{BASE, FakeHost, machine};
+    use crate::machine::NoDevices;
+    use crate::machine::system::Register as SystemRegister;
+    use crate::machine::system::TlbiKind::VAA;
+    const WFE: u32 = 0xd503_205f;
+    let start = |events: u64| {
+        let (hub, _) = hub(2);
+        let mut machine = machine(&[]);
+        machine.enter_parallel(Arc::clone(&hub)).unwrap();
+        hub.home.store(1, Ordering::Relaxed);
+        machine.host.counter_step = 1;
+        machine.idle_poll = 300;
+        // CNTHCTL_EL2.EVNTEN with EVNTI `events`: edges 2^(events+1) apart.
+        machine
+            .cpu
+            .registers
+            .set(SystemRegister::CNTHCTL_EL2, 0, 1 << 2 | events << 4);
+        (hub, machine)
+    };
+    let wfe = |machine: &mut Machine<FakeHost, NoDevices>| {
+        machine.cpu.pc = BASE;
+        machine.system_instruction(WFE).unwrap();
+        machine.schedule()
+    };
+    // Edges 128 counts apart: the spin reaches the next one.
+    let (_hub, mut machine) = start(6);
+    let edge = crate::machine::timer::next_event(&machine.cpu, machine.host.now).unwrap();
+    wfe(&mut machine).unwrap();
+    assert!(machine.waiting.is_none() && !machine.cpu.event);
+    assert_eq!(machine.cpu.pc, BASE + 4);
+    let statistics = &machine.statistics;
+    assert_eq!((statistics.waits, statistics.short_waits), (1, 1));
+    assert_eq!(statistics.halt_ticks, 0);
+    assert!(machine.host.timers.is_empty(), "no halt was armed");
+    assert!(machine.host.now >= edge && machine.host.now < edge + 100);
+    // Another PE's TLBI and SEV during the spin: both are read in it and
+    // the SEV ends the WFE before the edge.
+    let (hub, mut machine) = start(7);
+    let edge = crate::machine::timer::next_event(&machine.cpu, machine.host.now).unwrap();
+    let sender = Arc::clone(&hub);
+    machine.host.on_relax = Some(Box::new(move |turn| {
+        if turn == 3 {
+            sender.broadcast(1, &[tlbi(VAA, 0x1234)]);
+            sender.event(1);
+        }
+    }));
+    wfe(&mut machine).unwrap();
+    assert!(machine.waiting.is_none());
+    assert!(!hub.pending(0), "the mail was read");
+    assert_eq!(machine.statistics.short_waits, 1);
+    assert!(machine.host.now < edge, "the SEV ended it");
+    // Edges 65536 counts apart, past the poll: the wait passes take it.
+    let (_hub, mut machine) = start(15);
+    wfe(&mut machine).unwrap();
+    assert!(machine.waiting.is_none());
+    assert_eq!(machine.statistics.short_waits, 0);
+    assert!(machine.statistics.waits > 0);
+    // The home PE always takes the passes.
+    let (hub, mut machine) = start(6);
+    hub.home.store(0, Ordering::Relaxed);
+    wfe(&mut machine).unwrap();
+    assert_eq!(machine.statistics.short_waits, 0);
+}
+
+/// A device whose IRQ rises at `irq_at`, which a write sets; counts its
+/// advances where reading the count takes no lock.
+struct Armed {
+    irq_at: u64,
+    advances: Arc<AtomicUsize>,
+}
+
+impl Devices for Armed {
+    fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+        Ok(0)
+    }
+    fn write(&mut self, _: usize, _: u64, _: u8, value: u64, _: u64) -> Result<(), DeviceError> {
+        self.irq_at = value;
+        Ok(())
+    }
+    fn lines(&mut self, _: usize, now: u64) -> Lines {
+        Lines {
+            irq: now >= self.irq_at,
+            ..Lines::default()
+        }
+    }
+    fn deadline(&mut self, now: u64) -> Option<u64> {
+        self.advances.fetch_add(1, Ordering::Relaxed);
+        (now < self.irq_at).then_some(self.irq_at)
+    }
+}
+
+/// The home machine's wait pass advances the devices once: the deadline
+/// its cached lines came with stands in for a second advance, until
+/// another PE's call reaches the devices, such as one that arms an earlier
+/// deadline, which the next pass then sees.
+#[test]
+fn home_reuses_its_lines_deadline_until_another_pe_reaches_the_devices() {
+    use super::super::tests::board;
+    use stela_contracts::identity::Identity;
+    let (hub, _) = hub(2);
+    let count = Arc::new(AtomicUsize::new(0));
+    let home = SharedDevices::new(
+        Armed {
+            irq_at: 100,
+            advances: Arc::clone(&count),
+        },
+        hub,
+    );
+    let mut worker = home.worker();
+    let identities = vec![Identity {
+        midr: 0x611f_0320,
+        mpidr: 0x8000_0000,
+        clock: None,
+        caches: None,
+    }];
+    let mut machine = board(&[], home, identities);
+    let advances = |_: &Machine<_, SharedDevices<Armed>>| count.load(Ordering::Relaxed);
+    assert!(!machine.device_lines_of(0, 10).irq);
+    let before = advances(&machine);
+    assert_eq!(machine.next_deadline(10), Some(100));
+    assert_eq!(machine.next_deadline(20), Some(100));
+    assert_eq!(advances(&machine), before, "no second advance");
+    // PE 1 arms an earlier deadline: the next pass asks the devices.
+    worker.write(1, 0x30, 4, 50, 20).unwrap();
+    assert_eq!(machine.next_deadline(20), Some(50));
+    assert_eq!(advances(&machine), before + 1);
+    // Past the cached deadline the devices are asked again too.
+    machine.device_lines = None;
+    assert!(!machine.device_lines_of(0, 30).irq);
+    let before = advances(&machine);
+    assert_eq!(machine.next_deadline(40), Some(50));
+    assert_eq!(advances(&machine), before);
+    assert_eq!(machine.next_deadline(60), None);
+    assert_eq!(advances(&machine), before + 1);
+}
+
+/// Quiescent maintenance: the post-then-entry order. Mail posted while a
+/// PE is between blocks counts as applied at once, and the PE's next entry
+/// finds it and does not enter until it has read it.
+#[test]
+fn mail_posted_between_blocks_is_applied_at_once_and_blocks_the_next_entry() {
+    let (hub, _) = hub(2);
+    hub.leave_active(1);
+    let mut posted = hub.broadcast(0, &[Maintenance::Code(None)]);
+    assert_eq!(posted.len(), 1, "reached and interrupted");
+    assert!(
+        hub.applied(&mut posted),
+        "a PE between blocks is not waited for"
+    );
+    assert!(!hub.enter_active(1), "the entry finds the mail");
+    assert_eq!(hub.inboxes[1].active.load(Ordering::SeqCst) & 1, 0);
+    let mail = hub.take(1).unwrap();
+    hub.acknowledge(1, mail.serial);
+    assert!(hub.enter_active(1), "read, it enters");
+}
+
+/// The entry-then-post order: a PE running a block is waited for until it
+/// applies the mail or leaves the block, whichever is first.
+#[test]
+fn mail_posted_while_a_pe_runs_a_block_waits_for_it_to_apply_or_leave() {
+    let (hub, _) = hub(3);
+    let mut posted = hub.broadcast(0, &[Maintenance::Code(None)]);
+    assert_eq!(posted.len(), 2);
+    assert!(!hub.applied(&mut posted));
+    // PE 1 applies it while it runs; PE 2 leaves its block without it.
+    let mail = hub.take(1).unwrap();
+    hub.acknowledge(1, mail.serial);
+    assert!(!hub.applied(&mut posted));
+    assert_eq!(posted, [(2, 1)]);
+    hub.leave_active(2);
+    assert!(hub.applied(&mut posted));
+    // Left without reading it, PE 2 reads it before its next block.
+    assert!(!hub.enter_active(2));
+    let mail = hub.take(2).unwrap();
+    hub.acknowledge(2, mail.serial);
+    assert!(hub.enter_active(2));
+}
+
+/// A broadcast's DSB does not wait for a PE between blocks, however long
+/// it stays there (fetching, compiling, scheduling): the wait takes no
+/// turn at all, and the mail stays for the PE's next entry.
+#[test]
+fn a_completion_does_not_wait_for_a_pe_between_blocks() {
+    let (hub, _) = hub(2);
+    hub.leave_active(1);
+    let mut machine = first_of_two(&[], &hub);
+    machine.post(Maintenance::Code(Some(0x4000)));
+    machine.send_outgoing();
+    machine.complete_maintenance().unwrap();
+    assert_eq!(machine.host.relaxes, 0, "no turn of the wait");
+    assert!(machine.posted.is_empty());
+    assert!(hub.pending(1));
+    assert!(!hub.enter_active(1));
+}
+
+/// A machine that mail reached after its fetch does not run what it
+/// fetched: it reads the mail first and fetches again, so it never runs
+/// a block the mail retired.
+#[test]
+fn a_machine_reads_mail_that_came_after_its_fetch_before_it_runs_the_block() {
+    use super::super::tests::BASE;
+    use stela_compiler::block::ExitKind;
+    let (hub, _) = hub(2);
+    // NOP; NOP.
+    let mut machine = first_of_two(&[0xd503_201f, 0xd503_201f], &hub);
+    let exit = |next_pc| super::super::NativeExit::Exit {
+        next_pc,
+        kind: ExitKind::Direct as u64,
+    };
+    // The block runs once and comes back to itself: it stays installed.
+    machine.host.exits = vec![exit(BASE), exit(BASE + 8)];
+    machine.step().unwrap();
+    assert_eq!(machine.cpu.pc, BASE);
+    // PE 1 discards every block while PE 0 is between blocks; PE 0's next
+    // fetch still finds the old block.
+    let mut posted = hub.broadcast(1, &[Maintenance::Code(None)]);
+    let posted_serial = posted[0].1;
+    assert!(hub.applied(&mut posted));
+    machine.step().unwrap();
+    assert_eq!(machine.cpu.pc, BASE, "nothing ran");
+    assert_eq!(machine.host.exits.len(), 1);
+    assert_eq!(hub.inboxes[0].active.load(Ordering::SeqCst) & 1, 0);
+    // Its schedule reads the mail, and the next step runs a fresh block.
+    machine.read_mail().unwrap();
+    assert!(!hub.pending(0));
+    assert_eq!(hub.inboxes[0].applied.load(Ordering::SeqCst), posted_serial);
+    machine.step().unwrap();
+    assert_eq!(machine.cpu.pc, BASE + 8);
+    assert!(machine.host.exits.is_empty());
+    assert_eq!(hub.inboxes[0].active.load(Ordering::SeqCst) & 1, 0);
+}
+
+/// Racing posts against a PE that enters and leaves blocks: whenever the
+/// broadcaster has counted a post as applied, the PE, inside any block it
+/// runs, has applied it. Bounded by counts, not by time.
+#[test]
+fn a_pe_inside_a_block_has_applied_every_post_counted_as_applied() {
+    const POSTS: u64 = 5_000;
+    let (hub, _) = hub(2);
+    hub.leave_active(1);
+    let required = AtomicU64::new(0);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut applied = 0;
+            let mut entries = 0u64;
+            while !done.load(Ordering::SeqCst) {
+                if let Some(mail) = hub.take(1) {
+                    applied = mail.serial;
+                    hub.acknowledge(1, mail.serial);
+                    continue;
+                }
+                if hub.enter_active(1) {
+                    entries += 1;
+                    assert!(required.load(Ordering::SeqCst) <= applied);
+                    for _ in 0..(entries % 16) {
+                        core::hint::spin_loop();
+                    }
+                    assert!(required.load(Ordering::SeqCst) <= applied);
+                    hub.leave_active(1);
+                }
+            }
+        });
+        for page in 1..=POSTS {
+            let mut posted = hub.broadcast(0, &[Maintenance::Code(Some(page << 14))]);
+            let serial = posted[0].1;
+            while !hub.applied(&mut posted) {
+                std::thread::yield_now();
+            }
+            required.store(serial, Ordering::SeqCst);
+        }
+        done.store(true, Ordering::SeqCst);
+    });
+}
+
+/// A DSB completes natively while this PE has no maintenance outstanding,
+/// in any state and across derived state changes, and exits to the engine
+/// once a post or an open code page cell leaves it something to complete;
+/// the engine's DSB completes that and reopens the native path.
+#[test]
+fn native_dsb_completes_only_without_outstanding_maintenance() {
+    use super::super::mirrors::{BARRIER, CODE_PAGE};
+    use super::super::tests::{BASE, FakeHost};
+    use super::super::transitions::tests::run_native;
+    use crate::machine::NoDevices;
+    use crate::machine::exception::Pstate;
+    use stela_compiler::x86_64::register_read;
+    use stela_compiler::{GuestAddress, block::ExitKind};
+    const DSB_ISH: u32 = 0xd503_3b9f;
+    let (hub, _) = hub(2);
+    let mut machine = first_of_two(&[DSB_ISH], &hub);
+    machine.cpu.pstate = Pstate::reset(1);
+    let thunk = register_read::barrier_thunk(GuestAddress(BASE), BARRIER);
+    let native = |machine: &mut Machine<FakeHost, NoDevices>| {
+        let exit = run_native(machine, &thunk.code);
+        if exit == (BASE + 4, ExitKind::Fallthrough as u64) {
+            true
+        } else {
+            assert_eq!(exit, (BASE, ExitKind::System as u64));
+            false
+        }
+    };
+    let engine = |machine: &mut Machine<FakeHost, NoDevices>| {
+        machine.cpu.pc = BASE;
+        machine.system_instruction(DSB_ISH).unwrap();
+        assert_eq!(machine.cpu.pc, BASE + 4);
+    };
+    assert!(!native(&mut machine), "no DSB completed yet");
+    engine(&mut machine);
+    assert!(native(&mut machine));
+    // Neither derived state nor the PE's state decides it.
+    machine.derived_changed();
+    assert!(native(&mut machine), "derived state changed");
+    machine.cpu.pstate.el = 0;
+    assert!(native(&mut machine), "at EL0");
+    machine.cpu.pstate.el = 1;
+    // Maintenance for the other PE: the DSB must send it and wait.
+    machine.post(Maintenance::Code(None));
+    assert!(!native(&mut machine), "maintenance posted");
+    hub.set_live(1, false);
+    engine(&mut machine);
+    assert!(machine.outgoing.is_empty() && machine.posted.is_empty());
+    assert!(native(&mut machine));
+    // A code page cell the DSB that ends the run of lines must close.
+    machine.mirrors.open_code_page(0x4000);
+    assert!(!native(&mut machine), "code page cell open");
+    engine(&mut machine);
+    assert_eq!(machine.mirrors[CODE_PAGE].readable, 0);
+    assert!(native(&mut machine));
 }

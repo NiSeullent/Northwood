@@ -6,7 +6,7 @@ use crate::{
     GuestAddress, GuestState, Options, TargetCpu,
     aarch64::floating::{
         FPCR_AH, FPCR_AHP, FPCR_DN, FPCR_EXCEPTION_ENABLE_MASK, FPCR_FIZ, FPCR_FZ, FPCR_FZ16,
-        FPCR_NEP, FPCR_ROUNDING_SHIFT, Format, INEXACT,
+        FPCR_NEP, FPCR_ROUNDING_SHIFT, Format, INEXACT, INVALID,
         integer::{IntegerFormat, IntegerRounding, IntegerWidth, from_integer, to_integer},
     },
     block::{BlockProfile, CompilationPlan},
@@ -200,36 +200,61 @@ fn run_forms(
     assert!(inline > 100_000, "{inline}");
 }
 
-#[test]
-fn half_to_integer_fields_match_the_reference() {
-    // FCVTZS, FCVTZU.
+/// FCVTZS/FCVTZU and the rounding forms: every finite normal or zero lane
+/// whose result fits completes inline under each rounding the word names.
+fn half_to_integer_fields(mode: IntegerRounding, signed_base: u32) {
+    let reference = move |integer, fpcr, bits| {
+        to_integer(Format::Half, integer, 0, mode, fpcr, bits)
+            .ok()
+            .map(|outcome: crate::aarch64::floating::Outcome| (outcome.bits, outcome.exceptions))
+    };
     run_forms(
-        [(0x0ef9_b800, true), (0x2ef9_b800, false)],
+        [(signed_base, true), (signed_base | 1 << 29, false)],
         &|signed, bits, fpcr| {
             let exponent = bits >> 10 & 31;
-            let negative = bits >> 15 != 0;
+            let integer = IntegerFormat {
+                width: IntegerWidth::Bits16,
+                signed,
+            };
             fpcr & FPCR_EXCEPTION_ENABLE_MASK == 0
                 && exponent != 31
                 && (exponent != 0 || bits & 0x7fff == 0)
-                && if signed {
-                    exponent < 30
-                } else {
-                    !negative || exponent < 15
-                }
+                && (!signed || exponent < 30)
+                && reference(integer, 0, u64::from(bits))
+                    .is_some_and(|(_, flags)| flags & INVALID == 0)
         },
-        &|integer, fpcr, bits| {
-            to_integer(
-                Format::Half,
-                integer,
-                0,
-                IntegerRounding::TowardZero,
-                fpcr,
-                bits,
-            )
-            .ok()
-            .map(|outcome| (outcome.bits, outcome.exceptions))
-        },
+        &reference,
     );
+}
+
+#[test]
+fn half_to_integer_fields_match_the_reference() {
+    // FCVTZS, FCVTZU.
+    half_to_integer_fields(IntegerRounding::TowardZero, 0x0ef9_b800);
+}
+
+#[test]
+fn half_to_integer_nearest_even_fields_match_the_reference() {
+    // FCVTNS, FCVTNU.
+    half_to_integer_fields(IntegerRounding::NearestEven, 0x0e79_a800);
+}
+
+#[test]
+fn half_to_integer_nearest_away_fields_match_the_reference() {
+    // FCVTAS, FCVTAU.
+    half_to_integer_fields(IntegerRounding::NearestAway, 0x0e79_c800);
+}
+
+#[test]
+fn half_to_integer_toward_positive_fields_match_the_reference() {
+    // FCVTPS, FCVTPU.
+    half_to_integer_fields(IntegerRounding::TowardPositive, 0x0ef9_a800);
+}
+
+#[test]
+fn half_to_integer_toward_negative_fields_match_the_reference() {
+    // FCVTMS, FCVTMU.
+    half_to_integer_fields(IntegerRounding::TowardNegative, 0x0e79_b800);
 }
 
 #[test]

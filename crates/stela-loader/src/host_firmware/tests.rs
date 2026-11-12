@@ -18,9 +18,13 @@ fn mount_revision_checks_each_image_without_downgrading_unknown_contracts() {
     let mut legacy = MOUNT_CAPABILITY;
     legacy[20] = 1;
     let mut unknown = MOUNT_CAPABILITY;
-    unknown[20] = 4;
+    unknown[20] = 5;
     let mut small = MOUNT_CAPABILITY;
     small[20] = 2;
+    let mut no_bundle = MOUNT_CAPABILITY;
+    no_bundle[20] = 3;
+    assert!(reads_bundle(&MOUNT_CAPABILITY));
+    assert!(!reads_bundle(&no_bundle) && supports_mount(&no_bundle));
     let current = MountLimits::from_image(&MOUNT_CAPABILITY).unwrap();
     let old = MountLimits::from_image(&legacy).unwrap();
     let small = MountLimits::from_image(&small).unwrap();

@@ -266,12 +266,7 @@ impl KeyStore {
             .and_then(|fields| {
                 let reply = reply_message(&deferred.prefix, &fields);
                 payload.output(&reply).map_err(refuse)?;
-                Ok(Frame {
-                    tag: frame.tag | REPLY,
-                    parameter: 0,
-                    data: (reply.len() as u32) << LENGTH_SHIFT,
-                    ..frame
-                })
+                Ok(reply_frame(frame, &reply))
             });
         self.note_refusal(frame, result.as_ref().err());
         Some(result)
@@ -379,7 +374,9 @@ impl KeyStore {
         result
     }
 
-    /// [`Self::begin`], then any derivation to its end.
+    /// [`Self::begin`], then any derivation to its end, for tests: sepOS
+    /// runs one bounded slice per DMA step instead.
+    #[cfg(test)]
     pub fn request(
         &mut self,
         frame: Frame,
@@ -484,12 +481,7 @@ impl KeyStore {
             reply_fields.resize(reply_fields.len().next_multiple_of(4), 0);
             let reply = message.reply(&reply_fields);
             payload.output(&reply).map_err(refuse)?;
-            return Ok(Some(Frame {
-                tag: command | REPLY,
-                parameter: 0,
-                data: (reply.len() as u32) << LENGTH_SHIFT,
-                ..frame
-            }));
+            return Ok(Some(reply_frame(frame, &reply)));
         }
         if volume_key::recognizes(command) {
             let keys = self
@@ -508,12 +500,7 @@ impl KeyStore {
                 .map_err(refuse)?;
             let reply = message.reply(&reply_fields);
             payload.output(&reply).map_err(refuse)?;
-            return Ok(Some(Frame {
-                tag: command | REPLY,
-                parameter: 0,
-                data: (reply.len() as u32) << LENGTH_SHIFT,
-                ..frame
-            }));
+            return Ok(Some(reply_frame(frame, &reply)));
         }
         if command == GET_DEVICE_STATE {
             let state = self
@@ -524,12 +511,7 @@ impl KeyStore {
             reply_fields.resize(reply_fields.len().next_multiple_of(4), 0);
             let reply = message.reply(&reply_fields);
             payload.output(&reply).map_err(refuse)?;
-            return Ok(Some(Frame {
-                tag: command | REPLY,
-                parameter: 0,
-                data: (reply.len() as u32) << LENGTH_SHIFT,
-                ..frame
-            }));
+            return Ok(Some(reply_frame(frame, &reply)));
         }
         if command == CLIENT_TERMINATE {
             if message.variant() != 1 {
@@ -541,12 +523,7 @@ impl KeyStore {
             fields.end().map_err(refuse)?;
             let reply = message.reply(&TERMINATED);
             payload.output(&reply).map_err(refuse)?;
-            return Ok(Some(Frame {
-                tag: command | REPLY,
-                parameter: 0,
-                data: (reply.len() as u32) << LENGTH_SHIFT,
-                ..frame
-            }));
+            return Ok(Some(reply_frame(frame, &reply)));
         }
         if keybag::recognizes(command) {
             let Some(keybags) = self.keybags.as_mut() else {
@@ -574,12 +551,7 @@ impl KeyStore {
                 keybag::Outcome::Reply(reply_fields) => {
                     let reply = message.reply(&reply_fields);
                     payload.output(&reply).map_err(refuse)?;
-                    Ok(Some(Frame {
-                        tag: command | REPLY,
-                        parameter: 0,
-                        data: (reply.len() as u32) << LENGTH_SHIFT,
-                        ..frame
-                    }))
+                    Ok(Some(reply_frame(frame, &reply)))
                 }
                 keybag::Outcome::Derive(pending) => {
                     self.deferred = Some(Deferred {
@@ -605,12 +577,7 @@ impl KeyStore {
             fields.end().map_err(refuse)?;
             let reply = message.reply(&[]);
             payload.output(&reply).map_err(refuse)?;
-            return Ok(Some(Frame {
-                tag: command | REPLY,
-                parameter: 0,
-                data: (reply.len() as u32) << LENGTH_SHIFT,
-                ..frame
-            }));
+            return Ok(Some(reply_frame(frame, &reply)));
         }
         let blob = fields.blob().map_err(refuse)?;
         fields.end().map_err(refuse)?;
@@ -633,12 +600,17 @@ impl KeyStore {
         if environment.is_some() {
             self.environment = environment;
         }
-        Ok(Some(Frame {
-            tag: command | REPLY,
-            parameter: 0,
-            data: (reply.len() as u32) << LENGTH_SHIFT,
-            ..frame
-        }))
+        Ok(Some(reply_frame(frame, &reply)))
+    }
+}
+
+/// The reply frame to `frame`, whose reply message `reply` is written.
+fn reply_frame(frame: Frame, reply: &[u8]) -> Frame {
+    Frame {
+        tag: frame.tag | REPLY,
+        parameter: 0,
+        data: (reply.len() as u32) << LENGTH_SHIFT,
+        ..frame
     }
 }
 

@@ -522,6 +522,10 @@ pub struct State {
     pub initdata_va: Option<u64>,
     /// The root was validated through the UAT and startup status committed.
     pub initdata_checked: bool,
+    /// The last attempt to validate the root and commit the startup status
+    /// was refused: the start does not go on, so the firmware runs no
+    /// doorbell and has not published itself in the handoff.
+    start_refused: bool,
     /// The validated root, kept even if startup-status DMA later faults.
     pub root: Option<Root>,
     startup_word: usize,
@@ -552,6 +556,7 @@ impl State {
             family,
             initdata_va: None,
             initdata_checked: false,
+            start_refused: false,
             root: None,
             startup_word: 0,
             work: Vec::new(),
@@ -641,8 +646,24 @@ impl State {
             || self.stop.is_some()
     }
 
+    /// Whether an IOP sleep must wait for the firmware: a start or a stop
+    /// still in progress, or control work it holds. A start whose root was
+    /// refused does not progress, and none of its queued doorbells can run.
+    fn sleep_waits(&self) -> bool {
+        !self.start_refused && self.dma_pending()
+    }
+
     /// Read the root, then run the queued doorbells in order.
     fn dma(&mut self, memory: &mut dyn Shared, outbox: &mut Vec<Mail>) -> Result<()> {
+        let started = self.start(memory);
+        self.start_refused = started.is_err();
+        started?;
+        self.work(memory, outbox)
+    }
+
+    /// Validate the root the kext sent and commit the startup status and the
+    /// handoff magic, once.
+    fn start(&mut self, memory: &mut dyn Shared) -> Result<()> {
         if let Some(va) = self.initdata_va.filter(|_| !self.initdata_checked) {
             if self.root.is_none() {
                 let magic = self.family.initdata_magic.ok_or(refuse!(
@@ -671,6 +692,11 @@ impl State {
             memory.write_physical(handoff + offset, &magic.to_le_bytes())?;
             self.handoff = None;
         }
+        Ok(())
+    }
+
+    /// Run the queued doorbells in order.
+    fn work(&mut self, memory: &mut dyn Shared, outbox: &mut Vec<Mail>) -> Result<()> {
         while let Some(&job) = self.jobs.front() {
             let root = self
                 .root
@@ -1249,6 +1275,7 @@ impl Firmware for Coprocessor {
     /// with the firmware's state kept, without the native callbacks. Work the
     /// firmware holds goes as it does at a stop, because sleep ends its claim
     /// on those channels; a start or a stop still in progress stays unanswered.
+    /// A start that was refused is not in progress: its sleep is acknowledged.
     fn error_reply(&mut self, message: Mail, _reason: &Refusal) -> Option<Vec<Mail>> {
         if !is_iop_sleep(message) {
             return None;
@@ -1257,7 +1284,7 @@ impl Firmware for Coprocessor {
             let mut state = self.protocol.0.borrow_mut();
             state.jobs.retain(|job| !matches!(job, Job::Work(..)));
             state.active_work = None;
-            if state.dma_pending() {
+            if state.sleep_waits() {
                 return None;
             }
         }
@@ -1293,6 +1320,7 @@ impl Endpoint for Message {
         let mut state = self.0.0.borrow_mut();
         state.initdata_va = None;
         state.initdata_checked = false;
+        state.start_refused = false;
         state.root = None;
         state.startup_word = 0;
         // Historical counters/journals remain diagnostic evidence. Channel

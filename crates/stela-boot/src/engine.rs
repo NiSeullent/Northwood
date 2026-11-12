@@ -20,6 +20,7 @@ mod aml;
 mod bluetooth;
 mod boot_image;
 pub(crate) mod bundle;
+mod bundle_repair;
 mod cursor;
 mod display;
 pub(crate) mod fdr;
@@ -30,6 +31,7 @@ mod input;
 pub(crate) mod install;
 pub(crate) mod interrupts;
 mod kernel_work;
+mod large_blocks;
 pub(crate) use kernel_work::FirmwareContext;
 mod network;
 pub(crate) mod nor;
@@ -419,6 +421,7 @@ fn test_profile(target: TargetCpu, speculation: Speculation) -> CpuProfile {
 fn board_profile(board: &board::Board, target: TargetCpu, speculation: Speculation) -> CpuProfile {
     let chip = board.cpus.chip;
     let mut fixed = stela_engine::machine::identification::derive(chip, target, true, speculation);
+    report_steering(chip, target);
     // 64-byte DC ZVA blocks, enabled: XNU `osfmk/arm64/bzero.s` zeroes with
     // `dc zva` in fixed 64-byte steps.
     fixed.push((DCZID_EL0, 4));
@@ -429,6 +432,45 @@ fn board_profile(board: &board::Board, target: TargetCpu, speculation: Speculati
         fixed,
         processors: board.cpus.processors.clone(),
     }
+}
+
+/// Report once which steered features the identification advertises on
+/// this host and why the others are hidden
+/// (`identification::Basis::Steered`): the guest kernel's
+/// `hw.optional.arm.FEAT_*` sysctls and commpage bits follow the fields.
+fn report_steering(chip: Chip, target: TargetCpu) {
+    let steering = stela_engine::machine::identification::steering(chip, target);
+    let names = |advertised: bool| {
+        let mut names = String::new();
+        for entry in steering
+            .iter()
+            .filter(|entry| entry.advertised == advertised)
+        {
+            if !names.is_empty() {
+                names.push(',');
+            }
+            names.push_str(entry.feature);
+        }
+        if names.is_empty() {
+            names.push('-');
+        }
+        names
+    };
+    let mut reasons = String::new();
+    for entry in steering.iter().filter(|entry| !entry.advertised) {
+        if !reasons.is_empty() {
+            reasons.push_str("; ");
+        }
+        reasons.push_str(entry.feature);
+        reasons.push_str(": ");
+        reasons.push_str(entry.reason);
+    }
+    output::arguments(format_args!(
+        "GUEST FEATURES advertised={} hidden={} because {}\n",
+        names(true),
+        names(false),
+        if reasons.is_empty() { "-" } else { &reasons }
+    ));
 }
 
 /// How long the host's serial port goes without a look once it gave no
@@ -504,14 +546,79 @@ pub(crate) fn feed_console_input() {
     }
 }
 
-/// The guest's console UART, shown line by line as `GUEST| ...`.
+/// The guest's console UART, shown line by line as `GUEST| ...`. In the
+/// automatic Metal plugin repair's boot it also types the repair's commands
+/// (`bundle_repair`), ahead of the host's own input.
 #[derive(Default)]
 struct GuestConsole {
     lines: console_lines::Lines,
+    repair: ConsoleRepair,
+}
+
+#[derive(Default)]
+enum ConsoleRepair {
+    /// Not looked at yet: the boot's kind is known once the guest runs.
+    #[default]
+    Unknown,
+    Driving(stela_boot_core::bundle_repair::Driver),
+    Off,
+}
+
+impl GuestConsole {
+    fn millis() -> u64 {
+        host::fresh_counter() / (host::COUNTER_HZ / 1000)
+    }
+
+    fn repair(&mut self) -> Option<&mut stela_boot_core::bundle_repair::Driver> {
+        if matches!(self.repair, ConsoleRepair::Unknown) {
+            self.repair = match bundle_repair::driver(Self::millis()) {
+                Some(driver) => ConsoleRepair::Driving(driver),
+                None => ConsoleRepair::Off,
+            };
+        }
+        match &mut self.repair {
+            ConsoleRepair::Driving(driver) => Some(driver),
+            _ => None,
+        }
+    }
+
+    /// Log what the driver did. A repair whose shell stopped answering, or
+    /// whose guest did not restart, restarts the PC, once: the next normal
+    /// boot tries the kext, and NVRAM's record makes a still missing plugin
+    /// stop there with the manual remedy instead of repairing again. A
+    /// failed step the shell answered restarts the guest itself.
+    fn report_repair(&mut self) {
+        let Some(driver) = self.repair() else {
+            return;
+        };
+        let events = driver.take_events();
+        let restart = driver.failed();
+        for event in &events {
+            output::arguments(format_args!(
+                "{}\n",
+                stela_boot_core::bundle_repair::describe(event)
+            ));
+        }
+        if restart {
+            self.repair = ConsoleRepair::Off;
+            output::arguments(format_args!(
+                "BUNDLE REPAIR restarting the PC; the next boot tries the kext once\n"
+            ));
+            service::request_restart();
+        }
+    }
 }
 
 impl ConsoleSink for GuestConsole {
     fn poll(&mut self) -> Option<u8> {
+        if let Some(driver) = self.repair() {
+            driver.tick(Self::millis());
+            let byte = driver.next_byte();
+            self.report_repair();
+            if byte.is_some() {
+                return byte;
+            }
+        }
         let input = &CONSOLE_INPUT;
         let taken = input.taken.load(Ordering::Relaxed);
         if taken == input.put.load(Ordering::Acquire) {
@@ -534,6 +641,12 @@ impl ConsoleSink for GuestConsole {
                     "GUEST-FRAGMENT bytes={} continues=1\n",
                     fragment.bytes
                 ));
+            }
+            if let Some(driver) = self.repair() {
+                let now = Self::millis();
+                driver.tick(now);
+                driver.line(&line, now);
+                self.report_repair();
             }
             if !line.trim().is_empty()
                 && let Ok(mut lines) = GUEST_LINES.0.try_borrow_mut()
@@ -773,7 +886,7 @@ fn show_reset(otherwise: &str, action: &str, hold: u64) {
 /// [`show_stop`], then halt until the PC is turned off.
 fn stop_here(text: &str, code: u32) -> ! {
     show_stop(text);
-    crate::status::info(output::STOPPED);
+    crate::status::info(output::stopped_text());
     output::terminate(code)
 }
 
@@ -802,6 +915,72 @@ fn guest_panic() -> Option<String> {
         .try_borrow()
         .ok()
         .and_then(|panic| panic.message().map(String::from))
+}
+
+/// The panic region's guest-physical base and size, from the booted
+/// DeviceTree's `/pram reg` (the loader publishes it; zero when absent).
+static PANIC_REGION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Keep the panic region the booted DeviceTree names, for
+/// [`panic_region_report`].
+pub(crate) fn remember_panic_region(tree: &DeviceTree) {
+    let Some(reg) = tree.property(stela_loader::carveouts::PRAM, "reg") else {
+        return;
+    };
+    let Some((base, bytes)) = reg.value.get(..16).map(|pair| {
+        let (base, bytes) = pair.split_at(8);
+        (
+            u64::from_le_bytes(base.try_into().expect("8 bytes")),
+            u64::from_le_bytes(bytes.try_into().expect("8 bytes")),
+        )
+    }) else {
+        return;
+    };
+    PANIC_REGION[0].store(base, Ordering::Relaxed);
+    PANIC_REGION[1].store(bytes, Ordering::Relaxed);
+}
+
+/// When the guest went down without a panic on its console, what its panic
+/// region holds: XNU logs a panic there before it stops the other CPUs'
+/// work, and a CPU that never answers (parked in SPTM, say) keeps the
+/// console from ever printing it, until a watchdog resets the machine.
+fn panic_region_report<H: Host>(machine: &mut Machine<H, parallel::Board>) {
+    use stela_boot_core::panic_region::{Contents, HEADER_BYTES, TEXT_LIMIT, read};
+    let base = PANIC_REGION[0].load(Ordering::Relaxed);
+    let bytes = PANIC_REGION[1].load(Ordering::Relaxed);
+    if base == 0 || bytes < HEADER_BYTES as u64 {
+        output::arguments(format_args!("GUEST PANIC region=none\n"));
+        return;
+    }
+    // The header, the log offset XNU's header gives (0x331 bytes in) and the
+    // text limit, read a page at a time so a short region stays in bounds.
+    let wanted = bytes.min(0x1000 + TEXT_LIMIT as u64) as usize;
+    let mut region = alloc::vec![0u8; wanted];
+    for (index, chunk) in region.chunks_mut(0x1000).enumerate() {
+        if !machine.read_physical(base + index as u64 * 0x1000, chunk) {
+            output::arguments(format_args!(
+                "GUEST PANIC region={base:#x} unreadable at {:#x}\n",
+                base + index as u64 * 0x1000
+            ));
+            return;
+        }
+    }
+    match read(&region) {
+        Contents::NoHeader => output::arguments(format_args!(
+            "GUEST PANIC region={base:#x} no panic header: the kernel did not begin a panic log\n"
+        )),
+        Contents::BadOffset(offset) => output::arguments(format_args!(
+            "GUEST PANIC region={base:#x} header log offset {offset:#x} lies outside it\n"
+        )),
+        Contents::Empty => output::arguments(format_args!(
+            "GUEST PANIC region={base:#x} header present, no log text yet\n"
+        )),
+        Contents::Text { text, truncated } => {
+            output::arguments(format_args!(
+                "GUEST PANIC region={base:#x} truncated={truncated} text={text:?}\n"
+            ));
+        }
+    }
 }
 
 /// How the guest went down: the first panic, else `otherwise`.
@@ -858,9 +1037,9 @@ fn run_machine<H: Host>(
     }
     if options.install.is_some() {
         output::arguments(format_args!(
-            "INSTALL SIGNING: the restore host sends this machine's ECID, the restore's nonces \
-             and its component hashes to gs.apple.com for its root tickets and recoveryOS \
-             LocalPolicy\n"
+            "INSTALL SIGNING: the restore host answers its root tickets, Cryptex1 ticket and \
+             recoveryOS LocalPolicy from the USB's staged answers when they match, else sends \
+             this machine's ECID, the restore's nonces and its component hashes to gs.apple.com\n"
         ));
     }
     // Waits return to this loop often enough that a press of the host's
@@ -987,7 +1166,7 @@ fn finish<H: Host>(
     dump_report(machine, &options.dumps);
     let host = host::statistics();
     output::arguments(format_args!(
-        "STATISTICS {:?} shadow_fills={} shadow_prefills={} shadow_resets={} shadow_exhausted={} shadow_peak={}M/{}M/{}M lower_resets={} scoped_invalidations={} stray_interrupts={} helper_calls={} helper_fills={} bounces={} guard_faults={} events={} seconds={seconds:.3}\n",
+        "STATISTICS {:?} shadow_fills={} shadow_prefills={} shadow_resets={} shadow_exhausted={} shadow_peak={}M/{}M/{}M/{}M lower_resets={} scoped_invalidations={} stray_interrupts={} helper_calls={} helper_fills={} bounces={} guard_faults={} events={} seconds={seconds:.3}\n",
         machine.statistics,
         host.fills,
         host.prefills,
@@ -995,7 +1174,8 @@ fn finish<H: Host>(
         host.exhausted,
         host.shadow_peak[0] >> 20,
         host.shadow_peak[1] >> 20,
-        host.shadow_bytes >> 20,
+        host.shadow_bytes[0] >> 20,
+        host.shadow_bytes[1] >> 20,
         host.lower_resets,
         host.scoped,
         host.stray,
@@ -1005,6 +1185,7 @@ fn finish<H: Host>(
         host.guard_faults,
         EVENTS.load(Ordering::Relaxed),
     ));
+    watchdog_report(machine, drained.watchdog);
     for line in drained.sep {
         output::arguments(format_args!("SEP OBSERVE {line}\n"));
     }
@@ -1040,6 +1221,11 @@ fn finish<H: Host>(
                 output::arguments(format_args!("STOP macOS crashed: {message}\n"));
                 output::arguments(format_args!("RESET after panic: {reset}\n"));
             } else {
+                // Before the report: a watchdog's reset leaves RAM as the
+                // panicking PE left it.
+                if !orderly(&reset) {
+                    panic_region_report(machine);
+                }
                 output::arguments(format_args!("STOP reset: {reset}\n"));
             }
             // The run is over: its blocks' memory goes to proving the new
@@ -1162,11 +1348,14 @@ fn machine_report<H: Host>(machine: &mut Machine<H, parallel::Board>) {
             .filter(|&pe| pe != machine.processor())
             .filter_map(|pe| Some((pe, hub.source_observation(pe)?.source)))
             .filter(|(_, source)| source.el > 0)
-            .map(|(pe, source)| (pe, source.fp))
+            .map(|(pe, source)| (pe, source.fp, source.sp))
             .collect::<Vec<_>>()
     };
-    for (pe, frame) in sources {
+    for &(pe, frame, _) in &sources {
         frames(machine, &alloc::format!("PE {pe} SOURCE FRAME"), frame);
+    }
+    for (pe, _, sp) in sources {
+        stack_text_report(machine, pe, sp);
     }
     let cpu = &machine.cpu;
     for (entry, reads, writes) in cpu.apple.impdef.used() {

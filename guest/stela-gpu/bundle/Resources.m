@@ -1161,6 +1161,35 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 	return buffer;
 }
 
+/* A buffer over the surface's own pages, all of its allocation, shared with
+ * the CPU as any imported buffer is. It keeps the surface; wiring the pages
+ * outlasts the lock that maps them. */
+- (id)newBufferWithIOSurface:(IOSurfaceRef)surface
+{
+	if (!surface) {
+		return nil;
+	}
+	if (IOSurfaceLock(surface, 0, NULL) != 0) {
+		StelaFailure failure = {.reason = "the surface does not lock"};
+		stela_report("newBufferWithIOSurface:", &failure);
+		return nil;
+	}
+	CFRetain(surface);
+	StelaGPUBuffer *buffer = [self newBufferWithBytesNoCopy:IOSurfaceGetBaseAddress(surface)
+							 length:IOSurfaceGetAllocSize(surface)
+							options:MTLStorageModeShared << 4
+						    deallocator:^(void *contents, NSUInteger length) {
+							    CFRelease(surface);
+						    }];
+	IOSurfaceUnlock(surface, 0, NULL);
+	if (!buffer) {
+		CFRelease(surface);
+		return nil;
+	}
+	buffer->_surface = surface;
+	return buffer;
+}
+
 /* The texture reads the surface's own pages, through a buffer over them that
  * keeps the surface. Wiring them outlasts the lock that maps them. A surface
  * counts rows of its elements, which can be taller than the format's blocks. */

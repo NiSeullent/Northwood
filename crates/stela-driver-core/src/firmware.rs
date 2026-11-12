@@ -413,6 +413,50 @@ impl Catalog {
         Self::from_resources(resources, Bytes::Persistent)
     }
 
+    /// A catalog holding `image`'s verified bytes under the exact `name` and
+    /// `target` a driver asked for: the image's bytes and digest were checked
+    /// when its own catalog was built, so neither is copied nor hashed again.
+    /// The provenance stays the image's.
+    pub fn rebind(image: Image<'static>, name: &str, target: Target<'_>) -> Result<Self, Error> {
+        Self::rebind_all([(image, name, target)])
+    }
+
+    /// [`Self::rebind`] for several images, each under its own name and
+    /// target, which must differ.
+    pub fn rebind_all<'a>(
+        bindings: impl IntoIterator<Item = (Image<'static>, &'a str, Target<'a>)>,
+    ) -> Result<Self, Error> {
+        let mut entries: Vec<Entry> = Vec::new();
+        for (image, name, target) in bindings {
+            validate(name, target)?;
+            if entries
+                .iter()
+                .any(|entry| entry.name == name && entry.target.view() == target)
+            {
+                return Err(error(name, ErrorKind::Duplicate));
+            }
+            let provenance = image.provenance();
+            entries.push(Entry {
+                name: name.into(),
+                target: OwnedTarget {
+                    driver: target.driver.into(),
+                    hardware: target.hardware.into(),
+                    revision: target.revision.into(),
+                    board: target.board.map(String::from),
+                },
+                provenance: OwnedProvenance {
+                    source: provenance.source.into(),
+                    revision: provenance.revision.into(),
+                    member: provenance.member.into(),
+                    license: provenance.license.into(),
+                },
+                sha256: image.sha256(),
+                bytes: Bytes::Persistent(image.bytes()),
+            });
+        }
+        Ok(Self { entries })
+    }
+
     /// Number and total bytes of immutable resources, for boot diagnostics.
     pub fn inventory(&self) -> (usize, usize) {
         (

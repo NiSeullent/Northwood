@@ -16,6 +16,7 @@ use uefi::{
     CString16,
     proto::media::file::{Directory, File as _, FileAttribute, FileInfo, FileMode, RegularFile},
 };
+mod bundle;
 mod smbios;
 mod wifi;
 use stela_drivers::net::wifi::intel::platform::VARIABLE_DESCRIPTORS;
@@ -171,7 +172,12 @@ pub fn read(root: &mut Directory) -> Result<Resources> {
     for (slot, descriptor) in wifi.iter_mut().zip(&VARIABLE_DESCRIPTORS) {
         *slot = wifi::capture(descriptor.variable)?;
     }
-    let Some((layout, file)) = open_manifest(root)? else {
+    let exact = match open_manifest(root)? {
+        Some((layout, file)) => Some((layout, read_file(file, None, MAX_MANIFEST_BYTES)?)),
+        None => None,
+    };
+    let bundled = bundle::read(root);
+    if exact.is_none() && bundled.is_none() {
         output::arguments(format_args!("HOST FIRMWARE manifest=absent\n"));
         let resources = Resources {
             wifi,
@@ -183,29 +189,68 @@ pub fn read(root: &mut Directory) -> Result<Resources> {
             resources.catalog(|physical| physical, Some("before-ebs"), output::arguments)
         }?;
         return Ok(resources);
+    }
+    let exact_bytes = exact.as_ref().map(|(_, region)| {
+        // SAFETY: read_file reserved these pages and completed all writes.
+        unsafe { core::slice::from_raw_parts(region.physical as *const u8, region.bytes as usize) }
+    });
+    let parsed = exact_bytes
+        .map(Manifest::parse)
+        .transpose()
+        .map_err(|error| report(error, output::arguments))?;
+    // Parse/identity checks and the total budget precede every image allocation.
+    let started = output::now();
+    let mut regions = alloc::vec::Vec::new();
+    if let Some(((layout, _), parsed)) = exact.as_ref().zip(parsed.as_ref()) {
+        for image in &parsed.images {
+            let path = layout.esp_path(&format!("{FIRMWARE}/{}", image.path));
+            let file = open(root, &path)?
+                .ok_or(refuse!("host firmware manifest names a missing resource"))?;
+            regions.push(read_file(
+                file,
+                Some(image.length),
+                manifest::MAX_IMAGE_BYTES,
+            )?);
+        }
+    }
+    let read_ms = output::millis_since(started);
+    // Without a bundle, the older manifest is handed off as it was read.
+    let region = match (&bundled, exact) {
+        (None, Some((_, region))) => region,
+        _ => {
+            let (objects, bundle_regions) = bundled
+                .as_ref()
+                .map(|bundled| (bundled.objects(), bundled.regions.as_slice()))
+                .unwrap_or_default();
+            regions.extend_from_slice(bundle_regions);
+            let handoff = manifest::bundle::handoff_manifest(parsed.as_ref(), &objects)
+                .map_err(|error| report(error, output::arguments))?;
+            let physical = firmware::pages(handoff.len().div_ceil(PAGE))?;
+            // SAFETY: fresh reserved LOADER_DATA pages, written once here
+            // before any immutable view is published.
+            unsafe {
+                core::ptr::copy_nonoverlapping(handoff.as_ptr(), physical as *mut u8, handoff.len())
+            };
+            Region {
+                physical: physical as u64,
+                bytes: handoff.len() as u64,
+            }
+        }
     };
-    let region = read_file(file, None, MAX_MANIFEST_BYTES)?;
-    // SAFETY: read_file reserved these pages and completed all writes.
-    let bytes =
-        unsafe { core::slice::from_raw_parts(region.physical as *const u8, region.bytes as usize) };
-    let parsed = Manifest::parse(bytes).map_err(|error| report(error, output::arguments))?;
+    if regions.len() > manifest::MAX_IMAGES {
+        return Err(refuse!(
+            "host firmware resources exceed the handoff's slots"
+        ));
+    }
     let mut resources = Resources {
         present: true,
         manifest: region,
-        count: parsed.images.len(),
+        count: regions.len(),
         wifi,
         smbios,
         ..Resources::absent()
     };
-    // Parse/identity checks and the total budget precede every image allocation.
-    let started = output::now();
-    for (slot, image) in resources.images.iter_mut().zip(&parsed.images) {
-        let path = layout.esp_path(&format!("{FIRMWARE}/{}", image.path));
-        let file =
-            open(root, &path)?.ok_or(refuse!("host firmware manifest names a missing resource"))?;
-        *slot = read_file(file, Some(image.length), manifest::MAX_IMAGE_BYTES)?;
-    }
-    let read_ms = output::millis_since(started);
+    resources.images[..regions.len()].copy_from_slice(&regions);
     let started = output::now();
     // SAFETY: only this loader owns these permanent pages; identity alias is
     // currently mapped by firmware. Drop metadata before engine relocation.

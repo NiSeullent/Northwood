@@ -798,8 +798,10 @@ impl<R: ReadAt> Answers<R> {
     /// authenticator, as SEPROM is a Mac's. The
     /// firmware set and LLB are absent, so a reader of them fails.
     pub fn sep_firmware(&mut self, request: &Value) -> Result<Plan> {
-        self.sep_firmware_inner(request)
-            .map_err(|e| super::refuse(refuse!("SEP firmware plan: {e}", ?e), request))
+        self.sep_firmware_inner(request).map_err(|e| match e {
+            Error::Pending => e,
+            e => super::refuse(refuse!("SEP firmware plan: {e}", ?e), request),
+        })
     }
     fn sep_firmware_inner(&mut self, request: &Value) -> Result<Plan> {
         let empty = Value::dict([]);

@@ -110,4 +110,58 @@ mod tests {
         devices.transfer(0, &mut ram, 3).unwrap();
         assert_eq!(devices.take_transfer_times(), [PartTime::default(); 9]);
     }
+
+    struct Sink;
+    impl crate::uart::ConsoleSink for Sink {
+        fn transmit(&mut self, _: u8) -> Result<(), crate::uart::ConsoleBusy> {
+            Ok(())
+        }
+    }
+
+    struct Locked(Ram);
+    impl stela_engine::machine::engine::LockedMemory for Locked {
+        fn under(
+            &mut self,
+            _: stela_engine::machine::mmu::MemoryLocks,
+        ) -> &mut dyn stela_engine::machine::engine::Memory {
+            &mut self.0
+        }
+    }
+
+    /// A console byte's write settles its wires without the masters' steps,
+    /// except every `QUIET_WRITES + 1`th; a transfer of its own runs them.
+    #[test]
+    fn a_console_write_runs_the_masters_only_every_few_writes() {
+        const UART: u64 = 0x2_3520_0000;
+        let mut devices = AppleDevices::new();
+        devices
+            .add_uart(
+                Sink,
+                &[crate::machine::Range {
+                    physical: UART,
+                    bytes: 0x4000,
+                }],
+                None,
+            )
+            .unwrap();
+        let mut ram = Locked(Ram::new(0x8_0000_0000, 0x1000));
+        devices.time_transfers(Some(clock));
+        let writes = super::super::QUIET_WRITES as u64 + 4;
+        for now in 1..=writes {
+            devices
+                .write(0, UART + 0x20, 4, u64::from(b'a'), now)
+                .unwrap();
+            devices.settle_write(0, now, &mut ram).transfer.unwrap();
+        }
+        let times = devices.take_transfer_times();
+        // Every write settled its wires; the masters ran once, at the write
+        // after a full run of quiet ones.
+        assert_eq!(times[0].calls, writes, "{times:?}");
+        assert_eq!(times[8].calls, writes, "{times:?}");
+        assert!(times[1..8].iter().all(|time| time.calls == 1), "{times:?}");
+        // A transfer of its own, as at a DMA deadline, always runs them.
+        devices.transfer(0, &mut ram.0, writes + 1).unwrap();
+        let times = devices.take_transfer_times();
+        assert!(times.iter().all(|time| time.calls == 1), "{times:?}");
+    }
 }

@@ -343,9 +343,22 @@ fn decode_frame(
 /// or the output allocation cannot be made. The ordinary slice decoder can
 /// still handle streams outside this staging envelope.
 pub fn decode_bounded<E: From<LzfseError>>(
+    read: impl FnMut(&mut [u8]) -> core::result::Result<(), E>,
+    remaining: usize,
+    output_limit: usize,
+) -> core::result::Result<Option<Vec<u8>>, E> {
+    decode_bounded_observed(read, remaining, output_limit, |_| {})
+}
+
+/// [`decode_bounded`], handing `decoded` each frame's output in order once
+/// it is final, so a caller can hash the output while it is still in the
+/// cache instead of in a second pass. A stream this path declines may
+/// have handed out some frames already.
+pub fn decode_bounded_observed<E: From<LzfseError>>(
     mut read: impl FnMut(&mut [u8]) -> core::result::Result<(), E>,
     mut remaining: usize,
     output_limit: usize,
+    mut decoded: impl FnMut(&[u8]),
 ) -> core::result::Result<Option<Vec<u8>>, E> {
     const MAX_FRAME_BYTES: usize = 1 << 20;
     let mut output = Vec::new();
@@ -388,7 +401,9 @@ pub fn decode_bounded<E: From<LzfseError>>(
         if out.bytes.capacity() == 0 && out.bytes.try_reserve_exact(output_limit).is_err() {
             return Ok(None);
         }
+        let before = out.bytes.len();
         decode_frame(&input, 0, magic, &frame, &mut out, &mut decoder)?;
+        decoded(&out.bytes[before..]);
         remaining -= frame.end;
     }
 }
@@ -1089,6 +1104,31 @@ mod tests {
         out.copy_match(1, 5).unwrap();
         assert_eq!(out.bytes.as_slice(), b"abcabcabcabcabcaaaaaa");
         out.end_block().unwrap();
+    }
+
+    /// The observed decode hands out each frame's final output in order,
+    /// a compressed frame's included, and the pieces make the output.
+    #[test]
+    fn the_observed_bounded_decode_hands_out_every_frame_in_order() {
+        let lzvn = [&[0xe3, b'a', b'b', b'c', 0b00_000_111, 3, 0][..], &LZVN_END].concat();
+        let mut encoded = stored(b"first");
+        encoded.truncate(encoded.len() - 4);
+        encoded.extend_from_slice(&lzvn_block(6, &lzvn));
+        encoded.extend_from_slice(&stored(b"last"));
+        let mut at = 0;
+        let mut read = |part: &mut [u8]| -> Result<()> {
+            part.copy_from_slice(&encoded[at..at + part.len()]);
+            at += part.len();
+            Ok(())
+        };
+        let mut pieces = Vec::new();
+        let bytes = decode_bounded_observed(&mut read, encoded.len(), 15, |piece| {
+            pieces.push(piece.to_vec())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes, b"firstabcabclast");
+        assert_eq!(pieces, [&b"first"[..], b"abcabc", b"last"]);
     }
 
     #[test]

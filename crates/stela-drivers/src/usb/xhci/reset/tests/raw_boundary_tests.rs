@@ -62,6 +62,7 @@ fn unpublished_profile(
         accesses: 0,
         trap_mmio: false,
         stuck: None,
+        deaf: false,
         fault: Fault::None,
         hang_next: false,
         device_task: false,

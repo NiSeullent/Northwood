@@ -178,6 +178,7 @@ impl<const N: usize> Runtime<N> {
     /// Callback contexts must be provider-owned stable objects, not escaped
     /// references into this dispatcher stack. Queue ownership covers them.
     pub fn step(self: Pin<&Self>) -> Result<bool, WorkError> {
+        let entry = step_counts::now();
         self.queue.process()?;
         if self.current.get() != NONE {
             return Err(WorkError::WouldDeadlock);
@@ -200,6 +201,18 @@ impl<const N: usize> Runtime<N> {
             false
         };
         let flags = self.queue.cpu.save_disable()?;
+        // One lock spans the whole scan: the dispatcher holds IF0 on the
+        // queue's CPU, so no producer can change the slots between tasks,
+        // and taking it per task only repeated the CPU checks.
+        let mut guard = match self.queue.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                // SAFETY: `flags` came from the save_disable above, and no lock is held.
+                unsafe { self.queue.cpu.restore(flags) };
+                return Err(error);
+            }
+        };
+        let mut waiting = guard.state().waiting_lanes();
         // SAFETY: the task list's length never changes after construction.
         let count = unsafe { (*self.tasks.get()).len() };
         let mut selected = None;
@@ -210,18 +223,18 @@ impl<const N: usize> Runtime<N> {
             // reference to task `i`.
             let task = unsafe { &mut (*self.task(i)) };
             if task.state == TaskState::Idle {
-                match self
-                    .queue
-                    .next(task.lane, stack_requirement::Geometry::of(&task.stack))
-                {
+                match guard.state().select_waiting_job(
+                    &mut waiting,
+                    task.lane,
+                    stack_requirement::Geometry::of(&task.stack),
+                    self.queue.abandoned.load(Ordering::Acquire),
+                ) {
                     Ok(Some(job)) => {
-                        let inserted = (|| {
-                            self.queue.lock()?.state().scheduling.insert(
-                                task.id,
-                                job.1.sequence,
-                                task.lane == Lane::Service,
-                            )
-                        })();
+                        let inserted = guard.state().scheduling.insert(
+                            task.id,
+                            job.1.sequence,
+                            task.lane == Lane::Service,
+                        );
                         if let Err(error) = inserted {
                             self.queue.cpu.fatal(error);
                         }
@@ -229,7 +242,9 @@ impl<const N: usize> Runtime<N> {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        // SAFETY: `flags` came from the save_disable above, and no lock is held.
+                        drop(guard);
+                        // SAFETY: `flags` came from the save_disable above, and
+                        // the queue lock was released just above.
                         unsafe { self.queue.cpu.restore(flags) };
                         return Err(e);
                     }
@@ -241,12 +256,10 @@ impl<const N: usize> Runtime<N> {
                 // the final pending check but before block commit.
                 // Earlier IRQ publication already moved the row; duplicate
                 // wake preserves its original ready order.
-                let ready = (|| {
-                    self.queue.lock()?.state().scheduling.wake(
-                        task.id,
-                        task.job.ok_or(WorkError::CorruptContext)?.1.sequence,
-                    )
-                })();
+                let ready = task
+                    .job
+                    .ok_or(WorkError::CorruptContext)
+                    .and_then(|job| guard.state().scheduling.wake(task.id, job.1.sequence));
                 if let Err(error) = ready {
                     self.queue.cpu.fatal(error);
                 }
@@ -273,7 +286,7 @@ impl<const N: usize> Runtime<N> {
                     // SAFETY: dispatcher IF0, no task or callback is running.
                     let prior = unsafe { &*self.task(prior) };
                     let result = (|| {
-                        self.queue.lock()?.state().scheduling.precedes(
+                        guard.state().scheduling.precedes(
                             (
                                 task.id,
                                 task.job.ok_or(WorkError::CorruptContext)?.1.sequence,
@@ -296,6 +309,7 @@ impl<const N: usize> Runtime<N> {
                 }
             }
         }
+        drop(guard);
         // SAFETY: the checked dispatcher still holds IF0; all task
         // frames are stopped and no mutable task borrow survives the scan.
         let firmware = unsafe { self.next_firmware(count) };
@@ -311,6 +325,9 @@ impl<const N: usize> Runtime<N> {
         let Some(i) = selected else {
             // SAFETY: `flags` came from the save_disable above, and no lock is held.
             unsafe { self.queue.cpu.restore(flags) };
+            let counts = &step_counts::STEP_COUNTS;
+            step_counts::add(&counts.empty, step_counts::now().wrapping_sub(entry));
+            step_counts::add(&counts.empty_steps, 1);
             return Ok(false);
         };
         if !(due_service && i == 2) {
@@ -378,6 +395,7 @@ impl<const N: usize> Runtime<N> {
         #[cfg(feature = "linux-kernel")]
         self.physical_enter(i)
             .unwrap_or_else(|error| self.queue.cpu.fatal(error));
+        let switched = step_counts::now();
         // SAFETY: both frames are held, pinned and initialized; IRQs stay disabled
         // across the switch, and no lock or borrow spans it.
         unsafe {
@@ -386,6 +404,7 @@ impl<const N: usize> Runtime<N> {
                 core::ptr::addr_of!((*self.task(i)).frame),
             )
         };
+        let returned = step_counts::now();
         if self.current.get() != NONE || self.queue.active.id.load(Ordering::Acquire) != 0 {
             self.queue.cpu.fatal(WorkError::CorruptContext);
         }
@@ -401,7 +420,12 @@ impl<const N: usize> Runtime<N> {
         unsafe { self.queue.cpu.restore(flags) };
         // The completing/parked frame is stopped, Task/active metadata is clear,
         // and exact outer IF restoration finished before any observer executes.
-        self.publish_general_resources()?;
+        let published = self.publish_general_resources();
+        let counts = &step_counts::STEP_COUNTS;
+        step_counts::add(&counts.select, switched.wrapping_sub(entry));
+        step_counts::add(&counts.body, returned.wrapping_sub(switched));
+        step_counts::add(&counts.after, step_counts::now().wrapping_sub(returned));
+        published?;
         Ok(true)
     }
 
@@ -456,18 +480,9 @@ impl<const N: usize> Runtime<N> {
         if current == NONE {
             return true;
         }
-        let lane_index = |lane| match lane {
-            Lane::Foreground => 0,
-            Lane::Notify => 1,
-            Lane::General => 2,
-            Lane::Service => 3,
-            Lane::Firmware => 4,
-            Lane::Portal => 5,
-            Lane::Gpe => 6,
-        };
-        let mut queued_lanes = [false; 7];
+        let mut queued_lanes = [false; queue_state::LANES];
         for job in state.jobs.iter().flatten().filter(|job| !job.running) {
-            queued_lanes[lane_index(job.lane)] = true;
+            queued_lanes[queue_state::lane_index(job.lane)] = true;
         }
         // SAFETY: caller holds the same-CPU IF0 queue guard and all peer
         // frames are stopped. This read neither switches nor keeps references.
@@ -477,7 +492,7 @@ impl<const N: usize> Runtime<N> {
                     && match task.state {
                         TaskState::Ready | TaskState::Runnable => true,
                         TaskState::Blocked => task.signal.pending.load(Ordering::Acquire),
-                        TaskState::Idle => queued_lanes[lane_index(task.lane)],
+                        TaskState::Idle => queued_lanes[queue_state::lane_index(task.lane)],
                         TaskState::Running
                         | TaskState::Reserved
                         | TaskState::Escrow

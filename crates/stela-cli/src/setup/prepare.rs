@@ -232,6 +232,10 @@ pub(crate) fn cache_dir() -> PathBuf {
     cache_dir_in(std::env::consts::OS, var).unwrap_or_else(|| PathBuf::from("stela-cache"))
 }
 
+fn rooted(path: &Path) -> bool {
+    path.is_absolute() || path.to_string_lossy().starts_with('/')
+}
+
 /// [`cache_dir`] on operating system `os` with environment `var`: Linux and
 /// other Unix `$XDG_CACHE_HOME/stela` or `~/.cache/stela`, macOS
 /// `~/Library/Caches/stela`, Windows `%LOCALAPPDATA%\stela\cache`.
@@ -239,11 +243,7 @@ pub(super) fn cache_dir_in(
     os: &str,
     var: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    let home = || {
-        var("HOME")
-            .map(PathBuf::from)
-            .filter(|home| home.is_absolute())
-    };
+    let home = || var("HOME").map(PathBuf::from).filter(|home| rooted(home));
     match os {
         "windows" => var("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -252,7 +252,7 @@ pub(super) fn cache_dir_in(
         "macos" => home().map(|home| home.join("Library/Caches/stela")),
         _ => var("XDG_CACHE_HOME")
             .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
+            .filter(|path| rooted(path))
             .or_else(|| home().map(|home| home.join(".cache")))
             .map(|cache| cache.join("stela")),
     }

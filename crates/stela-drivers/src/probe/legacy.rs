@@ -12,6 +12,7 @@ use crate::{
     input::{InputDevice, virtio::VirtioInput},
     net::{
         alx::Alx,
+        atl1c::Atl1c,
         e1000e::{E1000e, pch::cold::attach as pch},
         igb::Igb,
         igc::Igc,
@@ -22,17 +23,27 @@ use crate::{
     usb::xhci,
 };
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use stela_driver_base::budget::Budget;
 
 pub(super) struct Context<'a> {
     pub handoff: &'a Handoff,
     pub dma: &'a mut dyn DmaAllocator,
     pub firmware: &'static dyn Provider,
     pub minimum: &'a Rc<dyn Timer>,
+    pub budget: Option<&'a Budget>,
     pub devices: &'a mut Devices,
 }
 
 /// The scan has granted exclusive post-ExitBootServices PCI and DMA ownership.
 pub(super) type Attach = unsafe fn(Function, &mut Context<'_>);
+
+/// A failed attach may have enabled bus mastering or interrupts before the
+/// budget elapsed. Quiesce only while the probe still holds the function.
+fn quiesce_if_expired(budget: Option<&Budget>, function: &mut Function) {
+    if budget.is_some_and(|budget| budget.expired().is_some()) {
+        let _ = function.abandon();
+    }
+}
 
 fn disks(
     devices: &mut Devices,
@@ -65,6 +76,9 @@ pub(super) unsafe fn virtio_block(mut function: Function, context: &mut Context<
     let dma = &mut *context.dma;
     let attached = virtio::VirtioBlk::new(&mut function, handoff, dma, minimum.as_ref())
         .map(|device| vec![Box::new(device) as Box<dyn BlockDevice>]);
+    if attached.is_err() {
+        quiesce_if_expired(context.budget, &mut function);
+    }
     disks(devices, address, attached);
 }
 
@@ -86,6 +100,9 @@ pub(super) unsafe fn nvme(mut function: Function, context: &mut Context<'_>) {
             .map(|device| Box::new(device) as Box<dyn BlockDevice>)
             .collect()
     });
+    if attached.is_err() {
+        quiesce_if_expired(context.budget, &mut function);
+    }
     disks(devices, address, attached);
 }
 
@@ -97,47 +114,11 @@ pub(super) unsafe fn xhci(mut function: Function, context: &mut Context<'_>) {
     let dma = &mut *context.dma;
     let firmware = context.firmware;
     match xhci::attach_with_provider(&mut function, handoff, dma, firmware, minimum.clone()) {
-        Ok(found) => {
-            devices.disks.extend(
-                found
-                    .disks
-                    .into_iter()
-                    .map(|d| Box::new(d) as Box<dyn BlockDevice>),
-            );
-            devices.inputs.extend(
-                found
-                    .inputs
-                    .into_iter()
-                    .map(|input| InputDevice::Usb(Box::new(input))),
-            );
-            devices.usb_devices.extend(found.devices);
-            devices.usb_hosts.extend(found.hosts);
-            devices.usb_storage.extend(found.storage);
-            devices.audio.extend(found.audio);
-            devices.bluetooth_bootloaders.extend(found.bootloaders);
-            for mut device in found.bluetooth {
-                // The kept result owns its evidence/errors;
-                // no catalog borrow or firmware bytes escape.
-                let _ = device.initialize_with_provider(
-                    firmware,
-                    devices.bluetooth_platform.platform_inputs(),
-                );
-                devices.bluetooth.push(device);
-            }
-            devices
-                .nics
-                .extend(found.links.into_iter().map(Adapter::Usb));
-            devices
-                .nics
-                .extend(found.vendor_links.into_iter().map(Adapter::UsbVendor));
-            devices.usb_failures.extend(found.failures);
-            devices.usb_vendor_failures.extend(found.vendor_failures);
-            devices.usb_unused.extend(found.unused);
-            devices
-                .usb_port_probes
-                .extend(found.probes.into_iter().map(|probe| (address, probe)));
+        Ok(found) => devices.absorb_usb(Some(address), found, firmware),
+        Err(error) => {
+            quiesce_if_expired(context.budget, &mut function);
+            devices.failures.push((address, error.into()));
         }
-        Err(error) => devices.failures.push((address, error.into())),
     }
 }
 
@@ -147,12 +128,11 @@ pub(super) unsafe fn virtio_net(mut function: Function, context: &mut Context<'_
     let handoff = context.handoff;
     let minimum = context.minimum;
     let dma = &mut *context.dma;
-    link(
-        devices,
-        address,
-        VirtioNet::new(&mut function, handoff, dma, minimum.as_ref()),
-        Adapter::Virtio,
-    );
+    let attached = VirtioNet::new(&mut function, handoff, dma, minimum.as_ref());
+    if attached.is_err() {
+        quiesce_if_expired(context.budget, &mut function);
+    }
+    link(devices, address, attached, Adapter::Virtio);
 }
 
 pub(super) unsafe fn igc(mut function: Function, context: &mut Context<'_>) {
@@ -164,6 +144,9 @@ pub(super) unsafe fn igc(mut function: Function, context: &mut Context<'_>) {
     // SAFETY: the caller grants exclusive post-EBS controller,
     // segment configuration and firmware/ASPM policy ownership.
     let attached = unsafe { Igc::new(&mut function, handoff, dma, minimum.clone()) };
+    if attached.is_err() {
+        quiesce_if_expired(context.budget, &mut function);
+    }
     link(devices, address, attached, Adapter::Igc);
 }
 
@@ -176,6 +159,9 @@ pub(super) unsafe fn e1000e(mut function: Function, context: &mut Context<'_>) {
     // SAFETY: the caller granted exclusive ownership of all mapped PCI
     // functions and controllers after ExitBootServices.
     let attached = unsafe { E1000e::new(&mut function, handoff, dma, minimum.clone()) };
+    if attached.is_err() {
+        quiesce_if_expired(context.budget, &mut function);
+    }
     link(devices, address, attached, Adapter::E1000e);
 }
 
@@ -224,6 +210,9 @@ pub(super) unsafe fn igb(mut function: Function, context: &mut Context<'_>) {
             ));
         }
     }
+    if attached.is_err() {
+        quiesce_if_expired(context.budget, &mut function);
+    }
     link(devices, address, attached, Adapter::Igb);
 }
 
@@ -236,7 +225,25 @@ pub(super) unsafe fn alx(mut function: Function, context: &mut Context<'_>) {
     // SAFETY: as for e1000e, the caller granted exclusive ownership
     // of the mapped PCI functions and their controllers.
     let attached = unsafe { Alx::new(&mut function, handoff, dma, minimum.clone()) };
+    if attached.is_err() {
+        quiesce_if_expired(context.budget, &mut function);
+    }
     link(devices, address, attached, Adapter::Alx);
+}
+
+pub(super) unsafe fn atl1c(mut function: Function, context: &mut Context<'_>) {
+    let address = function.address;
+    let devices = &mut *context.devices;
+    let handoff = context.handoff;
+    let minimum = context.minimum;
+    let dma = &mut *context.dma;
+    // SAFETY: as for e1000e, the caller granted exclusive ownership
+    // of the mapped PCI functions and their controllers.
+    let attached = unsafe { Atl1c::new(&mut function, handoff, dma, minimum.clone()) };
+    if attached.is_err() {
+        quiesce_if_expired(context.budget, &mut function);
+    }
+    link(devices, address, attached, Adapter::Atl1c);
 }
 
 pub(super) unsafe fn realtek(mut function: Function, context: &mut Context<'_>) {
@@ -251,6 +258,9 @@ pub(super) unsafe fn realtek(mut function: Function, context: &mut Context<'_>) 
     let attached = unsafe { Realtek::new(&mut function, handoff, dma, firmware, minimum.clone()) };
     if let Ok(Some(warning)) = attached.as_ref().map(Realtek::warning) {
         devices.warnings.push((address, Warning::Realtek(warning)));
+    }
+    if attached.is_err() {
+        quiesce_if_expired(context.budget, &mut function);
     }
     link(devices, address, attached, Adapter::Realtek);
 }

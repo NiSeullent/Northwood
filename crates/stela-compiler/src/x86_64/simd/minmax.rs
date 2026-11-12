@@ -1,10 +1,10 @@
-//! FP min/max: normal-or-zero S/D selection and normal H integer ordering.
+//! FP min/max: ordered (normal, infinite, S/D zero) selection and Half integer ordering.
 use super::super::isa::ShiftOpcode;
 use super::numerical::helper_section;
 use super::numerical::{
     Condition, INPUT_MINIMUM_EXPONENT, branch, clear_high_qword, clear_scalar, exponent_range,
-    jump, prepare_vector_input_range, read_numerical_vector, resolve, test_control,
-    vector_exponent_range, vector_normal_or_zero_range, zero_scalar,
+    infinity_scalar, jump, prepare_vector_input_range, read_numerical_vector, resolve,
+    test_control, vector_ordered_range, zero_scalar,
 };
 use super::{Host, commit, packed, packed_imm, read_vector};
 use crate::x86_64::asm::{Code, Gpr, Rm, vector_extensions};
@@ -178,28 +178,79 @@ fn exception_guard(code: &mut Code, helper: &mut Vec<usize>) {
     helper.push(branch(code, Condition::NotZero));
 }
 
+/// Infinities are ordinary ordered values for every selection here (and in
+/// Half's order key), so only NaNs, subnormals and Half zeros exit.
 fn input_guard(code: &mut Code, format: Format, shape: Shape, source: u8, helper: &mut Vec<usize>) {
     if shape == Shape::Scalar {
-        let zero = if format != Format::Half {
+        let mut accepted = Vec::new();
+        if format != Format::Half {
             zero_scalar(code, format, source);
-            Some(branch(code, Condition::Zero))
-        } else {
-            None
-        };
+            accepted.push(branch(code, Condition::Zero));
+        }
+        infinity_scalar(code, format, source);
+        accepted.push(branch(code, Condition::Zero));
         exponent_range(code, format, source, INPUT_MINIMUM_EXPONENT);
         helper.push(branch(code, Condition::AboveOrEqual));
-        if let Some(zero) = zero {
-            let end = code.len();
-            resolve(code, zero, end);
+        let end = code.len();
+        for patch in accepted {
+            resolve(code, patch, end);
         }
     } else {
-        if format == Format::Half {
-            vector_exponent_range(code, format, shape, source);
-        } else {
-            vector_normal_or_zero_range(code, format, shape, source, PAIR_VECTOR);
-        }
+        vector_ordered_range(code, format, shape, source, PAIR_VECTOR);
         helper.push(branch(code, Condition::NotZero));
     }
+}
+
+/// Whether [`quick_guard`] runs on `target`: PTEST (SSE4.1). The DIT
+/// profile keeps its reviewed classification.
+fn quick_guard_supported(target: TargetCpu) -> bool {
+    super::three::test_zero_supported(target) && !target.data_independent_timing()
+}
+
+/// With FZ, FIZ and AH clear no S/D input is flushed and a subnormal input
+/// raises no IDC (AH=1 reports it), and the selection is exact for every
+/// ordered pair (subnormals and infinities included, without status): only
+/// a NaN in either operand needs the full Arm rules. One
+/// unordered compare (UCOMIS for a scalar, CMPUNORD and PTEST over both
+/// whole registers for a vector, whose 8-byte form has its high qword clear)
+/// sends it to the helper. Returns the branch past the full classification
+/// that follows, which handles FZ, FIZ or AH set.
+fn quick_guard(
+    code: &mut Code,
+    shape: Shape,
+    format: Format,
+    helper: &mut Vec<usize>,
+    target: TargetCpu,
+) -> usize {
+    use crate::aarch64::floating::{FPCR_FIZ, FPCR_FZ};
+    const UNORDERED: u8 = 3;
+    test_control(code, FPCR_FZ | FPCR_FIZ | FPCR_AH);
+    let flushing = branch(code, Condition::NotZero);
+    let double = format == Format::Double;
+    if shape == Shape::Scalar {
+        let mut asm = code.asm();
+        if double {
+            asm.ucomisd(RESULT_VECTOR, Rm::Xmm(RIGHT_VECTOR));
+        } else {
+            asm.ucomiss(RESULT_VECTOR, Rm::Xmm(RIGHT_VECTOR));
+        }
+        helper.push(branch(code, Condition::Parity));
+    } else {
+        let lanes = if double {
+            FloatLanes::PackedDouble
+        } else {
+            FloatLanes::PackedSingle
+        };
+        packed(code, Host::MoveAligned, SELECTION_SCRATCH, RESULT_VECTOR);
+        code.asm()
+            .float_compare(lanes, SELECTION_SCRATCH, Rm::Xmm(RIGHT_VECTOR), UNORDERED);
+        super::three::test_zero(code, SELECTION_SCRATCH, target);
+        helper.push(branch(code, Condition::NotZero));
+    }
+    let unflushed = jump(code);
+    let end = code.len();
+    resolve(code, flushing, end);
+    unflushed
 }
 
 fn shuffle(code: &mut Code, opcode: Host, destination: u8, source: u8, control: u8) {
@@ -364,11 +415,17 @@ fn binary(code: &mut Code, operand: &Operand, pc: GuestAddress, target: TargetCp
     exception_guard(code, &mut helper);
     read_numerical_vector(code, shape, left, RESULT_VECTOR);
     read_numerical_vector(code, shape, right, RIGHT_VECTOR);
+    let unflushed = (format != Format::Half && quick_guard_supported(target))
+        .then(|| quick_guard(code, shape, format, &mut helper, target));
     if shape != Shape::Scalar {
         prepare_vector_input_range(code, format);
     }
     input_guard(code, format, shape, RESULT_VECTOR, &mut helper);
     input_guard(code, format, shape, RIGHT_VECTOR, &mut helper);
+    if let Some(unflushed) = unflushed {
+        let end = code.len();
+        resolve(code, unflushed, end);
+    }
     helper_section(code, &helper, pc);
     if format == Format::Half {
         if shape == Shape::Scalar {

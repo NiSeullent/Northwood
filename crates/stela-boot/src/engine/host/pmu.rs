@@ -75,9 +75,7 @@ const READ_SHARE: u64 = 500;
 /// measure the refill after each trap, not the interval.
 const WINDOW_READ_TICKS: u64 = 2_000;
 /// A window lasts at least this many ticks (about 2 ms at 3 GHz), and at
-/// least READ_SHARE reads' cost. A tick count, not a time: the engine image
-/// must not ask the firmware for the TSC rate (`firmware::tsc_hz` searches
-/// firmware tables that the engine's roots do not map).
+/// least READ_SHARE reads' cost. A tick count, not a time.
 const WINDOW_TICKS: u64 = 6_000_000;
 /// A window is credited to a bucket that holds at least this share of its
 /// ticks, in tenths.

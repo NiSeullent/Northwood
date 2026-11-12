@@ -69,6 +69,7 @@ mod northwood_config;
 mod nwconfig_publish;
 mod prepare;
 mod record;
+mod sources;
 mod state;
 mod swap;
 mod translations;
@@ -103,8 +104,18 @@ use std::{
     path::{Path, PathBuf},
 };
 use stela_formats::builds;
-use stela_loader::mount_interface::{self, Interface, layout::Layout};
+use stela_loader::mount_interface::{
+    self, Interface,
+    layout::{self, Layout},
+};
 use uninstall::uninstall;
+
+/// `relative`, spelled with `/`, below `base` with the host's own separators.
+fn join_slashed(base: &Path, relative: &str) -> PathBuf {
+    let mut path = base.to_path_buf();
+    path.extend(relative.split('/'));
+    path
+}
 
 /// The Mac models setup presents, with their names: the M2 Mac mini, the
 /// board the engine is tested on. Other Macs stay listed in the wizard,
@@ -264,6 +275,16 @@ fn split_report(result: Result<String>) -> (String, Result<()>) {
     }
 }
 
+/// Write `report` to `path` instead of the terminal, and say where it went.
+fn save_report(path: &Path, report: &str) -> Result<()> {
+    fs::write(path, report).with_context(|| format!("cannot write {}", path.display()))?;
+    println!(
+        "Saved the report to {}",
+        crate::boot_log::shown(path).display()
+    );
+    Ok(())
+}
+
 /// The startup choice that restores with a bundle of `kind` on a setup
 /// with one install.
 fn restore_choice_name(kind: Kind) -> &'static str {
@@ -400,6 +421,8 @@ struct Request {
     dns: Option<Vec<std::net::IpAddr>>,
     automatic_ipv4: bool,
     automatic_dns: bool,
+    /// `boot-log`: the file the report goes to instead of the terminal.
+    output: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -542,6 +565,12 @@ type Prepare = dyn for<'a> Fn(prepare::RamdiskOptions<'a>) -> Result<()>;
 
 /// An IPSW's restore inventory for a model.
 type InventoryOf = dyn Fn(&Path, &str) -> Result<restore::payload::Inventory>;
+/// The bytes of a build's boot members for a model on Apple's servers, and
+/// of its whole image (`restore::recovery_size`).
+type RecoverySizeOf<'a> = dyn Fn(&str, &str) -> Result<(u64, u64)> + 'a;
+/// Download a build's boot members for a model into a directory
+/// (`prepare::fetch_recovery`).
+type FetchRecoveryOf<'a> = dyn Fn(&Path, &str, &str) -> Result<PathBuf> + 'a;
 
 /// Inputs that the command line fixes and tests replace.
 #[derive(Clone, Copy)]
@@ -565,6 +594,11 @@ struct Environment<'a> {
     /// The revision of the bundles this `stela` prepares
     /// (`stela_loader::boot_bundle::REVISION`).
     bundle_revision: u32,
+    /// Where downloaded images may be, this user's cache first
+    /// (`sources::image_caches`).
+    image_caches: &'a [PathBuf],
+    recovery_size: &'a RecoverySizeOf<'a>,
+    fetch_recovery: &'a FetchRecoveryOf<'a>,
     /// The macOS builds setup prepares (`stela_formats::builds::SUPPORTED`);
     /// tests add their synthetic images' builds.
     builds: &'a [builds::Build],
@@ -651,7 +685,7 @@ fn revision_mismatch(environment: &Environment<'_>, record: &Record) -> Option<S
         format!(
             "this setup's boot bundles are revision {theirs}, and this stela prepares revision \
              {ours}: prepare them again with {}",
-            fix(&record.esp, "update stela --fetch")
+            fix(&record.esp, "update stela")
         )
     } else {
         format!(
@@ -661,9 +695,85 @@ fn revision_mismatch(environment: &Environment<'_>, record: &Record) -> Option<S
     })
 }
 
+/// The actions that find their USB when `--usb` is not given.
+fn finds_usb(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Status
+            | Action::Repair
+            | Action::UpdateStela
+            | Action::UpdateOs
+            | Action::HostFirmwareInstall(_)
+            | Action::HostFirmwareFetch { .. }
+    )
+}
+
+/// The mounted volume of each of this computer's disks that holds a Stela
+/// setup, with the disk it is on: an EFI partition with the setup record,
+/// or else a data volume with Stela's `stela/boot` directory. One per disk.
+fn find_setups(host: &dyn Host) -> Result<Vec<(PathBuf, String)>> {
+    let mut found = Vec::new();
+    for disk in host.disks()? {
+        let mounts = || disk.partitions.iter().filter_map(|p| p.mount.as_ref());
+        let volume = mounts()
+            .find(|mount| {
+                Layout::PREFERRED
+                    .into_iter()
+                    .any(|layout| join_slashed(mount, &layout.esp_path(layout::RECORD)).is_file())
+            })
+            .or_else(|| {
+                mounts().find(|mount| {
+                    Layout::PREFERRED.into_iter().any(|layout| {
+                        join_slashed(mount, &layout.data_path(layout::DATA_BOOT)).is_dir()
+                    })
+                })
+            });
+        if let Some(volume) = volume {
+            found.push((
+                volume.clone(),
+                format!("{} ({})", disk.identifier, disk.name),
+            ));
+        }
+    }
+    Ok(found)
+}
+
+/// The USB of the one disk that holds a setup ([`find_setups`]), named on
+/// the error output. None or several are an error that lists them; setup
+/// never guesses between two.
+fn choose_setup(host: &dyn Host) -> Result<PathBuf> {
+    let found = find_setups(host)?;
+    match found.as_slice() {
+        [(volume, disk)] => {
+            eprintln!("Using the Stela USB at {} on {disk}", volume.display());
+            Ok(volume.clone())
+        }
+        [] => bail!(
+            "no mounted volume on this computer holds a Stela setup: plug in the USB, mount its \
+             STELA volume, or name it with --usb"
+        ),
+        several => {
+            let list: String = several
+                .iter()
+                .map(|(volume, disk)| format!("  {} on {disk}\n", volume.display()))
+                .collect();
+            bail!(
+                "{} disks hold a Stela setup:\n{list}Name the one to use with --usb, such as \
+                 --usb {}",
+                several.len(),
+                several[0].0.display()
+            )
+        }
+    }
+}
+
 impl Request {
     fn run(mut self) -> Result<()> {
-        // A Windows relaunch opens its own window, which only the wizard wants.
+        // Maintenance commands can find a single setup without --usb.
+        if finds_usb(&self.action) && self.usb.as_os_str().is_empty() {
+            self.usb = choose_setup(&host::System)?;
+        }
+        let boot_log = matches!(self.action, Action::BootLog);
         let swap_image = matches!(
             self.action,
             Action::InspectSwap(_)
@@ -672,17 +782,38 @@ impl Request {
                 | Action::ApplySwapImage(_)
                 | Action::PrepareSwapVolumeImage(_)
         );
-        let interactive = !swap_image && self.usb.as_os_str().is_empty();
-        let elevate = !swap_image && (cfg!(unix) || interactive);
+        let interactive = !boot_log && !swap_image && self.usb.as_os_str().is_empty();
+        // Windows opens a new elevated window for the wizard or raw logs.
+        let elevate = !swap_image && (cfg!(unix) || interactive || boot_log);
         if elevate && !self.dry_run && elevation::relaunch()? {
+            if boot_log {
+                eprintln!(
+                    "Reading the disks needs administrator rights: the boot log opens in a new \
+                     window."
+                );
+            }
             return Ok(());
+        }
+        // Without a USB, `boot-log` reads every disk.
+        if boot_log && self.usb.as_os_str().is_empty() {
+            let logs = crate::boot_log::scan(&host::System)?;
+            return crate::boot_log::write_logs(&logs, true, self.output.as_deref());
         }
         debug_assert_eq!(
             stela_loader::boot_bundle::SCHEMA_VERSION,
             mount_interface::CURRENT.bundle_schema
         );
+        let image_caches = sources::image_caches();
         let environment = Environment {
             host: &host::System,
+            image_caches: &image_caches,
+            recovery_size: &|build, model| {
+                let image = restore::select(&restore::catalog()?, Some(build), Some(model))?;
+                restore::recovery_size(&image, model)
+            },
+            fetch_recovery: &|directory, build, model| {
+                prepare::fetch_recovery(directory, build, model)
+            },
             download: None,
             prepare_restore: &prepare_restore,
             prepare_update: &prepare_update,
@@ -721,6 +852,7 @@ impl Request {
         }
         let dry_run = self.dry_run;
         let profile = self.profile;
+        let output = self.output.take();
         let (report, result) = split_report(self.dispatch(&environment));
         if let Err(error) = result {
             print!("{report}");
@@ -732,24 +864,16 @@ impl Request {
             } else {
                 ""
             };
-            let gpu = match firmware::host_chips(environment.host) {
-                Ok((chips, _)) if chips.is_empty() => format!(
-                    "\nBefore that, {}.",
-                    firmware::missing(
-                        "`stela setup host-firmware fetch --gpu CHIP --usb USB` (USB: the \
-                         installer's data volume)"
-                    )
-                ),
-                _ => String::new(),
-            };
             cliclack::note(
                 "Next steps",
                 format!(
-                    "Boot the target PC from this USB and choose Install macOS.\nThe install \
-                     needs the internet for Apple's signing server.{gpu}{profile}"
+                    "Boot the target PC from this USB and choose Install macOS.\nThe installer \
+                     checks whether it needs the internet before it starts.{profile}"
                 ),
             )?;
             cliclack::outro("Your installer USB is ready")?;
+        } else if let Some(path) = output {
+            save_report(&path, &report)?;
         } else {
             print!("{report}");
         }
@@ -789,9 +913,9 @@ impl Request {
                     .then_some(InstallImage::Full)
             });
         }
-        // Repair puts back the active build's files, so `--fetch` downloads
-        // that build.
-        if matches!(action, Action::Repair) {
+        // Every maintenance command works on the active build's files, so
+        // what it downloads is that build; only `update os` names another.
+        if !matches!(action, Action::UpdateOs) {
             self.build = record.build.clone();
         }
         match action {
@@ -804,14 +928,17 @@ impl Request {
                     Some(path) => path.clone(),
                     None => assets::resolve()?,
                 };
-                let ipsw = self.optional_image()?;
+                // The update finds the restore image itself when it needs
+                // one, downloading only its boot files, never the whole
+                // image; `--fetch` adds nothing to that.
                 update::update_stela(
                     environment,
                     record,
                     update::UpdateOptions {
                         usb: &self.usb,
                         image_path: &image,
-                        ipsw: ipsw.as_deref(),
+                        ipsw: self.ipsw.as_deref(),
+                        download_dir: self.download_dir.as_deref(),
                         dry_run: self.dry_run,
                     },
                 )
@@ -859,6 +986,35 @@ impl Request {
                     .host_firmware_cache
                     .clone()
                     .unwrap_or_else(|| cache_dir().join("firmware"));
+                let bundled = stela_loader::host_firmware::reads_bundle(&mount_image);
+                ensure!(
+                    bundled || requirements.is_some() || gpu.is_some() || profile.is_some(),
+                    "this USB's stela.efi reads no firmware bundle: name a requirements file, a \
+                     GPU or a profile, or run {} first",
+                    fix(&record.esp, "update stela")
+                );
+                if bundled && requirements.is_none() && profile.is_none() {
+                    let mut report = format!(
+                        "Host firmware: the USB's bundle holds {}.\n",
+                        firmware::bundle_summary()
+                    );
+                    if self.dry_run {
+                        report.push_str("Dry run: nothing was changed.\n");
+                        return Ok(report);
+                    }
+                    for note in firmware::provision_bundle_from(
+                        environment.host,
+                        &record.volume,
+                        &record.esp,
+                        &mount_image,
+                        &cache,
+                        offline,
+                    )? {
+                        writeln!(report, "Note: {note}")?;
+                    }
+                    report.push_str("Done.\n");
+                    return Ok(report);
+                }
                 let (destination, installed) =
                     firmware::publication_paths(&record.esp, record.layout, &mount_image)?;
                 firmware::provision_from(

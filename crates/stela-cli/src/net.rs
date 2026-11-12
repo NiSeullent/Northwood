@@ -7,7 +7,7 @@ use reqwest::{
     StatusCode,
     blocking::{RequestBuilder, Response},
 };
-use std::{error::Error as _, time::Duration};
+use std::{error::Error, io, time::Duration};
 
 /// Attempts per request: with waits of 1, 2, 4 and 8 s between them, a
 /// network that drops for about 15 s costs a pause, not the setup.
@@ -77,7 +77,27 @@ fn host_of(url: &reqwest::Url) -> String {
 /// `error` with every cause under it, and what a user can do about the
 /// kinds of failure a network causes.
 pub(crate) fn explain(error: &reqwest::Error) -> String {
+    explain_causes(error, error.is_timeout())
+}
+
+/// Whether `cause` is the operating system finding no way to the server. Its
+/// kind says so on every system; its text is the system's own, which Windows
+/// writes in the user's language.
+fn unreachable(cause: &(dyn Error + 'static)) -> bool {
+    cause.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::HostUnreachable
+        )
+    })
+}
+
+/// [`explain`] for any error, one that ran out of time when `timed_out`.
+fn explain_causes(error: &(dyn Error + 'static), timed_out: bool) -> String {
     let mut text = error.to_string();
+    let mut no_way = unreachable(error);
     let mut source = error.source();
     while let Some(cause) = source {
         let cause_text = cause.to_string();
@@ -85,6 +105,7 @@ pub(crate) fn explain(error: &reqwest::Error) -> String {
             text.push_str(": ");
             text.push_str(&cause_text);
         }
+        no_way |= unreachable(cause);
         source = cause.source();
     }
     let lower = text.to_ascii_lowercase();
@@ -101,9 +122,9 @@ pub(crate) fn explain(error: &reqwest::Error) -> String {
              intercepts HTTPS does this: sign in to the network (a hotel or guest network's \
              page), or set HTTPS_PROXY to the proxy that network requires",
         )
-    } else if error.is_timeout() {
+    } else if timed_out {
         Some("the server did not answer in time: check the network connection, or try again later")
-    } else if lower.contains("connection refused") || lower.contains("network is unreachable") {
+    } else if no_way {
         Some("this computer cannot reach the server: check its network connection and proxy")
     } else {
         None
@@ -215,5 +236,42 @@ pub(crate) mod tests {
             "{error}"
         );
         assert!(error.contains("cannot reach the server"), "{error}");
+    }
+
+    #[test]
+    fn an_unreachable_server_is_named_whatever_the_system_calls_it() {
+        /// A cause above the system's own, as the HTTP client reports one.
+        #[derive(Debug)]
+        struct Connect(io::Error);
+        impl std::fmt::Display for Connect {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("tcp connect error")
+            }
+        }
+        impl Error for Connect {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        // The text a Windows set to German gives a refused connection.
+        let words = "Der Zielcomputer hat die Verbindung verweigert";
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::HostUnreachable,
+        ] {
+            let text = explain_causes(&Connect(io::Error::new(kind, words)), false);
+            assert!(
+                text.starts_with(&format!("tcp connect error: {words} (")),
+                "{text}"
+            );
+            assert!(text.contains("cannot reach the server"), "{text}");
+        }
+        // Another failure of the connection gets no such hint.
+        let reset = Connect(io::Error::new(io::ErrorKind::ConnectionReset, words));
+        assert_eq!(
+            explain_causes(&reset, false),
+            format!("tcp connect error: {words}")
+        );
     }
 }

@@ -36,6 +36,10 @@ pub(super) struct Board<D> {
     /// it passed while home is outside its run loop
     /// ([`SharedDevices::advance_for_home`]).
     pub(super) time: AtomicU64,
+    /// Locked calls so far, bumped as each releases the lock: the home
+    /// machine keeps the deadline its last advance gave while this moved
+    /// by its own call alone ([`Devices::generation`]).
+    pub(super) generation: AtomicU64,
     pub(super) reset: Mutex<Option<Reset>>,
     pub(super) resetting: AtomicBool,
     /// PE starts the devices made, which every machine asks for at every
@@ -109,6 +113,7 @@ impl<D: Devices> Board<D> {
             since,
             waited,
             wakes: 0,
+            pe: usize::MAX,
         }
     }
 
@@ -184,6 +189,7 @@ impl<D: Devices> Board<D> {
             since: self.hub.ticks(),
             waited: 0,
             wakes: 0,
+            pe: usize::MAX,
         })
     }
 
@@ -223,6 +229,10 @@ pub(super) struct Held<'a, D: Devices> {
     /// wake can cost the host an interrupt to another core, which no other
     /// PE should wait for the lock behind.
     wakes: u64,
+    /// The PE whose call this is, or `usize::MAX` when the caller did not
+    /// say: the host work its release leaves ([`Kick::released`]) runs only
+    /// on a PE outside its run loop ([`Hub::serves_released`]).
+    pe: usize,
 }
 
 impl<D: Devices> Held<'_, D> {
@@ -325,6 +335,9 @@ impl<D: Devices> Drop for Held<'_, D> {
         if held > self.board.longest[call].load(Ordering::Relaxed) {
             self.board.longest[call].store(held, Ordering::Relaxed);
         }
+        // Before the release: a reader that saw the lock free after this
+        // call sees its bump.
+        self.board.generation.fetch_add(1, Ordering::AcqRel);
         // SAFETY: dropped once, here, and not used after.
         unsafe { ManuallyDrop::drop(&mut self.state) };
         if self.wakes != 0 {
@@ -337,7 +350,11 @@ impl<D: Devices> Drop for Held<'_, D> {
         }
         // Host work completed outside the lock: the home machine takes its
         // next transfer at once, which publishes the real deadline again.
-        if self.board.hub.kick.released() {
+        // A PE inside its run loop leaves that work, which can wait on a
+        // host device, to the next release by a PE outside it or to the
+        // host's own service: meanwhile it would read no mail, and every
+        // maintenance broadcast would wait for it.
+        if self.board.hub.serves_released(self.pe) && self.board.hub.kick.released() {
             self.board.dma.store(0, Ordering::Release);
             self.board
                 .hub
@@ -408,6 +425,7 @@ impl<D: Devices> SharedDevices<D> {
             pins: (0..pes).map(|_| AtomicU8::new(UNLATCHED)).collect(),
             dma: AtomicU64::new(u64::MAX),
             time: AtomicU64::new(u64::MAX),
+            generation: AtomicU64::new(0),
             reset: Mutex::new(None),
             resetting: AtomicBool::new(false),
             starts: Mutex::new(VecDeque::new()),
@@ -568,6 +586,7 @@ impl<D: Devices> SharedDevices<D> {
         f: impl FnOnce(&mut D, u64) -> R,
     ) -> R {
         let mut devices = self.lock(call);
+        devices.pe = cpu;
         let now = devices.now(now);
         let result = f(&mut devices, now);
         devices.notify(cpu, now);
@@ -913,6 +932,10 @@ impl<D: Devices> Devices for SharedDevices<D> {
     }
     /// Only the home machine moves devices' asynchronous DMA, through its
     /// host's canonical RAM owner.
+    fn generation(&self) -> Option<u64> {
+        self.home
+            .then(|| self.board.generation.load(Ordering::Acquire))
+    }
     fn dma_deadline(&self) -> Option<u64> {
         if !self.home {
             return None;

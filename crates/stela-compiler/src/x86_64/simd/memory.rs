@@ -66,6 +66,27 @@ pub(super) fn transfers_xmm0(load: bool, bytes: u8) -> bool {
 /// commits nothing. With `held`, XMM0 holds the vector whole, and a store
 /// through XMM0 ([`transfers_xmm0`]) takes it from there.
 pub(in crate::x86_64) fn transfer(code: &mut Code, load: bool, bytes: u8, vector: u8, held: bool) {
+    let cache = code.vector_cache();
+    if load && bytes == VECTOR_BYTES && cache.active() && !cache.writes_through() {
+        // Straight into the vector's home ([`super::super::vector_cache`]).
+        let host = code.allocate_vector(vector);
+        let address = Mem::base(Gpr::Rax, 0);
+        code.guest_access(|code| {
+            code.asm_unguarded()
+                .sse(Some(0xf3), &[0x0f, 0x6f], host, address)
+        });
+        code.mark_vector_dirty(vector);
+        return;
+    }
+    if !load
+        && bytes == VECTOR_BYTES
+        && !held
+        && let Some(host) = code.vector_home(vector)
+    {
+        // Straight from the vector's home.
+        wide_transfer(code, false, bytes, host, 0);
+        return;
+    }
     if load {
         match bytes {
             BYTE_BYTES | HALFWORD_BYTES => {

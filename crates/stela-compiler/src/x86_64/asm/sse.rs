@@ -175,12 +175,12 @@ impl Asm<'_> {
     }
     /// `movdqu xmm/m128, xmm`.
     pub(crate) fn movdqu_store(&mut self, rm: impl Into<Rm>, xmm: u8) {
-        self.sse(Some(0xf3), &[0x0f, 0x7f], xmm, rm);
+        self.sse_reading(Some(0xf3), &[0x0f, 0x7f], xmm, rm);
     }
     /// `movdqa xmm/m128, xmm`: one 16-byte access, which faults unless
     /// 16-byte aligned.
     pub(crate) fn movdqa_store(&mut self, rm: impl Into<Rm>, xmm: u8) {
-        self.sse(Some(0x66), &[0x0f, 0x7f], xmm, rm);
+        self.sse_reading(Some(0x66), &[0x0f, 0x7f], xmm, rm);
     }
     /// `pextrw r32, xmm, imm8` (66 0F C5): zero-extends word `lane`.
     pub(crate) fn pextrw(&mut self, destination: Gpr, xmm: u8, lane: u8) {
@@ -214,7 +214,7 @@ impl Asm<'_> {
     }
     /// `movd r/m32, xmm`.
     pub(crate) fn movd_from_xmm(&mut self, rm: impl Into<Rm>, xmm: u8) {
-        self.sse(Some(0x66), &[0x0f, 0x7e], xmm, rm);
+        self.sse_reading(Some(0x66), &[0x0f, 0x7e], xmm, rm);
     }
     /// `stmxcsr m32`.
     pub(crate) fn stmxcsr(&mut self, memory: impl Into<Rm>) {

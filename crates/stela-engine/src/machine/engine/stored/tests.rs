@@ -120,11 +120,13 @@ fn sealed_shared_handoff_rejects_other_source_pc_and_profile_before_install() {
             (receiver.statistics.shared, receiver.statistics.compiled),
             (0, 1)
         );
+        // The block compiled anew, then the SVC's thunk.
         assert_eq!(
-            receiver.host.installed,
-            core::slice::from_ref(&genuine.block().native.x86_64_code),
+            receiver.host.installed.first(),
+            Some(&genuine.block().native.x86_64_code),
             "wrong handoff never reaches installation"
         );
+        assert_eq!(receiver.host.installed.len(), 2);
     }
 }
 
@@ -556,4 +558,80 @@ fn installs_count_where_their_block_came_from_at_their_level() {
     sources[USER][count(StoreSource::Unstorable)] = 1;
     assert_eq!(user.statistics.store_sources, sources);
     assert_eq!(user.statistics.compiled, 1);
+}
+
+/// The same page content at four addresses: compiled at the first,
+/// compiled and proven at the second, rebased at the third, where it is
+/// what a compile there installs. A rewritten page is compiled again.
+#[test]
+fn a_block_compiled_at_two_addresses_is_rebased_at_a_third() {
+    use super::super::tests::{FakeHost, NATIVE_CODE_STRIDE};
+    const PAGE_WORDS: usize = FETCH_PAGE as usize / INSTRUCTION as usize;
+    // adr x0, #8; add x0, x0, #1; svc #0, at the start of each page.
+    let block = [0x1000_0040, 0x9100_0400, 0xd400_0001];
+    let mut words = vec![0; 3 * PAGE_WORDS + block.len()];
+    for page in 0..4 {
+        words[page * PAGE_WORDS..page * PAGE_WORDS + block.len()].copy_from_slice(&block);
+    }
+    let page = |n: u64| BASE + n * FETCH_PAGE;
+    let mut reusing = machine(&words);
+    reusing.host.store = Some(MemoryStore::default());
+    assert!(reusing.fetch_block(page(0), false).is_ok());
+    assert_eq!(reusing.code.rebases.counts().proven, 0);
+    assert!(reusing.fetch_block(page(1), false).is_ok());
+    assert_eq!(reusing.statistics.compiled, 2);
+    assert_eq!(reusing.code.rebases.counts().proven, 1);
+    let Ok(Fetched::Block(rebased)) = reusing.fetch_block(page(2), false) else {
+        panic!("rebased block")
+    };
+    assert_eq!(reusing.statistics.compiled, 2);
+    let counts = reusing.code.rebases.counts();
+    assert_eq!((counts.hits, counts.proven, counts.unprovable), (1, 1, 0));
+    assert_eq!(
+        reusing.statistics.store_sources[1][super::super::StoreSource::Rebased as usize],
+        1
+    );
+
+    type Fake = super::super::Machine<FakeHost, crate::machine::NoDevices>;
+    let installed = |machine: &Fake, index: usize| {
+        let block = &machine.code.blocks[index];
+        (
+            machine.host.installed[block.code.0 / NATIVE_CODE_STRIDE - 1].clone(),
+            block.pc,
+            block.source_bytes(),
+            block.instructions,
+            block.terminal,
+            block.successors.len(),
+        )
+    };
+    let mut fresh = machine(&words);
+    let Ok(Fetched::Block(compiled)) = fresh.fetch_block(page(2), false) else {
+        panic!("compiled block")
+    };
+    assert_eq!(installed(&reusing, rebased), installed(&fresh, compiled));
+
+    // The third page rewritten (add x0, x0, #2): another key, compiled.
+    words[2 * PAGE_WORDS + 1] = 0x9100_0800;
+    let at = 2 * FETCH_PAGE as usize + 4;
+    reusing.host.ram[at..at + 4].copy_from_slice(&0x9100_0800u32.to_le_bytes());
+    reusing.invalidate_code_page(page(2));
+    let Ok(Fetched::Block(changed)) = reusing.fetch_block(page(2), false) else {
+        panic!("compiled block")
+    };
+    assert_eq!(reusing.statistics.compiled, 3);
+    assert_eq!(reusing.code.rebases.counts().hits, 1);
+    let mut fresh = machine(&words);
+    let Ok(Fetched::Block(compiled)) = fresh.fetch_block(page(2), false) else {
+        panic!("compiled block")
+    };
+    assert_eq!(installed(&reusing, changed), installed(&fresh, compiled));
+    // The fourth page still holds the proven content.
+    assert!(reusing.fetch_block(page(3), false).is_ok());
+    assert_eq!(
+        (
+            reusing.statistics.compiled,
+            reusing.code.rebases.counts().hits
+        ),
+        (3, 2)
+    );
 }

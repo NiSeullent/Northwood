@@ -688,6 +688,34 @@ const UNCORE_COUNTER: &str = "m1n1 cpu_regs.h names this uncore counter; 26A434 
     0xfffffe000bd8d020). It counts only under a UPMCR0 counter enable, which stops here, so \
     it holds what software writes, 0 from reset (inference). One per cluster";
 
+/// The selectors of the core performance counters, in counter order.
+pub const AON_SELECTS: [Encoding; super::aon::SLOTS] = [
+    AON_SELECT_0,
+    AON_SELECT_1,
+    AON_SELECT_2,
+    AON_SELECT_3,
+    AON_SELECT_4,
+    AON_SELECT_5,
+    AON_SELECT_6,
+    AON_SELECT_7,
+    AON_SELECT_8,
+    AON_SELECT_9,
+];
+
+/// The core performance counters, in counter order.
+pub const AON_COUNTERS: [Encoding; super::aon::SLOTS] = [
+    AON_COUNTER_0,
+    AON_COUNTER_1,
+    AON_COUNTER_2,
+    AON_COUNTER_3,
+    AON_COUNTER_4,
+    AON_COUNTER_5,
+    AON_COUNTER_6,
+    AON_COUNTER_7,
+    AON_COUNTER_8,
+    AON_COUNTER_9,
+];
+
 /// S3_7_C15_C5_0 bit 0, which enableCore sets and clears.
 const AON_ENABLED: u64 = 1;
 
@@ -695,8 +723,9 @@ const AON_ENABLE_EVIDENCE: &str = "no public name; AppleT8112CLPC's \
     CorePerfSampler::readAONCounterEnable and writeAONCounterEnable read and write it \
     (0xfffffe0009f40a3c, 0xfffffe0009f40a48), and enableCore sets it after selecting three \
     core counters' events in S3_7_C15_C1_3, C3_3 and C5_3 (0xfffffe0009f40b14). What those \
-    counters count is not documented: bit 0 is held, the counters keep what software writes \
-    (platform::apple::core_counters) and enabling them is reported once";
+    counters count is not documented: under bit 0 the cycle and instruction selectors count \
+    (machine::aon, inference) and the others keep what software writes \
+    (platform::apple::core_counters); enabling them is reported once";
 
 const AON_SELECT_EVIDENCE: &str = "no public name; AppleT8112CLPC's \
     CorePerfSampler::enableCore writes the selectors 0x8000, 0x8100 and 0x8700 to \
@@ -708,8 +737,9 @@ const AON_COUNTER_EVIDENCE: &str = "no public name; AppleT8112CLPC's CorePerfSam
     and SchedulerInterface::contextSwitch read it as a wrapping 32-bit count \
     (0xfffffe0009f39778, 0xfffffe0009f382ac), and other PEs read it through this PE's \
     cpu-impl-reg + 0x4000 (platform::apple::core_counters, which a board's PEs read it from). It \
-    counts only under S3_7_C15_C5_0, whose counting is not modeled, so it holds what software \
-    wrote, 0 from reset (inference)";
+    counts under S3_7_C15_C5_0 what its selector selects: cycles for 0x8000 and retired \
+    instructions for 0x8100, added to what software wrote (machine::aon, inference); other \
+    selectors count nothing";
 
 const AON_FOURTH_EVIDENCE: &str = "no public name; the CorePerfSampler of AppleT6000CLPCv3, \
     AppleT6020CLPC and the M3-and-later CLPCs selects a fourth core counter: enableCore writes \
@@ -721,9 +751,9 @@ const AON_FOURTH_EVIDENCE: &str = "no public name; the CorePerfSampler of AppleT
     is stored and the counter holds what software wrote, 0 from reset (inference)";
 
 /// What a running sampler's counters lack here.
-const CORE_COUNTERS_UNMODELED: &str = "core performance counters enabled; events not counted: \
-    CLPC reads zero work from them, which only lowers its DVFS and shared-resource placement \
-    inputs";
+const CORE_COUNTERS_UNMODELED: &str = "core performance counters enabled; selectors 0x8000 \
+    and 0x8100 count cycles and retired instructions (inference, machine::aon), other events \
+    are not counted: CLPC reads a zero fraction from them";
 
 const MEM_STALL_UNMODELED: &str = "memory-stall counters started; events not counted: CLPC \
     reads no stalls, which only changes its efficiency-stall DVFS caps";
@@ -1933,6 +1963,25 @@ impl Registers {
             Scope::Pe => self.values.get(entry.encoding),
             Scope::Cluster => self.cluster.borrow().get(&key).copied(),
         }
+    }
+
+    /// The value software last wrote to the PE-scoped `encoding`, without
+    /// counting a read.
+    pub fn value(&self, encoding: Encoding) -> Option<u64> {
+        self.values.get(encoding)
+    }
+
+    /// The enable and selectors of the CLPC core performance counters
+    /// (`machine::aon`).
+    pub fn aon_controls(&self) -> super::aon::Controls {
+        let mut controls = super::aon::Controls {
+            enabled: self.value(AON_ENABLE).unwrap_or(0) & AON_ENABLED != 0,
+            ..Default::default()
+        };
+        for (selector, encoding) in controls.selectors.iter_mut().zip(AON_SELECTS) {
+            *selector = self.value(encoding);
+        }
+        controls
     }
 
     /// The address of a [`Entry::stored`] entry's value on this PE, whose

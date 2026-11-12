@@ -48,6 +48,9 @@ static ACTIVE_GS: AtomicU64 = AtomicU64::new(0);
 /// (a hand-back with no guest deadline leaves it masked): the host keeps
 /// its LVT write only while this is unchanged (`bare_host::arm_timer`).
 pub(crate) static TIMER_HANDOVERS: AtomicU64 = AtomicU64::new(0);
+/// Counts clock samples (`RootCpu::sample_ticks`), for the `GPU LINUX`
+/// report's `clocks=`.
+pub(crate) static SAMPLES: AtomicU64 = AtomicU64::new(0);
 
 fn processor_id() -> u32 {
     let highest = core::arch::x86_64::__cpuid(0).eax;
@@ -124,9 +127,14 @@ impl RootCpu {
     /// Caller holds local IRQ exclusion. A source fault does not
     /// revoke the time-free CPU identity needed to drain/release resources.
     fn sample_ticks(&self) -> Result<u64, WorkError> {
+        SAMPLES.fetch_add(1, Ordering::Relaxed);
         self.health.check()?;
         let result = (|| {
-            self.deadline_control.check()?;
+            // No CPUID here: it is slow on every CPU and exits under a
+            // hypervisor. The caller's `affinity` already proved this is the
+            // owning processor (its unique GS record and descriptors), whose
+            // leaves 0, 1 and 6 cannot change; ARAT matters only to the
+            // timer, and `rearm` checks it before every arm.
             // SAFETY: original owner and CPU remain held. Source checks
             // real control/power eligibility around the coherent read.
             let mut raw = unsafe { self.source.read()? };
@@ -258,21 +266,24 @@ impl CounterEpoch {
     }
     fn sample_ticks(&self) -> Result<u64, WorkError> {
         self.cpu.health.check()?;
-        self.cpu.check_cpu()?;
         self.cpu
             .source
             .continuous_period()
             .map_err(|error| self.cpu.health.fail(error))?;
         let flags = flags_disable();
-        let result = self.cpu.sample_ticks();
+        // One CPU and root check with IF clear covers the sample: from it to
+        // the restore nothing runs on this processor but the counter read,
+        // no task switch, callback or root change, and an NMI returns to the
+        // same root. Checking again in the restore and after it (two more
+        // page walks per Linux clock read) proved nothing more.
+        let result = self.cpu.check_cpu().and_then(|()| self.cpu.sample_ticks());
         // Restore depends only on the real time-free CPU identity. A failed
         // source must not prevent resources from being drained on that CPU.
-        // SAFETY: same CPU's enclosing IRQ save; no switch/callback.
+        // SAFETY: the same CPU's enclosing IRQ save above; no switch/callback.
         unsafe {
-            self.cpu.restore(flags);
+            restore(flags);
         }
         let ticks = result?;
-        self.cpu.check_cpu()?;
         self.cpu.health.check()?;
         Ok(ticks)
     }

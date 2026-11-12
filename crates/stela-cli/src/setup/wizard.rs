@@ -318,7 +318,7 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
         // What the install needs the network for, and what is not known
         // about the installed system's first start.
         let full = install_image == InstallImage::Full;
-        for note in super::create::network_notes(!full, full) {
+        for note in super::create::expected_network_notes(full) {
             cliclack::log::info(note)?;
         }
         choose_wifi(command)?;
@@ -333,7 +333,10 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
                     |serial| format!("{} · serial {serial}", usb.description())
                 ),
                 match full {
-                    true => "Full · macOS goes on the USB, the install needs no network",
+                    true => {
+                        "Full · macOS goes on the USB; the install needs a network only if \
+                         Apple's signing answers do not fit it"
+                    }
                     false => "Network · macOS downloads during installation",
                 },
                 command.build,
@@ -357,15 +360,8 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
                 },
             ),
         )?;
-        let (chips, notes) = firmware::host_chips(host)?;
-        for note in notes {
-            cliclack::log::warning(note)?;
-        }
-        if chips.is_empty() {
-            cliclack::log::warning(firmware::missing(
-                "`stela setup host-firmware fetch --gpu CHIP --usb USB` (USB: the installer's \
-                 data volume)",
-            ))?;
+        for note in firmware::host_notes(host)? {
+            cliclack::log::info(note)?;
         }
         cliclack::log::info(super::create::SIGNING_NOTE)?;
         cliclack::log::warning(format!("Everything on {} will be erased.", usb.short()))?;
@@ -500,13 +496,9 @@ mod tests {
     #[test]
     fn maintenance_without_a_usb_is_refused_before_opening_prompts() {
         use clap::Parser;
-        for words in [
-            &["status"][..],
-            &["repair"],
-            &["uninstall"],
-            &["update", "stela"],
-            &["configure", "--no-profile"],
-        ] {
+        // Status, repair, update and host-firmware find their USB instead
+        // (`setup::tests::maintenance_commands_parse_without_usb`).
+        for words in [&["uninstall"][..], &["configure", "--no-profile"]] {
             let line = ["stela", "setup"].into_iter().chain(words.iter().copied());
             assert!(crate::Cli::try_parse_from(line).is_err(), "{words:?}");
         }

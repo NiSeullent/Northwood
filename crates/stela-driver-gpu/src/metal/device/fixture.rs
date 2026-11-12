@@ -135,6 +135,11 @@ pub(crate) struct MockBackend {
     pub(crate) idle_calls: usize,
     pub(crate) idle_error: Option<Error>,
     pub(crate) semaphore_error: Option<Error>,
+    /// Timeline values the device told the backend passed without a query,
+    /// in order.
+    pub(crate) passed: Vec<(Semaphore, u64)>,
+    /// Semaphores whose value the driver was asked for, in order.
+    pub(crate) queried: Vec<Semaphore>,
     /// Freed semaphores' handles, which `create_semaphore` hands out again
     /// when `reuse_semaphores` is set.
     pub(crate) reuse_semaphores: bool,
@@ -578,10 +583,14 @@ impl Backend for MockBackend {
         self.outstanding = Some(outstanding.clone());
     }
     fn semaphore_value(&mut self, semaphore: Semaphore) -> Result<u64> {
+        self.queried.push(semaphore);
         if let Some(error) = self.semaphore_error.take() {
             return Err(error);
         }
         Ok(self.semaphores[&semaphore.0])
+    }
+    fn timeline_passed(&mut self, semaphore: Semaphore, value: u64) {
+        self.passed.push((semaphore, value));
     }
     fn signal_semaphore(&mut self, semaphore: Semaphore, value: u64) -> Result<()> {
         self.semaphores.insert(semaphore.0, value);

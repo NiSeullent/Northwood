@@ -16,6 +16,7 @@ use crate::{
 };
 use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
 use core::fmt;
+use stela_driver_base::budget;
 
 mod adapter;
 pub use adapter::Adapter;
@@ -255,6 +256,57 @@ pub fn claims_identity(function: &crate::bus::pci::Identity) -> bool {
     registry::pre_exit_claim(function)
 }
 
+/// What [`probe_with_provider`] will do with `function`, for a boot log
+/// line written before boot services end: the default candidate, or why
+/// none applies. Later admission also checks the boot's driver policy.
+/// `displays` are the slots whose function 0 is a display
+/// controller. Options decided after the census (a Wi-Fi network, the
+/// mount's native services) are named where they apply.
+pub fn plan(
+    function: &crate::bus::pci::Identity,
+    displays: &[Address],
+) -> alloc::borrow::Cow<'static, str> {
+    use alloc::borrow::Cow;
+    let selection = registry::select_pci(function, &registry::DriverPolicy::default());
+    if let Some(why) = selection.refusal() {
+        return Cow::Owned(alloc::format!("unsupported: {why}"));
+    }
+    if let Some(registry::Driver::Native(kind)) = selection.driver() {
+        return Cow::Borrowed(kind.driver());
+    }
+    let driver = match selection {
+        registry::Selection::Entry(entry) => match entry.manifest.implementation {
+            "pci-display" | "nouveau-nvk" => "GPU",
+            "i801" => "i801 SMBus",
+            "ehci" => "EHCI USB",
+            "xhci" | "xhci-handoff" => "xHCI USB",
+            "uhci-handoff" | "ohci-handoff" => {
+                "taken from firmware, not driven: UHCI or OHCI USB host controller"
+            }
+            "nvme" => "NVMe",
+            "igc" => "igc Ethernet",
+            "e1000e" => "e1000e Ethernet",
+            "e1000e-pch" => "Intel PCH Ethernet",
+            "igb" => "igb Ethernet",
+            "alx" => "alx Ethernet",
+            "atl1c" => "atl1c Ethernet",
+            "r8169" => "r8169 Ethernet",
+            "rtsx_pci" => "Realtek card reader",
+            "sdhci" => "SDHCI card reader",
+            "ahci" => "AHCI SATA",
+            implementation => implementation,
+        },
+        _ if function.class[..2] == [6, 4] => "PCI bridge",
+        _ => {
+            if let Some(why) = unclaimed(function.class, function.address, displays) {
+                return Cow::Owned(alloc::format!("unsupported: {why}"));
+            }
+            "not driven"
+        }
+    };
+    Cow::Borrowed(driver)
+}
+
 /// An HD Audio function beside a display controller's function 0 is that
 /// GPU's HDMI/DP audio, as Linux `get_bound_vga` finds it. No HDMI/DP codec
 /// profile here serves one outside the admitted identities.
@@ -400,9 +452,97 @@ pub struct Devices {
     /// Storage, network, audio and USB functions no driver here takes, with
     /// their class and why.
     pub unsupported: Vec<(Address, [u8; 3], &'static str)>,
+    /// Functions whose start ran past [`DEVICE_START_US`]: their waits then
+    /// ended at once, the driver gave up, and the function was left with
+    /// bus mastering and interrupts off where the probe still held it.
+    pub abandoned: Vec<(Address, budget::Expiry)>,
+}
+
+/// The longest one PCI function's start may take. Linux's own per-step
+/// bounds are smaller: xHCI commands 5 s (`XHCI_CMD_DEFAULT_TIMEOUT`), USB
+/// control transfers 5 s (`USB_CTRL_GET_TIMEOUT`), AHCI port reset 1 s,
+/// the NVMe admin queue 60 s but CC.RDY by CAP.TO, which drives already
+/// started by the firmware meet in a few seconds. A device that answers
+/// starts far inside this; one that stops answering is given up here even
+/// when a driver's per-step bounds would add up to more.
+pub const DEVICE_START_US: u64 = 30_000_000;
+
+/// One function's start under its [`DEVICE_START_US`] budget; a passed
+/// budget is recorded as the function's abandonment when the start ends.
+struct DeviceStart<'a> {
+    address: Address,
+    budget: Option<budget::Budget>,
+    abandoned: &'a mut Vec<(Address, budget::Expiry)>,
+}
+
+impl<'a> DeviceStart<'a> {
+    fn begin(
+        address: Address,
+        clock: Clock,
+        abandoned: &'a mut Vec<(Address, budget::Expiry)>,
+    ) -> Self {
+        Self {
+            address,
+            budget: budget::Budget::start(clock, DEVICE_START_US).ok(),
+            abandoned,
+        }
+    }
+}
+
+impl Drop for DeviceStart<'_> {
+    fn drop(&mut self) {
+        if let Some(expiry) = self.budget.as_ref().and_then(budget::Budget::expired) {
+            self.abandoned.push((self.address, expiry));
+        }
+    }
 }
 
 impl Devices {
+    /// Take up what an xHCI controller brought, at its start or later
+    /// through a port change: disks, inputs, links, audio and Bluetooth,
+    /// failures and the owners that keep them.
+    pub fn absorb_usb(
+        &mut self,
+        address: Option<Address>,
+        found: xhci::Found,
+        firmware: &dyn crate::firmware::Provider,
+    ) {
+        self.disks.extend(
+            found
+                .disks
+                .into_iter()
+                .map(|d| Box::new(d) as Box<dyn BlockDevice>),
+        );
+        self.inputs.extend(
+            found
+                .inputs
+                .into_iter()
+                .map(|input| InputDevice::Usb(Box::new(input))),
+        );
+        self.usb_devices.extend(found.devices);
+        self.usb_hosts.extend(found.hosts);
+        self.usb_storage.extend(found.storage);
+        self.audio.extend(found.audio);
+        self.bluetooth_bootloaders.extend(found.bootloaders);
+        for mut device in found.bluetooth {
+            // The kept result owns its evidence/errors;
+            // no catalog borrow or firmware bytes escape.
+            let _ = device
+                .initialize_with_provider(firmware, self.bluetooth_platform.platform_inputs());
+            self.bluetooth.push(device);
+        }
+        self.nics.extend(found.links.into_iter().map(Adapter::Usb));
+        self.nics
+            .extend(found.vendor_links.into_iter().map(Adapter::UsbVendor));
+        self.usb_failures.extend(found.failures);
+        self.usb_vendor_failures.extend(found.vendor_failures);
+        self.usb_unused.extend(found.unused);
+        if let Some(address) = address {
+            self.usb_port_probes
+                .extend(found.probes.into_iter().map(|probe| (address, probe)));
+        }
+    }
+
     /// Failures from attempted native vendor initialization, USB and PCIe,
     /// and USB controllers no vendor setup here takes, each named once: no
     /// consumer runs them, so they stay off.
@@ -877,6 +1017,7 @@ unsafe fn probe_with_resources(
     } else {
         Vec::new()
     };
+    let mut abandoned = Vec::new();
     let intel_ehci = scanned.iter().flatten().any(|function| {
         function.vendor == 0x8086
             && usb::handoff::Kind::of(function.class) == Some(usb::handoff::Kind::Ehci)
@@ -954,6 +1095,7 @@ unsafe fn probe_with_resources(
                 continue;
             }
             crate::working(&alloc::format!("PCI {address}"));
+            let start = DeviceStart::begin(address, handoff.clock, &mut abandoned);
             #[cfg(feature = "native-acpi")]
             if let Some(registry::Early::Smbus) = early {
                 smbus_functions.push(address);
@@ -1048,6 +1190,7 @@ unsafe fn probe_with_resources(
                             dma,
                             firmware,
                             minimum,
+                            budget: start.budget.as_ref(),
                             devices: &mut devices,
                         },
                     );
@@ -1057,6 +1200,7 @@ unsafe fn probe_with_resources(
             }
         }
     }
+    devices.abandoned = abandoned;
     let companions_released = pci_scan_complete && usb_handoffs.companions_released;
     #[cfg_attr(not(feature = "native-acpi"), allow(unused_variables))]
     let ehci_legacy_released = attach_ehci_hosts(
@@ -1716,11 +1860,128 @@ fn attach_platform(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A function whose device never answers spends its whole budget and
+    /// is recorded abandoned, with the wait it stopped at; the next
+    /// function then starts with a fresh budget and answers normally.
+    #[test]
+    fn a_dead_function_is_abandoned_and_the_next_one_still_starts() {
+        let _clock = crate::test_clock::virtualize();
+        let clock = Clock {
+            ticks_per_microsecond: 1,
+        };
+        let at = |bus| Address {
+            segment: 0,
+            bus,
+            device: 0,
+            function: 0,
+        };
+        let mut abandoned = Vec::new();
+        let started = Clock::ticks();
+        {
+            let _start = DeviceStart::begin(at(0x0b), clock, &mut abandoned);
+            // A driver step whose own bound is a minute: the budget ends it.
+            assert!(!clock.wait(60_000_000, || false));
+        }
+        assert!(Clock::ticks() - started < DEVICE_START_US + 1_000);
+        {
+            let _start = DeviceStart::begin(at(0x0c), clock, &mut abandoned);
+            assert!(!clock.deadline(1_000_000).passed());
+            assert!(clock.wait(1_000_000, || true));
+        }
+        assert_eq!(abandoned.len(), 1);
+        let (address, expiry) = abandoned[0];
+        assert_eq!(address, at(0x0b));
+        assert_eq!(expiry.budget_us, DEVICE_START_US);
+        assert!(expiry.at.unwrap().file().ends_with("probe.rs"));
+    }
     use crate::firmware::{
         self, Catalog, HandoffProvider, Provenance, Provider, Requirement, Resource, Target,
     };
     use alloc::format;
     use sha2::{Digest, Sha256};
+
+    fn identity(
+        bus: u8,
+        function: u8,
+        vendor: u16,
+        device: u16,
+        class: u32,
+    ) -> crate::bus::pci::Identity {
+        crate::bus::pci::Identity {
+            address: Address {
+                segment: 0,
+                bus,
+                device: 0,
+                function,
+            },
+            vendor,
+            device,
+            class: [(class >> 16) as u8, (class >> 8) as u8, class as u8],
+        }
+    }
+
+    #[test]
+    fn plan_names_the_driver_of_common_desktop_functions() {
+        let gpu = identity(1, 0, 0x10de, 0x2882, 0x03_00_00);
+        let displays = [gpu.address];
+        for (function, expected) in [
+            (identity(0x0b, 0, 0x1022, 0x149c, 0x0c_03_30), "xHCI USB"),
+            (identity(0x0c, 0, 0x1022, 0x7901, 0x01_06_01), "AHCI SATA"),
+            (identity(0x04, 0, 0x144d, 0xa808, 0x01_08_02), "NVMe"),
+            (
+                identity(0x05, 0, 0x1969, 0x1063, 0x02_00_00),
+                "atl1c Ethernet",
+            ),
+            (gpu, "GPU"),
+            (identity(0x00, 1, 0x1022, 0x1483, 0x06_04_00), "PCI bridge"),
+            (identity(0x00, 0, 0x1022, 0x1480, 0x06_00_00), "not driven"),
+            (
+                identity(0x05, 0, 0x1106, 0x0571, 0x01_01_80),
+                "unsupported: IDE storage controller",
+            ),
+        ] {
+            assert_eq!(
+                plan(&function, &displays),
+                expected,
+                "{:?}",
+                function.address
+            );
+        }
+        // The GPU's own HDMI audio function, beside its function 0.
+        let hdmi = identity(1, 1, 0x1234, 0x0001, 0x04_03_00);
+        assert!(plan(&hdmi, &displays).starts_with("unsupported: HDMI/DP audio"));
+        assert!(plan(&hdmi, &[]).starts_with("unsupported: HD Audio controller"));
+    }
+
+    #[test]
+    fn plan_names_a_driver_exactly_for_the_functions_claimed() {
+        let functions = [
+            identity(0x0b, 0, 0x1022, 0x149c, 0x0c_03_30),
+            identity(0x0b, 1, 0x1022, 0x43d5, 0x0c_03_30),
+            identity(0x0c, 0, 0x1022, 0x7901, 0x01_06_01),
+            identity(0x04, 0, 0x144d, 0xa808, 0x01_08_02),
+            identity(0x0d, 0, 0x10ec, 0x8168, 0x02_00_00),
+            identity(0x05, 0, 0x1969, 0x1063, 0x02_00_00),
+            identity(0x0e, 0, 0x8086, 0x15f3, 0x02_00_00),
+            identity(0x0f, 0, 0x1022, 0x1487, 0x04_03_00),
+            identity(0x10, 0, 0x1af4, 0x1042, 0x01_00_00),
+            identity(0x11, 0, 0x8086, 0x1e2d, 0x0c_03_20),
+            identity(0x00, 0, 0x1022, 0x1480, 0x06_00_00),
+            identity(0x12, 0, 0x1234, 0x5678, 0x0c_03_10),
+        ];
+        for function in functions {
+            let named = plan(&function, &[]);
+            // A USB host taken from firmware has its registers mapped too.
+            let driven = !named.starts_with("unsupported") && named != "not driven";
+            assert_eq!(
+                driven,
+                claims_identity(&function),
+                "{:?} {named}",
+                function.address
+            );
+        }
+    }
 
     #[test]
     fn i8042_requires_the_usb_legacy_result_of_a_complete_scan() {

@@ -103,6 +103,138 @@ fn devices_missing_a_required_feature_are_refused() {
     assert!(matches!(device, Err(Error::Unsupported("nullDescriptor"))));
 }
 
+/// A guest's poll takes the completion marker's serial as the timeline: no
+/// driver query, whether or not the marker shows something new; without a
+/// marker the driver is asked as before.
+#[test]
+fn a_marked_poll_needs_no_driver_query() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let mut backend = MockBackend::new();
+    backend.marker = Some(alloc::boxed::Box::new(AtomicU32::new(0)));
+    let mut device = device_on(backend);
+    let first = submit(&mut device);
+    let second = submit(&mut device);
+    // A query would fail and lose the device.
+    device.backend().semaphore_error = Some(Error::DeviceLost);
+    assert_eq!(device.poll_marked(), Ok(0), "nothing marked yet");
+    device
+        .backend()
+        .marker
+        .as_ref()
+        .unwrap()
+        .store(first as u32, Ordering::SeqCst);
+    assert_eq!(device.poll_marked(), Ok(first));
+    assert_eq!(device.reached_for(0), first);
+    device
+        .backend()
+        .marker
+        .as_ref()
+        .unwrap()
+        .store(second as u32, Ordering::SeqCst);
+    assert_eq!(device.poll_marked(), Ok(second));
+    assert!(!device.is_lost());
+    // The driver was never asked: its error is still waiting.
+    assert_eq!(device.poll(), Ok(second), "nothing in flight to ask about");
+    let third = submit(&mut device);
+    assert_eq!(device.poll(), Err(Error::DeviceLost));
+    assert!(third > second);
+}
+
+/// A marked poll tells the backend which submissions finished, so it frees
+/// their command buffers without the query it would otherwise make once
+/// enough wait: every one before the marked serial, which the queue ran
+/// first, not the marked one, whose last command wrote the marker.
+#[test]
+fn a_marked_poll_lets_the_backend_recycle_finished_submissions() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let mut backend = MockBackend::new();
+    backend.marker = Some(alloc::boxed::Box::new(AtomicU32::new(0)));
+    let mut device = device_on(backend);
+    let first = submit(&mut device);
+    let second = submit(&mut device);
+    device.backend().semaphore_error = Some(Error::DeviceLost);
+    assert_eq!(device.poll_marked(), Ok(0));
+    assert!(device.backend().passed.is_empty(), "nothing marked yet");
+    let mark = |device: &mut TestDevice, serial: u64| {
+        device
+            .backend()
+            .marker
+            .as_ref()
+            .unwrap()
+            .store(serial as u32, Ordering::SeqCst)
+    };
+    mark(&mut device, first);
+    assert_eq!(device.poll_marked(), Ok(first));
+    assert!(
+        device
+            .backend()
+            .passed
+            .iter()
+            .all(|&(_, value)| value < first),
+        "the marked submission may still run"
+    );
+    mark(&mut device, second);
+    assert_eq!(device.poll_marked(), Ok(second));
+    let passed = device.backend().passed.clone();
+    assert_eq!(passed.last().map(|&(_, value)| value), Some(first));
+    assert!(
+        passed
+            .iter()
+            .all(|&(semaphore, _)| semaphore == passed[0].0)
+    );
+    assert!(!device.is_lost(), "no driver query was made");
+}
+
+/// While held work completes on the late timeline, a marked poll asks the
+/// driver for that timeline alone: the marker still stands for the queue's
+/// own, as a late submission writes it only after all submitted before it.
+#[test]
+fn a_marked_poll_with_late_work_asks_only_for_the_late_timeline() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let mut backend = MockBackend::new();
+    backend.marker = Some(alloc::boxed::Box::new(AtomicU32::new(0)));
+    let mut device = device_on(backend);
+    let event = device.new_event().unwrap();
+    let semaphore = device.event_semaphore(event).unwrap();
+    let mut commands = device.new_command_buffer();
+    commands
+        .encode_wait_for_event(&mut device.resolver(), semaphore, 1)
+        .unwrap();
+    let held = device.commit_for(2, commands).unwrap();
+    let later = submit(&mut device);
+    assert!(later > held && device.holds());
+    // The later command buffer completes; the held one is released after
+    // it, so it completes on the late timeline.
+    device.backend().finish();
+    let store = |device: &mut TestDevice, serial: u64| {
+        device
+            .backend()
+            .marker
+            .as_ref()
+            .unwrap()
+            .store(serial as u32, Ordering::SeqCst)
+    };
+    store(&mut device, later);
+    device.set_signaled_value(event, 1).unwrap();
+    assert!(device.holds(), "the released command buffer completes late");
+    device.backend().queried.clear();
+    device.poll_marked().unwrap();
+    let timeline = device.timeline;
+    assert!(
+        !device.backend().queried.contains(&timeline),
+        "the marker answers for the queue's own timeline"
+    );
+    assert!(device.reached_for(0) >= later);
+    // The held one runs and writes its serial late; the late timeline says
+    // it completed.
+    device.backend().finish();
+    store(&mut device, held);
+    device.poll_marked().unwrap();
+    assert!(!device.backend().queried.contains(&timeline));
+    assert_eq!(device.reached_for(2), device.submitted_serial());
+    assert!(!device.is_lost());
+}
+
 #[test]
 fn destruction_waits_for_submitted_work() {
     let mut device = device();

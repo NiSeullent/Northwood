@@ -275,6 +275,9 @@ pub struct Cpu {
     pub pmu: Option<super::pmu::Pmu>,
     /// The activity monitors (`machine::amu`), on a chip with FEAT_AMUv1.
     pub amu: Option<super::amu::Amu>,
+    /// What the CLPC core performance counters count (`machine::aon`), on
+    /// the PEs whose core clock the profile declares.
+    pub aon: Option<super::aon::CoreActivity>,
     /// The instructions this PE has retired (`machine::pmu`).
     pub retired: u64,
     /// The CTRR registers of this PE's cluster, shared with its other PEs
@@ -449,6 +452,7 @@ impl Cpu {
             }),
             pmu: None,
             amu: None,
+            aon: None,
             retired: 0,
             ctrr: Default::default(),
             ctrr_core: super::ctrr::Core::default(),

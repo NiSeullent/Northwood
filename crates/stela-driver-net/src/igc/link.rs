@@ -25,6 +25,9 @@ pub(super) enum Change {
 pub(super) struct Supervisor {
     /// hw->mac.get_link_status: a PHY link check is due.
     check: bool,
+    /// The last check found no link and no link change arrived since, so
+    /// its read cleared the latched-low MII link bit.
+    latch_cleared: bool,
     /// When the pending link update began, while it holds the carrier down.
     settle: Option<u64>,
     /// When a 1 Gb/s link began waiting for the remote receiver.
@@ -39,6 +42,7 @@ impl Supervisor {
     pub(super) const fn new() -> Self {
         Self {
             check: true,
+            latch_cleared: false,
             settle: None,
             gigabit: None,
             link: None,
@@ -49,6 +53,13 @@ impl Supervisor {
     /// The negotiated link while the carrier is reported up.
     pub(super) fn carrier(&self) -> Option<Negotiated> {
         self.link.filter(|_| self.carrier)
+    }
+
+    /// A link status change cause read outside `poll`: the next poll checks
+    /// the PHY, reading the latched-low link bit twice.
+    pub(super) fn link_changed(&mut self) {
+        self.check = true;
+        self.latch_cleared = false;
     }
 
     /// One watchdog pass at `now` microseconds. Errors are failed register
@@ -64,13 +75,18 @@ impl Supervisor {
             return Err(BlockError::Device { status: cause });
         }
         if cause & ICR_LSC != 0 {
-            self.check = true;
+            self.link_changed();
         }
         // igc_has_link.
         let mut link = true;
         if self.check {
             let mut hardware = Hardware::new(registers, timer)?;
-            if let Some(negotiated) = hardware.check_for_copper_link()? {
+            let negotiated = match self.latch_cleared {
+                true => hardware.recheck_copper_link()?,
+                false => hardware.check_for_copper_link()?,
+            };
+            self.latch_cleared = negotiated.is_none();
+            if let Some(negotiated) = negotiated {
                 self.check = false;
                 self.link = Some(negotiated);
             }
@@ -132,6 +148,7 @@ impl Supervisor {
     pub(super) const fn established(link: Negotiated) -> Self {
         Self {
             check: false,
+            latch_cleared: false,
             settle: None,
             gigabit: None,
             link: Some(link),
@@ -205,6 +222,30 @@ mod tests {
             supervisor.poll(&model, &model, 2_600_000),
             Ok(Change::Up(up))
         );
+    }
+
+    #[test]
+    fn without_a_cable_each_repeated_check_reads_the_phy_status_once() {
+        let model = linked(LINK_2500, 1 << 10);
+        let mut supervisor = Supervisor::new();
+        set_link(&model, false);
+        let exchanges = |supervisor: &mut Supervisor, now| {
+            let before = model.mdio_count.get();
+            assert_eq!(supervisor.poll(&model, &model, now), Ok(Change::None));
+            model.mdio_count.get() - before
+        };
+        // The first check reads the latched-low bit twice, later ones once.
+        let first = exchanges(&mut supervisor, 0);
+        let repeated = exchanges(&mut supervisor, 10);
+        assert_eq!(first, repeated + 1);
+        assert_eq!(exchanges(&mut supervisor, 20), repeated);
+        // A link change cause makes the next check read twice again.
+        lsc(&model);
+        assert_eq!(exchanges(&mut supervisor, 30), first);
+        model.state.borrow_mut().registers.insert(ICR, 0);
+        assert_eq!(exchanges(&mut supervisor, 40), repeated);
+        supervisor.link_changed();
+        assert_eq!(exchanges(&mut supervisor, 50), first);
     }
 
     #[test]

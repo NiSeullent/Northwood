@@ -27,6 +27,12 @@ jobs:
           if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             BASE=$(git merge-base HEAD "refs/remotes/origin/$DEFAULT_BRANCH")
           fi
-          python3 .github/scripts/check_licenses.py "$BASE"
+          args=("$BASE")
+          # Inherit only from a trusted upstream revision already in this checkout's history.
+          if git fetch --no-tags https://github.com/tylertms/Stela.git refs/heads/main &&
+            upstream=$(git merge-base HEAD FETCH_HEAD); then
+            args+=(--upstream-ref "$upstream")
+          fi
+          python3 .github/scripts/check_licenses.py "${args[@]}"
       - name: Test license guard
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts

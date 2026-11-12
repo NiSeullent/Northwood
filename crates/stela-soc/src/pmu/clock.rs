@@ -5,14 +5,91 @@ use crate::counter::FREQUENCY_HZ;
 use alloc::rc::Rc;
 use core::cell::Cell;
 use stela_contracts::refuse;
+use stela_soc_data::pmu::WallClock;
 
-const LIMIT: u64 = 1 << 47;
+/// The upcount's qualified range: 2^32 seconds at 32768 Hz.
+pub const LIMIT: u64 = 1 << 47;
 
 /// Declared emulated resource origin, not an observed Apple reset value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtcEpoch {
     pub counter: u64,
     pub ticks: u64,
+}
+
+/// What the machine state keeps of the upcount, as a Mac's PMIC keeps
+/// counting while the machine is off: the upcount at one moment and the
+/// host's Unix seconds then, `None` when no boot that wrote it knew them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtcAnchor {
+    pub ticks: u64,
+    pub unix_seconds: Option<u64>,
+}
+
+impl RtcEpoch {
+    /// The origin of this boot's upcount at counter `now`. Without an
+    /// anchor (a new machine, or one whose state an older Stela wrote) the
+    /// upcount starts at zero, a PMIC that lost power. With one it goes on
+    /// from the anchor's ticks by the wall seconds since the anchor, carried
+    /// to `now`; never backwards: a wall time before the anchor's, or no wall
+    /// time on either side, continues from the anchor's ticks. An anchor at
+    /// or past the 47-bit limit, or one the elapsed time carries there,
+    /// also starts at zero: the upcount's wrap is unqualified.
+    pub fn anchored(now: u64, wall: Option<WallClock>, anchor: Option<RtcAnchor>) -> Self {
+        let cold = Self {
+            counter: now,
+            ticks: 0,
+        };
+        let Some(anchor) = anchor else {
+            return cold;
+        };
+        let elapsed = match (wall, anchor.unix_seconds) {
+            (Some(wall), Some(then)) => {
+                // Carry the wall time's ticks from its counter to `now`.
+                let rate = |counter: u64| {
+                    i128::from(counter) * i128::from(RTC_HZ) / i128::from(FREQUENCY_HZ)
+                };
+                let seconds = i128::from(wall.unix_seconds) - i128::from(then);
+                (seconds * i128::from(RTC_HZ) + rate(now) - rate(wall.counter)).max(0)
+            }
+            _ => 0,
+        };
+        match u64::try_from(i128::from(anchor.ticks) + elapsed) {
+            Ok(ticks) if ticks < LIMIT => Self {
+                counter: now,
+                ticks,
+            },
+            _ => cold,
+        }
+    }
+}
+
+impl RtcAnchor {
+    /// The anchor of the upcount `ticks` at counter `counter`, in a boot
+    /// whose wall time was `wall` and whose anchor was `loaded`. The Unix
+    /// seconds follow the same counter as the ticks, so a counter that lags
+    /// the host's time lags both alike and the next boot's wall time makes
+    /// up the difference. Without a wall time they follow the loaded
+    /// anchor's by the ticks since it, else stay unknown.
+    pub fn at(
+        counter: u64,
+        ticks: u64,
+        wall: Option<WallClock>,
+        loaded: Option<RtcAnchor>,
+    ) -> Self {
+        let unix_seconds = match wall {
+            Some(wall) => {
+                Some(wall.unix_seconds + counter.saturating_sub(wall.counter) / FREQUENCY_HZ)
+            }
+            None => loaded.and_then(|loaded| {
+                Some(loaded.unix_seconds? + ticks.saturating_sub(loaded.ticks) / RTC_HZ)
+            }),
+        };
+        Self {
+            ticks,
+            unix_seconds,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +162,15 @@ impl RtcClock {
         Ok(())
     }
 
+    /// The upcount at counter `now`, without a publication and without
+    /// recording a regression: `None` before the epoch or past the limit.
+    pub fn ticks_at(&self, now: u64) -> Option<u64> {
+        let elapsed = now.checked_sub(self.0.epoch.counter)?;
+        let elapsed = u128::from(elapsed) * u128::from(RTC_HZ) / u128::from(FREQUENCY_HZ);
+        let ticks = u128::from(self.0.epoch.ticks) + elapsed;
+        (ticks < u128::from(LIMIT)).then_some(ticks as u64)
+    }
+
     /// The last counter [`Self::check`] refused for moving backwards, and
     /// the publication it preceded: a diagnostic of the stop it causes.
     pub fn regression(&self) -> Option<(u64, u64)> {
@@ -119,6 +205,144 @@ fn counter_ticks(ticks: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const UNIX: u64 = 1_792_000_000;
+
+    fn wall(unix_seconds: u64, counter: u64) -> Option<WallClock> {
+        Some(WallClock {
+            unix_seconds,
+            counter,
+        })
+    }
+
+    fn anchor(ticks: u64, unix_seconds: Option<u64>) -> Option<RtcAnchor> {
+        Some(RtcAnchor {
+            ticks,
+            unix_seconds,
+        })
+    }
+
+    #[test]
+    fn without_an_anchor_the_upcount_starts_at_zero_and_its_anchor_follows() {
+        let now = 7 * FREQUENCY_HZ;
+        let cold = RtcEpoch {
+            counter: now,
+            ticks: 0,
+        };
+        // State an older Stela wrote holds no anchor: the old cold origin,
+        // with or without a wall time.
+        assert_eq!(RtcEpoch::anchored(now, wall(UNIX, now), None), cold);
+        assert_eq!(RtcEpoch::anchored(now, None, None), cold);
+        // The anchor kept 10 s into that boot: ticks since zero, wall then.
+        let clock = RtcClock::new(cold).unwrap();
+        let later = now + 10 * FREQUENCY_HZ;
+        let ticks = clock.ticks_at(later).unwrap();
+        assert_eq!(ticks, 10 * RTC_HZ);
+        assert_eq!(
+            RtcAnchor::at(later, ticks, wall(UNIX, now), None),
+            RtcAnchor {
+                ticks: 10 * RTC_HZ,
+                unix_seconds: Some(UNIX + 10),
+            }
+        );
+        // Without a wall time and no anchor, its wall seconds stay unknown.
+        assert_eq!(RtcAnchor::at(later, ticks, None, None).unix_seconds, None);
+        assert_eq!(clock.ticks_at(now - 1), None);
+    }
+
+    #[test]
+    fn an_anchor_and_a_later_wall_time_continue_the_upcount() {
+        let ticks = 1_000 * RTC_HZ;
+        // Off for an hour, booted with a smaller counter.
+        let now = 3 * FREQUENCY_HZ;
+        let epoch = RtcEpoch::anchored(now, wall(UNIX + 3600, now), anchor(ticks, Some(UNIX)));
+        assert_eq!(epoch.counter, now);
+        assert_eq!(epoch.ticks, ticks + 3600 * RTC_HZ);
+        // A wall time sampled at another counter is carried to `now`.
+        let carried = RtcEpoch::anchored(
+            now,
+            wall(UNIX + 3600, 5 * FREQUENCY_HZ),
+            anchor(ticks, Some(UNIX)),
+        );
+        assert_eq!(carried.ticks, ticks + 3598 * RTC_HZ);
+        // The anchor of that boot 60 s on, then the next boot a day later.
+        let clock = RtcClock::new(epoch).unwrap();
+        let later = now + 60 * FREQUENCY_HZ;
+        let kept = RtcAnchor::at(
+            later,
+            clock.ticks_at(later).unwrap(),
+            wall(UNIX + 3600, now),
+            anchor(ticks, Some(UNIX)),
+        );
+        assert_eq!(kept.ticks, ticks + 3660 * RTC_HZ);
+        assert_eq!(kept.unix_seconds, Some(UNIX + 3660));
+        let next = RtcEpoch::anchored(0, wall(UNIX + 3660 + 86_400, 0), Some(kept));
+        assert_eq!(next.ticks, ticks + (3660 + 86_400) * RTC_HZ);
+        // A lost last write costs nothing with a wall time: the earlier
+        // anchor and the same wall time give the same upcount.
+        assert_eq!(
+            RtcEpoch::anchored(0, wall(UNIX + 3660 + 86_400, 0), anchor(ticks, Some(UNIX))),
+            next
+        );
+    }
+
+    #[test]
+    fn an_earlier_or_missing_wall_time_never_moves_the_upcount_back() {
+        let ticks = 50_000 * RTC_HZ + 123;
+        let continued = RtcEpoch { counter: 9, ticks };
+        // The host's clock was set back a day.
+        assert_eq!(
+            RtcEpoch::anchored(9, wall(UNIX - 86_400, 9), anchor(ticks, Some(UNIX))),
+            continued
+        );
+        // Less than the carry from the wall time's counter back to `now`.
+        assert_eq!(
+            RtcEpoch::anchored(0, wall(UNIX, FREQUENCY_HZ), anchor(ticks, Some(UNIX))),
+            RtcEpoch { counter: 0, ticks }
+        );
+        // No wall time now, or none when the anchor was kept.
+        assert_eq!(
+            RtcEpoch::anchored(9, None, anchor(ticks, Some(UNIX))),
+            continued
+        );
+        assert_eq!(
+            RtcEpoch::anchored(9, wall(UNIX, 9), anchor(ticks, None)),
+            continued
+        );
+        // A boot without a wall time keeps the anchor's wall seconds moving
+        // with its ticks, so the next boot with one does not count it twice.
+        let kept = RtcAnchor::at(0, ticks + 100 * RTC_HZ, None, anchor(ticks, Some(UNIX)));
+        assert_eq!(kept.unix_seconds, Some(UNIX + 100));
+        assert_eq!(
+            RtcEpoch::anchored(0, wall(UNIX + 100, 0), Some(kept)).ticks,
+            ticks + 100 * RTC_HZ
+        );
+    }
+
+    #[test]
+    fn the_47_bit_limit_starts_a_lost_power_upcount_instead_of_refusing() {
+        let cold = RtcEpoch {
+            counter: 5,
+            ticks: 0,
+        };
+        // The last tick still continues and its clock is representable.
+        let last = RtcEpoch::anchored(5, None, anchor(LIMIT - 1, Some(UNIX)));
+        assert_eq!(last.ticks, LIMIT - 1);
+        assert!(RtcClock::new(last).is_ok());
+        // An anchor at the limit, or carried to it by the wall time.
+        assert_eq!(RtcEpoch::anchored(5, None, anchor(LIMIT, Some(UNIX))), cold);
+        assert_eq!(
+            RtcEpoch::anchored(5, wall(UNIX + 1, 5), anchor(LIMIT - RTC_HZ, Some(UNIX))),
+            cold
+        );
+        assert_eq!(
+            RtcEpoch::anchored(5, wall(u64::MAX, 5), anchor(1, Some(0))),
+            cold
+        );
+        // Past the limit there is no upcount to keep.
+        let clock = RtcClock::new(last).unwrap();
+        assert_eq!(clock.ticks_at(5 + FREQUENCY_HZ), None);
+    }
     #[test]
     fn explicit_epoch_is_shared_and_has_no_implicit_sample() {
         let clock = RtcClock::new(RtcEpoch {

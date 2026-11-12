@@ -447,12 +447,14 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
     super::remove_bundles(&record, &removed_bundles)?;
     if command.wifi.is_some() {
         let mount_image = fs::read(record.esp.join(super::LOADER_PATH))?;
-        super::firmware::provision_wifi_in(
-            environment.host,
-            &record.esp,
-            record.layout,
-            &mount_image,
-        )?;
+        if !stela_loader::host_firmware::reads_bundle(&mount_image) {
+            super::firmware::provision_wifi_in(
+                environment.host,
+                &record.esp,
+                record.layout,
+                &mount_image,
+            )?;
+        }
     }
     let key = record.esp.join(super::wifi::key_path(record.layout));
     if command.no_wifi && key.is_file() {

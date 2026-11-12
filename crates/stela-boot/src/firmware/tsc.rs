@@ -89,6 +89,16 @@ pub fn tsc_hz() -> u64 {
     hz
 }
 
+/// Take the rate the loader found, in the engine image, whose statics start
+/// empty: [`tsc_hz`] and its companions answer from it and never search,
+/// which would read firmware tables that the engine's roots do not map.
+pub fn adopt(hz: u64, source: TscSource, tolerance_ppm: u32) {
+    TSC_SOURCE.store(source as u8, Ordering::Relaxed);
+    TSC_TOLERANCE_PPM.store(u64::from(tolerance_ppm), Ordering::Relaxed);
+    TSC_HZ.store(hz, Ordering::Relaxed);
+    FOUND.store(true, Ordering::Release);
+}
+
 /// How [`tsc_hz`] found the rate.
 pub fn tsc_source() -> TscSource {
     tsc_hz();

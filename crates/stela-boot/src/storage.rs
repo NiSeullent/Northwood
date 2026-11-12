@@ -234,6 +234,55 @@ fn root_bridges() -> Vec<(u16, core::ops::RangeInclusive<u8>)> {
     handles.iter().copied().filter_map(bridge).collect()
 }
 
+/// The most `HOST PCI` lines one census writes; a PC has under 100
+/// functions.
+const CENSUS_LINES: usize = 256;
+
+/// One `HOST PCI` line for each function the firmware lists, with what the
+/// drivers will do with it, written while the firmware still stores the
+/// boot log: a later report that names only a PCI address then maps to a
+/// device. Written once per boot.
+fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
+    static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let displays: Vec<_> = functions
+        .iter()
+        .map(crate::pci_io::FunctionObservation::identity)
+        .filter(|identity| identity.class[0] == 0x03 && identity.address.function == 0)
+        .map(|identity| identity.address)
+        .collect();
+    for function in functions.iter().take(CENSUS_LINES) {
+        let identity = function.identity();
+        let header = &function.header;
+        let word = |offset: usize| u16::from_le_bytes([header[offset], header[offset + 1]]);
+        let [base, sub, interface] = identity.class;
+        output::arguments(format_args!(
+            "HOST PCI {} {:04x}:{:04x} class={base:02x}{sub:02x}{interface:02x} rev={:02x}",
+            identity.address, identity.vendor, identity.device, header[8]
+        ));
+        // Only a type 0 header has its subsystem at 0x2c.
+        if header[0x0e] & 0x7f == 0 {
+            output::arguments(format_args!(
+                " subsystem={:04x}:{:04x}",
+                word(0x2c),
+                word(0x2e)
+            ));
+        }
+        output::arguments(format_args!(
+            ": {}\n",
+            stela_drivers::probe::plan(&identity, &displays)
+        ));
+    }
+    if functions.len() > CENSUS_LINES {
+        output::arguments(format_args!(
+            "HOST PCI {} more functions not listed\n",
+            functions.len() - CENSUS_LINES
+        ));
+    }
+}
+
 /// What the storage drivers need after ExitBootServices: the ECAM windows,
 /// DMA pages below 4 GiB, the TSC rate and every range to map uncached.
 /// Runs before ExitBootServices.
@@ -296,6 +345,7 @@ pub fn discover() -> Result<Handoff> {
                     "PCI firmware observation incomplete: {failure}; native owned discovery required\n"
                 ));
             }
+            report_census(&census.functions);
             for function in census.functions {
                 let identity = function.identity();
                 if !stela_drivers::probe::claims_identity(&identity) {

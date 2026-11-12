@@ -245,6 +245,11 @@ pub struct System {
     pub maintenance_write: bool,
     /// Boot the installed system single-user, for maintenance at its console.
     pub single_user: bool,
+    /// This boot is the automatic Metal plugin repair NVRAM asked for
+    /// (`--bundle-repair`, never from `stela.cfg`): single-user with
+    /// filesystem protection off, its console driven by the engine
+    /// (`bundle_repair`).
+    pub bundle_repair: bool,
     /// Keep the newest presented frame in host memory for a debugger to read:
     /// a passed-through GPU's picture otherwise leaves only through its port.
     pub scanout_mirror: bool,
@@ -408,6 +413,7 @@ impl Default for System {
             safe_boot: false,
             maintenance_write: false,
             single_user: false,
+            bundle_repair: false,
             scanout_mirror: false,
             boot_command: None,
             upgrade: false,
@@ -807,6 +813,7 @@ impl fmt::Display for System {
         line.flag(boot_selection::SAFE_BOOT_OPTION, self.safe_boot)?;
         line.flag(MAINTENANCE_WRITE, self.maintenance_write)?;
         line.flag(SINGLE_USER, self.single_user)?;
+        line.flag(boot_selection::BUNDLE_REPAIR_OPTION, self.bundle_repair)?;
         line.flag(SCANOUT_MIRROR, self.scanout_mirror)?;
         line.flag(boot_selection::UPGRADE_OPTION, self.upgrade)?;
         line.flag(

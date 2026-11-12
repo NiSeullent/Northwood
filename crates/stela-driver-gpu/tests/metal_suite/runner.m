@@ -5363,6 +5363,44 @@ static void host_iosurface(Case *c, id<MTLCommandQueue> queue, NSDictionary *h)
 	CFRelease(yuv);
 }
 
+/* Metal's private calls for a buffer over an IOSurface's memory. */
+@protocol SuiteSurfaceBuffers
+- (id<MTLBuffer>)newBufferWithIOSurface:(IOSurfaceRef)surface;
+- (IOSurfaceRef)iosurface;
+@end
+
+/* A buffer over a surface's memory, which the CPU fills through the surface;
+ * a kernel adds to each word in place, and the CPU reads the sums back
+ * through the surface. */
+static void host_iosurface_buffer(Case *c, id<MTLCommandQueue> queue, NSDictionary *h)
+{
+	size_t words = number(h, @"words", 1);
+	IOSurfaceRef s = make_surface(@{
+		(__bridge id)kIOSurfaceWidth : @(words), (__bridge id)kIOSurfaceHeight : @1,
+		(__bridge id)kIOSurfaceBytesPerElement : @4,
+	});
+	surface_rows(s, 0, contents(c.buffers[@"in"]), nil, words * 4, 1);
+	if (![c.device respondsToSelector:@selector(newBufferWithIOSurface:)])
+		@throw failure(@"the device makes no buffer of an IOSurface");
+	id<MTLBuffer> b = [(id<SuiteSurfaceBuffers>)c.device newBufferWithIOSurface:s];
+	if (!b)
+		@throw failure(@"newBufferWithIOSurface: refused a surface of %zu bytes", IOSurfaceGetAllocSize(s));
+	put(c, @"props", 0, [(id<SuiteSurfaceBuffers>)b iosurface] == s);
+	put(c, @"props", 1, b.length >= words * 4);
+	put(c, @"props", 2, (uint32_t)b.storageMode);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	dispatch_one(e, host_pipeline(c, @"surface_buffer_add"), @[ b ], (uint32_t)number(h, @"add", 0),
+		     MTLSizeMake(words, 1, 1));
+	[e endEncoding];
+	wait_for(cb, c.spec);
+	NSMutableData *out = [NSMutableData dataWithLength:words * 4];
+	surface_rows(s, 0, nil, out, words * 4, 1);
+	memcpy(c.buffers[@"out"].contents, out.bytes, MIN(out.length, c.buffers[@"out"].length));
+	b = nil;
+	CFRelease(s);
+}
+
 /* A surface of two planes, '444f' unless `fourcc` names another: elements
  * of `bytes` bytes, then pairs of them subsampled to cw x ch. */
 static IOSurfaceRef two_plane_surface(size_t w, size_t height, size_t cw, size_t ch, size_t bytes, uint32_t fourcc)
@@ -8043,6 +8081,7 @@ static void run_host(Case *c, id<MTLCommandQueue> queue, NSDictionary *spec)
 	NSDictionary *work = @{
 		@"drawables" : [NSValue valueWithPointer:host_drawables],
 		@"iosurface" : [NSValue valueWithPointer:host_iosurface],
+		@"iosurface_buffer" : [NSValue valueWithPointer:host_iosurface_buffer],
 		@"two_plane" : [NSValue valueWithPointer:host_two_plane],
 		@"two_plane_render" : [NSValue valueWithPointer:host_two_plane_render],
 		@"share" : [NSValue valueWithPointer:host_share],

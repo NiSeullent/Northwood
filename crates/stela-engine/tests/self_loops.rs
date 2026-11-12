@@ -452,6 +452,81 @@ fn self_loops_end_where_their_linked_blocks_do() -> Result<()> {
     Ok(())
 }
 
+/// The host bytes a mapping of `address` lies in: its first and last
+/// address and whether any access is allowed, from `/proc/self/maps`.
+fn host_mapping(address: u64) -> Result<Option<(u64, u64, bool)>> {
+    for line in std::fs::read_to_string("/proc/self/maps")?.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(rights)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Some((first, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (first, end) = (
+            u64::from_str_radix(first, 16)?,
+            u64::from_str_radix(end, 16)?,
+        );
+        if (first..end).contains(&address) {
+            return Ok(Some((first, end - 1, !rights.starts_with("---"))));
+        }
+    }
+    Ok(None)
+}
+
+/// A store loop that runs past the end of its data stops there with a data
+/// abort, as the guest's tables map nothing beyond: native code reaches
+/// guest addresses as host addresses, so the test host keeps inaccessible
+/// guards beside each region. Without them a loop ran into whatever the
+/// process had mapped next (an engine allocation, another region) and the
+/// run crashed or diverged depending on the host's layout.
+#[test]
+fn a_store_loop_past_its_data_stops_at_the_end() -> Result<()> {
+    let data = Mapping::new()?;
+    let code = Mapping::new()?;
+    let end = data.0 + BYTES;
+    for (address, before) in [(end, false), (data.0 - 1, true)] {
+        let Some((first, last, accessible)) = host_mapping(address)? else {
+            continue;
+        };
+        // At least 16 inaccessible pages on each side.
+        let room = if before {
+            address - first
+        } else {
+            last - address
+        };
+        ensure!(
+            !accessible && room >= 16 * PAGE - 1,
+            "host bytes {first:#x}..={last:#x} beside the data at {address:#x}"
+        );
+    }
+    let copy = [
+        0xf840_8426,
+        0xf800_8466,
+        0xf100_2042,
+        b_cond(HS, -3),
+        SUFFIX,
+    ];
+    for loops in [false, true] {
+        let mut machine = machine(&code, &data, &copy, TargetCpu::detect())?;
+        machine.set_self_loops(loops);
+        machine.cpu.state.x[1] = data.0;
+        machine.cpu.state.x[3] = end - 64;
+        machine.cpu.state.x[2] = 1024;
+        machine.cpu.pc = code.0;
+        let stop = machine.run(machine.statistics.blocks + 10_000);
+        ensure!(
+            stop == Stop::Breakpoint(machine.host.lower_synchronous())
+                && machine.cpu.registers.get(Register::FAR_EL1, 0) == end
+                && machine.cpu.state.x[3] == end,
+            "loops {loops}: {stop:?}, FAR {:#x}, x3 {:#x}",
+            machine.cpu.registers.get(Register::FAR_EL1, 0),
+            machine.cpu.state.x[3]
+        );
+    }
+    Ok(())
+}
+
 /// A loop that never falls through leaves its block through the polled
 /// link after at most a block's instructions, so a run spends its budget
 /// (and takes the link's interrupt check) as often as blocks of

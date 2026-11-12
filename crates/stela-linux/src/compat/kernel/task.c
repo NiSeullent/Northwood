@@ -1402,6 +1402,9 @@ static int prepare(struct stela_linux_task *task, int count)
 		return -EBUSY;
 	if (count)
 		preempt_count_sub(count);
+	/* Owed irq_work runs before the task stops, as its self-interrupt
+	 * would have before schedule(). */
+	stela_linux_irq_work_run_owed();
 	stela_linux_printk_flush();
 	stela_linux_pages_finish();
 	if (!stela_linux_quiescent() || !stela_linux_lease_matches(&lease))
@@ -2078,6 +2081,8 @@ int __cond_resched(void)
 	 * flag effects. The private guard survives public counter rebalance. */
 	if (stela_linux_atomic_callback_active() || preempt_count() || irqs_disabled())
 		return 0;
+	/* irq_work the item raised, which the worker owes before its next. */
+	stela_linux_irq_work_run_owed();
 	if (!task->scope || task->scope_boundary || task->prepared || task->suspended ||
 	    READ_ONCE(task->linux_task->__state) != TASK_RUNNING)
 		__builtin_trap();

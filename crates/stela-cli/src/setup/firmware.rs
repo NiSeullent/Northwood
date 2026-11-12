@@ -11,7 +11,7 @@ use std::{
 };
 use stela_drivers::firmware::{Requirement, Target};
 use stela_loader::host_firmware::{
-    self, MAX_MANIFEST_BYTES,
+    self, MAX_MANIFEST_BYTES, bundle,
     recipes::{self, Artifact, Plan},
     requirements::{self, Inventory, Request},
 };
@@ -51,21 +51,6 @@ fn read_cached(path: &Path, artifact: &Artifact) -> Result<Vec<u8>> {
     );
     artifact.verify(&bytes)?;
     Ok(bytes)
-}
-
-fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
-    let primary = download_member(client, artifact, &artifact.url(), false);
-    if artifact.source != recipes::WIRELESS_REGDB {
-        return primary;
-    }
-    primary.or_else(|error| {
-        let mirror = format!(
-            "https://kernel.googlesource.com/pub/scm/linux/kernel/git/wens/wireless-regdb/+/{}/{}?format=TEXT",
-            artifact.revision, artifact.member,
-        );
-        download_member(client, artifact, &mirror, true)
-            .with_context(|| format!("wireless-regdb primary source failed: {error:#}"))
-    })
 }
 
 fn download_member(
@@ -117,6 +102,166 @@ fn download_member(
     Ok(bytes)
 }
 
+/// The most one file's sources may make it wait in all. A source that asks
+/// for a longer pause (a Retry-After of an hour, as GitLab's per-IP limit
+/// sends) is left for the next source at once.
+const WAIT_BUDGET: Duration = Duration::from_secs(30);
+/// Requests to one source for one file.
+const ATTEMPTS: u32 = 3;
+
+/// How one request to a source ended, when it brought no file.
+enum Answer {
+    /// A rate limit or a source down for now (429, 503), with the pause
+    /// its Retry-After asks for.
+    Busy(Option<Duration>, String),
+    /// A failure the same request may not meet again.
+    Transient(String),
+    /// An answer asking again would not change.
+    Final(String),
+}
+
+/// The pause a `Retry-After` header asks for, in seconds; an HTTP date is
+/// taken as a long pause.
+fn retry_after(response: &reqwest::blocking::Response) -> Option<Duration> {
+    let value = response.headers().get(header::RETRY_AFTER)?.to_str().ok()?;
+    Some(
+        value
+            .trim()
+            .parse::<u64>()
+            .map_or(Duration::MAX, Duration::from_secs),
+    )
+}
+
+fn request(client: &Client, url: &str, artifact: &Artifact) -> Result<Vec<u8>, Answer> {
+    // A minute, and the file at 32 kB/s: a GPU's 64 MB firmware may take
+    // many minutes on a slow network.
+    let timeout = Duration::from_secs(60 + artifact.length as u64 / 32_000);
+    let mut response = match client
+        .get(url)
+        .header(header::ACCEPT_ENCODING, "identity")
+        .timeout(timeout)
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) if crate::net::transient(&error) => {
+            return Err(Answer::Transient(crate::net::explain(&error)));
+        }
+        Err(error) => return Err(Answer::Final(crate::net::explain(&error))),
+    };
+    let status = response.status();
+    match status.as_u16() {
+        200 => {}
+        429 | 503 => {
+            let after = retry_after(&response);
+            let asked = match after {
+                Some(after) if after != Duration::MAX => {
+                    format!(", Retry-After {} s", after.as_secs())
+                }
+                Some(_) => ", Retry-After a date".into(),
+                None => String::new(),
+            };
+            return Err(Answer::Busy(after, format!("answered {status}{asked}")));
+        }
+        _ if crate::net::transient_status(status) => {
+            return Err(Answer::Transient(format!("answered {status}")));
+        }
+        _ => return Err(Answer::Final(format!("answered {status}"))),
+    }
+    if response
+        .content_length()
+        .is_some_and(|n| n != artifact.length as u64)
+    {
+        return Err(Answer::Final("sent a length other than the pin's".into()));
+    }
+    let mut bytes = Vec::with_capacity(artifact.length);
+    if let Err(error) = response
+        .by_ref()
+        .take(artifact.length as u64 + 1)
+        .read_to_end(&mut bytes)
+    {
+        return Err(Answer::Transient(format!("transfer failed: {error}")));
+    }
+    artifact.verify(&bytes).map_err(|_| {
+        Answer::Final("sent bytes whose length or SHA-256 differs from the pin".into())
+    })?;
+    Ok(bytes)
+}
+
+fn host_of(url: &str) -> &str {
+    url.split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or(url)
+}
+
+fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
+    let primary = download_from(client, artifact, &artifact.urls(), &mut std::thread::sleep);
+    if artifact.source != recipes::WIRELESS_REGDB {
+        return primary;
+    }
+    primary.or_else(|error| {
+        let mirror = format!(
+            "https://kernel.googlesource.com/pub/scm/linux/kernel/git/wens/wireless-regdb/+/{}/{}?format=TEXT",
+            artifact.revision, artifact.member,
+        );
+        download_member(client, artifact, &mirror, true)
+            .with_context(|| format!("wireless-regdb primary source failed: {error:#}"))
+    })
+}
+
+/// Download `artifact` from the first of `urls` that sends its pinned
+/// bytes. A source that is busy waits only within [`WAIT_BUDGET`]; past it,
+/// or after [`ATTEMPTS`] requests, the next source is asked at once. The
+/// error names the file and what each source answered.
+fn download_from(
+    client: &Client,
+    artifact: &Artifact,
+    urls: &[String],
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<Vec<u8>> {
+    let mut waited = Duration::ZERO;
+    let mut answers = Vec::new();
+    for url in urls {
+        let host = host_of(url);
+        let mut backoff = Duration::from_secs(1);
+        let mut attempt = 1;
+        let last = loop {
+            let pause = match request(client, url, artifact) {
+                Ok(bytes) => return Ok(bytes),
+                Err(Answer::Busy(Some(after), what)) => (Some(after), what),
+                Err(Answer::Busy(None, what) | Answer::Transient(what)) => (Some(backoff), what),
+                Err(Answer::Final(what)) => (None, what),
+            };
+            match pause {
+                (Some(pause), what)
+                    if attempt < ATTEMPTS
+                        && waited.checked_add(pause).is_some_and(|w| w <= WAIT_BUDGET) =>
+                {
+                    eprintln!(
+                        "note: {} from {host}: {what}; asking again in {} s",
+                        artifact.member,
+                        pause.as_secs().max(1)
+                    );
+                    sleep(pause);
+                    waited += pause;
+                    backoff *= 2;
+                    attempt += 1;
+                }
+                (_, what) => break what,
+            }
+        };
+        if urls.len() > 1 {
+            eprintln!("note: {} from {host}: {last}", artifact.member);
+        }
+        answers.push(format!("{host} {last}"));
+    }
+    anyhow::bail!(
+        "cannot download {}: {}",
+        artifact.member,
+        answers.join("; ")
+    )
+}
+
 fn cached(client: Option<&Client>, directory: &Path, artifact: &Artifact) -> Result<Vec<u8>> {
     let path = directory.join(artifact.sha256);
     match fs::symlink_metadata(&path) {
@@ -131,13 +276,20 @@ fn cached(client: Option<&Client>, directory: &Path, artifact: &Artifact) -> Res
         )
     })?;
     let bytes = download(client, artifact)?;
+    store(directory, artifact, &bytes)
+}
+
+/// Keep `bytes`, `artifact`'s checked download, in the cache `directory`.
+fn store(directory: &Path, artifact: &Artifact, bytes: &[u8]) -> Result<Vec<u8>> {
+    artifact.verify(bytes)?;
+    let path = directory.join(artifact.sha256);
     fs::create_dir_all(directory)?;
     ensure!(
         !fs::symlink_metadata(directory)?.is_symlink(),
         "firmware cache directory is a symlink"
     );
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-    temporary.write_all(&bytes)?;
+    temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
     if let Err(error) = temporary.persist_noclobber(&path)
         && error.error.kind() != std::io::ErrorKind::AlreadyExists
@@ -180,6 +332,30 @@ pub(super) fn missing(fix: &str) -> String {
     )
 }
 
+/// Informational notes about unsupported NVIDIA GPUs on this computer.
+pub(super) fn host_notes(host: &dyn super::host::Host) -> Result<Vec<String>> {
+    let mut notes = Vec::new();
+    for device in host.nvidia_gpus()? {
+        if recipes::nvidia_chip(device).is_none() {
+            notes.push(format!(
+                "this computer's NVIDIA GPU (device {device:04x}) is unsupported \
+                 ({})",
+                stela_boot_core::gpu_status::SUPPORTED
+            ));
+        }
+    }
+    Ok(notes)
+}
+
+/// The firmware line of a setup plan.
+pub(super) fn bundle_summary() -> String {
+    let (count, bytes) = bundle::size();
+    format!(
+        "every supported device: {count} files, {:.1} MiB (each PC loads only its own)",
+        bytes as f64 / MIB as f64
+    )
+}
+
 /// Add what a Wi-Fi network needs to the firmware on the USB's EFI partition
 /// `esp`, whose boot program is `mount_image`: the regulatory database, and
 /// the files of this computer's Wi-Fi adapters whose PCI IDs name them.
@@ -213,68 +389,354 @@ pub(super) fn provision_wifi_in(
     Ok(())
 }
 
-/// A note for a setup with a Wi-Fi network on a computer none of whose
-/// adapters' files setup can add.
-pub(super) fn wifi_note(host: &dyn super::host::Host) -> Result<Option<String>> {
-    let mut inventory = Inventory::default();
-    for (vendor, device) in host.network_adapters()? {
-        if recipes::require_wifi(&mut inventory, vendor, device)? {
-            return Ok(None);
+/// Download every file of the complete bundle that neither the cache nor
+/// the stick's data volume `volume` (when it exists yet) holds, before
+/// setup, `repair` or `update` changes anything on the stick: a failed
+/// download leaves the stick as it was. Nothing for a stela.efi
+/// (`mount_image`) that reads no bundle.
+pub(super) fn prefetch_bundle(mount_image: &[u8], volume: Option<&Path>) -> Result<()> {
+    if !host_firmware::reads_bundle(mount_image) {
+        return Ok(());
+    }
+    prefetch_catalog(&super::cache_dir().join("firmware"), volume, false)
+}
+
+fn prefetch_catalog(cache: &Path, volume: Option<&Path>, offline: bool) -> Result<()> {
+    let client = (!offline).then(client).transpose()?;
+    prefetch(
+        &bundle::complete(),
+        cache,
+        volume
+            .map(|volume| super::join_slashed(volume, bundle::DIRECTORY))
+            .as_deref(),
+        &mut |artifact| {
+            let client = client.as_ref().with_context(|| {
+                format!(
+                    "offline firmware cache is missing {} ({})",
+                    artifact.member, artifact.sha256
+                )
+            })?;
+            download(client, artifact)
+        },
+    )
+    .context("the firmware bundle could not be prepared, so the USB was left as it was")?;
+    Ok(())
+}
+
+/// [`prefetch_bundle`] of `files` into `cache` through `download`; the
+/// files `on_stick` already holds by hash are not downloaded. Returns how
+/// many files were downloaded.
+fn prefetch(
+    files: &[(&Artifact, &Artifact)],
+    cache: &Path,
+    on_stick: Option<&Path>,
+    download: &mut dyn FnMut(&Artifact) -> Result<Vec<u8>>,
+) -> Result<usize> {
+    let mut wanted: Vec<(&Artifact, String)> = Vec::new();
+    for (object, notice) in files {
+        for (artifact, path) in [
+            (*object, bundle::object_path(object.sha256)),
+            (*notice, bundle::notice_path(notice.sha256)),
+        ] {
+            if wanted
+                .iter()
+                .any(|(seen, _)| seen.sha256 == artifact.sha256)
+            {
+                continue;
+            }
+            let cached = holds(&cache.join(artifact.sha256), artifact);
+            let kept = on_stick.is_some_and(|directory| holds(&directory.join(&path), artifact));
+            if !cached && !kept {
+                wanted.push((artifact, path));
+            }
         }
     }
-    Ok(Some(NO_WIFI_FILES.into()))
-}
-
-/// A note for each of this computer's Bluetooth controllers. Setup adds no
-/// Bluetooth firmware itself: every vendor setup chooses its files by
-/// registers only a boot of the PC reads, whose log then names them for
-/// `repair`, the command that adds them.
-pub(super) fn bluetooth_notes(host: &dyn super::host::Host, repair: &str) -> Result<Vec<String>> {
-    Ok(describe_bluetooth(&host.bluetooth_controllers()?, repair))
-}
-
-/// What [`bluetooth_notes`] says for `controllers`.
-fn describe_bluetooth(controllers: &[super::host::UsbBluetooth], repair: &str) -> Vec<String> {
-    use stela_drivers::usb::bluetooth::Setup;
-    let mut notes = Vec::new();
-    for controller in controllers {
-        let ids = format!("USB {:04x}:{:04x}", controller.vendor, controller.product);
-        let setup = Setup::of(
-            controller.vendor,
-            controller.product,
-            controller.vendor_interface,
-        );
-        notes.push(match setup {
-            // Recipes pin images for these setups' drivers only
-            // (`recipes::MEDIATEK_BLUETOOTH`, `recipes::INTEL_RSA`).
-            Some(setup @ (Setup::MediaTek | Setup::Intel)) => format!(
-                "this computer's Bluetooth controller ({}, {ids}) loads firmware that its \
-                 registers choose, so the USB has none yet: boot the PC from the USB once, \
-                 then run {repair} on a computer with internet, which adds the file the boot \
-                 asked for when Stela has a pinned source for it",
-                setup.name()
-            ),
-            Some(setup) => format!(
-                "this computer's Bluetooth controller ({}, {ids}) needs firmware Stela has no \
-                 pinned source for, so it stays off",
-                setup.name()
-            ),
-            // A vendor-class interface no setup takes is no HCI.
-            None if controller.vendor_interface => continue,
-            None => format!(
-                "this computer's Bluetooth controller ({ids}) is not one Stela has a setup for, \
-                 so it stays off"
-            ),
-        });
+    if wanted.is_empty() {
+        return Ok(0);
     }
-    notes
+    let bytes: usize = wanted.iter().map(|(artifact, _)| artifact.length).sum();
+    eprintln!(
+        "Downloading the firmware bundle: {} files, {:.1} MiB",
+        wanted.len(),
+        bytes as f64 / MIB as f64
+    );
+    for (index, (artifact, _)) in wanted.iter().enumerate() {
+        eprintln!(
+            "  {} ({:.1} MiB), file {} of {}",
+            artifact.member,
+            artifact.length as f64 / MIB as f64,
+            index + 1,
+            wanted.len()
+        );
+        let bytes = download(artifact)?;
+        store(cache, artifact, &bytes)?;
+    }
+    Ok(wanted.len())
 }
 
-/// What [`wifi_note`] says.
-const NO_WIFI_FILES: &str = "this computer has no Wi-Fi adapter whose firmware setup \
-    can add (Intel AX200 to BE200, Realtek RTL8822C, MediaTek MT7921, MT7922 or MT7925), \
-    so the USB has none: the PC needs wired \
-    Ethernet, or run setup on the PC itself";
+const MIB: u64 = 1024 * 1024;
+/// Room a volume short of space keeps free beside the bundle.
+const MARGIN: u64 = 16 * MIB;
+
+/// The bundle's files that go on a volume with `free` bytes left (`None`:
+/// no limit) beside `present` bytes the bundle already holds there, in
+/// [`bundle::FAMILIES`] order, and the files left out.
+pub(super) fn bundle_plan(
+    free: Option<u64>,
+    present: u64,
+) -> (
+    Vec<(&'static Artifact, &'static Artifact)>,
+    Vec<&'static Artifact>,
+) {
+    let mut room = free.map(|free| (free + present).saturating_sub(MARGIN));
+    let mut kept = Vec::new();
+    let mut left = Vec::new();
+    for (object, notice) in bundle::complete() {
+        let length = (object.length + notice.length) as u64;
+        match &mut room {
+            Some(room) if *room < length => left.push(object),
+            Some(room) => {
+                *room -= length;
+                kept.push((object, notice));
+            }
+            None => kept.push((object, notice)),
+        }
+    }
+    (kept, left)
+}
+
+/// Whether `path` holds `artifact`'s exact bytes.
+fn holds(path: &Path, artifact: &Artifact) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == artifact.length as u64)
+        && read_cached(path, artifact).is_ok()
+}
+
+/// Bytes of `files` that `directory` already holds.
+fn present_bytes(directory: &Path) -> u64 {
+    bundle::complete()
+        .iter()
+        .flat_map(|(object, notice)| {
+            [
+                (bundle::object_path(object.sha256), object.length),
+                (bundle::notice_path(notice.sha256), notice.length),
+            ]
+        })
+        .filter_map(|(path, length)| {
+            fs::metadata(directory.join(path))
+                .is_ok_and(|m| m.len() == length as u64)
+                .then_some(length as u64)
+        })
+        .sum()
+}
+
+/// Write `files` and their notices to the bundle on `volume`, each fetched
+/// through `fetch` unless the volume holds it already, then its manifest,
+/// and remove files no longer listed.
+pub(super) fn publish_bundle(
+    volume: &Path,
+    files: &[(&Artifact, &Artifact)],
+    fetch: &mut dyn FnMut(&Artifact) -> Result<Vec<u8>>,
+) -> Result<()> {
+    let directory = volume.join(bundle::DIRECTORY);
+    fs::create_dir_all(directory.join("licenses"))?;
+    let mut kept = vec![directory.join("bundle.json")];
+    for (object, notice) in files {
+        for (artifact, path) in [
+            (*object, bundle::object_path(object.sha256)),
+            (*notice, bundle::notice_path(notice.sha256)),
+        ] {
+            let path = directory.join(path);
+            if !kept.contains(&path) && !holds(&path, artifact) {
+                let bytes = fetch(artifact)?;
+                artifact.verify(&bytes)?;
+                let parent = path.parent().context("bundle path has no directory")?;
+                let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+                temporary.write_all(&bytes)?;
+                temporary.as_file().sync_all()?;
+                temporary.persist(&path)?;
+            }
+            kept.push(path);
+        }
+    }
+    let manifest = bundle::manifest(files)?;
+    let path = directory.join("bundle.json");
+    if fs::read(&path).ok().as_deref() != Some(manifest.as_slice()) {
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+        temporary.write_all(&manifest)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(&path)?;
+    }
+    for listing in [directory.clone(), directory.join("licenses")] {
+        for entry in fs::read_dir(&listing)? {
+            let path = entry?.path();
+            if path.is_file() && !kept.contains(&path) {
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Put the complete bundle on the USB's data volume `volume`, beside the
+/// EFI partition `esp` whose boot program is `mount_image`, downloading
+/// what the cache lacks. A volume short of room gets what fits, in
+/// [`bundle::FAMILIES`] order, and the notes name what was left out. Once
+/// the bundle holds every file of an older per-PC set on the EFI partition,
+/// that set is removed. Nothing depends on this computer's devices.
+pub(super) fn provision_bundle(
+    host: &dyn super::host::Host,
+    volume: &Path,
+    esp: &Path,
+    mount_image: &[u8],
+) -> Result<Vec<String>> {
+    provision_bundle_from(
+        host,
+        volume,
+        esp,
+        mount_image,
+        &super::cache_dir().join("firmware"),
+        false,
+    )
+}
+
+/// Provision the complete bundle with the caller's cache and download policy.
+pub(super) fn provision_bundle_from(
+    host: &dyn super::host::Host,
+    volume: &Path,
+    esp: &Path,
+    mount_image: &[u8],
+    cache: &Path,
+    offline: bool,
+) -> Result<Vec<String>> {
+    if !host_firmware::reads_bundle(mount_image) {
+        return Ok(Vec::new());
+    }
+    let directory = super::join_slashed(volume, bundle::DIRECTORY);
+    let free = host.volume(volume)?.free_bytes;
+    let (files, left) = bundle_plan(Some(free), present_bytes(&directory));
+    let bytes: usize = files.iter().map(|(object, _)| object.length).sum();
+    eprintln!(
+        "Firmware for every supported device: {} files, {:.1} MiB, to {}",
+        files.len(),
+        bytes as f64 / MIB as f64,
+        directory.display()
+    );
+    // Every download before the first write to the stick.
+    prefetch_catalog(cache, Some(volume), offline)?;
+    publish_bundle(volume, &files, &mut |artifact| {
+        read_cached(&cache.join(artifact.sha256), artifact)
+    })
+    .context("the USB did not get the complete firmware bundle")?;
+    let mut notes = Vec::new();
+    if !left.is_empty() {
+        notes.push(format!(
+            "{} has no room for {} of the firmware bundle's files, so PCs that need them \
+             lack them: {}",
+            volume.display(),
+            left.len(),
+            left.iter()
+                .map(|artifact| artifact.member)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    remove_superseded(esp, volume, &files)?;
+    Ok(notes)
+}
+
+/// Remove the older per-PC firmware on the EFI partition when the bundle on
+/// another volume holds every one of its files.
+fn remove_superseded(esp: &Path, volume: &Path, files: &[(&Artifact, &Artifact)]) -> Result<()> {
+    let old = esp.join(host_firmware::DIRECTORY);
+    if esp == volume {
+        return Ok(());
+    }
+    let Some(bytes) = installed_manifest(&old)? else {
+        return Ok(());
+    };
+    let manifest = host_firmware::Manifest::parse(&bytes)?;
+    if manifest.images.iter().all(|image| {
+        files
+            .iter()
+            .any(|(object, _)| object.sha256 == image.sha256)
+    }) {
+        fs::remove_dir_all(&old)?;
+    }
+    Ok(())
+}
+
+/// What `setup status` says of the bundle on `volume`.
+pub(super) fn bundle_status(volume: &Path) -> std::result::Result<String, String> {
+    let path = volume.join(bundle::MANIFEST);
+    let Ok(bytes) = fs::read(&path) else {
+        // Files without the manifest, which setup writes last: a bundle
+        // whose writing stopped.
+        let directory = volume.join(bundle::DIRECTORY);
+        let present = bundle::complete()
+            .iter()
+            .filter(|(object, _)| {
+                fs::metadata(directory.join(bundle::object_path(object.sha256)))
+                    .is_ok_and(|m| m.len() == object.length as u64)
+            })
+            .count();
+        return Err(if present == 0 {
+            "the USB has no firmware bundle".into()
+        } else {
+            format!(
+                "the firmware bundle is incomplete: {present} of {} files are on the USB",
+                bundle::size().0
+            )
+        });
+    };
+    let parsed = bundle::Bundle::parse(&bytes).map_err(|error| error.0)?;
+    let directory = volume.join(bundle::DIRECTORY);
+    let damaged = parsed
+        .objects
+        .iter()
+        .filter(|object| {
+            fs::metadata(directory.join(object.path))
+                .map_or(true, |m| m.len() != object.length as u64)
+        })
+        .count();
+    let missing = parsed.missing();
+    let (count, bytes) = bundle::size();
+    if missing.is_empty() && damaged == 0 {
+        return Ok(format!(
+            "complete: {count} files, {:.1} MiB",
+            bytes as f64 / MIB as f64
+        ));
+    }
+    Err(format!(
+        "the bundle lacks {} of {count} files{}{}",
+        missing.len(),
+        if missing.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({})",
+                missing
+                    .iter()
+                    .map(|artifact| artifact.member)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+        if damaged == 0 {
+            String::new()
+        } else {
+            format!(" and {damaged} of its files are damaged")
+        }
+    ))
+}
+
+fn client() -> Result<Client> {
+    Ok(Client::builder()
+        .user_agent(concat!("stela/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(120))
+        .redirect(Policy::none())
+        .build()?)
+}
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub(super) enum Profile {
@@ -469,7 +931,10 @@ pub(super) fn requested_in(esp: &Path, layout: Layout, mount_image: &[u8]) -> Re
             continue;
         }
         if recipes::recipe(request).is_some() {
-            requested.pinned.push(request.clone());
+            // The bundle holds every pinned file: `repair` completes it.
+            if !host_firmware::reads_bundle(mount_image) {
+                requested.pinned.push(request.clone());
+            }
         } else {
             requested.unpinned.push(request.clone());
         }
@@ -630,16 +1095,7 @@ fn publish_plan(
         report.push_str("Dry run: no downloads or writes.\n");
         return Ok(report);
     }
-    let client = (!offline)
-        .then(|| {
-            Client::builder()
-                .user_agent(concat!("stela/", env!("CARGO_PKG_VERSION")))
-                .connect_timeout(Duration::from_secs(30))
-                .timeout(Duration::from_secs(120))
-                .redirect(Policy::none())
-                .build()
-        })
-        .transpose()?;
+    let client = (!offline).then(client).transpose()?;
     let package = plan.package(|artifact| {
         cached(client.as_ref(), cache, artifact)
             .map_err(|e| host_firmware::Error(format!("firmware provisioning: {e:#}")))
@@ -654,42 +1110,316 @@ fn publish_plan(
 mod tests {
     use super::*;
     #[test]
-    fn each_bluetooth_controller_is_named_with_what_a_boot_and_repair_do() {
-        use super::super::host::UsbBluetooth;
-        let controller = |vendor, product, vendor_interface| UsbBluetooth {
-            vendor,
-            product,
-            vendor_interface,
+    fn the_bundle_plan_holds_every_recipe_whatever_the_computer() {
+        let (files, left) = bundle_plan(None, 0);
+        assert!(left.is_empty());
+        for recipe in bundle::recipes() {
+            assert!(
+                files
+                    .iter()
+                    .any(|(object, notice)| object.sha256 == recipe.image.sha256
+                        && notice.sha256 == recipe.license.sha256),
+                "{}",
+                recipe.image.member
+            );
+        }
+        let manifest = bundle::manifest(&files).unwrap();
+        let parsed = bundle::Bundle::parse(&manifest).unwrap();
+        assert!(parsed.missing().is_empty());
+        assert_eq!(parsed.objects.len(), 66);
+        assert!(bundle_summary().starts_with("every supported device: 66 files, "));
+        // A volume short of room keeps the small files and leaves the large
+        // GPU images out, by name.
+        let (files, left) = bundle_plan(Some(MARGIN + 40 * MIB), 0);
+        assert!(
+            files
+                .iter()
+                .any(|(object, _)| object.member == "regulatory.db")
+        );
+        let left: Vec<_> = left.iter().map(|artifact| artifact.member).collect();
+        assert!(
+            left.contains(&"nvidia/ga102/gsp/gsp-570.144.bin"),
+            "{left:?}"
+        );
+        assert!(
+            left.contains(&"nvidia/tu102/gsp/gsp-570.144.bin"),
+            "{left:?}"
+        );
+        assert!(!left.contains(&"regulatory.db"));
+        // Files the volume already holds count as room.
+        let (_, left) = bundle_plan(Some(MARGIN), 200 * MIB);
+        assert!(left.is_empty());
+    }
+
+    /// A synthetic catalog: files whose digests these tests can satisfy.
+    fn synthetic() -> Vec<(Artifact, Vec<u8>)> {
+        use sha2::{Digest, Sha256};
+        let artifact = |member: &'static str, bytes: &[u8]| {
+            let sha256: &'static str =
+                Box::leak(hex::encode(Sha256::digest(bytes)).into_boxed_str());
+            (
+                Artifact {
+                    source: "https://vendor.invalid",
+                    revision: "synthetic",
+                    member,
+                    length: bytes.len(),
+                    sha256,
+                },
+                bytes.to_vec(),
+            )
         };
-        let notes = describe_bluetooth(
-            &[
-                controller(0x13d3, 0x3602, false),
-                controller(0x0bda, 0x8771, false),
-                controller(0x0a12, 0x0001, false),
-                // A vendor-class interface no setup takes is no controller.
-                controller(0x0bda, 0x8153, true),
-            ],
-            "`stela setup repair --usb E:`",
-        );
-        assert_eq!(notes.len(), 3, "{notes:?}");
+        vec![
+            artifact("vendor/a.bin", b"first file"),
+            artifact("vendor/b.bin", b"second file"),
+            artifact("LICENSES/LICENCE.vendor", b"notice"),
+        ]
+    }
+
+    fn snapshot(directory: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files = Vec::new();
+        for entry in walk(directory) {
+            files.push((
+                entry
+                    .strip_prefix(directory)
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/"),
+                fs::read(&entry).unwrap(),
+            ));
+        }
+        files.sort();
+        files
+    }
+
+    fn walk(directory: &Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found.extend(walk(&path));
+            } else {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_bundle_is_the_same_on_every_computer_and_stores_a_shared_file_once() {
+        use super::super::{host::Host, tests::FakeHost};
+        let catalog = synthetic();
+        let [(a, a_bytes), (b, b_bytes), (notice, notice_bytes)] = &catalog[..] else {
+            unreachable!()
+        };
+        // Two names for the first file's content.
+        let alias = Artifact {
+            member: "vendor/alias.bin",
+            ..*a
+        };
+        let mut files: Vec<(&Artifact, &Artifact)> = Vec::new();
+        for object in [a, &alias, b] {
+            if !files.iter().any(|(seen, _)| seen.sha256 == object.sha256) {
+                files.push((object, notice));
+            }
+        }
+        let fetches = std::cell::Cell::new(0);
+        let mut fetch = |artifact: &Artifact| -> Result<Vec<u8>> {
+            fetches.set(fetches.get() + 1);
+            Ok([a_bytes, b_bytes, notice_bytes]
+                .into_iter()
+                .zip([a, b, notice])
+                .find(|(_, candidate)| candidate.sha256 == artifact.sha256)
+                .unwrap()
+                .0
+                .clone())
+        };
+        // A computer with an NVIDIA GPU and Wi-Fi, and one with neither.
+        let with = FakeHost::new(Default::default(), Vec::new());
+        with.nvidia_gpus.replace(vec![0x2c02]);
+        let without = FakeHost::new(Default::default(), Vec::new());
+        let mut snapshots = Vec::new();
+        for host in [&with as &dyn Host, &without] {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(host.nvidia_gpus().is_ok());
+            publish_bundle(dir.path(), &files, &mut fetch).unwrap();
+            snapshots.push(snapshot(dir.path()));
+            // A second publication fetches nothing.
+            let before = fetches.get();
+            publish_bundle(dir.path(), &files, &mut fetch).unwrap();
+            assert_eq!(fetches.get(), before);
+        }
+        assert_eq!(snapshots[0], snapshots[1]);
+        // Two files and one notice: the shared content once.
+        let names: Vec<_> = snapshots[0].iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.contains(&"stela/firmware/bundle.json"));
+        let manifest = &snapshots[0]
+            .iter()
+            .find(|(name, _)| name == "stela/firmware/bundle.json")
+            .unwrap()
+            .1;
+        let parsed = bundle::Bundle::parse(manifest).unwrap();
+        assert_eq!(parsed.objects.len(), 2);
+        assert_eq!(parsed.notices.len(), 1);
+        // A damaged file is fetched again; a file no longer listed goes.
+        let dir = tempfile::tempdir().unwrap();
+        publish_bundle(dir.path(), &files, &mut fetch).unwrap();
+        let stored = dir
+            .path()
+            .join(bundle::DIRECTORY)
+            .join(bundle::object_path(a.sha256));
+        fs::write(&stored, b"first filX").unwrap();
+        publish_bundle(dir.path(), &files[..1], &mut fetch).unwrap();
+        assert_eq!(fs::read(&stored).unwrap(), *a_bytes);
         assert!(
-            notes[0].starts_with("this computer's Bluetooth controller (MediaTek, USB 13d3:3602)")
-                && notes[0].contains(
-                    "boot the PC from the USB once, then run `stela setup repair --usb E:`"
-                ),
-            "{}",
-            notes[0]
+            !dir.path()
+                .join(bundle::DIRECTORY)
+                .join(bundle::object_path(b.sha256))
+                .exists()
         );
+    }
+
+    #[test]
+    fn prefetch_downloads_only_what_neither_the_cache_nor_the_stick_holds() {
+        let catalog = synthetic();
+        let [(a, a_bytes), (b, b_bytes), (notice, notice_bytes)] = &catalog[..] else {
+            unreachable!()
+        };
+        let files: Vec<(&Artifact, &Artifact)> = vec![(a, notice), (b, notice)];
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let volume = dir.path().join("volume");
+        let stick = volume.join(bundle::DIRECTORY);
+        // The stick kept the first file from a stopped setup.
+        fs::create_dir_all(&stick).unwrap();
+        fs::write(stick.join(bundle::object_path(a.sha256)), a_bytes).unwrap();
+        let before = snapshot(&volume);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let fail_on = std::cell::Cell::new(Some(b.sha256));
+        let mut download = |artifact: &Artifact| -> Result<Vec<u8>> {
+            asked.borrow_mut().push(artifact.member);
+            if fail_on.get() == Some(artifact.sha256) {
+                anyhow::bail!("cannot download {}: every source refused", artifact.member);
+            }
+            Ok([a_bytes, b_bytes, notice_bytes]
+                .into_iter()
+                .zip([a, b, notice])
+                .find(|(_, candidate)| candidate.sha256 == artifact.sha256)
+                .unwrap()
+                .0
+                .clone())
+        };
+        // A failed download: the stick is as it was, the cache keeps what
+        // came.
+        let error = prefetch(&files, &cache, Some(&stick), &mut download).unwrap_err();
+        assert!(error.to_string().contains("vendor/b.bin"), "{error}");
+        assert_eq!(snapshot(&volume), before);
+        assert_eq!(*asked.borrow(), ["LICENSES/LICENCE.vendor", "vendor/b.bin"]);
+        // Run again: only the failed file is asked for, once.
+        fail_on.set(None);
+        asked.borrow_mut().clear();
+        assert_eq!(
+            prefetch(&files, &cache, Some(&stick), &mut download).unwrap(),
+            1
+        );
+        assert_eq!(*asked.borrow(), ["vendor/b.bin"]);
+        assert_eq!(snapshot(&volume), before);
+        // Then nothing; and publishing from the cache alone completes the
+        // bundle, keeping the stick's file.
+        assert_eq!(
+            prefetch(&files, &cache, Some(&stick), &mut download).unwrap(),
+            0
+        );
+        let mut from_cache =
+            |artifact: &Artifact| read_cached(&cache.join(artifact.sha256), artifact);
+        publish_bundle(&volume, &files, &mut from_cache).unwrap();
+        let manifest = fs::read(stick.join("bundle.json")).unwrap();
+        assert_eq!(bundle::Bundle::parse(&manifest).unwrap().objects.len(), 2);
         assert!(
-            notes[1].contains("(Realtek, USB 0bda:8771) needs firmware Stela has no pinned source"),
-            "{}",
-            notes[1]
+            !cache.join(a.sha256).exists(),
+            "the stick's file was never downloaded"
         );
+    }
+
+    #[test]
+    fn status_names_a_partly_written_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join(bundle::DIRECTORY);
+        fs::create_dir_all(&directory).unwrap();
+        // Three files of a setup whose download stopped, no manifest yet.
+        for (object, _) in bundle::complete().iter().take(3) {
+            fs::write(
+                directory.join(bundle::object_path(object.sha256)),
+                vec![0; object.length],
+            )
+            .unwrap();
+        }
+        let status = bundle_status(dir.path()).unwrap_err();
+        assert_eq!(
+            status,
+            "the firmware bundle is incomplete: 3 of 66 files are on the USB"
+        );
+    }
+
+    #[test]
+    fn status_names_a_bundle_as_complete_or_what_it_lacks() {
+        let dir = tempfile::tempdir().unwrap();
         assert!(
-            notes[2].contains("(USB 0a12:0001) is not one Stela has a setup for"),
-            "{}",
-            notes[2]
+            bundle_status(dir.path())
+                .unwrap_err()
+                .contains("no firmware bundle")
         );
+        // A partial bundle: one real recipe's entry, its file not written.
+        let first = bundle::complete()[0];
+        let directory = dir.path().join(bundle::DIRECTORY);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("bundle.json"),
+            bundle::manifest(&[first]).unwrap(),
+        )
+        .unwrap();
+        let status = bundle_status(dir.path()).unwrap_err();
+        assert!(status.contains("lacks 65 of 66 files"), "{status}");
+        assert!(
+            status.contains("nvidia/ga102/gsp/gsp-570.144.bin"),
+            "{status}"
+        );
+        assert!(status.contains("1 of its files are damaged"), "{status}");
+    }
+
+    #[test]
+    fn an_older_per_pc_set_goes_once_the_bundle_holds_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let esp = dir.path().join("esp");
+        let volume = dir.path().join("volume");
+        let old = esp.join(host_firmware::DIRECTORY);
+        fs::create_dir_all(&old).unwrap();
+        let image = recipes::REGULATORY[0].image;
+        let manifest = serde_json::json!({"schema":1,"images":[{
+            "name":"regulatory.db", "path":"0.bin",
+            "target":{"driver":"wifi-regulatory","hardware":"wireless-regdb","revision":"v20","board":null},
+            "provenance":{"source":image.source,"revision":image.revision,"member":image.member,"license":"x"},
+            "length":image.length,"sha256":image.sha256}]});
+        fs::write(
+            old.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        // A bundle without that file keeps the set.
+        let files = bundle::complete();
+        let without: Vec<_> = files
+            .iter()
+            .copied()
+            .filter(|(object, _)| object.sha256 != image.sha256)
+            .collect();
+        remove_superseded(&esp, &volume, &without).unwrap();
+        assert!(old.exists());
+        // The same volume as the EFI partition keeps it too.
+        remove_superseded(&esp, &esp, &files).unwrap();
+        assert!(old.exists());
+        remove_superseded(&esp, &volume, &files).unwrap();
+        assert!(!old.exists());
     }
 
     #[test]
@@ -931,9 +1661,111 @@ mod tests {
                 .redirect(Policy::none())
                 .build()
                 .unwrap();
-            assert_eq!(download(&client, &artifact).is_ok(), valid);
+            assert_eq!(
+                download_from(&client, &artifact, &artifact.urls(), &mut |_| {}).is_ok(),
+                valid
+            );
             server.join().unwrap();
         }
+    }
+
+    /// A source on localhost that answers its requests with `responses` in
+    /// order, then closes; its URL, and how many requests it served.
+    fn source(responses: Vec<&'static str>) -> (String, std::thread::JoinHandle<usize>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/one.bin", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut served = 0;
+            for response in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let _ = socket.read(&mut [0; 4096]);
+                let _ = socket.write_all(response.as_bytes());
+                served += 1;
+            }
+            served
+        });
+        (url, server)
+    }
+
+    const ABC: Artifact = Artifact {
+        source: "https://vendor.invalid",
+        revision: "synthetic-v1",
+        member: "one.bin",
+        length: 3,
+        sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    };
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc";
+    const HOURLY: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2789\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const SHORT: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const DOWN: &str =
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const GONE: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    fn client() -> Client {
+        Client::builder()
+            .timeout(Duration::from_secs(2))
+            .redirect(Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_hour_long_rate_limit_goes_to_the_next_source_at_once() {
+        let (first, first_server) = source(vec![HOURLY]);
+        let (second, second_server) = source(vec![OK]);
+        let mut slept = Vec::new();
+        let bytes =
+            download_from(&client(), &ABC, &[first, second], &mut |d| slept.push(d)).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert!(slept.is_empty(), "{slept:?}");
+        assert_eq!(first_server.join().unwrap(), 1);
+        assert_eq!(second_server.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_short_retry_after_is_waited_out_on_the_same_source() {
+        let (first, server) = source(vec![SHORT, OK]);
+        let mut slept = Vec::new();
+        let bytes = download_from(&client(), &ABC, &[first], &mut |d| slept.push(d)).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert_eq!(slept, [Duration::from_secs(2)]);
+        assert_eq!(server.join().unwrap(), 2);
+    }
+
+    #[test]
+    fn when_every_source_fails_the_error_names_the_file_and_each_answer() {
+        let (first, first_server) = source(vec![DOWN, DOWN, DOWN]);
+        let (second, second_server) = source(vec![GONE]);
+        let mut slept = Vec::new();
+        let error = download_from(&client(), &ABC, &[first, second], &mut |d| slept.push(d))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("cannot download one.bin: 127.0.0.1:"),
+            "{error}"
+        );
+        assert!(
+            error.contains("answered 503 Service Unavailable"),
+            "{error}"
+        );
+        assert!(error.contains("answered 404 Not Found"), "{error}");
+        // Two backoffs on the busy source, within the budget, then the next.
+        assert_eq!(slept, [Duration::from_secs(1), Duration::from_secs(2)]);
+        assert_eq!(first_server.join().unwrap(), 3);
+        assert_eq!(second_server.join().unwrap(), 1);
+        // A wrong file from the first source is never kept; the second's is.
+        let (first, _) = source(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabd",
+        ]);
+        let (second, _) = source(vec![OK]);
+        assert_eq!(
+            download_from(&client(), &ABC, &[first, second], &mut |_| {}).unwrap(),
+            b"abc"
+        );
     }
 
     #[test]
@@ -1007,10 +1839,20 @@ mod tests {
         let modern = requests_line(&[realtek("rtl_nic/rtl8168d-1.fw", "xid-281")]);
         boot_log_in(esp, Layout::Legacy, &[&legacy]);
         boot_log_in(esp, Layout::Northwood, &[&modern]);
-        let image = host_firmware::MOUNT_CAPABILITY;
+        // A Northwood EFI with per-PC firmware still uses its own log and
+        // publishes to its own ESP directory.
+        let mut marker = host_firmware::MOUNT_CAPABILITY;
+        marker[20] = 3;
+        let mut image = marker.to_vec();
+        image.extend_from_slice(&Layout::MOUNT_CAPABILITY);
         let found = requested_in(esp, Layout::Northwood, &image).unwrap();
         assert_eq!(found.layout, Layout::Northwood);
-        assert_eq!(found.pinned[0].name, "rtl_nic/rtl8168d-1.fw");
+        let names: Vec<_> = found
+            .pinned
+            .iter()
+            .map(|request| request.name.as_str())
+            .collect();
+        assert_eq!(names, ["rtl_nic/rtl8168d-1.fw"]);
         let plan = found
             .plan(esp, &image, &esp.join("cache"), true)
             .unwrap()
@@ -1021,6 +1863,19 @@ mod tests {
             esp.join("EFI/northwood/firmware")
         );
         assert!(!directory(esp, Layout::Legacy).exists());
+
+        // A current Northwood EFI gets the same pinned file from the DATA
+        // bundle, so this request does not schedule an ESP publication.
+        let mut image = host_firmware::MOUNT_CAPABILITY.to_vec();
+        image.extend_from_slice(&Layout::MOUNT_CAPABILITY);
+        let found = requested_in(esp, Layout::Northwood, &image).unwrap();
+        assert!(found.is_empty());
+        assert!(
+            found
+                .plan(esp, &image, &esp.join("cache"), true)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1076,7 +1931,9 @@ mod tests {
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        let image = host_firmware::MOUNT_CAPABILITY;
+        // A stela.efi before the bundle, which reads exact per-PC files.
+        let mut image = host_firmware::MOUNT_CAPABILITY;
+        image[20] = 3;
         // No log, or a log without requests: nothing.
         assert!(requested(&esp, &image).unwrap().is_empty());
         boot_log(&esp, &["CHOICE 1 (macOS)\n"]);
@@ -1108,6 +1965,11 @@ mod tests {
         assert_eq!(names(&found.pinned), ["rtl_nic/rtl8168d-1.fw"]);
         assert_eq!(names(&found.unpinned), ["brcm/synthetic.bin"]);
         assert!(found.unreadable.is_none());
+        // A stela.efi that reads the bundle needs no file added: the bundle
+        // holds every pinned one. The unpinned stay named.
+        let bundled = requested(&esp, &host_firmware::MOUNT_CAPABILITY).unwrap();
+        assert!(bundled.pinned.is_empty());
+        assert_eq!(names(&bundled.unpinned), ["brcm/synthetic.bin"]);
         let lines = found.lines().join("\n");
         assert!(
             lines.contains("add rtl_nic/rtl8168d-1.fw (realtek 10ec:8168 xid-281)"),

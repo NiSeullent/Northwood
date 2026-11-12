@@ -302,6 +302,7 @@ fn mount(
             reset: Some(manifest.entry.physical_address),
             now: 0,
             wall: None,
+            rtc_anchor: None,
             backing: board.ans.is_some().then(|| {
                 Box::new(Sparse {
                     identity: stela_drivers::block::Identity {
@@ -928,12 +929,15 @@ impl Prepare {
                 // needs no network.
                 if !self.update {
                     eprintln!(
-                        "Sending the same ECID and the install's recoveryOS and Cryptex1 \
-                         requests to Apple's signing service, so the install needs no network"
+                        "Sending the same ECID and the install's recoveryOS, Cryptex1 and \
+                         LocalPolicy requests to Apple's signing service now, so the install \
+                         does not ask for them"
                     );
                     staged = ticket::staged(&manifest, identity.index, ecid, &bytes)
                         .inspect_err(|error| {
-                            eprintln!("note: {error:#}; installing macOS will need a network")
+                            eprintln!(
+                                "note: {error:#}; installing macOS will ask Apple's signing service"
+                            )
                         })
                         .ok();
                 }

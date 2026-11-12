@@ -933,7 +933,12 @@ fn receive_discards_whole_fragment_chains_crc_errors_and_out_of_bounds_lengths()
     fixture.deliver(3, &[4; 60], 3, 4096); // metadata must not produce an out-of-bounds slice
     fixture.deliver(4, &[5; 13], 3, 13);
     fixture.deliver(5, &[6; 60], 3, 60);
-    assert_eq!(fixture.net.receive().unwrap(), Some(vec![6; 60]));
+    // The stack's reused buffer takes only the good frame, in place.
+    let mut reused = Vec::with_capacity(MAX_FRAME);
+    let storage = reused.as_ptr();
+    assert_eq!(fixture.net.receive_reusing(&mut reused), Ok(true));
+    assert_eq!(reused, vec![6; 60]);
+    assert_eq!(reused.as_ptr(), storage);
     assert_eq!(fixture.net.receive.next, 6);
     assert_eq!(fixture.registers[RDT / 4], (DESCRIPTORS - 1) as u32);
     assert_eq!(fixture.net.receive().unwrap(), None);

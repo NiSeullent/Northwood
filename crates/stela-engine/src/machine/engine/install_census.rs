@@ -34,6 +34,13 @@ pub struct InstallCauses {
     /// Code bytes of the blocks installed and of the blocks evicted.
     pub installed_bytes: u64,
     pub evicted_bytes: u64,
+    /// Guest instructions of the blocks installed: with `installed_bytes`,
+    /// host code bytes per guest instruction. And of those, the code bytes
+    /// and guest instructions of blocks in the upper half of the address
+    /// space (TTBR1: the kernel and the guarded monitors).
+    pub guest_instructions: u64,
+    pub upper_bytes: u64,
+    pub upper_instructions: u64,
     /// Counter ticks spent evicting ([`super::Machine::evict_code`]).
     pub evict_ticks: u64,
 }

@@ -35,6 +35,12 @@ pub(super) fn request_shutdown(force: bool) {
     });
 }
 
+/// Stop the guest and restart the PC: what NVRAM records at the stop
+/// chooses the next boot: the Metal plugin repair's.
+pub(super) fn request_restart() {
+    SHUTDOWN.request(Shutdown::Restart);
+}
+
 pub(super) fn shutdown_pending() -> bool {
     SHUTDOWN.pending()
 }
@@ -54,6 +60,14 @@ const STEP_MICROS: u64 = 1000;
 
 /// Seconds between the service's own reports.
 const REPORT_SECONDS: u64 = 10;
+
+/// Seconds between stores of the PMU upcount's anchor (`nor::HostNor`),
+/// after the first, which goes once the guest's time has started, and
+/// before the one at the stop. One 4 KiB write each. The next boot's
+/// upcount is the anchor's plus the wall time since it, so with a host wall
+/// time a lost last store costs nothing; without one the upcount goes on
+/// from the last stored anchor and loses at most this interval.
+const ANCHOR_SECONDS: u64 = 600;
 
 /// The longest a part that calls the host drivers (the logs, network,
 /// Bluetooth and NOR) is left to a later turn because another core holds
@@ -84,6 +98,8 @@ pub(super) struct Service {
     tsc_hz: u64,
     log_flushed: u64,
     reported: u64,
+    /// When the RTC anchor was last stored, `None` before the first.
+    anchored: Option<u64>,
     /// The part the next service starts at: after the last one a step
     /// ended on, else the first.
     next: usize,
@@ -128,6 +144,7 @@ impl Service {
             tsc_hz,
             log_flushed: now,
             reported: now,
+            anchored: None,
             next: 0,
             ran: [now; TURN_PARTS],
             #[cfg(feature = "diagnostics")]
@@ -143,8 +160,23 @@ impl Service {
     /// waiting: at the stop, before the PC restarts or turns off.
     pub(super) fn stop(&mut self) {
         if let Some(nor) = self.nor.as_mut() {
-            let dirty = self.devices.with(nor::HostNor::dirty);
+            let repair = super::bundle_repair::change_pending();
+            let (mut dirty, anchor, image) = self.devices.with(|devices| {
+                (
+                    nor::HostNor::dirty(devices),
+                    devices.rtc_anchor(),
+                    repair.then(|| devices.nor_image()).flatten(),
+                )
+            });
+            // The automatic plugin repair's record, on top of what the
+            // guest committed: the guest no longer writes its NOR.
+            if let Some(mut image) = image {
+                dirty.extend(super::bundle_repair::at_stop(&mut image));
+            }
             nor.store(dirty);
+            if let Some(anchor) = anchor {
+                nor.keep_anchor(anchor);
+            }
             nor.finish();
         }
         #[cfg(feature = "nvk")]
@@ -164,6 +196,10 @@ impl Service {
                     self.stop();
                     self.power.power_off();
                 }
+                Shutdown::Restart => {
+                    self.stop();
+                    self.power.restart();
+                }
                 Shutdown::Orderly => self
                     .devices
                     .serve(|devices| self.power.request_shutdown(devices)),
@@ -181,6 +217,7 @@ impl Service {
             tsc_hz,
             log_flushed,
             reported,
+            anchored,
             next,
             ran,
             #[cfg(feature = "diagnostics")]
@@ -333,8 +370,17 @@ impl Service {
         }
         if due(NOR, true, next) {
             if let Some(nor) = nor {
-                let dirty = devices.with(nor::HostNor::dirty);
+                let due =
+                    anchored.is_none_or(|at| now.wrapping_sub(at) >= ANCHOR_SECONDS * *tsc_hz);
+                let (dirty, anchor) = devices.with(|devices| {
+                    let anchor = due.then(|| devices.rtc_anchor()).flatten();
+                    (nor::HostNor::dirty(devices), anchor)
+                });
                 nor.store(dirty);
+                if let Some(anchor) = anchor {
+                    nor.keep_anchor(anchor);
+                    *anchored = Some(now);
+                }
             }
             if power.pressed() {
                 devices.serve(|devices| power.press(devices));
@@ -366,6 +412,9 @@ impl Service {
                 .and_then(|experiment| experiment.asr_report())
             {
                 output::arguments(format_args!("{line}\n"));
+            }
+            if let Some(network) = network.as_ref() {
+                network.report();
             }
             power.disks().report(*tsc_hz);
             *reported = now;

@@ -31,6 +31,9 @@ pub(super) struct StoredOrigin {
     pub(super) context: Digest,
     pub(super) page: u64,
     pub(super) preparation: Arc<Preparation>,
+    /// The entry itself, for one proven during the boot
+    /// ([`super::rebase`]): no pack holds its record.
+    pub(super) kept: Option<Arc<Entry>>,
 }
 
 /// An installed block's recovery owner: its code's length and the rows that
@@ -329,7 +332,7 @@ impl CodeRecovery {
     /// The key of the record whose entry this owner's rows still are.
     pub(super) fn stored_key(&self) -> Option<Digest> {
         match &self.rows {
-            Rows::Stored { origin, .. } => Some(origin.key),
+            Rows::Stored { origin, .. } if origin.kept.is_none() => Some(origin.key),
             _ => None,
         }
     }
@@ -350,9 +353,11 @@ impl CodeRecovery {
             let block = match &self.rows {
                 Rows::Qualified { .. } => unreachable!("unqualified above"),
                 Rows::Stored { origin, offset, .. } => {
-                    let entry = record
-                        .and_then(|record| record.find(*offset, &origin.context))
-                        .ok_or(NativeFailureReason::StoredRecord)?;
+                    let entry = match &origin.kept {
+                        Some(kept) => Some(&**kept).filter(|kept| kept.offset == *offset),
+                        None => record.and_then(|record| record.find(*offset, &origin.context)),
+                    }
+                    .ok_or(NativeFailureReason::StoredRecord)?;
                     let stored = entry
                         .rebase(origin.page, &entry.input)
                         .ok_or(NativeFailureReason::StoredRecord)?;

@@ -25,7 +25,7 @@ use stela_runtime::pc::boot_log::{PENDING_BYTES, Pending, Unkept, Writer};
 
 mod terminal;
 pub(crate) mod volume_log;
-pub(crate) use terminal::{panic, print_stack_at};
+pub(crate) use terminal::{Callers, panic, print_stack_at};
 
 /// One engine-wide value. The mount runs on one processor and its handlers
 /// only print; every access is a `try_borrow`, so output that arrives while
@@ -1052,13 +1052,32 @@ pub(crate) fn boot_diagnostic(text: &str) {
 pub const STOPPED: &str = "Stela stopped. Its log is on this USB: on another computer, `stela \
     setup boot-log --usb USB` prints it; include it in a report. Turn the PC off to try again.";
 
+/// What a stop before the engine writes the USB's log again tells the
+/// user: the screen is all that is kept of this part of the run.
+pub const STOPPED_UNLOGGED: &str = "Stela stopped before it could write this part of its log \
+    to the USB: this screen is the only record of it. Take a photo of it for a report. Turn the \
+    PC off to try again.";
+
+/// [`STOPPED`], or [`STOPPED_UNLOGGED`] while no USB log is open. Never
+/// waits: a stop raised inside a log store finds the logs held.
+pub fn stopped_text() -> &'static str {
+    let open = with_sinks(false, |sinks| {
+        sinks.iter().any(|sink| sink.kind != Log::Machine)
+    });
+    if open.unwrap_or(true) {
+        STOPPED
+    } else {
+        STOPPED_UNLOGGED
+    }
+}
+
 pub fn fatal(message: impl core::fmt::Display) -> ! {
     let message = alloc::string::ToString::to_string(&message);
     arguments(format_args!("\nSTELA FATAL {message}\n"));
     // The reason reaches the port before any later step can stop for good.
     unqueue_serial();
     crate::engine::stop_gpus_for_fatal();
-    stopped(&message, STOPPED);
+    stopped(&message, stopped_text());
     terminate(0x11)
 }
 

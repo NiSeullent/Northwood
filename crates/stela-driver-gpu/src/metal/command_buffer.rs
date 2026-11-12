@@ -494,9 +494,11 @@ impl Bindings {
             None => BufferBinding::default(),
         };
         let table = self.table(target);
-        table.slots.buffers[slot] = binding;
         table.buffers[slot] = buffer;
-        table.address = None;
+        if table.slots.buffers[slot] != binding {
+            table.slots.buffers[slot] = binding;
+            table.address = None;
+        }
         Ok(())
     }
 
@@ -531,8 +533,10 @@ impl Bindings {
             "texture index exceeds the argument table",
         )?;
         let table = self.table(slot);
-        table.slots.textures[index as usize] = texture;
-        table.address = None;
+        if table.slots.textures[index as usize] != texture {
+            table.slots.textures[index as usize] = texture;
+            table.address = None;
+        }
         Ok(())
     }
 
@@ -556,8 +560,10 @@ impl Bindings {
     /// The pass's dirty tiles, which its fragment functions mark.
     fn set_dirty(&mut self, dirty: crate::metal::binding::PassDirty) {
         let table = self.table(Stage::Fragment);
-        table.slots.dirty = dirty;
-        table.address = None;
+        if table.slots.dirty != dirty {
+            table.slots.dirty = dirty;
+            table.address = None;
+        }
     }
 
     /// What a fragment function testing fragments itself reads.
@@ -589,8 +595,10 @@ impl Bindings {
             "sampler index exceeds the argument table",
         )?;
         let table = self.table(slot);
-        table.slots.samplers[index as usize] = sampler;
-        table.address = None;
+        if table.slots.samplers[index as usize] != sampler {
+            table.slots.samplers[index as usize] = sampler;
+            table.address = None;
+        }
         Ok(())
     }
 

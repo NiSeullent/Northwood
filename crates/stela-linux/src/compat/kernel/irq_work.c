@@ -10,8 +10,10 @@
 #include <linux/hardirq.h>
 #include <linux/llist.h>
 #include <linux/rcupdate.h>
+#include <linux/sched.h>
 #include <linux/workqueue.h>
 #include <stela/atomic_callback.h>
+#include <stela/linux.h>
 
 static_assert(!IS_ENABLED(CONFIG_SMP));
 static_assert(!IS_ENABLED(CONFIG_PREEMPT_RT));
@@ -59,13 +61,36 @@ bool irq_work_needs_cpu(void)
 	return !llist_empty(&queued);
 }
 
-/* The host supplies no self-interrupt or native tick entry to Linux. These
- * requests route both raised and lazy work to the retained worker instead;
- * callers never receive an inline callback or an invented interrupt entry. */
+/* Whether work raised now runs at the raising worker's own next quiescent
+ * point instead. On a processor with a self-interrupt Linux runs it as soon
+ * as interrupts are enabled again, which in a workqueue worker's process
+ * context is before the work item returns; every item of a worker with a
+ * task ends in cond_resched() (process_one_work), and an item that sleeps
+ * first parks: both run it (stela_linux_irq_work_run_owed), with the
+ * function's hard interrupt context, after the raising code and before any
+ * other task runs. That needs no runner step of its own. */
+static bool owed_to_raising_worker(void)
+{
+	return in_task() && !stela_linux_atomic_callback_active() &&
+	       (current->flags & PF_WQ_WORKER);
+}
+
+/* The host supplies no self-interrupt or native tick entry to Linux. Raised
+ * and lazy work runs at the raising worker's next quiescent point (above) or
+ * on the retained worker; callers never receive an inline callback or an
+ * invented interrupt entry. */
 void arch_irq_work_raise(void)
 {
-	if (irq_work_needs_cpu())
+	if (irq_work_needs_cpu() && !owed_to_raising_worker())
 		schedule_work(&runner);
+}
+
+/* Runs queued work in its hard interrupt context from a quiescent task, as
+ * the self-interrupt that work raised there would have. Nothing otherwise. */
+void stela_linux_irq_work_run_owed(void)
+{
+	if (irq_work_needs_cpu() && stela_linux_quiescent())
+		run_queued(NULL);
 }
 
 void irq_work_run(void)

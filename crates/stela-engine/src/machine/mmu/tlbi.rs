@@ -339,8 +339,9 @@ pub enum Everywhere {
     /// context: the VA forms ([`Reach::Containing`] or
     /// [`Reach::Overlapping`]), or [`Reach::Nothing`].
     Addresses(Reach),
-    /// The non-global entries of one ASID.
-    NonGlobal,
+    /// The non-global entries of the ASID named (TLBI ASIDE1): a global
+    /// entry or a non-global entry of another ASID stays (Arm `TLBIMatch`).
+    NonGlobal(u16),
     /// Every entry.
     All,
 }
@@ -364,7 +365,7 @@ impl Scope {
                 Everywhere::Addresses(Reach::Containing(canonical(self.address)))
             }
             TlbiKind::RVA | TlbiKind::RVAA => Everywhere::Addresses(self.overlapping()),
-            TlbiKind::ASID => Everywhere::NonGlobal,
+            TlbiKind::ASID => Everywhere::NonGlobal(self.asid),
             _ => Everywhere::All,
         }
     }
@@ -448,10 +449,7 @@ impl Scope {
             address: first,
             // The address after the last; the end of the address space is
             // its own marker ([`Scope::overlapping`]).
-            end: last
-                .checked_add(1)
-                .filter(|end| *end != u64::MAX)
-                .unwrap_or(u64::MAX),
+            end: last.saturating_add(1),
             ttl: 0,
             level: if self.level == TlbiLevel::Last && other.level == TlbiLevel::Last {
                 TlbiLevel::Last

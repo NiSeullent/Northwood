@@ -39,6 +39,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use stela_boot_core::chosen_disk::{Search, Stale};
 use stela_loader::mount_interface::layout::{self, Layout};
 use stela_loader::{boot_selection, mount_interface, recovery};
 use {
@@ -285,6 +286,14 @@ fn firmware_status(record: &Record, report: &mut Report) {
     let Ok(tool) = fs::read(record.esp.join(LOADER_PATH)) else {
         return;
     };
+    if stela_loader::host_firmware::reads_bundle(&tool) {
+        match super::firmware::bundle_status(&record.volume) {
+            Ok(complete) => report.line("firmware", format!("bundle {complete}")),
+            Err(missing) => {
+                report.problem(format!("{missing}: {} adds the rest", report.fix("repair")))
+            }
+        }
+    }
     let requested = match super::firmware::requested_in(&record.esp, record.layout, &tool) {
         Ok(requested) => requested,
         Err(error) => {
@@ -461,10 +470,14 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
         report.line(
             "install medium",
             format!(
-                "{} (macOS {}, partition {}): {}",
+                "{} (macOS {}, {}): {}",
                 medium.directory().display(),
                 medium.build,
-                medium.partition_guid,
+                // A streamed image is on Apple's servers, not a partition.
+                match medium.remote {
+                    true => "downloads during installation".into(),
+                    false => format!("partition {}", medium.partition_guid),
+                },
                 if problems.is_empty() {
                     "intact"
                 } else {
@@ -478,6 +491,67 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
                 medium.build
             ));
         }
+    }
+}
+
+/// What this computer holds of the partition Install macOS chose
+/// (`disk.cfg`, `SERIAL:GUID`), as `stela.efi` searches for it
+/// (`chosen_disk::Search`); `None` when the record cannot be read or this
+/// computer cannot list its disks.
+fn chosen_search(host: &dyn Host, chosen: &str) -> Option<Search> {
+    let (serial, guid) = chosen.trim().rsplit_once(':')?;
+    let disks = host.disks().ok().filter(|disks| !disks.is_empty())?;
+    let with_serial: Vec<_> = disks
+        .iter()
+        .filter(|d| host.serial(&d.identifier).ok().flatten().as_deref() == Some(serial))
+        .collect();
+    let disk = match with_serial[..] {
+        [] => return Some(Search::NoDisk),
+        [disk] => disk,
+        _ => return Some(Search::SeveralDisks),
+    };
+    if disk.partitions.is_empty() {
+        return Some(Search::NoTable);
+    }
+    let matching: Vec<_> = disk
+        .partitions
+        .iter()
+        .filter(|p| {
+            host.partition(&p.identifier)
+                .is_ok_and(|info| info.guid.eq_ignore_ascii_case(guid))
+        })
+        .collect();
+    Some(match matching[..] {
+        [] => Search::NoPartition,
+        [partition] if partition.content == "EFI" => Search::EspPartition,
+        [_] => Search::Found,
+        _ => Search::SeveralPartitions,
+    })
+}
+
+/// The partition Install macOS chose, when it chose one: one that is not
+/// on this computer is a note, not a problem. This may not be the PC that
+/// runs macOS, and on that PC a stale record only makes Install macOS ask
+/// for a disk again.
+fn chosen_status(host: &dyn Host, record: &Record, report: &mut Report) {
+    let Ok(chosen) = fs::read_to_string(record.esp.join("EFI/stela/disk.cfg")) else {
+        return;
+    };
+    match chosen_search(host, &chosen) {
+        Some(Search::Found) => report.line("", "the chosen disk is in this computer"),
+        Some(search) => {
+            if let Some(stale) = Stale::of(search) {
+                report.line(
+                    "",
+                    format!(
+                        "note: {}: if this is the PC that runs macOS, Install macOS will ask \
+                         for a disk again",
+                        stale.case()
+                    ),
+                );
+            }
+        }
+        None => {}
     }
 }
 
@@ -520,6 +594,7 @@ fn install_status(
     // computer's reach.
     if disk.is_chosen() {
         report.line("Mac's SSD", "a PC disk chosen at Install macOS");
+        chosen_status(host, record, report);
         return;
     }
     match installed::confirm(host, disk, installed::Role::AppleRegion, None) {
@@ -678,6 +753,19 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String
     memory_status(&record, &mut report);
     firmware_status(&record, &mut report);
     bundle_status(environment, &record, &mut report);
+    if record.installs_media() {
+        let restore_bundles: Vec<PathBuf> = record
+            .bundles
+            .iter()
+            .filter(|kept| kept.kind == bundle::Kind::Restore && kept.build == record.build)
+            .map(|kept| kept.directory(&record.volume))
+            .collect();
+        let remote = record.active_medium().is_some_and(|medium| medium.remote);
+        report.line(
+            "install",
+            super::create::network_status(remote, &restore_bundles),
+        );
+    }
     translations_status(&record, &mut report);
     swap_status(environment.host, &record, &mut report);
     for install in &record.installs {
@@ -737,6 +825,11 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
     };
     // The firmware the last boot asked for and the USB lacks.
     let requested = super::firmware::requested_in(&esp, record.layout, &tool)?;
+    // Every missing bundle file goes into the cache before the stick
+    // changes; a failed download leaves it as it was.
+    if !command.dry_run {
+        super::firmware::prefetch_bundle(&tool, Some(&record.volume))?;
+    }
     // Machines without an ECID get one; their bundles are prepared again.
     let ipsw = command.optional_image()?;
     if ipsw.is_some() {
@@ -1040,7 +1133,13 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
         update::prune(&mut record)?;
         write_record(&esp, &record)?;
     }
-    requested.provision(&esp, &tool)?;
+    // The complete firmware bundle, which an older USB lacks.
+    for note in super::firmware::provision_bundle(environment.host, &record.volume, &esp, &tool)? {
+        writeln!(text, "  firmware       {note}")?;
+    }
+    if !stela_loader::host_firmware::reads_bundle(&tool) {
+        requested.provision(&esp, &tool)?;
+    }
     writeln!(text, "Done. Check it with {}", fix(usb, "status"))?;
     Ok(text)
 }

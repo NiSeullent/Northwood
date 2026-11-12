@@ -33,6 +33,7 @@ use crate::{
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::arch::{asm, global_asm};
+use stela_boot_core::host_memory::Profile;
 use stela_boot_core::native_resources::{CodeExtents, MAX_CODE_PARTS, code_part_bytes};
 use stela_compiler::context::memory::MemoryStatus;
 use stela_compiler::{GuestState, block::BlockExit};
@@ -107,6 +108,9 @@ pub use ram::RamRange;
 struct Pool {
     base: u64,
     bytes: u64,
+    /// The upper half's bytes at the shadow part's end
+    /// (`host_memory::upper_half`); the lower half has the rest.
+    upper: u64,
     permanent: u64,
     /// The next free shadow frame's offset of each half ([`LOWER`],
     /// [`UPPER`]).
@@ -156,11 +160,11 @@ impl Pool {
         zero(frame);
         Some(frame)
     }
-    /// The offsets of `half`'s shadow frames: the lower half of the shadow
-    /// part, or the upper.
+    /// The offsets of `half`'s shadow frames: the shadow part's first bytes,
+    /// or its last [`Self::upper`].
     fn range(&self, half: usize) -> (u64, u64) {
         let start = self.shadow_base - self.base;
-        let middle = start + (self.bytes - start) / 2 / PAGE * PAGE;
+        let middle = self.bytes - self.upper;
         if half == LOWER {
             (start, middle)
         } else {
@@ -575,6 +579,7 @@ pub struct Config {
     pub ram: Vec<RamRange>,
     pub pool_physical: u64,
     pub pool_bytes: u64,
+    pub memory_profile: Profile,
     /// The loader's root, whose window entries every root shares.
     pub window_root: u64,
     pub(crate) loader_tables: &'static crate::paging::loader::LoaderTables,
@@ -610,9 +615,13 @@ pub struct Config {
 /// and CPUID do not prove that external promise or hardware validation.
 pub unsafe fn install(config: Config) -> Result<HostOwner> {
     let code_part_bytes = code_part_bytes(config.code_bytes, config.code_parts)?;
+    let guest = config.ram.iter().map(|range| range.bytes).sum();
+    let shadow = config.pool_bytes.saturating_sub(PERMANENT_FRAMES * PAGE);
+    let upper = config.memory_profile.upper_shadow(shadow, guest, PAGE);
     let mut pool = Pool {
         base: config.pool_physical,
         bytes: config.pool_bytes,
+        upper,
         permanent: 0,
         shadow: [0; 2],
         shadow_base: config.pool_physical + PERMANENT_FRAMES * PAGE,
@@ -795,7 +804,7 @@ pub struct Statistics {
     pub bounces: u64,
     pub guard_faults: u64,
     /// Each half's shadow bytes and the most it has held at once.
-    pub shadow_bytes: u64,
+    pub shadow_bytes: [u64; 2],
     pub shadow_peak: [u64; 2],
     /// The code arena's bytes and the furthest its code has reached.
     pub code_bytes: u64,
@@ -826,10 +835,10 @@ pub fn statistics() -> Statistics {
         helper_fills: state.helper_fills,
         bounces: state.bounces,
         guard_faults: state.guard_faults,
-        shadow_bytes: {
-            let (start, end) = state.pool.range(LOWER);
+        shadow_bytes: [LOWER, UPPER].map(|half| {
+            let (start, end) = state.pool.range(half);
             end - start
-        },
+        }),
         shadow_peak: state.pool.peak,
         code_bytes: state.code_bytes,
         code_peak: state.code_peak,
@@ -1056,6 +1065,29 @@ impl State {
         true
     }
 
+    /// A TLBI ASIDE1 of the current ASID: it removes the non-global entries
+    /// of that ASID alone (Arm `TLBIMatch`), so of the current shadow only
+    /// a half that holds a non-global translation goes
+    /// (`mmu::shadow::Extents::private`); the kernel's global upper half
+    /// stays.
+    /// Clearing the lower half drops the kept halves too, as their tables
+    /// share its frames.
+    fn drop_non_global(&mut self) {
+        let mut cleared = false;
+        for half in [LOWER, UPPER] {
+            if self.extents[half].private() {
+                self.clear(half);
+                cleared = true;
+            }
+        }
+        self.tlb.clear();
+        if cleared {
+            self.resets += 1;
+            self.reset_causes[Cause::Maintained as usize] += 1;
+            self.reload();
+        }
+    }
+
     /// Drop the lower half's translations only, and the kept halves.
     fn reset_lower(&mut self) {
         self.clear(LOWER);
@@ -1069,7 +1101,8 @@ impl State {
     /// half kept for `to`, if any. Return the views the caller must flush.
     fn switch_lower(&mut self, from: (u64, u64), to: (u64, u64)) -> [bool; ROOTS] {
         self.lower_switches += 1;
-        let mut entries = Vec::new();
+        // XNU switches thousands of times a second: reuse a list's storage.
+        let mut entries = self.kept.buffer();
         let mut changed = 0;
         let lower_roots = core::mem::take(&mut self.lower_roots);
         for entry in self.lower_entries() {
@@ -1101,6 +1134,7 @@ impl State {
                 changed |= self.lower_root_bit(root);
             }
             self.extents[LOWER] = half.extents;
+            self.kept.recycle(half.entries);
         }
         if changed == 0 {
             [false; ROOTS]

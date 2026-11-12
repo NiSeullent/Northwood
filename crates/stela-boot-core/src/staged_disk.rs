@@ -203,11 +203,33 @@ impl Staging {
     /// A disk whose one finish collects every completion is reached once a
     /// reap; the other results come from what it collected.
     fn advance(&self, host: &mut Host, most: usize, reap: bool) -> Step {
+        self.advance_within(host, most, reap, &mut || false)
+    }
+
+    /// [`Self::advance`], ending once `over` says the step's time is spent,
+    /// after at least one call of the host disk: what is left keeps for the
+    /// next step, so no step holds its processor for long whatever one
+    /// call of the disk takes.
+    fn advance_within(
+        &self,
+        host: &mut Host,
+        most: usize,
+        reap: bool,
+        over: &mut dyn FnMut() -> bool,
+    ) -> Step {
         let mut done = Vec::new();
         let together = reap && host.device.reaps_together();
         let mut looked = false;
         let mut index = 0;
+        let mut calls = 0usize;
         while reap && let Some(&(tag, ours)) = host.running.get(index) {
+            if calls != 0 && over() {
+                // The next step looks again at once: a disk that collects
+                // its completions together may hold the rest unposted.
+                host.looked = 0;
+                break;
+            }
+            calls += 1;
             let result = if together && looked {
                 host.device.finished(tag)
             } else {
@@ -226,6 +248,10 @@ impl Staging {
         let queued = host.device.depth() > 0;
         let mut started = 0;
         while started < most && (!queued || host.device.room()) {
+            if calls != 0 && over() {
+                break;
+            }
+            calls += 1;
             let Some((ours, command)) = self.queue.lock().waiting.pop_front() else {
                 break;
             };
@@ -299,6 +325,13 @@ impl DiskWorker {
     /// look at memory), or `lost` after the last look without, for one whose
     /// signal was lost; a step with nothing to do reaches no register.
     pub fn step(&self, now: u64, lost: u64) -> Step {
+        self.step_within(now, lost, &mut || false)
+    }
+
+    /// [`Self::step`], ending once `over` says its time is spent, after
+    /// at least one call of the host disk; what is left keeps for the next
+    /// step, which `work` still shows.
+    pub fn step_within(&self, now: u64, lost: u64, over: &mut dyn FnMut() -> bool) -> Step {
         let Some(mut host) = self.staging.host.try_lock() else {
             return Step {
                 work: self.work(),
@@ -313,7 +346,7 @@ impl DiskWorker {
         if reap {
             host.looked = now;
         }
-        self.staging.advance(&mut host, STARTS, reap)
+        self.staging.advance_within(&mut host, STARTS, reap, over)
     }
 }
 

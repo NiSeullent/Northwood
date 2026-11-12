@@ -28,6 +28,7 @@ use crate::{
 };
 use alloc::string::ToString;
 use alloc::{format, string::String, vec, vec::Vec};
+use stela_boot_core::chosen_disk::{self, Search, Stale};
 use stela_contracts::refusal::Within;
 use stela_contracts::refuse;
 use stela_loader::{
@@ -214,28 +215,57 @@ fn table(io: ScopedProtocol<BlockIO>) -> Result<(Partition, gpt::Table)> {
     Ok((whole, table))
 }
 
-fn find(target: &Target) -> Result<Partition> {
-    let disks: Vec<_> = whole_disks()?
+/// The partition `target` names, as the engine finds it, or what was found
+/// instead (`chosen_disk::Search`). Fails only when the disks cannot be
+/// listed.
+fn search(target: &Target) -> Result<core::result::Result<Partition, Search>> {
+    let mut disks: Vec<_> = whole_disks()?
         .into_iter()
         .filter(|(serial, _)| serial.as_deref() == Some(target.serial.as_str()))
         .collect();
-    let [(_, io)] =
-        <[_; 1]>::try_from(disks).map_err(|_| refuse!("not exactly one disk has the serial"))?;
-    let (mut whole, table) = table(io)?;
+    let io = match disks.len() {
+        0 => return Ok(Err(Search::NoDisk)),
+        1 => disks.remove(0).1,
+        _ => return Ok(Err(Search::SeveralDisks)),
+    };
+    // A table that cannot be read is a blank or wiped disk to a boot.
+    let Ok((mut whole, table)) = table(io) else {
+        return Ok(Err(Search::NoTable));
+    };
     let matching: Vec<_> = table
         .partitions
         .iter()
         .filter(|p| p.unique_guid.0 == target.partition.0)
         .collect();
-    let [partition] = matching[..] else {
-        return Err(refuse!("not exactly one partition has the GUID"));
+    let partition = match matching[..] {
+        [partition] => partition,
+        [] => return Ok(Err(Search::NoPartition)),
+        _ => return Ok(Err(Search::SeveralPartitions)),
     };
     if partition.role() == Some(Role::Esp) {
-        return Err(refuse!("the partition is an EFI system partition"));
+        return Ok(Err(Search::EspPartition));
     }
     whole.first_lba = partition.first_lba;
     whole.bytes = partition.blocks() * whole.block_bytes;
-    Ok(whole)
+    Ok(Ok(whole))
+}
+
+fn find(target: &Target) -> Result<Partition> {
+    search(target)?.map_err(|found| match found {
+        Search::NoDisk | Search::SeveralDisks => refuse!("not exactly one disk has the serial"),
+        Search::NoTable => refuse!("the disk has no valid GPT"),
+        Search::NoPartition | Search::SeveralPartitions => {
+            refuse!("not exactly one partition has the GUID")
+        }
+        Search::EspPartition => refuse!("the partition is an EFI system partition"),
+        Search::Found => refuse!("the partition was found"),
+    })
+}
+
+/// Why the partition `target` names is no longer there to boot, when it is
+/// not (`chosen_disk::Stale::of`).
+fn stale(target: &Target) -> Result<Option<Stale>> {
+    Ok(search(target)?.err().and_then(Stale::of))
 }
 
 /// The external disk's partition NVRAM's boot volume names, as the
@@ -268,6 +298,27 @@ fn external(volume: &BootVolume) -> Result<Option<Target>> {
         });
     }
     Ok(found)
+}
+
+/// [`select`]; a store that cannot be read on a Preboot disk without a Mac
+/// system container is an install that did not finish
+/// (`chosen_disk::unreadable_store`), and any other stops the boot with
+/// what to do.
+fn select_or_unprepared(
+    target: &Target,
+    part: Part,
+    consume: bool,
+    (preboot, preboot_part): &(Target, Part),
+) -> Result<Selection, Refusal> {
+    let error = match select(target, part, consume) {
+        Ok(selection) => return Ok(selection),
+        Err(error) => error,
+    };
+    output::arguments(format_args!("NVRAM boot refusal: {error}\n"));
+    match chosen_disk::unreadable_store(blank(preboot, *preboot_part).ok()) {
+        chosen_disk::Unreadable::Unprepared => Err(Refusal::Stale(Stale::NoMacOs)),
+        chosen_disk::Unreadable::Fatal => Err(Refusal::Other(chosen_disk::UNREADABLE_STORE)),
+    }
 }
 
 /// The boot NVRAM chooses, with its one-shot variables consumed and saved
@@ -419,6 +470,9 @@ pub enum Readiness {
     /// recovery mode, as an unfinished restore leaves it, or NVRAM asks for
     /// a recoveryOS the disk does not hold: only Install macOS starts.
     Unprepared,
+    /// The disk Install macOS chose is no longer there, or holds no macOS:
+    /// only Install macOS starts, and it chooses again.
+    Stale(Stale),
     /// The check could not be made; starting the choice reports why.
     Unknown,
 }
@@ -437,6 +491,7 @@ pub fn ready(options: &str, kind: ChoiceKind) -> Readiness {
                 | Refusal::RecoveryMode
                 | Refusal::NoRecovery { installed: true },
             ) => Readiness::Unprepared,
+            Err(Refusal::Stale(stale)) => Readiness::Stale(stale),
             Err(Refusal::Other(_)) => Readiness::Unknown,
         },
         _ => Readiness::Unknown,
@@ -458,6 +513,9 @@ pub enum Refusal {
     NoRecovery {
         installed: bool,
     },
+    /// The disk or partition the options name is no longer there, or holds
+    /// no macOS and no readable NVRAM: Install macOS chooses again.
+    Stale(Stale),
     Other(&'static str),
 }
 
@@ -492,6 +550,14 @@ fn route_checked(options: Vec<u8>, consume: bool) -> Result<(Vec<u8>, bool), Ref
     let selection = match option(text, boot_selection::PREBOOT_OPTION) {
         Some(preboot) => {
             let nor = option(text, "--nor");
+            // A disk or partition no longer there is a choice to make again,
+            // not a store to read.
+            let preboot_too = (nor != Some(preboot)).then_some(preboot);
+            for name in nor.into_iter().chain(preboot_too) {
+                if let Some(stale) = stale(&parse(name)?).map_err(refuse)? {
+                    return Err(Refusal::Stale(stale));
+                }
+            }
             // The engine splits a `--storage` partition that `--nor` also
             // names; the Preboot disk is then its namespace.
             let target = |name: Option<&str>| name.and_then(|name| name.parse::<Target>().ok());
@@ -506,7 +572,13 @@ fn route_checked(options: Vec<u8>, consume: bool) -> Result<(Vec<u8>, bool), Ref
                     } else {
                         Part::Whole
                     };
-                    select(&parse(nor)?, part, consume).map_err(refuse)?
+                    let preboot_part = if in_storage(preboot) {
+                        Part::Namespace
+                    } else {
+                        Part::Whole
+                    };
+                    let preboot = (parse(preboot)?, preboot_part);
+                    select_or_unprepared(&parse(nor)?, part, consume, &preboot)?
                 }
                 None => boot_selection::select(&Variables::parse(&empty_bank()).map_err(refuse)?)
                     .map_err(|error| refuse(error.into()))?,

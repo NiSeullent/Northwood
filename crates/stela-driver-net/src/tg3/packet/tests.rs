@@ -1018,6 +1018,7 @@ fn wraps_tx_and_rx_producer_return_indices() {
     let (mut packet, _, domain, peer) = attach();
     // One frame past the 512-entry send ring, then past the 2048-entry
     // standard and 4096-entry return rings.
+    let mut reused = Vec::new();
     for value in 0..4097u32 {
         let mut frame = vec![0x2a; 60];
         frame[14..18].copy_from_slice(&value.to_le_bytes());
@@ -1025,11 +1026,31 @@ fn wraps_tx_and_rx_producer_return_indices() {
             packet.transmit(&frame).unwrap();
         }
         peer.lock().unwrap().receive(&frame, 0, &domain);
-        assert_eq!(packet.receive().unwrap(), Some(frame));
+        if value % 2 == 0 {
+            assert_eq!(packet.receive().unwrap(), Some(frame));
+        } else {
+            assert_eq!(packet.receive_reusing(&mut reused), Ok(true));
+            assert_eq!(reused, frame);
+        }
     }
     assert_eq!(peer.lock().unwrap().sent.len(), 513);
     assert_eq!(peer.lock().unwrap().tx, 1);
     assert_eq!(peer.lock().unwrap().ret, 1);
+    // The stack's path trades buffers with the driver: two allocations
+    // serve every frame once both have grown to the largest one.
+    let mut storage = Vec::new();
+    for value in 0..8u8 {
+        let frame = vec![value; 1514 - usize::from(value)];
+        peer.lock().unwrap().receive(&frame, 0, &domain);
+        assert_eq!(packet.receive_reusing(&mut reused), Ok(true));
+        assert_eq!(reused, frame);
+        if value >= 2 && !storage.contains(&reused.as_ptr()) {
+            storage.push(reused.as_ptr());
+        }
+    }
+    assert_eq!(storage.len(), 2);
+    assert_eq!(packet.receive_reusing(&mut reused), Ok(false));
+    assert_eq!(reused, vec![7; 1507]);
     assert!(packet.retire().is_ok());
 }
 #[test]
@@ -1088,7 +1109,9 @@ fn corrupted_rx_is_dropped_and_invalid_opaque_poison_keeps_owners() {
         (u64::from(p.sram[&0x200]) << 32) | u64::from(p.sram[&0x204])
     };
     domain.store(returns + 32 + 28, &0x20001u32.to_le_bytes());
-    assert!(packet.receive().is_err());
+    let mut reused = vec![9; 60];
+    assert!(packet.receive_reusing(&mut reused).is_err());
+    assert_eq!(reused, vec![9; 60]);
     assert_eq!(packet.failure(), Some(Error::RingCorrupt));
     drop(packet);
     assert_eq!(pages.drops.load(Ordering::Relaxed), 0);

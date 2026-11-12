@@ -498,6 +498,7 @@ pub(crate) unsafe fn start(
                 ram: ram.to_vec(),
                 pool_physical: handoff.pool.physical + part.pool_offset,
                 pool_bytes: part.pool_bytes,
+                memory_profile: handoff.memory_profile,
                 window_root: handoff.root,
                 loader_tables: &handoff.native_loader_tables,
                 code_virtual: layout::code(handoff.code.bytes) + part.code_offset,

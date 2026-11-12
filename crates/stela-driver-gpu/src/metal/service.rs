@@ -756,7 +756,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 call.reply(&wire::Value { value: allocated })
             }
             Operation::Poll => {
-                self.device.poll()?;
+                self.device.poll_marked()?;
                 let key = call.connection.get();
                 let value = self.device.reached_for(key);
                 let refused = self.device.submit_failed_for(key);

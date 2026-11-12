@@ -98,7 +98,15 @@ fn check(
     // SAFETY: this host's owned RX image holds three non-memory instructions
     // under the one-pointer block ABI; the state is private.
     let exit = unsafe { mapping.call_block(&mut state) }.unwrap();
-    assert_eq!(mxcsr(), before, "MXCSR {word:#010x}");
+    // The control must survive. The six status bits may gain flags (UCOMISS
+    // sets IE for an SNaN): no guest state derives from them, and every
+    // reader of host status installs a clean control first.
+    const MXCSR_STATUS: u32 = 0x3f;
+    assert_eq!(
+        mxcsr() & !MXCSR_STATUS,
+        before & !MXCSR_STATUS,
+        "MXCSR {word:#010x}"
+    );
     let mut expected = input.clone();
     expected.x[8] += 1;
     let native = exit.kind == ExitKind::Fallthrough as u64;

@@ -945,6 +945,7 @@ fn load_named<'a>(
                 .ok_or(refuse!("DeviceTree range is out of bounds"))?;
             let tree = DeviceTree::parse(bytes)
                 .map_err(|error| refuse!("boot trace tree: {error}", %error))?;
+            super::remember_panic_region(&tree);
             let trace = boot_trace::Region::from_tree(&tree)
                 .map_err(|error| refuse!("boot trace region: {error}", %error))?;
             if let Some(trace) = trace {
@@ -1034,6 +1035,16 @@ fn load_named<'a>(
             trace.bytes().len()
         ));
     }
+    // The load blanked them before it wrote the regions.
+    output::arguments(format_args!(
+        "CARVEOUTS blank count={} bytes={:#x}\n",
+        manifest.carveouts.len(),
+        manifest
+            .carveouts
+            .iter()
+            .map(|carveout| carveout.bytes)
+            .sum::<u64>()
+    ));
     for region in &image.regions {
         output::arguments(format_args!(
             "REGION {} pa={:#x} bytes={:#x} memory={:#x}\n",

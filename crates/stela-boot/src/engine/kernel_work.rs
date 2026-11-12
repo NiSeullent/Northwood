@@ -41,7 +41,13 @@ use plan::Plan;
 #[derive(Debug)]
 pub(crate) enum Error {
     Inventory,
-    WrongCpu,
+    /// The CPUID topology APIC ID observed now differs from the firmware's
+    /// MP-services processor ID of the boot processor, which the loader
+    /// proved equal to the same CPUID observation at capture.
+    WrongCpu {
+        observed: Option<u32>,
+        captured: u64,
+    },
     Clock,
     Geometry,
     Allocation,
@@ -53,12 +59,18 @@ pub(crate) enum Error {
     Image(crate::native_image::Error),
     NoKernelStacks,
     Pages(stela_linux::pages::Error),
+    /// The preparation stage that refused, around its refusal.
+    At(&'static str, Box<Error>),
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Inventory => f.write_str("sealed loader stack inventory unavailable"),
-            Self::WrongCpu => f.write_str("kernel work requires the actual BSP"),
+            Self::WrongCpu { observed, captured } => write!(
+                f,
+                "kernel work requires the actual BSP: CPUID topology APIC ID {observed:#x?} \
+                 now, firmware MP-services processor ID {captured:#x} at capture"
+            ),
             Self::Clock => f.write_str("kernel work counter calibration unavailable"),
             Self::Geometry => f.write_str("kernel stack geometry is invalid"),
             Self::Allocation => f.write_str("kernel work metadata allocation failed"),
@@ -74,7 +86,33 @@ impl core::fmt::Display for Error {
                 f.write_str("actual work pool has no Linux-compatible stack slots")
             }
             Self::Pages(error) => write!(f, "Linux page catalog: {error:?}"),
+            Self::At(stage, error) => write!(f, "{stage}: {error}"),
         }
+    }
+}
+impl Error {
+    /// What a user could check or report for this refusal.
+    fn cause(&self) -> stela_boot_core::work_status::Cause {
+        use stela_boot_core::work_status::Cause;
+        match self {
+            Self::Inventory
+            | Self::Geometry
+            | Self::AlreadyOwned
+            | Self::NoKernelStacks
+            | Self::Pages(_) => Cause::Records,
+            Self::WrongCpu { .. } => Cause::Processor,
+            Self::Clock => Cause::Clock,
+            Self::Allocation => Cause::Memory,
+            Self::Mapping(_) => Cause::Mapping,
+            Self::Cache(_) => Cause::Cache,
+            Self::Image(_) => Cause::Code,
+            Self::Work(_) | Self::Qualification => Cause::Continuation,
+            Self::At(_, error) => error.cause(),
+        }
+    }
+    /// The screen's reason for this refusal, with its log detail.
+    pub(crate) fn reason(&self) -> alloc::string::String {
+        stela_boot_core::work_status::reason(self.cause(), &alloc::format!("{self}"))
     }
 }
 struct Reservation {
@@ -340,9 +378,13 @@ impl KernelWork {
             .map(InstalledClock::services)
             .transpose()
             .map_err(Error::Work)?;
+        let stage = Cell::new("stack plan");
         // SAFETY: original caller's handoff/owner/stack lifetime contract.
-        let mut work =
-            unsafe { Self::prepare_plan(handoff, owner, Plan::new(handoff)?, clock.as_ref()) }?;
+        let mut work = Plan::new(handoff)
+            .and_then(|plan| unsafe {
+                Self::prepare_plan(handoff, owner, plan, clock.as_ref(), &stage)
+            })
+            .map_err(|error| Error::At(stage.get(), Box::new(error)))?;
         work.installed_clock = installed_clock;
         Ok(work)
     }
@@ -354,22 +396,36 @@ impl KernelWork {
         owner: &mut HostOwner,
         plan: Plan,
         clock: Option<&ClockServices>,
+        stage: &Cell<&'static str>,
     ) -> Result<Self, Error> {
         plan.validate(handoff)?;
+        stage.set("root identity");
         // SAFETY: inherited handoff/physmap lifetime and sealed capture.
         let wire = unsafe { native_mmio::captured(handoff) }.map_err(|_| Error::Inventory)?;
         let identity = owner.root_identity().map_err(Error::Work)?;
         if let Some(clock) = clock {
+            stage.set("service clock identity");
             clock.check_identity(&identity).map_err(Error::Work)?;
         }
+        stage.set("boot processor");
         let snapshot = identity.memory_snapshot().map_err(Error::Work)?;
         // SAFETY: same immutable processor capture as native admission.
         let capture = unsafe { native_smp::firmware::captured(handoff.native_processors) }
             .map_err(|_| Error::Inventory)?;
         let bsp = capture.processors[capture.selected[0] as usize];
-        if snapshot.apic_id().map(u64::from) != Some(bsp.apic_id) {
-            return Err(Error::WrongCpu);
+        // Both sides are the one CPUID topology decoding (leaf 0x1F/0xB
+        // EDX, AMD 0x8000001E EAX, else leaf 1 EBX[31:24]) the loader
+        // matched to this processor's MP-services ID at capture
+        // (`Snapshot::matches`), at full width: only a different processor
+        // differs here.
+        let observed = snapshot.apic_id();
+        if observed.map(u64::from) != Some(bsp.apic_id) {
+            return Err(Error::WrongCpu {
+                observed,
+                captured: bsp.apic_id,
+            });
         }
+        stage.set("stack region");
         if handoff.tsc_hz < 1_000_000 {
             return Err(Error::Clock);
         }
@@ -382,6 +438,7 @@ impl KernelWork {
         }
         // SAFETY: loader root, excluding task/native entry.
         let _root = unsafe { RestoreRoot::enter(handoff.root) };
+        stage.set("engine image");
         // SAFETY: the same validated original handoff/loader root; source
         // allocation, guest exclusions and callback code stay pinned below.
         let image = unsafe { handoff.native_image.pin(handoff) }.map_err(Error::Image)?;
@@ -409,6 +466,7 @@ impl KernelWork {
                     .read_volatile()
             })
         };
+        stage.set("stack mappings and cache types");
         for index in 0..plan.count() {
             let (slot, physical) = plan.slot(index)?;
             mappings::absent(
@@ -458,6 +516,7 @@ impl KernelWork {
             layout::physical(0),
         )
         .map_err(Error::Cache)?;
+        stage.set("stack claim");
         let allocation =
             handoff
                 .native_task_allocations
@@ -485,6 +544,7 @@ impl KernelWork {
                 },
             }),
         };
+        stage.set("task pages");
         let stack_pages = (clock.is_some() || cfg!(feature = "diagnostics"))
             .then(|| pages::TaskPageInventory::from_spans(reservation.clone(), &spans))
             .transpose()?;
@@ -498,6 +558,7 @@ impl KernelWork {
                 ..foreground_slot.upper_guard.end as usize,
             physical: foreground_physical,
         });
+        stage.set("continuation runtime");
         let mut stacks = Vec::new();
         stacks
             .try_reserve_exact(spans.len())
@@ -546,6 +607,7 @@ impl KernelWork {
         // global driver/root guard itself. No mapping walk or table borrower
         // survives here; release this non-reentrant construction guard first.
         drop(_root);
+        stage.set("first foreground call");
         result.qualify_foreground()?;
         Ok(result)
     }

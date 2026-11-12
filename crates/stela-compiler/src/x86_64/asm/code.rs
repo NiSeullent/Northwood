@@ -28,6 +28,8 @@ pub(crate) struct Code {
     /// access applied ([`super::super::masked_base`]).
     base_request: Option<super::super::masked_base::Request>,
     base_applied: Option<super::super::masked_base::Plan>,
+    /// Guest vectors kept in host XMM registers ([`super::super::vector_cache`]).
+    pub(in crate::x86_64) vectors: super::super::vector_cache::VectorCache,
 }
 
 /// Exact faulting instruction interval, separate from source retirement.
@@ -98,6 +100,7 @@ impl Code {
             failures: Vec::new(),
             base_request: None,
             base_applied: None,
+            vectors: Default::default(),
         }
     }
     /// Code that keeps [`super::super::pinned`] guest registers in host
@@ -141,6 +144,10 @@ impl Code {
     /// taken costs no more than the mask a guest range check would pay for,
     /// and needs no address in RAX.
     pub(crate) fn check_failure(&mut self, failed: super::Cond) {
+        assert!(
+            !self.vectors.has_dirty(),
+            "a check failure with V registers only in XMM"
+        );
         let jump = self.asm().jcc(failed);
         self.failures.push((jump, self.instruction, self.dirty));
     }
@@ -194,6 +201,8 @@ impl Code {
     }
     /// An encoder that appends here and adds to this count.
     pub(crate) fn asm(&mut self) -> Asm<'_> {
+        let guarded = self.vectors.occupied();
+        let vectors_dirty = self.vectors.has_dirty();
         Asm {
             code: &mut self.bytes,
             instructions: 0,
@@ -203,10 +212,23 @@ impl Code {
             locals: self.locals,
             dirty: self.dirty,
             linked_block: self.linked_block,
+            guarded,
+            vectors_dirty,
         }
+    }
+    /// [`Self::asm`] for the vector cache's own moves, which may write the
+    /// pool registers that hold guest vectors.
+    pub(in crate::x86_64) fn asm_unguarded(&mut self) -> Asm<'_> {
+        let mut asm = self.asm();
+        asm.guarded = 0;
+        asm
     }
     /// A typed recipe that emits exactly one guest memory instruction.
     pub(crate) fn guest_access(&mut self, emit: impl FnOnce(&mut Self)) {
+        assert!(
+            !self.vectors.has_dirty(),
+            "a guest access with V registers only in XMM"
+        );
         let start = self.bytes.len();
         let count = self.instructions;
         emit(self);
@@ -359,6 +381,7 @@ impl Code {
             failures,
             base_request: None,
             base_applied: None,
+            vectors: Default::default(),
         };
         self.instructions = at.instructions;
         tail

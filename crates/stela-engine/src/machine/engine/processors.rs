@@ -332,6 +332,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // a lock and stays busy.
             self.clock.wait(|| self.host.counter());
         }
+        if let Some(step) = self.short_event_wait(run_deadline) {
+            return step;
+        }
         let mut armed = false;
         loop {
             let pass = self.host.counter();
@@ -439,11 +442,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 };
                 let slept = self.host.counter();
                 if !self.poll_for_wake(slept, until) {
-                    let blocked = self.outside_run(|machine| {
+                    let (blocked, halted) = self.outside_run(|machine| {
+                        let halt = machine.host.counter();
                         machine.host.arm_timer(Some(until));
                         machine.sleep();
-                        machine.host.counter().wrapping_sub(slept)
+                        let woke = machine.host.counter();
+                        (woke.wrapping_sub(slept), woke.wrapping_sub(halt))
                     });
+                    self.statistics.halt_ticks += halted;
                     armed = true;
                     self.tune_idle_poll(blocked);
                 }
@@ -478,7 +484,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The PEs that share the round with the running one, itself included:
     /// those out of reset and not waiting for an interrupt. A PE in WFE
     /// spins, so it shares the round.
-    fn runnable(&self) -> u64 {
+    pub(super) fn runnable(&self) -> u64 {
         let parked = self.peers.iter().enumerate().filter(|(pe, peer)| {
             if self.processor_paused(*pe) {
                 return false;
@@ -634,9 +640,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 consider(timeout(parked.waiting));
             }
         }
-        consider(self.devices.deadline(now));
+        consider(self.devices_deadline(now));
         consider(self.devices.dma_deadline());
         earliest
+    }
+
+    /// The devices' next deadline at `now`. The one the running PE's cached
+    /// lines came with still holds while no other machine's call reached
+    /// the devices since ([`Devices::generation`]): their advance with time
+    /// gave it, and nothing changes them before it but such a call. That
+    /// saves the home PE a second advance of every device in each wait pass.
+    fn devices_deadline(&mut self, now: u64) -> Option<u64> {
+        if let (Some((_, until, pe)), Some(expected)) = (self.device_lines, self.device_generation)
+            && pe == self.current
+            && now < until
+            && self.devices.generation() == Some(expected)
+        {
+            return (until != u64::MAX).then_some(until);
+        }
+        self.devices.deadline(now)
     }
 
     /// Run PE `next` in place of the running one, which parks with its state.

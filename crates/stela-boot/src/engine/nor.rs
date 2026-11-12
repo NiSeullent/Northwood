@@ -1,8 +1,10 @@
 //! The machine-state partition (`--nor SERIAL:GUID`): the guest's NOR flash
 //! image in its first [`CAPACITY`] bytes, so NVRAM survives reboots, then the
 //! SEP's roots and anti-replay store ([`sep_state`]), then, when the
-//! partition holds them, the boot log ([`boot_log`]) and the board devices'
-//! flash ([`board_flash`]). The image is loaded
+//! partition holds them, the boot log ([`boot_log`]), the board devices'
+//! flash ([`board_flash`]) and the PMU upcount's anchor ([`rtc_anchor`]),
+//! which the service stores every [`ANCHOR_SECONDS`](super::service) and at
+//! the stop. The image is loaded
 //! before the bundle, which hands the kernel its newest valid bank; every
 //! sector a committed program or erase changes is stored durably by the
 //! host's service, the guest not waiting, and at the stop, as is the
@@ -17,7 +19,8 @@ use stela_contracts::refuse;
 use stela_drivers::block::{BlockDevice, BlockError, Shared, Submission};
 use {
     stela_formats::boot_bundle::Nvram, stela_runtime::pc::board_flash, stela_runtime::pc::boot_log,
-    stela_runtime::pc::machine_state, stela_soc::machine::AppleDevices,
+    stela_runtime::pc::machine_state, stela_runtime::pc::rtc_anchor,
+    stela_soc::machine::AppleDevices, stela_soc::machine::RtcAnchor,
     stela_soc::machine::nor::persist, stela_soc::machine::sep_state, stela_soc_data::nor::CAPACITY,
     stela_soc_data::nor::Image,
 };
@@ -47,6 +50,113 @@ pub struct HostNor {
     /// The store in progress: its sectors' writes run together, and they
     /// are durable before the next store begins.
     running: Option<Submission>,
+    /// The PMU upcount's anchor, when the partition holds its region.
+    anchor: Option<AnchorStore>,
+}
+
+/// The RTC anchor's region ([`rtc_anchor`]): the anchor this boot started
+/// from and the stores of newer ones, which never wait on the device.
+struct AnchorStore {
+    device: Box<dyn BlockDevice>,
+    loaded: Option<RtcAnchor>,
+    anchors: rtc_anchor::Anchors,
+    /// The newest anchor not yet stored; it replaces an older waiting one.
+    waiting: Option<RtcAnchor>,
+    running: Option<Submission>,
+}
+
+impl AnchorStore {
+    /// The region after the board flash, when the partition holds it and
+    /// its device reads; otherwise say why there is none. Without it the
+    /// upcount starts at zero each boot, as before the anchor.
+    fn open(disk: &Shared, block: u64, available: u64) -> Option<Self> {
+        if available < rtc_anchor::PARTITION_BYTES {
+            output::arguments(format_args!(
+                "RTC ANCHOR off: the machine-state partition holds {available:#x} bytes; the \
+                 anchor needs {:#x}; the upcount starts at zero each boot\n",
+                rtc_anchor::PARTITION_BYTES
+            ));
+            return None;
+        }
+        let opened = disk
+            .window(rtc_anchor::OFFSET / block, rtc_anchor::BYTES / block)
+            .map_err(|error| format!("{error}"))
+            .and_then(|window| {
+                let mut device: Box<dyn BlockDevice> = Box::new(window);
+                let read = rtc_anchor::read(&mut *device).map_err(|error| format!("{error}"))?;
+                Ok((device, read))
+            });
+        let (device, (loaded, anchors)) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "RTC ANCHOR off: {error}; the upcount starts at zero each boot\n"
+                ));
+                return None;
+            }
+        };
+        match loaded {
+            Some(anchor) => output::arguments(format_args!(
+                "RTC ANCHOR ticks={:#x} unix={}\n",
+                anchor.ticks,
+                anchor.unix_seconds.unwrap_or(0)
+            )),
+            None => output::arguments(format_args!(
+                "RTC ANCHOR none: the upcount starts at zero\n"
+            )),
+        }
+        Some(Self {
+            device,
+            loaded,
+            anchors,
+            waiting: None,
+            running: None,
+        })
+    }
+
+    /// Start the waiting anchor's store once the one in progress is done,
+    /// the caller waiting for both when `wait`. A failed store is reported
+    /// and ends the anchor's stores for this run: the next boot goes on
+    /// from the last stored anchor, which with a wall time loses nothing.
+    fn advance(slot: &mut Option<Self>, wait: bool) {
+        let Some(store) = slot.as_mut() else {
+            return;
+        };
+        loop {
+            if let Some(running) = store.running.as_mut() {
+                match running.poll(&mut *store.device) {
+                    None if wait => {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                    None => return,
+                    Some(Err(error)) => {
+                        output::arguments(format_args!(
+                            "RTC ANCHOR refusal: store: {error}; no more anchors this run\n"
+                        ));
+                        *slot = None;
+                        return;
+                    }
+                    Some(Ok(_)) => store.running = None,
+                }
+            }
+            let Some(anchor) = store.waiting.take() else {
+                return;
+            };
+            let identity = store.device.identity();
+            let request = store.anchors.request(anchor, identity.block_size);
+            match Submission::new(request, identity) {
+                Ok(running) => store.running = Some(running),
+                Err(error) => {
+                    output::arguments(format_args!(
+                        "RTC ANCHOR refusal: store: {error}; no more anchors this run\n"
+                    ));
+                    *slot = None;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl HostNor {
@@ -86,11 +196,13 @@ impl HostNor {
         output::arguments(format_args!("NOR persistent fresh={fresh} bank={bank}\n"));
         open_log(&disk, block, available);
         let board_flash = BoardFlash::open(&disk, block, available);
+        let anchor = AnchorStore::open(&disk, block, available);
         (
             Self {
                 device,
                 waiting: BTreeMap::new(),
                 running: None,
+                anchor,
             },
             image,
             Nvram { bank, proxy },
@@ -112,11 +224,28 @@ impl HostNor {
     pub fn store(&mut self, dirty: Vec<(usize, Vec<u8>)>) {
         self.waiting.extend(dirty);
         self.advance(false);
+        AnchorStore::advance(&mut self.anchor, false);
     }
 
     /// Complete every store, the caller waiting: at the stop.
     pub fn finish(&mut self) {
         self.advance(true);
+        AnchorStore::advance(&mut self.anchor, true);
+    }
+
+    /// The PMU upcount's anchor this boot starts from: `None` on a new
+    /// machine, one an older Stela wrote, or without the anchor's region.
+    pub fn loaded_anchor(&self) -> Option<RtcAnchor> {
+        self.anchor.as_ref().and_then(|store| store.loaded)
+    }
+
+    /// Store `anchor` without waiting for the device: after the store in
+    /// progress, replacing a waiting one.
+    pub fn keep_anchor(&mut self, anchor: RtcAnchor) {
+        if let Some(store) = self.anchor.as_mut() {
+            store.waiting = Some(anchor);
+        }
+        AnchorStore::advance(&mut self.anchor, false);
     }
 
     fn advance(&mut self, wait: bool) {

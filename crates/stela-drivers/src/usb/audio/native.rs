@@ -64,9 +64,7 @@ impl Arena {
     fn new(dma: &mut dyn DmaAllocator) -> Result<Self, BlockError> {
         let memory = dma.allocate(65536, 65536)?;
         // SAFETY: reserved exclusively for this adapter, kept for the boot.
-        let allocator = unsafe {
-            RegionAllocator::new(memory.physical()..memory.physical() + memory.len() as u64)
-        };
+        let allocator = unsafe { RegionAllocator::within(&memory) };
         Ok(Self {
             _memory: memory,
             allocator,

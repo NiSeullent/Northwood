@@ -813,8 +813,16 @@ fn bad_rx_metadata_and_fragment_chains_are_not_invented_as_frames() {
     ] {
         peer.receive(&[9; 60], kind, status, len);
     }
+    let mut reused = vec![0x52; 1514];
+    let buffer = reused.as_ptr();
     peer.receive(&[7; 60], 0, 3, 60);
-    assert_eq!(net.receive().unwrap(), Some(vec![7; 60]));
+    assert_eq!(net.receive_reusing(&mut reused), Ok(true));
+    assert_eq!(reused, [7; 60]);
+    assert_eq!(reused.as_ptr(), buffer);
+    assert_eq!(net.receive_reusing(&mut reused), Ok(false));
+    assert_eq!(reused, [7; 60]);
+    peer.receive(&[8; 60], 0, 3, 60);
+    assert_eq!(net.receive().unwrap(), Some(vec![8; 60]));
     assert_eq!(net.receive().unwrap(), None);
     net.retire().unwrap();
 }

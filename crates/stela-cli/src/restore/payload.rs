@@ -725,22 +725,13 @@ pub fn identity(image: &Path, model: &str) -> Result<(String, String)> {
 /// only the members copied are read. The archive is written beside
 /// `output` and renamed when complete, so a partial one is never taken for
 /// a medium. Returns the bytes written for the members.
-pub fn trim<R: Read + Seek>(source: R, model: &str, output: &Path) -> Result<u64> {
+pub fn trim<R: Read + Seek>(source: R, model: &str, output: &Path, what: &str) -> Result<u64> {
     let mut archive = ZipArchive::new(source)?;
-    let selection = select_scope(&mut archive, model, true)?;
-    let mut names: Vec<&str> = vec![BUILD_MANIFEST];
-    if archive.index_for_name(RESTORE_PLIST).is_some() {
-        names.push(RESTORE_PLIST);
-    }
-    names.extend(selection.names.iter().map(String::as_str));
-    let total = names.iter().try_fold(0u64, |total, name| -> Result<u64> {
-        total
-            .checked_add(archive.by_name(name)?.size())
-            .context("boot archive size overflow")
-    })?;
+    let (names, total) = recovery_members(&mut archive, model)?;
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let directory = output.parent().unwrap_or(Path::new("."));
-    crate::setup::ensure_room(directory, "Downloading the boot files", total)?;
-    let progress = crate::progress::Phase::bytes("Downloading boot files", total);
+    crate::setup::ensure_room(directory, what, total)?;
+    let progress = crate::progress::Phase::bytes(what, total);
     let part = output.with_extension("part");
     // A partial archive cannot be resumed: it is removed on any failure.
     let written = copy_members(&mut archive, &names, &part, &progress).inspect_err(|_| {
@@ -749,6 +740,33 @@ pub fn trim<R: Read + Seek>(source: R, model: &str, output: &Path) -> Result<u64
     fs::rename(&part, output)?;
     progress.finish();
     Ok(written)
+}
+
+/// The members [`trim`] copies from `archive` for `model`, and their bytes.
+fn recovery_members<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    model: &str,
+) -> Result<(Vec<String>, u64)> {
+    let selection = select_scope(archive, model, true)?;
+    let mut names = vec![BUILD_MANIFEST.to_owned()];
+    if archive.index_for_name(RESTORE_PLIST).is_some() {
+        names.push(RESTORE_PLIST.into());
+    }
+    names.extend(selection.names);
+    let total = names.iter().try_fold(0u64, |total, name| -> Result<u64> {
+        total
+            .checked_add(archive.by_name(name)?.size())
+            .context("boot archive size overflow")
+    })?;
+    Ok((names, total))
+}
+
+/// The bytes [`trim`] would copy from the IPSW `source` for `model`, read
+/// from its ZIP directory alone; and the whole IPSW's.
+pub fn recovery_bytes<R: Read + Seek>(mut source: R, model: &str) -> Result<(u64, u64)> {
+    let whole = source.seek(std::io::SeekFrom::End(0))?;
+    let mut archive = ZipArchive::new(source)?;
+    Ok((recovery_members(&mut archive, model)?.1, whole))
 }
 
 /// Copy `names` of `archive` into a new stored archive `part`.
@@ -1159,7 +1177,12 @@ mod tests {
         let image = dir.path().join("Synthetic.ipsw");
         synthetic_ipsw(&image)?;
         let trimmed = dir.path().join("Recovery.ipsw");
-        let copied = trim(File::open(&image)?, SYNTHETIC_MODEL, &trimmed)?;
+        let copied = trim(
+            File::open(&image)?,
+            SYNTHETIC_MODEL,
+            &trimmed,
+            "Copying boot files",
+        )?;
         assert!(copied > 0 && !trimmed.with_extension("part").exists());
         let mut archive = ZipArchive::new(File::open(&trimmed)?)?;
         assert_eq!(archive.comment(), RECOVERY_COMMENT);

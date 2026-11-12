@@ -152,9 +152,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 if step_timing::exception_return(word) {
                     timing.levels.in_interrupt = false;
                 }
-                let timed = self.system_words.entry(word).or_default();
-                timed.accesses += 1;
-                timed.ticks += spent;
+                if slot != stela_compiler::block::ExitKind::FloatingPoint as usize {
+                    let timed = self.system_words.entry(word).or_default();
+                    timed.accesses += 1;
+                    timed.ticks += spent;
+                }
                 let key = step_timing::system_key(word);
                 self.system_exits.add(key, 1, spent, u64::from(closed));
             }

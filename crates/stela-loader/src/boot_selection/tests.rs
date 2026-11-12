@@ -378,3 +378,59 @@ fn recovery_boots_of_a_disk_without_recoveryos_are_refused() {
     assert!(log.contains("missing-boot-media"), "{log}");
     assert!(route("--system --safe-boot", None).is_err());
 }
+
+#[test]
+fn a_pending_bundle_repair_boots_macos_once_for_it_and_never_again_by_itself() {
+    let mut vars = variables(&[(Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_PENDING)]);
+    let selection = select(&vars).unwrap();
+    assert_eq!(selection.target, Target::MacOs { safe: false });
+    assert!(selection.bundle_repair);
+    let (options, log) = route(CONFIG, Some(&selection)).unwrap();
+    assert!(
+        options.ends_with(" --boot-command 1 --bundle-repair"),
+        "{options}"
+    );
+    assert!(log.contains("repair the Metal plugin"), "{log}");
+    // Recorded as attempted before the boot: a power loss in the middle
+    // leaves no request to repeat.
+    assert!(consume(&mut vars, &selection).unwrap());
+    assert_eq!(lookup(&vars, BUNDLE_REPAIR), Some(BUNDLE_REPAIR_ATTEMPTED));
+    let next = select(&vars).unwrap();
+    assert!(!next.bundle_repair);
+    assert!(!next.consumes());
+    let (plain, _) = route(CONFIG, Some(&next)).unwrap();
+    assert!(!plain.contains(BUNDLE_REPAIR_OPTION), "{plain}");
+}
+
+#[test]
+fn a_bundle_repair_waits_for_a_macos_boot_and_stela_cfg_cannot_ask_for_one() {
+    let vars = variables(&[
+        (Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_PENDING),
+        (Partition::System, ONE_TIME_BOOT_COMMAND, b"recover"),
+    ]);
+    let selection = select(&vars).unwrap();
+    assert_eq!(selection.target, Target::PairedRecovery);
+    assert!(!selection.bundle_repair);
+    assert!(
+        !selection
+            .assigned
+            .iter()
+            .any(|(name, _)| *name == BUNDLE_REPAIR)
+    );
+    // A disk without an installed system boots System Recovery, which
+    // leaves the request too.
+    let mut empty = select(&variables(&[(
+        Partition::System,
+        BUNDLE_REPAIR,
+        BUNDLE_REPAIR_PENDING,
+    )]))
+    .unwrap();
+    empty.missing_boot_media();
+    assert!(!empty.bundle_repair && empty.assigned.is_empty());
+    // A NUL-terminated value is the same request; others are none.
+    let terminated = variables(&[(Partition::Common, BUNDLE_REPAIR, b"pending\0")]);
+    assert!(select(&terminated).unwrap().bundle_repair);
+    let other = variables(&[(Partition::System, BUNDLE_REPAIR, b"done")]);
+    assert!(!select(&other).unwrap().bundle_repair);
+    assert!(route(&format!("{CONFIG} {BUNDLE_REPAIR_OPTION}"), None).is_err());
+}

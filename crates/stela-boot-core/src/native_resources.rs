@@ -144,8 +144,13 @@ const WINDOW_SHARE: u64 = 16;
 /// The window per runner where the host's memory allows it. A sign-in on 8
 /// PEs with 512 MiB (64 MiB per runner) compiled 45% of its installs again
 /// within one turn of the ring, the code lock waited 3.5 s per 10 s, and
-/// each part the ring took cost about 0.75 s of PE time.
-pub const WINDOW_PER_RUNNER: u64 = 128 * MIB;
+/// each part the ring took cost about 0.75 s of PE time. With 704 MiB (88
+/// MiB per runner) the ring evicted 31-51 thousand blocks a heartbeat and
+/// the lock waited 0.6-0.9 s; with 976 MiB, 22 thousand and 0.5 s. Each
+/// window byte also takes a heap byte for its block records, so 96 MiB per
+/// runner, between the two, gives the guest twice the 32 MiB it takes off
+/// each runner's window.
+pub const WINDOW_PER_RUNNER: u64 = 96 * MIB;
 /// The window per runner when [`WINDOW_PER_RUNNER`] would leave the guest
 /// under its floor ([`crate::host_memory::sizes`] falls back to it).
 pub const SMALL_WINDOW_PER_RUNNER: u64 = 64 * MIB;
@@ -278,14 +283,14 @@ mod tests {
     fn the_window_grows_with_the_host_and_its_runners_between_bounds() {
         for (free, cores, runners, window) in [
             (0, 1, 1, 64),
-            (6 * 1024, 2, 2, 256),
+            (6 * 1024, 2, 2, 192),
             (7936, 8, 8, 496),
             (12 * 1024, 8, 8, 768),
-            (16 * 1024, 8, 8, 1024),
-            (32 * 1024, 8, 8, 1024),
+            (16 * 1024, 8, 8, 768),
+            (32 * 1024, 8, 8, 768),
             (32 * 1024, 32, 32, 2048),
             (128 * 1024, 64, 64, 2048),
-            (128 * 1024, 64, 8, 1024),
+            (128 * 1024, 64, 8, 768),
         ] {
             let code = code_reservation(free * MIB, cores, runners).unwrap();
             assert_eq!(

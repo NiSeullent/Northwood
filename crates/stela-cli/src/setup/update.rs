@@ -32,7 +32,7 @@ use super::{
     restore_bundles, write_record,
 };
 use crate::efi;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{fmt::Write as _, fs, path::Path};
 use stela_loader::mount_interface::layout::Layout;
@@ -105,6 +105,7 @@ pub(super) struct UpdateOptions<'a> {
     pub(super) usb: &'a Path,
     pub(super) image_path: &'a Path,
     pub(super) ipsw: Option<&'a Path>,
+    pub(super) download_dir: Option<&'a Path>,
     pub(super) dry_run: bool,
 }
 
@@ -119,6 +120,7 @@ pub(super) fn update_stela(
         usb,
         image_path,
         ipsw,
+        download_dir,
         dry_run,
     } = options;
     let image = read_efi(environment, image_path)?;
@@ -126,10 +128,47 @@ pub(super) fn update_stela(
     let to = version_id(&image);
     let to_generation = environment.generation();
     ready(&record, usb)?;
+    let from_generation = record.generation();
+    // Restore bundles of the new generation for every machine of the active
+    // build while it has an install medium. Where their restore image comes
+    // from is decided before anything is downloaded or changed.
+    let mut next = record.clone();
+    next.bundle_schema = to_generation.schema;
+    next.bundle_revision = to_generation.revision;
+    let missing_restore = match from_generation == to_generation {
+        true => Vec::new(),
+        false => next.missing_restore_bundles(),
+    };
+    let lookup = super::sources::Lookup {
+        build: &record.build,
+        model: &record.model,
+        ipsw,
+        download_dir,
+        medium: record.active_medium(),
+    };
+    let source = match missing_restore.is_empty() {
+        true => None,
+        false => Some(
+            super::sources::locate(environment, &lookup).map_err(|error| {
+                anyhow::anyhow!(
+                    "this stela and stela.efi {to} boot bundles of {to_generation}, and this \
+                     setup's are {from_generation}, so the update prepares them again from the \
+                     macOS {} restore image; but {error:#}",
+                    record.build
+                )
+            })?,
+        ),
+    };
+    // Every bundle file goes into the cache before the stick changes, so a
+    // failed download leaves the old stela.efi and the old firmware.
+    let bundle_incomplete = stela_loader::host_firmware::reads_bundle(&image)
+        && super::firmware::bundle_status(&record.volume).is_err();
+    if !dry_run && bundle_incomplete {
+        super::firmware::prefetch_bundle(&image, Some(&record.volume))?;
+    }
     let esp = record.esp.clone();
     // A missing or damaged loader is what an update also puts right.
     let from = fs::read(esp.join(LOADER_PATH)).map_or("none".into(), |image| version_id(&image));
-    let from_generation = record.generation();
     let mut text = String::new();
     writeln!(text, "Stela update on {}:", esp.display())?;
     text.push_str(&super::fdr::prepare(&record, true)?);
@@ -163,10 +202,29 @@ pub(super) fn update_stela(
             }
             activate(&mut record, to)?;
             requested.provision(&esp, &image)?;
+            // An update whose bundle download stopped it is finished here.
+            for note in
+                super::firmware::provision_bundle(environment.host, &record.volume, &esp, &image)?
+            {
+                writeln!(text, "  firmware       {note}")?;
+            }
             text.push_str("Done.\n");
             return Ok(text);
         }
         writeln!(text, "  stela.efi      version {to} is already installed")?;
+        if bundle_incomplete {
+            writeln!(text, "  firmware       complete the firmware bundle")?;
+            if !dry_run {
+                for note in super::firmware::provision_bundle(
+                    environment.host,
+                    &record.volume,
+                    &esp,
+                    &image,
+                )? {
+                    writeln!(text, "  firmware       {note}")?;
+                }
+            }
+        }
         let spare = record
             .translations
             .as_ref()
@@ -194,27 +252,44 @@ pub(super) fn update_stela(
     } else {
         writeln!(text, "  stela.efi      version {from} -> {to}")?;
     }
-    // Restore bundles of the new generation for every machine of the active
-    // build while it has an install medium.
-    let mut next = record.clone();
-    next.bundle_schema = to_generation.schema;
-    next.bundle_revision = to_generation.revision;
-    let missing_restore = match from_generation == to_generation {
-        true => Vec::new(),
-        false => next.missing_restore_bundles(),
-    };
-    let prepared = if missing_restore.is_empty() {
+    if let Some(source) = &source {
+        writeln!(
+            text,
+            "  restore image  {}",
+            super::sources::describe(source, &record.build)
+        )?;
+    }
+    // A dry run prepares only from an image already on this computer: it
+    // reads nothing from the USB and downloads nothing.
+    let local = matches!(
+        source,
+        Some(super::sources::Source::Given(_) | super::sources::Source::Cached(_))
+    );
+    if dry_run && !local {
+        for &(kind, ecid) in &missing_restore {
+            writeln!(
+                text,
+                "  {:<14} {} ({to_generation}), replaces {from_generation}",
+                kind.label(),
+                bundle::directory_of(
+                    &record.volume,
+                    bundle::Identity {
+                        kind,
+                        build: &record.build,
+                        ecid,
+                        generation: to_generation
+                    }
+                )
+                .display(),
+            )?;
+        }
+    }
+    let prepared = if missing_restore.is_empty() || (dry_run && !local) {
         Vec::new()
     } else {
-        let Some(ipsw) = ipsw else {
-            bail!(
-                "this stela and stela.efi {to} boot bundles of {to_generation}, and this \
-                 setup's are {from_generation}. The update prepares new ones from the macOS {} \
-                 restore image: run {} (or --ipsw FILE in place of --fetch)",
-                record.build,
-                super::fix(usb, "update stela --fetch")
-            );
-        };
+        let source = source.as_ref().expect("missing bundles have a source");
+        let obtained = super::sources::obtain(environment, source, &lookup)?;
+        let ipsw = obtained.path.as_path();
         let mut prepared: Vec<Prepared> = Vec::new();
         for kind in bundle::RESTORE_KINDS {
             let ecids: Vec<_> = missing_restore
@@ -291,11 +366,17 @@ pub(super) fn update_stela(
     super::fdr::prepare(&record, false)?;
     efi::add_mount_in(&esp, &image, None, None, record.layout)?;
     activate(&mut record, to)?;
-    // A USB whose setup left its Wi-Fi network without firmware gets it now.
-    if record.wifi.is_some() {
-        super::firmware::provision_wifi_in(environment.host, &esp, record.layout, &image)?;
+    // An older USB, with a per-PC firmware set or none, gets the complete
+    // bundle.
+    for note in super::firmware::provision_bundle(environment.host, &record.volume, &esp, &image)? {
+        writeln!(text, "  firmware       {note}")?;
     }
-    requested.provision(&esp, &image)?;
+    if !stela_loader::host_firmware::reads_bundle(&image) {
+        requested.provision(&esp, &image)?;
+        if record.wifi.is_some() {
+            super::firmware::provision_wifi_in(environment.host, &esp, record.layout, &image)?;
+        }
+    }
     text.push_str("Done.\n");
     Ok(text)
 }

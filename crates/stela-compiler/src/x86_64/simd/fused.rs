@@ -6,8 +6,8 @@ use super::numerical::{
     emit_opcode, environment, jump, prepare_vector_input_range, prepare_vector_result_range,
     read_inputs, read_numerical_right, read_numerical_vector, reject_other_status,
     reject_product_status, resolve, restore_environment, restore_environment_with_product,
-    save_product_status, scalar_range_or_zero, sticky_inexact, sticky_result_check, test_control,
-    vector_normal_or_zero_range, zero_product_check,
+    save_product_status, scalar_ordered_range, sticky_inexact, sticky_result_check, test_control,
+    vector_ordered_range, zero_product_check,
 };
 use super::{Host, commit, packed};
 use crate::x86_64::asm::Code;
@@ -55,6 +55,11 @@ fn prepare_right(code: &mut Code, operand: &Operand) {
         operand.right,
         operand.right_lane,
     );
+    if operand.shape == Shape::Vector64 && operand.right_lane.is_some() {
+        // Inactive lanes multiply zeros, so an infinite element raises no
+        // host invalid there.
+        packed(code, Host::MoveQword, RIGHT, RIGHT);
+    }
 }
 
 fn prepare_negation(code: &mut Code, operand: &Operand) -> u8 {
@@ -125,18 +130,23 @@ pub(in crate::x86_64) fn emit(
     // FMA follow IEEE 754's signed-zero sums under the installed rounding
     // (an exact zero sum is +0, -0 rounding toward minus infinity, and a sum
     // of two zeros of one sign keeps it), a zero product adds exactly, and
-    // the excluded infinities keep 0 x inf out. A zero is not subnormal, so
-    // FZ and FIZ flush nothing, and neither side raises status for it.
+    // a zero is not subnormal, so FZ and FIZ flush nothing, and neither side
+    // raises status for it. An infinite input is exact too: its result is an
+    // infinity in every rounding mode, without status, unless it meets a zero
+    // factor or an opposite infinity, which raise the host's invalid (the
+    // separate product's too) and go to the helper; a finite product that
+    // overflowed raised overflow. The SSE2 product's own status rejects any
+    // rounding before the sum.
     for source in [LEFT, RIGHT, ADDEND] {
         if operand.shape == Shape::Scalar {
-            helper.push(scalar_range_or_zero(
+            helper.push(scalar_ordered_range(
                 code,
                 operand.format,
                 source,
                 INPUT_MINIMUM_EXPONENT,
             ));
         } else {
-            vector_normal_or_zero_range(
+            vector_ordered_range(
                 code,
                 operand.format,
                 operand.shape,
@@ -179,7 +189,7 @@ pub(in crate::x86_64) fn emit(
     let success = if operand.shape == Shape::Scalar {
         // An exact zero result raised no status; a nonzero one rounded to
         // zero raised underflow, which went to the helper above.
-        helper.push(scalar_range_or_zero(
+        helper.push(scalar_ordered_range(
             code,
             operand.format,
             LEFT,
@@ -190,7 +200,7 @@ pub(in crate::x86_64) fn emit(
         prepare_vector_result_range(code);
         // A zero result is exact: one that underflowed raised the host's
         // underflow status, which went to the helper above.
-        vector_normal_or_zero_range(
+        vector_ordered_range(
             code,
             operand.format,
             operand.shape,
@@ -245,7 +255,7 @@ pub(in crate::x86_64) fn emit(
 /// FMA3, whose single rounding is the guest's: the operation in the entry
 /// MXCSR, its result classification and the commit, which clears scalar
 /// upper bits as NEP is zero there. A rejected zero takes the out-of-line
-/// zero-product check. Returns the branches to the full path, to the helper
+/// zero-product check, and other rejected results the full path. Returns the branches to the full path, to the helper
 /// and past the full path, and those between the sticky path and the rest
 /// ([`ColdSplit`]).
 struct StickyPath {
@@ -276,7 +286,7 @@ fn sticky_path(code: &mut Code, operand: &Operand, target: TargetCpu, entry: Ent
         prepare_right(code, operand);
     }
     emit_checked_fma(code, operand, target);
-    let rejected = sticky_result_check(code, operand.format, operand.shape, LEFT, false);
+    let rejected = sticky_result_check(code, operand.format, operand.shape, LEFT, false, target);
     let resume = code.len();
     if operand.shape == Shape::Vector64 {
         packed(code, Host::MoveQword, LEFT, LEFT);
@@ -288,7 +298,10 @@ fn sticky_path(code: &mut Code, operand: &Operand, target: TargetCpu, entry: Ent
     let check = code.len();
     resolve(code, rejected, check);
     let mut crossing = vec![rejected];
-    let helper = zero_product_check(
+    // An infinite result may be exact: the full path tells, from its inputs
+    // and the host's status, rather than the helper.
+    let mut full = full;
+    full.extend(zero_product_check(
         code,
         &ZeroProduct {
             format: operand.format,
@@ -299,10 +312,10 @@ fn sticky_path(code: &mut Code, operand: &Operand, target: TargetCpu, entry: Ent
         },
         resume,
         &mut crossing,
-    );
+    ));
     StickyPath {
         full,
-        helper,
+        helper: vec![],
         done,
         crossing,
         cold,

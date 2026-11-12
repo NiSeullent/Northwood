@@ -759,7 +759,19 @@ fn a_media_key_unwraps_to_the_same_inline_key_only_on_its_machine_and_class() {
 fn rewrap(
     keys: &mut VolumeKeys,
     parameters: &[u8],
+    classes: (u32, u32),
+    wrapped: &[u8],
+    flags: u32,
+) -> Result<Vec<u8>> {
+    rewrap_with(keys, parameters, classes, [&[], &[]], wrapped, flags)
+}
+
+/// A REWRAP request with the old and new ephemeral keys `ephemerals`.
+fn rewrap_with(
+    keys: &mut VolumeKeys,
+    parameters: &[u8],
     (old, new): (u32, u32),
+    [ephemeral, new_ephemeral]: [&[u8]; 2],
     wrapped: &[u8],
     flags: u32,
 ) -> Result<Vec<u8>> {
@@ -771,8 +783,8 @@ fn rewrap(
         .word(u32::MAX - 4)
         .word(old)
         .word(new)
-        .blob(&[])
-        .blob(&[])
+        .blob(ephemeral)
+        .blob(new_ephemeral)
         .blob(wrapped)
         .word(flags)
         .blob(&[0; 28])
@@ -814,6 +826,39 @@ fn a_per_file_key_rewraps_to_another_class_of_its_volume() {
     let moved = rewrap(&mut keys, &parameters, (2, 3), &moved, 1 << 9).unwrap();
     assert!(unwrap_file_key(&mut keys, &VOLUME, 3, &moved).is_ok());
     assert!(rewrap(&mut keys, &[], (3, 2), &moved, 0).is_err());
+}
+
+#[test]
+fn a_scalable_key_rewraps_from_one_ekwk_to_another_as_a_clone_splits() {
+    // fs_rewrap_ek: the old and new ephemeral keys in the two blobs, the
+    // wrapped EK and flags 0x100.
+    let (mut keys, engine) = keys(1);
+    let (vek, _) = new_vek(&mut keys, &[], &[]);
+    load_class_keys(&mut keys, &vek);
+    let parameters = parameters(&VOLUME);
+    let [area, _, ephemeral, ek, _] = new_scalable(&mut keys, 4, &[]).unwrap();
+    let [_, _, new_ephemeral, _, _] = new_scalable(&mut keys, 2, &[]).unwrap();
+    let ephemerals = [&ephemeral[..], &new_ephemeral];
+    let moved = rewrap_with(&mut keys, &parameters, (4, 2), ephemerals, &ek, 0x100).unwrap();
+    assert_eq!(moved.len(), file_key::WRAPPED_EK_BYTES);
+    let [again, ..] = unwrap_scalable(&mut keys, 0, [&moved, &[], &new_ephemeral], 0x102).unwrap();
+    assert_eq!(cipher(&engine, &again), cipher(&engine, &area));
+    assert!(unwrap_scalable(&mut keys, 0, [&moved, &[], &ephemeral], 0x102).is_err());
+    // Classes are the ephemeral keys' and need not be named.
+    let back = [&new_ephemeral[..], &ephemeral];
+    let moved = rewrap_with(&mut keys, &parameters, (0, 0), back, &moved, 0x100).unwrap();
+    let [again, ..] = unwrap_scalable(&mut keys, 0, [&moved, &[], &ephemeral], 0x102).unwrap();
+    assert_eq!(cipher(&engine, &again), cipher(&engine, &area));
+    // A missing ephemeral key, keys with other flags, a wrong EKWK or a
+    // foreign key refuse.
+    let one = [&ephemeral[..], &[]];
+    assert!(rewrap_with(&mut keys, &parameters, (4, 2), one, &ek, 0x100).is_err());
+    assert!(rewrap(&mut keys, &parameters, (4, 2), &ek, 0x100).is_err());
+    assert!(rewrap_with(&mut keys, &parameters, (4, 2), ephemerals, &ek, 0).is_err());
+    let swapped = [&new_ephemeral[..], &ephemeral];
+    assert!(rewrap_with(&mut keys, &parameters, (2, 4), swapped, &ek, 0x100).is_err());
+    let foreign = [&ek[..], &new_ephemeral];
+    assert!(rewrap_with(&mut keys, &parameters, (4, 2), foreign, &ek, 0x100).is_err());
 }
 
 #[test]

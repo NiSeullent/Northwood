@@ -45,12 +45,16 @@ Stela currently models the Mac mini (M2) and runs macOS 27.
 
 1. Download the archive for your system from
    [Northwood releases](https://github.com/NiSeullent/Northwood/releases).
-2. On the PC that will run macOS, run `sudo ./northwood setup` on Linux or
-   macOS. On Windows, run `northwood.exe setup` or open `stela.exe` for the
-   installer wizard. The `stela setup` command also works.
+2. Run `sudo ./northwood setup` on Linux or macOS. On Windows, run
+   `northwood.exe setup` or double-click `stela.exe` for the installer wizard.
+   The `stela setup` command also works.
 3. Choose the USB stick, the macOS version and the Mac model, then confirm.
    Setup erases the USB stick.
 4. Boot the PC from the USB stick.
+
+To update an existing USB stick, download the new archive, plug in the stick,
+and run `sudo ./northwood setup update stela` on Linux or macOS, or
+`northwood.exe setup update stela` on Windows.
 
 The removable-media entry is `EFI/BOOT/BOOTX64.EFI`. With the bundled
 Northwood loader, a fresh setup writes `EFI/northwood/nwconfig.plist` and

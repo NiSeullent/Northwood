@@ -534,6 +534,27 @@ impl Link for Igc {
     }
 
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        self.receive_frame(<[u8]>::to_vec)
+    }
+
+    /// The stack's receive path: the frame is copied into its reused
+    /// buffer, so a received frame allocates nothing.
+    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
+        self.receive_frame(|bytes| {
+            frame.clear();
+            frame.extend_from_slice(bytes);
+        })
+        .map(|received| received.is_some())
+    }
+}
+
+impl Igc {
+    /// The next whole frame the controller wrote back, passed to `take`
+    /// while its buffer is still held.
+    fn receive_frame<T>(
+        &mut self,
+        mut take: impl FnMut(&[u8]) -> T,
+    ) -> Result<Option<T>, LinkError> {
         self.watchdog()?;
         loop {
             let index = self.receive.next;
@@ -553,6 +574,8 @@ impl Link for Igc {
                     let link = self.device.read32(ICR) & IMS_LSC != 0;
                     self.device.write32(EIMS, 1 << VECTOR);
                     if link {
+                        // This read cleared the cause the watchdog reads.
+                        self.link.link_changed();
                         self.watchdog()?;
                     }
                 }
@@ -562,7 +585,7 @@ impl Link for Igc {
             self.discarding = status & RX_EOP == 0;
             let frame = frame
                 .filter(|_| !discarded)
-                .map(|length| self.receive.buffer(index)[..length].to_vec());
+                .map(|length| take(&self.receive.buffer(index)[..length]));
             advanced::offer_receive(&mut self.receive, index);
             self.receive.advance();
             if let Some(tail) = self.receive.offered(index) {
@@ -789,6 +812,8 @@ mod tests {
         assert_ne!(registers[RCTL / 4] & RCTL_MPE, 0);
         // 256 sixteen-byte descriptors each, as IGC_DEFAULT_RXD/TXD.
         assert_eq!([registers[RDLEN / 4], registers[TDLEN / 4]], [4096; 2]);
+        let mut reused = Vec::with_capacity(MAX_FRAME);
+        let storage = reused.as_ptr();
         for sequence in 0..(DESCRIPTORS * 3) {
             let frame = vec![sequence as u8; 60 + sequence % 128];
             net.transmit(&frame).unwrap();
@@ -813,7 +838,14 @@ mod tests {
             net.receive
                 .descriptors
                 .write(index * DESCRIPTOR + 12, frame.len() as u16);
-            assert_eq!(net.receive().unwrap(), Some(frame));
+            if sequence % 2 == 0 {
+                assert_eq!(net.receive().unwrap(), Some(frame));
+            } else {
+                // The stack's path refills its own buffer in place.
+                assert_eq!(net.receive_reusing(&mut reused), Ok(true));
+                assert_eq!(reused, frame);
+                assert_eq!(reused.as_ptr(), storage);
+            }
             // Linux's IGC_RX_BUFFER_WRITE: one tail write per sixteen.
             if (sequence + 1) % 16 == 0 {
                 assert_eq!(registers[RDT / 4], index as u32);
@@ -837,6 +869,9 @@ mod tests {
         assert!(!net.carrier());
         assert!(net.transmit(&[0; 60]).is_err());
         assert!(net.receive().is_err());
+        reused.clone_from(&vec![7; 60]);
+        assert!(net.receive_reusing(&mut reused).is_err());
+        assert_eq!(reused, vec![7; 60]);
         assert!(station(u32::MAX, u32::MAX).is_none());
         assert_eq!(received(RX_DD | RX_EOP, 0), Some(None));
         assert_eq!(received(RX_DD | RX_EOP, (MAX_FRAME + 1) as u16), Some(None));

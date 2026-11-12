@@ -358,6 +358,18 @@ pub(super) fn map(
         image_rights.push((native_resources.sipi, native_resources.sipi + PAGE, PRESENT));
     }
     identity(frames, root, ram, &image_rights)?;
+    // The engine's drivers reach the DMA pages through the physmap, which
+    // maps RAM alone: pages outside it would fault in a driver call.
+    if let Some(storage) = storage
+        && !storage.dma.is_empty()
+        && !ram
+            .iter()
+            .any(|&(start, end)| start as u64 <= storage.dma.start && storage.dma.end <= end as u64)
+    {
+        return Err(refuse!(
+            "host DMA pages lie outside the engine's RAM physmap"
+        ));
+    }
     if let Some(storage) = storage {
         map_devices(frames, root, ram, &storage.mapped)?;
     }

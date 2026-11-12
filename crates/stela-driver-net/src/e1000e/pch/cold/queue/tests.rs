@@ -306,8 +306,17 @@ fn fragments_bad_status_and_bad_lengths_are_never_delivered() {
     inject(&mut net, 3, RX_DONE | RX_EOP, BUFFER + 1, 4);
     inject(&mut net, 4, RX_DONE | RX_EOP, 3, 5);
     inject(&mut net, 5, RX_DONE | RX_EOP, 64, 6);
-    assert_eq!(net.receive().unwrap(), Some(vec![6; 60]));
+    // The stack's reused buffer keeps its allocation and holds the frame.
+    let mut reused = vec![0x52; 1514];
+    let buffer = reused.as_ptr();
+    assert_eq!(net.receive_reusing(&mut reused), Ok(true));
+    assert_eq!(reused, [6; 60]);
+    assert_eq!(reused.as_ptr(), buffer);
     assert_eq!(net.next_rx, 6);
+    assert_eq!(net.receive_reusing(&mut reused), Ok(false));
+    assert_eq!(reused, [6; 60]);
+    inject(&mut net, 6, RX_DONE | RX_EOP, 64, 7);
+    assert_eq!(net.receive().unwrap(), Some(vec![7; 60]));
     assert_eq!(net.receive().unwrap(), None);
 }
 #[test]

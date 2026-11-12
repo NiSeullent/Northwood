@@ -4,6 +4,18 @@
 use super::*;
 
 #[test]
+fn phy_status_bit_7_is_tbi_only_on_the_8169_family() {
+    let at = |xid: u32| revision::detect(xid << 20).unwrap();
+    // RTL8169SC (version 06): the bit is its TBI interface.
+    assert!(tbi_mode(at(0x980), 0x80));
+    assert!(!tbi_mode(at(0x980), 0x7f));
+    // RTL8111H/8168M (version 46) and RTL8168G (40) set it with copper.
+    for xid in [0x541, 0x6c0, 0x4c0] {
+        assert!(!tbi_mode(at(xid), 0x80 | 0x13), "{xid:03x}");
+    }
+}
+
+#[test]
 fn exact_ordered_revision_fixtures_refuse_unknown_ancient_and_wrong_pci_family() {
     // Independent source-table cases include overlapping specific/generic masks.
     for (xid, version, fw) in [

@@ -1,6 +1,17 @@
 //! Download straight into FAT32 pieces; no complete IPSW is cached on the PC.
+//!
+//! Each piece is synced before the next starts, and [`RESUME_FILE`] beside
+//! the pieces records those done. A download that stopped goes on after the
+//! last recorded piece when the image on the server is the same one (URL,
+//! entity tag, size) and the piece size is too: the done pieces are read
+//! back from the USB to rebuild the whole image's hashes, and the rest is
+//! asked for by range. The catalog's SHA-1 of the whole image still decides.
 use super::*;
 use std::io;
+
+/// The record of a download's finished pieces, in its build's directory
+/// until the download is published.
+pub(super) const RESUME_FILE: &str = "download-resume.json";
 
 const BLOCK: usize = HASH_BLOCK_BYTES as usize;
 const WINDOW: usize = 16 * BLOCK;
@@ -18,7 +29,7 @@ impl Download {
         boot: &Path,
     ) -> Result<Self> {
         let (download, source) = Self::open_source(image)?;
-        restore::payload::trim(source, model, boot)?;
+        restore::payload::trim(source, model, boot, "Downloading boot files")?;
         ensure!(
             restore::payload::identity(boot, model)?.1 == download.image.build,
             "the catalog download contains a different macOS build"
@@ -62,6 +73,7 @@ impl Download {
             layout,
             model,
             &self.image,
+            &self.etag,
             self.bytes,
             piece_bytes,
         )
@@ -110,12 +122,79 @@ fn publish_fresh(
     Ok(written)
 }
 
+/// What [`RESUME_FILE`] holds: the object the pieces came from, and the
+/// pieces synced so far, in order.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Resume {
+    url: String,
+    etag: String,
+    total: u64,
+    piece_bytes: u64,
+    done: Vec<Piece>,
+}
+
+/// The pieces a stopped download of the same object finished, read back to
+/// rebuild their hashes into `whole_sha256`/`whole_sha1`, and their block
+/// hashes. Stops at the first piece that is missing or reads back
+/// otherwise; an unreadable or different record resumes nothing.
+fn resumed(
+    directory: &Path,
+    record: &Resume,
+    sizes: &[u64],
+    whole_sha256: &mut Sha256,
+    whole_sha1: &mut Sha1,
+) -> (Vec<Piece>, Vec<u8>) {
+    let Ok(previous) = stela_engine::read_json::<Resume>(&directory.join(RESUME_FILE)) else {
+        return (Vec::new(), Vec::new());
+    };
+    if (
+        &previous.url,
+        &previous.etag,
+        previous.total,
+        previous.piece_bytes,
+    ) != (&record.url, &record.etag, record.total, record.piece_bytes)
+    {
+        return (Vec::new(), Vec::new());
+    }
+    let offset: u64 = previous.done.iter().map(|piece| piece.bytes).sum();
+    let progress = crate::progress::Phase::bytes("Checking pieces already on the USB", offset);
+    let (mut pieces, mut blocks) = (Vec::new(), Vec::new());
+    for (index, piece) in previous.done.into_iter().enumerate() {
+        if sizes.get(index) != Some(&piece.bytes) {
+            break;
+        }
+        let partial = partial_path(directory, index);
+        // The partial is not longer than its piece, or its tail would sit
+        // where the next piece's first bytes go.
+        if fs::metadata(&partial).map(|meta| meta.len()).ok() != Some(piece.bytes) {
+            break;
+        }
+        let (mut hashes, mut sha256, mut sha1) =
+            (Hashes::default(), whole_sha256.clone(), whole_sha1.clone());
+        let read = stream_file(&partial, piece.bytes, &progress, |bytes| {
+            hashes.update(bytes);
+            sha256.update(bytes);
+            sha1.update(bytes);
+        });
+        let (digest, digests) = hashes.finish();
+        if read.is_err() || digest != piece.sha256 {
+            break;
+        }
+        (*whole_sha256, *whole_sha1) = (sha256, sha1);
+        pieces.push(piece);
+        blocks.extend(digests);
+    }
+    progress.finish();
+    (pieces, blocks)
+}
+
 fn write_from(
-    mut source: impl Read,
+    mut source: impl Read + Seek,
     volume: &Path,
     layout: VolumeLayout,
     model: &str,
     image: &restore::Image,
+    etag: &str,
     total: u64,
     piece_bytes: u64,
 ) -> Result<Written> {
@@ -136,12 +215,35 @@ fn write_from(
     if manifest_path.exists() {
         fs::remove_file(&manifest_path)?;
     }
-    let mut pieces = Vec::new();
-    let mut piece_blocks = Vec::new();
     let mut whole_sha256 = Sha256::new();
     let mut whole_sha1 = Sha1::new();
+    let mut record = Resume {
+        url: image.url.clone(),
+        etag: etag.into(),
+        total,
+        piece_bytes,
+        done: Vec::new(),
+    };
+    let resume_path = directory.join(RESUME_FILE);
+    let (mut pieces, mut piece_blocks) = resumed(
+        &directory,
+        &record,
+        &sizes,
+        &mut whole_sha256,
+        &mut whole_sha1,
+    );
+    let offset: u64 = pieces.iter().map(|piece| piece.bytes).sum();
+    if offset > 0 {
+        eprintln!(
+            "note: going on with the macOS download at {:.1} of {:.1} GB",
+            offset as f64 / 1e9,
+            total as f64 / 1e9
+        );
+        source.seek(SeekFrom::Start(offset))?;
+    }
     let progress = crate::progress::Phase::bytes("Downloading macOS onto USB", total);
-    for (index, &size) in sizes.iter().enumerate() {
+    progress.position(offset);
+    for (index, &size) in sizes.iter().enumerate().skip(pieces.len()) {
         let mut file = fs::File::create(partial_path(&directory, index))?;
         let mut hashes = Hashes::default();
         stream(&mut source, size, |bytes| {
@@ -153,12 +255,15 @@ fn write_from(
             Ok(())
         })?;
         file.sync_all()?;
+        crate::progress::drop_cached(&file);
         let (sha256, blocks) = hashes.finish();
         pieces.push(Piece {
             bytes: size,
             sha256,
         });
         piece_blocks.extend(blocks);
+        record.done.clone_from(&pieces);
+        efi::write_atomic(&resume_path, &serde_json::to_vec(&record)?, false)?;
     }
     ensure!(
         source.read(&mut [0])? == 0,
@@ -166,13 +271,15 @@ fn write_from(
     );
     let sha256 = hex::encode(whole_sha256.finalize());
     let sha1 = hex::encode(whole_sha1.finalize());
-    ensure!(
-        image
-            .sha1
-            .as_ref()
-            .is_some_and(|expected| expected.eq_ignore_ascii_case(&sha1)),
-        "download differs from the catalog digest"
-    );
+    if !image
+        .sha1
+        .as_ref()
+        .is_some_and(|expected| expected.eq_ignore_ascii_case(&sha1))
+    {
+        // Nothing of it can be trusted to go on from.
+        let _ = fs::remove_file(&resume_path);
+        bail!("download differs from the catalog digest");
+    }
     progress.finish();
     let mut completing = false;
     let inventory = (|| {
@@ -227,6 +334,10 @@ fn write_from(
     efi::write_atomic(&directory.join(BLOCK_HASHES_FILE), &inventory.blocks, false)?;
     let json = inventory.manifest.to_json();
     efi::write_atomic(&manifest_path, json.as_bytes(), false)?;
+    match fs::remove_file(&resume_path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
     Ok(Written {
         wrote: sizes.len(),
         kept: 0,
@@ -430,11 +541,12 @@ mod tests {
         let attempt = |source: &[u8]| {
             publish_fresh(&volume, &image.build, |scratch| {
                 write_from(
-                    source,
+                    io::Cursor::new(source),
                     scratch,
                     VolumeLayout::Legacy,
                     model,
                     &image,
+                    ETAG,
                     bytes.len() as u64,
                     HASH_BLOCK_BYTES,
                 )
@@ -470,6 +582,154 @@ mod tests {
                 .contains("already exists")
         );
         assert_eq!(manifest, fs::read(manifest_path)?);
+        Ok(())
+    }
+
+    const ETAG: &str = "\"pinned\"";
+
+    /// A seekable source that fails once it reaches `stop_at`, as a stopped
+    /// download does, and counts what was read and where it was sought.
+    struct Tracked {
+        data: io::Cursor<Vec<u8>>,
+        stop_at: Option<u64>,
+        seeks: Vec<u64>,
+        read: u64,
+    }
+
+    impl Tracked {
+        fn new(data: &[u8], stop_at: Option<u64>) -> Self {
+            Self {
+                data: io::Cursor::new(data.to_vec()),
+                stop_at,
+                seeks: Vec::new(),
+                read: 0,
+            }
+        }
+    }
+
+    impl Read for Tracked {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let at = self.data.position();
+            let room = match self.stop_at {
+                Some(stop) if at >= stop => return Err(io::Error::other("connection lost")),
+                Some(stop) => (stop - at) as usize,
+                None => usize::MAX,
+            };
+            let take = output.len().min(room);
+            let n = self.data.read(&mut output[..take])?;
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl Seek for Tracked {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            let at = self.data.seek(to)?;
+            self.seeks.push(at);
+            Ok(at)
+        }
+    }
+
+    fn synthetic(temp: &Path) -> Result<(Vec<u8>, restore::Image)> {
+        let ipsw = temp.join("source.ipsw");
+        crate::efi::synthetic_ipsw(&ipsw)?;
+        let bytes = fs::read(&ipsw)?;
+        let image = restore::Image {
+            version: "test".into(),
+            build: restore::payload::SYNTHETIC_BUILD.into(),
+            models: vec![restore::payload::SYNTHETIC_MODEL.into()],
+            url: "https://updates.cdn-apple.com/source.ipsw".into(),
+            sha1: Some(hex::encode(Sha1::digest(&bytes))),
+        };
+        Ok((bytes, image))
+    }
+
+    fn write(
+        volume: &Path,
+        image: &restore::Image,
+        etag: &str,
+        source: &mut Tracked,
+    ) -> Result<Written> {
+        let total = source.data.get_ref().len() as u64;
+        write_from(
+            source,
+            volume,
+            VolumeLayout::Legacy,
+            restore::payload::SYNTHETIC_MODEL,
+            image,
+            etag,
+            total,
+            HASH_BLOCK_BYTES,
+        )
+    }
+
+    #[test]
+    fn a_stopped_download_goes_on_after_its_last_synced_piece() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (bytes, image) = synthetic(temp.path())?;
+        let piece = HASH_BLOCK_BYTES;
+        assert!(bytes.len() as u64 > piece + 100, "the fixture needs pieces");
+        let volume = temp.path().join("usb");
+        let path = directory(&volume, &image.build);
+        // Stopped in the second piece: the first is synced and recorded.
+        let mut stopped = Tracked::new(&bytes, Some(piece + 100));
+        assert!(write(&volume, &image, ETAG, &mut stopped).is_err());
+        assert!(path.join(RESUME_FILE).exists());
+        let mut resumed = Tracked::new(&bytes, None);
+        let written = write(&volume, &image, ETAG, &mut resumed)?;
+        assert_eq!(resumed.seeks, [piece]);
+        assert_eq!(resumed.read, bytes.len() as u64 - piece);
+        assert!(!path.join(RESUME_FILE).exists());
+        let manifest = fs::read(path.join(MANIFEST_FILE))?;
+        assert_eq!(written.manifest_sha256, stela_formats::sha256(&manifest));
+        for (index, part) in bytes.chunks(piece as usize).enumerate() {
+            assert_eq!(fs::read(path.join(piece_name(index)))?, part);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_changed_object_or_a_damaged_piece_is_downloaded_again() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (bytes, image) = synthetic(temp.path())?;
+        let piece = HASH_BLOCK_BYTES;
+        let volume = temp.path().join("usb");
+        let path = directory(&volume, &image.build);
+        // The synced piece no longer reads back as recorded.
+        let mut stopped = Tracked::new(&bytes, Some(piece + 1));
+        assert!(write(&volume, &image, ETAG, &mut stopped).is_err());
+        fs::write(partial_path(&path, 0), vec![0; piece as usize])?;
+        let mut again = Tracked::new(&bytes, None);
+        write(&volume, &image, ETAG, &mut again)?;
+        assert!(again.seeks.is_empty());
+        assert_eq!(again.read, bytes.len() as u64);
+        // Another entity tag is another object.
+        let mut stopped = Tracked::new(&bytes, Some(piece + 1));
+        assert!(write(&volume, &image, ETAG, &mut stopped).is_err());
+        let mut fresh = Tracked::new(&bytes, None);
+        write(&volume, &image, "\"other\"", &mut fresh)?;
+        assert!(fresh.seeks.is_empty());
+        assert_eq!(fresh.read, bytes.len() as u64);
+        assert!(!path.join(RESUME_FILE).exists());
+        for (index, part) in bytes.chunks(piece as usize).enumerate() {
+            assert_eq!(fs::read(path.join(piece_name(index)))?, part);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_download_that_misses_the_catalog_digest_forgets_its_pieces() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (bytes, mut image) = synthetic(temp.path())?;
+        image.sha1 = Some(hex::encode(Sha1::digest(b"another image")));
+        let volume = temp.path().join("usb");
+        let mut source = Tracked::new(&bytes, None);
+        let error = write(&volume, &image, ETAG, &mut source).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "download differs from the catalog digest"
+        );
+        assert!(!directory(&volume, &image.build).join(RESUME_FILE).exists());
         Ok(())
     }
 
@@ -589,6 +849,12 @@ mod tests {
             partial: PathBuf,
         }
 
+        impl Seek for CorruptAtEof<'_> {
+            fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+                Err(io::Error::other("this source does not seek"))
+            }
+        }
+
         impl Read for CorruptAtEof<'_> {
             fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
                 if self.data.is_empty() {
@@ -610,11 +876,12 @@ mod tests {
         let volume = temp.path();
         assert!(
             write_from(
-                &data[..],
+                io::Cursor::new(&data[..]),
                 volume,
                 VolumeLayout::Legacy,
                 restore::payload::SYNTHETIC_MODEL,
                 &image,
+                ETAG,
                 data.len() as u64,
                 BLOCK as u64,
             )
@@ -639,6 +906,7 @@ mod tests {
             VolumeLayout::Legacy,
             restore::payload::SYNTHETIC_MODEL,
             &image,
+            ETAG,
             data.len() as u64,
             BLOCK as u64,
         )
@@ -666,11 +934,12 @@ mod tests {
         };
         let volume = temp.path().join("usb");
         let written = write_from(
-            &bytes[..],
+            io::Cursor::new(&bytes[..]),
             &volume,
             VolumeLayout::Northwood,
             restore::payload::SYNTHETIC_MODEL,
             &image,
+            ETAG,
             bytes.len() as u64,
             HASH_BLOCK_BYTES,
         )?;
@@ -725,11 +994,12 @@ mod tests {
             let bad = temp.path().join(format!("bad-{index}"));
             assert!(
                 write_from(
-                    &bad_bytes[..],
+                    io::Cursor::new(&bad_bytes[..]),
                     &bad,
                     VolumeLayout::Legacy,
                     restore::payload::SYNTHETIC_MODEL,
                     &image,
+                    ETAG,
                     bytes.len() as u64,
                     HASH_BLOCK_BYTES
                 )

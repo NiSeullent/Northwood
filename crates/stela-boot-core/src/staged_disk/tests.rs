@@ -708,3 +708,42 @@ fn a_completion_posted_after_a_fruitless_step_is_taken_by_the_next_step() {
     assert_eq!(model.finish(tag), Some(Ok(None)));
     assert_eq!(disk.borrow().calls, calls);
 }
+
+/// A step whose time is spent ends after the call it is in: the commands
+/// and completions left keep for the next steps, which take them in order.
+#[test]
+fn a_step_whose_time_is_spent_leaves_the_rest_to_the_next() {
+    let (mut model, worker, disk) = staged(DEPTH);
+    let tags: Vec<u32> = (0..4)
+        .map(|lba| model.start(write(lba, 1)).unwrap())
+        .collect();
+    // Out of time from the first look: one start a step.
+    let mut over = || true;
+    let step = worker.step_within(0, u64::MAX, &mut over);
+    assert_eq!((step.started, step.work), (1, true));
+    assert_eq!(disk.borrow().running.len(), 1);
+    assert_eq!(worker.step_within(0, u64::MAX, &mut over).started, 1);
+    // Time for two calls: two more starts.
+    let mut calls = 0;
+    let mut two = || {
+        calls += 1;
+        calls > 1
+    };
+    assert_eq!(worker.step_within(0, u64::MAX, &mut two).started, 2);
+    assert_eq!(disk.borrow().taken.len(), 4);
+    // Completions, too, are taken one a call while out of time.
+    disk.borrow_mut().auto = true;
+    disk.borrow_mut().complete_oldest();
+    disk.borrow_mut().complete_oldest();
+    let step = worker.step_within(0, 0, &mut over);
+    assert_eq!((step.started, step.finished), (0, 1));
+    let mut finished = 0;
+    for _ in 0..8 {
+        finished += worker.step_within(0, 0, &mut over).finished;
+    }
+    assert_eq!(finished, 3);
+    assert!(!worker.work());
+    for tag in tags {
+        assert!(model.finish(tag).unwrap().is_ok());
+    }
+}

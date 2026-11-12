@@ -454,6 +454,13 @@ fn powered_serial_controllers() -> (AppleDevices, Console, u64, [u64; 3]) {
 }
 
 #[test]
+fn the_host_copies_the_nor_image_only_when_a_nor_exists() {
+    let (mut d, ..) = powered_serial_controllers();
+    assert_eq!(d.nor_image(), Some(stela_soc_data::nor::Image::fresh()));
+    assert_eq!(AppleDevices::new().nor_image(), None);
+}
+
+#[test]
 fn pmgr_serial_constructor_hooks_gate_mmio_and_preserve_kept_configuration() {
     let (mut d, console, supply, [uart, i2c, spi]) = powered_serial_controllers();
     for (address, value) in [(uart, 3), (i2c + 0x30, 0x1234), (spi + 0x30, 7)] {
@@ -1999,6 +2006,45 @@ fn smc_places_a_running_wrapper_its_shared_page_and_watchdog() {
     assert_eq!(devices.read(0, WATCHDOG + 0xc, 4, 0), Ok(0));
     devices.write(0, WATCHDOG + 0xc, 4, 0, 0).unwrap();
     assert_eq!(devices.coprocessor_diagnostics().len(), 1);
+}
+
+#[test]
+fn the_kept_rtc_anchor_is_the_pmu_upcount_at_the_latest_board_entry() {
+    let hz = crate::counter::FREQUENCY_HZ;
+    let wall = stela_soc_data::pmu::WallClock {
+        unix_seconds: 1_792_000_000,
+        counter: 100,
+    };
+    let loaded = pmu::RtcAnchor {
+        ticks: 77 * pmu::RTC_HZ,
+        unix_seconds: Some(wall.unix_seconds - 60),
+    };
+    let epoch = pmu::RtcEpoch::anchored(100, Some(wall), Some(loaded));
+    assert_eq!(epoch.ticks, 137 * pmu::RTC_HZ);
+    let mut devices = AppleDevices::new();
+    devices.pmu_clocks.push(pmu::RtcClock::new(epoch).unwrap());
+    // No origin kept, or no board entry yet: nothing to keep.
+    assert_eq!(devices.rtc_anchor(), None);
+    devices.keep_rtc_origin(Some(wall), Some(loaded));
+    assert_eq!(devices.rtc_anchor(), None);
+    devices.observe_time(100 + 5 * hz, "test");
+    assert_eq!(
+        devices.rtc_anchor(),
+        Some(pmu::RtcAnchor {
+            ticks: 142 * pmu::RTC_HZ,
+            unix_seconds: Some(wall.unix_seconds + 5),
+        })
+    );
+    // The next boot, 100 s later on the host's clock, continues from it.
+    let next = pmu::RtcEpoch::anchored(
+        0,
+        Some(stela_soc_data::pmu::WallClock {
+            unix_seconds: wall.unix_seconds + 105,
+            counter: 0,
+        }),
+        devices.rtc_anchor(),
+    );
+    assert_eq!(next.ticks, 242 * pmu::RTC_HZ);
 }
 
 #[test]

@@ -49,56 +49,9 @@ pub(super) fn pci_device(instance: &str) -> Option<(u16, u16)> {
     Some((vendor, u16::from_str_radix(device, 16).ok()?))
 }
 
-/// The USB vendor and product IDs in a device's instance ID, such as
-/// `USB\VID_13D3&PID_3602\...` or a composite function's
-/// `USB\VID_13D3&PID_3602&MI_00\...`.
-pub(super) fn usb_device(instance: &str) -> Option<(u16, u16)> {
-    let ids = instance.strip_prefix("USB\\VID_")?;
-    let vendor = u16::from_str_radix(ids.get(..4)?, 16).ok()?;
-    let product = ids.get(4..)?.strip_prefix("&PID_")?.get(..4)?;
-    Some((vendor, u16::from_str_radix(product, 16).ok()?))
-}
-
-/// Whether a USB interface's compatible IDs, such as
-/// `USB\Class_FF&SubClass_01&Prot_01`, give it Broadcom's vendor-class HCI
-/// interface rather than the standard `USB\Class_E0&SubClass_01&Prot_01`.
-pub(super) fn vendor_hci_interface(compatible: &[String]) -> bool {
-    compatible
-        .iter()
-        .any(|id| id.eq_ignore_ascii_case("USB\\Class_FF&SubClass_01&Prot_01"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn instance_ids_name_usb_devices_and_compatible_ids_their_interface_class() {
-        assert_eq!(
-            usb_device("USB\\VID_13D3&PID_3602&MI_00\\7&1A2B3C4D&0&0000"),
-            Some((0x13d3, 0x3602))
-        );
-        assert_eq!(
-            usb_device("USB\\VID_0a5c&PID_21e8\\5C"),
-            Some((0x0a5c, 0x21e8))
-        );
-        for other in [
-            "BTHENUM\\{0000110E-0000-1000-8000-00805F9B34FB}",
-            "PCI\\VEN_8086&DEV_A0F0",
-            "USB\\VID_13D3",
-            "USB\\VID_13D3&PID_36",
-        ] {
-            assert_eq!(usb_device(other), None, "{other}");
-        }
-        let ids = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(vendor_hci_interface(&ids(&[
-            "USB\\Class_ff&SubClass_01&Prot_01",
-            "USB\\Class_ff&SubClass_01",
-        ])));
-        assert!(!vendor_hci_interface(&ids(&[
-            "USB\\Class_E0&SubClass_01&Prot_01",
-        ])));
-    }
 
     #[test]
     fn whole_disks_are_named_by_physical_drive_or_disk_number() {

@@ -313,4 +313,40 @@ mod tests {
         assert!(range(4096, 0xffff_ffff_e800, 48).is_err()); // nonaligned base
         assert!(range(0, 0xffff_ffff_a800, 48).is_err()); // mask hole
     }
+
+    /// A Ryzen desktop with 32 GiB: UC default, WB variable ranges below
+    /// TOP_MEM only, and SYSCFG 0x740000 (MtrrFixDramEn, MtrrVarDramEn,
+    /// MtrrTom2En, Tom2ForceMemTypeWB) making RAM from 4 GiB to TOP_MEM2
+    /// write-back without any variable range.
+    #[test]
+    fn ryzen_tom2_force_wb_covers_ram_above_4_gib() {
+        let mut image = image();
+        image.default = 0xc00;
+        image.cap = (1 << 8) | 2;
+        let state = image.amd.as_mut().unwrap();
+        state.syscfg = 0x74_0000;
+        state.top_mem = 0xe000_0000;
+        state.top_mem2 = 0x8_2000_0000;
+        set(&mut image, VARIABLE_BASE, 6);
+        set(&mut image, VARIABLE_BASE + 1, 0xffff_8000_0800);
+        set(&mut image, VARIABLE_BASE + 2, 0x8000_0006);
+        set(&mut image, VARIABLE_BASE + 3, 0xffff_c000_0800);
+        for (start, bytes, expected) in [
+            (1 << 20, (3 << 30) - (1 << 20), true),
+            (0xc000_0000, 4096, false),
+            (0xe000_0000, 4096, false),
+            (4 << 30, 32 << 20, true),
+            (0x8_2000_0000 - (32 << 20), 32 << 20, true),
+            (0x8_2000_0000, 4096, false),
+        ] {
+            assert_eq!(
+                image.writeback_ram(start, bytes).is_ok(),
+                expected,
+                "{start:x}/{bytes:x}"
+            );
+        }
+        // Without the force bit the same memory reads as the UC default.
+        image.amd.as_mut().unwrap().syscfg &= !amd::TOM2_WB;
+        assert!(image.writeback_ram(4 << 30, 4096).is_err());
+    }
 }

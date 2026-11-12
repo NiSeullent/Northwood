@@ -18,7 +18,6 @@ use stela_soc::machine::DartId;
 use stela_soc::machine::DcpextDma;
 use stela_soc::machine::DcpextNub;
 use stela_soc::machine::Range;
-use stela_soc::machine::RtcEpoch;
 use stela_soc::machine::Scanout;
 use stela_soc::machine::SepEntropy;
 use stela_soc::machine::SepProvisioning;
@@ -27,6 +26,7 @@ use stela_soc::machine::UsbId;
 use stela_soc::machine::memory_resources::MemoryResources;
 use stela_soc::machine::sep_state;
 use stela_soc::machine::typec;
+use stela_soc::machine::{RtcAnchor, RtcEpoch};
 use stela_soc_data::board::{Board, PmgrBankRefusal};
 use stela_soc_data::pmu::WallClock;
 
@@ -87,6 +87,9 @@ pub struct Inputs<'f> {
     /// The system counter at placement and the host's wall time at it.
     pub now: u64,
     pub wall: Option<WallClock>,
+    /// The PMU upcount the machine state kept (`pc::rtc_anchor`); `None`
+    /// on a new machine or one whose state an older Stela wrote.
+    pub rtc_anchor: Option<RtcAnchor>,
     /// The internal SSD's backing (`--storage`).
     pub backing: Option<Box<dyn BlockDevice>>,
     /// The SEP's state on the machine-state partition (`--nor`); volatile
@@ -145,6 +148,7 @@ pub fn devices_with_memory<C: ConsoleSink + 'static>(
         reset,
         now,
         wall,
+        rtc_anchor,
         backing,
         sep_state,
         sep_observe,
@@ -188,7 +192,7 @@ pub fn devices_with_memory<C: ConsoleSink + 'static>(
     )?;
     add_gpio_and_nor(&mut devices, board)?;
     add_storage(&mut devices, board, backing, build)?;
-    add_power_controllers(&mut devices, board, build, wall, now)?;
+    add_power_controllers(&mut devices, board, build, wall, rtc_anchor, now)?;
     add_processor_blocks(&mut devices, board, reset)?;
     for controller in &board.i2cs {
         devices.add_i2c(controller, firmware)?;
@@ -352,6 +356,7 @@ fn add_power_controllers(
     board: &Board,
     build: &'static stela_formats::builds::Build,
     wall: Option<WallClock>,
+    rtc_anchor: Option<RtcAnchor>,
     now: u64,
 ) -> Result<()> {
     if let Some(smc) = board.smc.as_ref() {
@@ -373,16 +378,16 @@ fn add_power_controllers(
                     .map(|(kind, window)| (pmu.sid, kind, vec![0; usize::from(window.bytes)]))
             })
             .collect::<Vec<_>>();
+        // The upcount goes on from the machine state's anchor, as a Mac's
+        // PMIC keeps counting while the machine is off.
         devices.add_spmi_with_resources(
             spmi,
             wall,
-            RtcEpoch {
-                counter: now,
-                ticks: 0,
-            },
+            RtcEpoch::anchored(now, wall, rtc_anchor),
             &history,
         )?;
     }
+    devices.keep_rtc_origin(wall, rtc_anchor);
     Ok(())
 }
 

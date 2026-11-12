@@ -12,6 +12,7 @@ const STORED: Changes = Changes {
     floating_point: false,
     stored: false,
     reads_kept: true,
+    pointer: false,
     unmodeled: None,
     irq_steering: None,
 };

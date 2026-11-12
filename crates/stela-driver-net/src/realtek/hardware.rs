@@ -83,22 +83,26 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
             self.registers.write16(INTERRUPT_MASK, events);
         }
     }
-    /// rtl_get_events and rtl_ack_events for `events`: those pending,
-    /// cleared. A later event raises the interrupt again.
-    pub fn acknowledge(&self, events: u16) -> u16 {
-        if self.revision.nbase() {
-            let pending = self.registers.read32(NBASE_INTERRUPT_STATUS) & u32::from(events);
-            if pending != 0 {
-                self.registers.write32(NBASE_INTERRUPT_STATUS, pending);
-            }
-            pending as u16
+    /// rtl_get_events and rtl_ack_events of the status read: every pending
+    /// event, cleared at the register's own width, so a later one raises
+    /// the interrupt again. Returns the status's low word, which holds the
+    /// events every chip has. A low word of all ones is a function that has
+    /// left the bus, which rtl8169_interrupt leaves alone.
+    pub fn acknowledge(&self) -> u16 {
+        let pending = if self.revision.nbase() {
+            self.registers.read32(NBASE_INTERRUPT_STATUS)
         } else {
-            let pending = self.registers.read16(INTERRUPT_STATUS) & events;
-            if pending != 0 {
-                self.registers.write16(INTERRUPT_STATUS, pending);
-            }
-            pending
+            u32::from(self.registers.read16(INTERRUPT_STATUS))
+        };
+        if pending == 0 || pending as u16 == u16::MAX {
+            return 0;
         }
+        if self.revision.nbase() {
+            self.registers.write32(NBASE_INTERRUPT_STATUS, pending);
+        } else {
+            self.registers.write16(INTERRUPT_STATUS, pending as u16);
+        }
+        pending as u16
     }
     pub fn efuse_read(&self, address: u16) -> Result<u8, BlockError> {
         if address > 0x03ff {

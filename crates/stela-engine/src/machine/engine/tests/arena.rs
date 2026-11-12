@@ -639,7 +639,9 @@ fn a_part_of_interleaved_pages_retires_in_steps_that_visit_each_page_once() {
         "{visits} visits for {} blocks, {indexed} indexed",
         evicted.len()
     );
-    assert!(step <= 1024 + FETCH_PAGE / 4, "{step} visits in one step");
+    // A step stays within its budget, but for one page index list's share.
+    let budget = super::super::code_cache::STEP_VISITS;
+    assert!(step <= budget + FETCH_PAGE / 4, "{step} visits in one step");
     assert!(
         evicted
             .iter()
@@ -1725,7 +1727,13 @@ fn a_block_whose_thunk_fills_its_part_is_published_in_a_part_that_stays() {
     let id = machine.variant_id(variant);
     let identity = super::super::churn::identity(pc, physical, id.0);
     let gone = super::super::churn::Gone::Ring;
-    code.ghosts.gone(identity, 0, ring.generation(), gone);
+    code.ghosts.gone(
+        &mut Default::default(),
+        identity,
+        0,
+        ring.generation(),
+        gone,
+    );
     let outs: u64 = ring.outs().iter().sum();
     let slot = fetched(&mut machine, pc);
     let block = &code.blocks[slot];

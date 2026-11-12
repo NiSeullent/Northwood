@@ -35,7 +35,7 @@ impl Setup {
 enum Command {
     /// Report everything about the setup and check it, changing nothing;
     /// fails when something needs fixing.
-    Status(Usb),
+    Status(Found),
     /// Put back what the setup record says (stela.cfg, the startup choices,
     /// damaged boot files); with `--fetch` or `--ipsw`, also prepare the
     /// active build's restore bundles again and put back a damaged install
@@ -53,8 +53,9 @@ enum Command {
     #[command(subcommand)]
     State(State),
     /// Print the boot logs: the USB's own, then the one stela.efi keeps in
-    /// the install's machine state.
-    BootLog(Machine),
+    /// the install's machine state. Without --usb, every disk of this
+    /// computer is read directly.
+    BootLog(BootLog),
     /// Change the settings of an existing setup.
     Configure(Configure),
     /// Install host-device firmware for the PC onto an existing USB.
@@ -74,7 +75,7 @@ impl Command {
             Self::Uninstall(command) => command.request(Action::Uninstall),
             Self::Nvram(command) => command.request(),
             Self::State(command) => command.request(),
-            Self::BootLog(command) => command.request(Action::BootLog),
+            Self::BootLog(command) => command.request(),
             Self::Configure(command) => command.request(),
             Self::HostFirmware(command) => command.request(),
             Self::Swap(Swap::Inspect(inspect)) => Request {
@@ -135,6 +136,27 @@ impl Usb {
         Request {
             action,
             usb: self.usb,
+            ..Request::default()
+        }
+    }
+}
+
+/// The USB a command that changes nothing it cannot put back acts on:
+/// without `--usb`, the one mounted volume of this computer's disks that
+/// holds a Stela setup (`find_setups`).
+#[derive(Args)]
+struct Found {
+    /// The USB's EFI partition, or another mounted volume of the same USB.
+    /// Without it, the USB is found when exactly one disk holds a setup.
+    #[arg(long, value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from))]
+    usb: Option<PathBuf>,
+}
+
+impl Found {
+    fn request(self, action: Action) -> Request {
+        Request {
+            action,
+            usb: self.usb.unwrap_or_default(),
             ..Request::default()
         }
     }
@@ -292,6 +314,40 @@ impl Machine {
     }
 }
 
+/// `boot-log`: the setup and install to read, and where the report goes.
+#[derive(Args)]
+struct BootLog {
+    /// The USB's EFI partition, or another mounted volume of the same USB.
+    /// Without it, every disk of this computer is read directly, so the USB
+    /// only needs to be plugged in.
+    #[arg(long, value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from))]
+    usb: Option<PathBuf>,
+    /// With --usb: the install to read (the default install otherwise).
+    #[arg(long, requires = "usb")]
+    install: Option<String>,
+    /// The install's machine-state partition, when this computer names it
+    /// differently than setup found it by its GUID and disk serial.
+    #[arg(long, value_parser = partition_name, requires = "usb", hide = true)]
+    nor: Option<String>,
+    /// Write the logs to this file instead of the terminal, to attach to a
+    /// report.
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
+}
+
+impl BootLog {
+    fn request(self) -> Request {
+        Request {
+            action: Action::BootLog,
+            usb: self.usb.unwrap_or_default(),
+            install: self.install,
+            nor: self.nor,
+            output: self.output,
+            ..Request::default()
+        }
+    }
+}
+
 /// Create a setup: the wizard without `--usb`.
 #[derive(Args)]
 struct Create {
@@ -383,7 +439,8 @@ struct Create {
     volume_swap_bytes: Option<u64>,
     /// The model or size, as setup shows it, of the whole disk `--usb`
     /// names, which erasing a removable disk other than a USB (an SD card,
-    /// a FireWire or Thunderbolt disk) needs typed back.
+    /// a FireWire or Thunderbolt disk), or any disk without a terminal to
+    /// ask at, needs typed back.
     #[arg(long, value_name = "MODEL|SIZE")]
     confirm_disk: Option<String>,
 }
@@ -422,7 +479,7 @@ impl Create {
 #[derive(Args)]
 struct Repair {
     #[command(flatten)]
-    usb: Usb,
+    usb: Found,
     #[command(flatten)]
     image: Image,
     /// Download the restore image from Apple to prepare the restore files
@@ -468,9 +525,11 @@ impl Repair {
 
 #[derive(Subcommand)]
 enum Update {
-    /// Replace `stela.efi` (`--efi`, or the one built into `stela`); `--ipsw`
-    /// or `--fetch` lets it prepare the boot bundles again when it reads a
-    /// new bundle schema or this `stela` prepares a new bundle revision.
+    /// Replace `stela.efi` (`--efi`, or the one built into `stela`). When it
+    /// reads a new bundle schema or this `stela` prepares a new bundle
+    /// revision, the boot bundles are prepared again from `--ipsw`, an image
+    /// already downloaded, the USB's own copy of macOS, or else the image's
+    /// boot files downloaded alone.
     Stela(UpdateStela),
     /// Replace Install macOS's build with a new one (`--fetch` or `--ipsw`):
     /// its install medium and restore bundles replace the old build's.
@@ -504,15 +563,15 @@ impl Update {
 #[derive(Args)]
 struct UpdateStela {
     #[command(flatten)]
-    usb: Usb,
+    usb: Found,
     /// The `stela.efi` to install instead of the one built into `stela`.
     #[arg(long, hide = true)]
     efi: Option<PathBuf>,
     #[command(flatten)]
     image: Image,
-    /// Download the restore image from Apple, to prepare the boot files
-    /// again when the new stela.efi needs it.
-    #[arg(long, conflicts_with = "ipsw")]
+    /// Accepted for older instructions: the update downloads what it needs
+    /// by itself.
+    #[arg(long, conflicts_with = "ipsw", hide = true)]
     fetch: bool,
     /// Show what would change, and change nothing.
     #[arg(long)]
@@ -522,7 +581,7 @@ struct UpdateStela {
 #[derive(Args)]
 struct UpdateOs {
     #[command(flatten)]
-    usb: Usb,
+    usb: Found,
     #[command(flatten)]
     image: Image,
     /// Show what would change, and change nothing.
@@ -701,7 +760,7 @@ enum HostFirmware {
         #[arg(value_name = "DIRECTORY")]
         directory: PathBuf,
         #[command(flatten)]
-        usb: Usb,
+        usb: Found,
         /// Show what would change, and change nothing.
         #[arg(long)]
         dry_run: bool,
@@ -709,17 +768,17 @@ enum HostFirmware {
     /// Provision pinned vendor firmware from the target PC's inventory,
     /// a known hardware profile or an NVIDIA chip name.
     Fetch {
-        #[arg(value_name = "REQUIREMENTS", required_unless_present_any = ["gpu", "profile"])]
+        #[arg(value_name = "REQUIREMENTS")]
         requirements: Option<PathBuf>,
-        /// Also keep what the USB holds, and add the GPU firmware this NVIDIA
-        /// chip needs, such as ga104. A boot without it names the chip.
+        /// Kept for older instructions: the firmware bundle holds every
+        /// supported chip's files, which this command completes.
         #[arg(long, value_name = "CHIP")]
         gpu: Option<String>,
         /// Add the pinned firmware candidates for the target hardware profile.
         #[arg(long, value_enum)]
         profile: Option<firmware::Profile>,
         #[command(flatten)]
-        usb: Usb,
+        usb: Found,
         /// Cache for pinned host firmware images and redistribution notices.
         #[arg(long, value_name = "DIRECTORY")]
         cache: Option<PathBuf>,

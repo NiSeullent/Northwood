@@ -547,6 +547,38 @@ impl<'a> Verified<'a> {
                 self.manifest.top_of_kernel_data, machine.ram_bytes
             )));
         }
+        static ZEROES: [u8; 16 * 1024] = [0; 16 * 1024];
+        // iBoot hands its carveouts over blank, and their readers take
+        // fresh state from them: SPTM's `sptm_uat_set_ctx_id` panics
+        // (`VIOLATION_UAT_ILLEGAL_SET_CTX_ID`) when the GPU's TTBAT
+        // (`gpu-region`) shows a free slot's valid bit set. Guest DRAM
+        // holds what its backing held before, the last system's data after
+        // a warm restart or memory training's patterns, so blank each
+        // carveout before the regions load: the boot manifest's lies in
+        // the loaded-object carveout.
+        for carveout in &self.manifest.carveouts {
+            let fail = |reason: &str| {
+                BundleError::Machine(format!(
+                    "carveout {:#x} at {:#x} {reason}",
+                    carveout.id, carveout.base
+                ))
+            };
+            let end = carveout
+                .base
+                .checked_add(carveout.bytes)
+                .ok_or_else(|| fail("overflows"))?;
+            if carveout.base < machine.dram_base || end > ram_end {
+                return Err(fail("lies outside backed guest DRAM"));
+            }
+            let mut at = carveout.base;
+            while at < end {
+                let chunk = (end - at).min(ZEROES.len() as u64) as usize;
+                if !write(at, &ZEROES[..chunk]) {
+                    return Err(fail("could not be blanked: guest RAM write failed"));
+                }
+                at += chunk as u64;
+            }
+        }
         let mut regions = Vec::with_capacity(self.manifest.regions.len());
         for (region, &bytes) in self.manifest.regions.iter().zip(&self.regions) {
             let fail = |reason: &str| BundleError::Region {
@@ -565,7 +597,6 @@ impl<'a> Verified<'a> {
             }
             // Reserved and zero-fill regions can be much larger than
             // their file bytes. Stream the zeros without allocating a tail.
-            static ZEROES: [u8; 16 * 1024] = [0; 16 * 1024];
             let mut tail = region.guest_pa + region.bytes;
             while tail < end {
                 let chunk = (end - tail).min(ZEROES.len() as u64) as usize;

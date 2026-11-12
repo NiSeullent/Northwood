@@ -193,6 +193,15 @@ impl NativeProcessorState<'_> {
                 monitors.sync(now, cpu.retired, waiting);
             }
         }
+        // The core performance counts carry to the next monitor update,
+        // which adds them to the board's storage (`Machine::sync_monitor`).
+        let aon_controls = cpu.aon.as_ref().map(|_| cpu.apple.impdef.aon_controls());
+        if let (Some(aon), Some(controls)) = (cpu.aon.as_mut(), aon_controls)
+            && (aon.counting() || controls.enabled)
+        {
+            let now = clock.read(|| self.host.counter());
+            aon.sync(now, cpu.retired, waiting, controls);
+        }
         if plan.watch_changed {
             *self.translation_generation = plan.generation;
             self.host.invalidate_translations();

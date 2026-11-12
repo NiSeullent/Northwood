@@ -43,9 +43,10 @@ fn every_host_size_keeps_the_parts_in_bounds_and_the_guest_above_its_floor() {
             free
         );
         // The pool maps each sharer's guest DRAM once, or its base and a
-        // 160th of it if less, up to its cap.
+        // halves' sizes if less, up to its cap.
         let sharers = (runners as u64).min(POOL_SHARERS);
-        let each = (sizes.guest / POOL_SHARE).min(POOL_BASE + sizes.guest / POOL_GROWTH);
+        let (lower, upper) = pool_halves(sizes.guest);
+        let each = (sizes.guest / POOL_SHARE).min(lower + upper);
         let wanted = sharers * each;
         let cap = sharers * POOL_PER_RUNNER;
         let floor = POOL_FLOOR.max(runners as u64 * POOL_RUNNER_FLOOR);
@@ -70,15 +71,15 @@ fn an_8_gib_host_gives_the_guest_what_the_parts_leave() {
 }
 
 #[test]
-fn a_16_gib_host_takes_a_sixteenth_for_its_window_and_raises_the_heap_floor() {
+fn a_16_gib_host_takes_96_mib_per_runner_for_its_window_and_raises_the_heap_floor() {
     let sizes = sizes(free(16), 8, 8).unwrap();
-    // A sixteenth (992 MiB, under 8 runners' 128 MiB), and each executor's
-    // 2 MiB of its own.
-    assert_eq!(sizes.code.window, 992 * MIB);
-    assert_eq!(sizes.code.bytes, 1008 * MIB);
-    // The floor plus a byte per window byte past 512 MiB: a twelfth, the
-    // window and 16 MiB per PE are under it.
-    assert_eq!(sizes.heap, HEAP_FLOOR + 480 * MIB);
+    // 8 runners' 96 MiB (768 MiB, under a sixteenth's 992 MiB), and each
+    // executor's 2 MiB of its own.
+    assert_eq!(sizes.code.window, 768 * MIB);
+    assert_eq!(sizes.code.bytes, 784 * MIB);
+    // The floor plus a byte per window byte past 512 MiB: a twenty-fourth,
+    // the window and 16 MiB per PE are under it.
+    assert_eq!(sizes.heap, HEAP_FLOOR + 256 * MIB);
     assert!(sizes.guest > 10 * GIB);
 }
 
@@ -89,7 +90,7 @@ fn a_12_gib_8_core_host_takes_a_larger_window_and_heap_from_its_guest() {
     let sizes = sizes(11514 * MIB, 8, 8).unwrap();
     assert_eq!(
         [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB),
-        [3008, 720, 858, 6928]
+        [3008, 720, 722, 7064]
     );
 }
 
@@ -97,7 +98,7 @@ fn a_12_gib_8_core_host_takes_a_larger_window_and_heap_from_its_guest() {
 /// 64 MiB per runner, and boots where it booted before.
 #[test]
 fn a_host_short_of_the_larger_window_falls_back_to_the_smaller() {
-    // Two runners near the floor: 256 MiB of window would leave the guest
+    // Two runners near the floor: 192 MiB of window would leave the guest
     // under 3 GiB, 128 MiB does not.
     let short = (5 * GIB / MIB..8 * GIB / MIB)
         .step_by(16)
@@ -123,12 +124,12 @@ fn sizes_of(free: u64) -> Sizes {
 #[test]
 fn a_128_gib_host_grows_the_heap_with_its_share_window_and_pes() {
     let sizes = sizes(free(128), 8, 8).unwrap();
-    let heap = free(128) / HEAP_SHARE + HEAP_PER_WINDOW * 1024 * MIB + 8 * PE_HEAP;
+    let heap = free(128) / HEAP_SHARE + HEAP_PER_WINDOW * 768 * MIB + 8 * PE_HEAP;
     assert_eq!(sizes.heap, heap / ALIGNMENT * ALIGNMENT);
     assert!(HEAP_FLOOR < sizes.heap && sizes.heap < HEAP_CEILING);
-    assert_eq!(sizes.code.bytes, 1040 * MIB);
-    // Each runner's base and a 160th of the guest's 106 GiB, not a 64th.
-    assert_eq!(sizes.pool, 5924 * MIB);
+    assert_eq!(sizes.code.bytes, 784 * MIB);
+    // Each runner's halves for the guest's 115 GiB, not a 64th.
+    assert_eq!(sizes.pool, 2022 * MIB);
     assert!(sizes.pool < 8 * POOL_PER_RUNNER);
     assert!(sizes.guest > 100 * GIB);
 }
@@ -140,25 +141,25 @@ fn a_128_gib_host_grows_the_heap_with_its_share_window_and_pes() {
 fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
     for (runners, free, expected) in [
         (2, 4, [1518, 68, 76, 2434]),
-        (2, 8, [2560, 260, 162, 5210]),
-        (2, 16, [2560, 260, 292, 13272]),
-        (2, 30, [2848, 260, 466, 27146]),
-        (2, 128, [11210, 260, 1602, 118000]),
+        (2, 8, [2496, 196, 166, 5334]),
+        (2, 16, [2496, 196, 198, 13494]),
+        (2, 30, [2496, 196, 240, 27788]),
+        (2, 128, [5684, 196, 524, 124668]),
         (8, 4, [1528, 144, 268, 2156]),
         (8, 8, [2816, 528, 538, 4310]),
-        (8, 16, [3328, 1040, 1058, 10958]),
-        (8, 30, [3712, 1040, 1724, 24244]),
-        (8, 128, [12074, 1040, 6104, 111854]),
+        (8, 16, [3072, 784, 776, 11752]),
+        (8, 30, [3072, 784, 942, 25922]),
+        (8, 128, [6356, 784, 2068, 121864]),
         (24, 4, [1152, 72, 64, 2792]),
         (24, 8, [2816, 560, 768, 4048]),
-        (24, 16, [3328, 1072, 1058, 10926]),
-        (24, 30, [4864, 1968, 1624, 22264]),
-        (24, 128, [13354, 2096, 5992, 109630]),
+        (24, 16, [3328, 1072, 770, 11214]),
+        (24, 30, [4224, 1968, 916, 23612]),
+        (24, 128, [7892, 2096, 2034, 119050]),
         (64, 4, [1152, 72, 64, 2792]),
         (64, 8, [3520, 640, 1024, 3008]),
-        (64, 16, [3412, 1152, 2048, 9772]),
-        (64, 30, [5504, 2048, 2048, 21120]),
-        (64, 128, [13994, 2176, 5958, 108944]),
+        (64, 16, [3328, 1152, 2048, 9856]),
+        (64, 30, [4224, 2048, 2048, 22400]),
+        (64, 128, [8532, 2176, 2048, 118316]),
     ] {
         let sizes = sizes(free * GIB, runners, runners).unwrap();
         let split = [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB);
@@ -172,23 +173,25 @@ fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
     }
 }
 
-/// The splits of measured boots' free RAM on 8 PEs, with what they gave
-/// before the heap floor followed smaller windows down and the pool grew
-/// by a 160th of the guest past its base:
+/// The splits of measured boots' free RAM on 8 PEs, and the guest MiB each
+/// boot gave:
 /// - the 8 GiB VM, `HOST MEMORY free=7354M heap=2816M code=464M pool=452M
 ///   guest=3622M`: 58 MiB more guest;
 /// - an 8 GB PC (7544 MiB free): 44 MiB more;
 /// - the 12 GiB VM, `free=11514M heap=3008M code=720M pool=864M
-///   guest=6922M`: 6 MiB more;
+///   guest=6922M`: 42 MiB more;
+/// - the 16 GiB VM, `free=15710M heap=3280M code=992M pool=1032M
+///   guest=10406M`: 596 MiB more;
 /// - the 32 GB PC, `free=30242M heap=3672M code=1040M pool=2836M
-///   guest=22694M`: 1134 MiB more.
+///   guest=22694M`: 2726 MiB more.
 #[test]
 fn measured_boots_split_as_expected() {
     for (free, expected) in [
         (7354, [2752, 464, 458, 3680]),
         (HOST_8_GB / MIB, [2768, 480, 476, 3820]),
-        (11514, [3008, 720, 858, 6928]),
-        (30242, [3672, 1040, 1702, 23828]),
+        (11514, [3008, 720, 722, 7064]),
+        (15710, [3072, 784, 768, 11086]),
+        (30242, [3072, 784, 938, 25448]),
     ] {
         let sizes = sizes(free * MIB, 8, 8).unwrap();
         assert_eq!(
@@ -199,29 +202,30 @@ fn measured_boots_split_as_expected() {
     }
 }
 
-/// Installed GiB and cores to the split, and the guest MiB they gave before
-/// (8 GiB: +248 at 2 cores, +14 at 4, +16 at 8; 16 GiB: +182 at 4, +246 at
-/// 8; 32 GiB: +1220; 64 GiB: +3068; 128 GiB: +2268).
+/// Installed GiB and cores to the split, and the guest MiB the sizing of
+/// v0.1.0 gave (8 GiB: +372 at 2 cores, +226 at 4, +16 at 8; 16 GiB: +560
+/// at 4, +878 at 8; 32 GiB: +2990; 64 GiB: +8160; 128 GiB: +12302).
 #[test]
 fn host_sizes_split_as_expected() {
     for (installed, cores, expected, before) in [
-        (8, 2, [2560, 260, 154, 4962], 4714),
-        (8, 4, [2800, 504, 272, 4360], 4346),
+        (8, 2, [2496, 196, 158, 5086], 4714),
+        (8, 4, [2688, 392, 284, 4572], 4346),
         (8, 8, [2800, 512, 512, 4112], 4096),
-        (16, 4, [2816, 520, 554, 11982], 11800),
-        (16, 8, [3296, 1008, 1038, 10530], 10284),
-        (32, 8, [3796, 1040, 1768, 25140], 23920),
-        (64, 8, [6442, 1040, 3154, 52852], 49784),
-        (128, 8, [11732, 1040, 5924, 108280], 106012),
+        (16, 4, [2688, 392, 392, 12400], 11800),
+        (16, 8, [3072, 784, 770, 11246], 10284),
+        (32, 8, [3072, 784, 954, 26934], 23920),
+        (64, 8, [3540, 784, 1316, 57848], 49784),
+        (128, 8, [6186, 784, 2022, 117984], 106012),
     ] {
         let sizes = sizes(free(installed), cores, cores).unwrap();
         let split = [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB);
         assert_eq!(split, expected, "{installed} GiB, {cores} cores");
         assert!(split[3] > before, "{installed} GiB, {cores} cores");
-        // From 16 GiB up each runner's pool halves hold at least the 52 MiB
-        // lower half the 12 GiB VM filled.
+        // From 16 GiB up each runner's user half holds at least the 52 MiB
+        // the 12 GiB VM filled, beside its kernel half.
         if installed >= 16 {
-            assert!(sizes.pool / cores as u64 / 2 >= 52 * MIB);
+            let per = sizes.pool / cores as u64;
+            assert!(per - upper_half(per, sizes.guest, 4096) >= 52 * MIB);
         }
     }
 }
@@ -230,9 +234,9 @@ fn host_sizes_split_as_expected() {
 fn a_2_tib_host_caps_every_part() {
     let sizes = sizes(free(2048), 8, 8).unwrap();
     assert_eq!(sizes.heap, HEAP_CEILING);
-    assert_eq!(sizes.code.bytes, 1040 * MIB);
+    assert_eq!(sizes.code.bytes, 784 * MIB);
     assert_eq!(sizes.pool, 8 * POOL_PER_RUNNER);
-    assert_eq!(sizes.guest, free(2048) - 24 * GIB - 1040 * MIB);
+    assert_eq!(sizes.guest, free(2048) - 24 * GIB - 784 * MIB);
 }
 
 #[test]
@@ -422,7 +426,7 @@ fn parked_executors_add_only_their_reserves() {
     let parked = sizes(free(16), 12, 8).unwrap();
     let rest = free(16) - parked.heap - parked.code.bytes;
     let share = 8 * rest / (POOL_SHARE + 8);
-    let grown = 8 * (POOL_GROWTH * POOL_BASE + rest) / (POOL_GROWTH + 8);
+    let grown = 8 * (2048 * (LOWER_BASE + UPPER_BASE) + 3 * rest) / (2048 + 3 * 8);
     let running = share.min(grown) / ALIGNMENT * ALIGNMENT;
     assert_eq!(parked.pool, running + 4 * 4 * MIB);
 }
@@ -507,4 +511,59 @@ fn the_guest_reports_the_dram_that_backs_it_not_the_hosts() {
     assert!(base + stela_contracts::tag_storage::bytes(dram.reported) <= phys_base + managed);
     // A host that backs everything it has keeps nothing.
     assert_eq!(guest_dram(8 * GIB, 8 * GIB).kept, 0);
+}
+
+/// Each runner's pool splits into the kernel half's 32 MiB and 1024th of
+/// the guest and the user half's 48 MiB and 2048th; a pool smaller than
+/// both (a sixty-fourth of a small guest, at 8 GiB) splits in their ratio.
+#[test]
+fn each_runners_pool_gives_the_kernel_half_what_it_needs_and_the_user_half_the_rest() {
+    const PAGE: u64 = 4096;
+    const ROOTS: u64 = 64 * PAGE;
+    for (installed, sized) in [(8, false), (12, true), (16, true), (64, true)] {
+        let sizes = sizes(free(installed), 8, 8).unwrap();
+        let shadow = sizes.pool / 8 / PAGE * PAGE - ROOTS;
+        let upper = sizes.profile.upper_shadow(shadow, sizes.guest, PAGE);
+        let lower = shadow - upper;
+        let (lower_wanted, upper_wanted) = pool_halves(sizes.guest);
+        assert!(upper.is_multiple_of(PAGE));
+        assert!(upper <= upper_wanted, "{installed} GiB");
+        if sized {
+            // Both sizes, less the roots and the pool's 2 MiB rounding.
+            assert!(upper + ROOTS + 2 * MIB >= upper_wanted, "{installed} GiB");
+            assert!(lower + ROOTS + 2 * MIB >= lower_wanted, "{installed} GiB");
+        } else {
+            // Short of both: each the part's share in their ratio.
+            let ratio = |half: u64| half as f64 / (lower_wanted + upper_wanted) as f64;
+            let share = |bytes: u64| bytes as f64 / shadow as f64;
+            assert!(
+                (share(upper) - ratio(upper_wanted)).abs() < 0.01,
+                "{installed} GiB"
+            );
+            assert!(lower > upper, "{installed} GiB");
+        }
+    }
+    // The 16 GiB host's kernel half: 32 MiB and a MiB per GiB of its
+    // 11 GiB guest.
+    let sizes = sizes(free(16), 8, 8).unwrap();
+    let upper = upper_half(sizes.pool / 8 / 4096 * 4096 - ROOTS, sizes.guest, PAGE);
+    assert!((42..=43).contains(&(upper / MIB)));
+    // A tiny pool's halves never go below a page each.
+    assert_eq!(upper_half(2 * PAGE, 64 * GIB, PAGE), PAGE);
+}
+
+#[test]
+fn low_memory_profiles_keep_the_even_shadow_pool_split() {
+    const PAGE: u64 = 4096;
+    const ROOTS: u64 = 64 * PAGE;
+    for (runners, profile) in [(8, Profile::Compact), (24, Profile::Paged)] {
+        let sizes = sizes(4 * GIB, runners, runners).unwrap();
+        assert_eq!(sizes.profile, profile);
+        let shadow = sizes.pool / sizes.cores as u64 / PAGE * PAGE - ROOTS;
+        assert_eq!(
+            profile.upper_shadow(shadow, sizes.guest, PAGE),
+            (shadow / PAGE).div_ceil(2) * PAGE,
+        );
+        assert_eq!(profile.upper_shadow(5 * PAGE, sizes.guest, PAGE), 3 * PAGE);
+    }
 }

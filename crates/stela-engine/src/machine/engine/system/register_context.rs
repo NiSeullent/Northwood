@@ -366,6 +366,10 @@ impl<H: Host, D: Devices> Context for Access<'_, H, D> {
                         | Register::TPIDR_EL0
                         | Register::TPIDRRO_EL0
                         | Register::TPIDR_EL1
+                        | Register::CONTEXTIDR_EL1
+                        | Register::CONTEXTIDR_EL2
+                        | Register::TTBR0_EL1
+                        | Register::TTBR0_EL2
                 )
             {
                 self.plain.set(Some((register, index)));
@@ -397,14 +401,9 @@ impl<H: Host, D: Devices> Context for Access<'_, H, D> {
         if watches(register) {
             self.regime = true;
         }
-        // A CONTEXTIDR write changes the guest's prediction context
-        // (`PredictionContext`) without changing translation.
-        if matches!(
-            register,
-            Register::CONTEXTIDR_EL1 | Register::CONTEXTIDR_EL2
-        ) {
-            self.machine.sync_host_regime();
-        }
+        // A CONTEXTIDR write changes neither translation, the host's regime
+        // nor the prediction context (`PredictionContext`): breakpoints
+        // read it live.
         Ok(())
     }
 

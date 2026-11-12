@@ -13,7 +13,16 @@ pub(super) struct Outstanding {
     deadline: Deadline,
     /// Aborted into a No Op, whose completion reports a timeout.
     retired: bool,
+    /// Times the ring was restarted for this command after it stopped
+    /// without completing it.
+    restarts: u8,
 }
+
+/// Restarts of a stopped command ring one command may take before the
+/// controller counts as dead. Linux re-arms `xhci_handle_stopped_cmd_ring`
+/// without end while its issuer sleeps; here the issuer is the boot, so a
+/// controller that does not run its ring after a restart is given up.
+const RING_RESTARTS: u8 = 1;
 
 #[derive(Clone, Copy)]
 enum Phase {
@@ -50,6 +59,7 @@ impl Controller {
             phase: Phase::Running,
             deadline,
             retired: false,
+            restarts: 0,
         });
         Ok(address)
     }
@@ -230,6 +240,9 @@ impl Controller {
                             None => {
                                 // xhci_handle_stopped_cmd_ring: it becomes a No
                                 // Op, which the restarted ring retires.
+                                if let Err(error) = self.restart_ring() {
+                                    return Some(Err(error));
+                                }
                                 if let Err(error) = self.commands.no_op(address) {
                                     return Some(Err(error));
                                 }
@@ -268,6 +281,20 @@ impl Controller {
         Ok(())
     }
 
+    /// Count one restart of a stopped ring for the outstanding command; one
+    /// past [`RING_RESTARTS`] means the controller no longer runs commands.
+    fn restart_ring(&mut self) -> Result<(), BlockError> {
+        let Some(current) = self.outstanding.as_mut() else {
+            return Ok(());
+        };
+        if current.restarts >= RING_RESTARTS {
+            self.died();
+            return Err(BlockError::Timeout);
+        }
+        current.restarts += 1;
+        Ok(())
+    }
+
     /// Linux xhci_handle_command_timeout for the one outstanding command.
     fn command_timeout(&mut self, control: u32) -> Result<(), BlockError> {
         // A Stop Endpoint the controller never answers means the host died.
@@ -283,6 +310,7 @@ impl Controller {
         }
         if self.command_ring_stopped || low & CRCR_RUNNING == 0 {
             // xhci_handle_stopped_cmd_ring: restart the ring and wait again.
+            self.restart_ring()?;
             self.command_ring_stopped = false;
             self.doorbell(0, 0);
             return self.set_command_phase(Phase::Running, COMMAND_US);

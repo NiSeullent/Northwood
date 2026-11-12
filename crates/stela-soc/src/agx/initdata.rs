@@ -86,7 +86,21 @@ impl Root {
         let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
         if u64_at(0) != magic {
-            return Err(refuse!("GFX initdata root lacks its magic"));
+            if let Some((build, family)) =
+                stela_soc_data::agx::generation::unchecked_initdata(u64_at(0))
+            {
+                return Err(refuse!(
+                    "GFX initdata root is a later kext interface revision whose layouts the model has not checked",
+                    build = %build,
+                    family = %family,
+                    found = %format_args!("{:#018x}", u64_at(0))
+                ));
+            }
+            return Err(refuse!(
+                "GFX initdata root lacks its magic",
+                found = %format_args!("{:#018x}", u64_at(0)),
+                second = %format_args!("{:#018x}", u64_at(8))
+            ));
         }
         if (u32_at(0x28), u32_at(0x2c)) != ROOT_CONSTANTS {
             return Err(refuse!(
@@ -201,8 +215,19 @@ pub(crate) mod tests {
         kext_root(&mut memory);
         memory.put_u64(ROOT, 0);
         assert_eq!(
-            Root::read(&mut memory, ROOT, MAGIC),
-            Err(refuse!("GFX initdata root lacks its magic"))
+            Root::read(&mut memory, ROOT, MAGIC).unwrap_err().what(),
+            "GFX initdata root lacks its magic"
+        );
+    }
+
+    #[test]
+    fn a_later_kext_revisions_root_refuses_by_its_revision() {
+        let mut memory = Flat::new(BASE, 0x10000);
+        kext_root(&mut memory);
+        memory.put_u64(ROOT, 0x0c8a_8342_8392_04c8);
+        assert_eq!(
+            Root::read(&mut memory, ROOT, MAGIC).unwrap_err().what(),
+            "GFX initdata root is a later kext interface revision whose layouts the model has not checked"
         );
     }
 

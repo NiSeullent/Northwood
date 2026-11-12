@@ -750,6 +750,14 @@ pub trait Devices {
     fn dma_deadline(&self) -> Option<u64> {
         None
     }
+    /// For a machine that advances devices shared with other PEs' machines:
+    /// a count of the locked calls of any of them, which moves at every one
+    /// that can change a device's deadline. While it moved by the machine's
+    /// own last [`Self::lines_and_deadline`] alone, the deadline that call
+    /// gave still holds. None: no such count, ask every time.
+    fn generation(&self) -> Option<u64> {
+        None
+    }
     /// Run the DMA a device write by PE `cpu` started, on guest RAM
     /// `memory`, before the next guest access: device DMA completes in the
     /// write's own step.

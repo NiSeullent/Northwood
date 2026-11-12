@@ -7,6 +7,7 @@ use crate::{
     bus::dma::{DmaAllocator, DmaBuffer},
     ring::write_transmit_frame,
 };
+#[cfg(test)]
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
@@ -75,7 +76,26 @@ impl Ring {
         self.next = (self.next + 1) % DESCRIPTORS;
         Ok(())
     }
+    #[cfg(test)]
     pub fn receive(&mut self) -> Option<Vec<u8>> {
+        self.receive_with(<[u8]>::to_vec)
+    }
+    /// Completes the next receive slot with `frame` and a four-byte FCS,
+    /// as the controller would.
+    #[cfg(test)]
+    pub fn deliver(&mut self, frame: &[u8]) {
+        let start = self.next * BUFFER;
+        let bytes = self.buffers.bytes_mut();
+        bytes[start..start + frame.len()].copy_from_slice(frame);
+        bytes[start + frame.len()..start + frame.len() + 4].fill(0xcd);
+        self.descriptors.write(
+            self.next * DESCRIPTOR,
+            FIRST | LAST | end(self.next) | (frame.len() + 4) as u32,
+        );
+    }
+    /// The next good frame, passed to `take` while its buffer is still
+    /// held, before the slot goes back to the controller.
+    pub fn receive_with<T>(&mut self, mut take: impl FnMut(&[u8]) -> T) -> Option<T> {
         for _ in 0..DESCRIPTORS {
             let status = self.descriptors.read::<u32>(self.next * DESCRIPTOR);
             if status & OWN != 0 {
@@ -87,7 +107,7 @@ impl Ring {
                 && status & (FIRST | LAST) == FIRST | LAST
                 && (18..=MAX_FRAME + 4).contains(&length);
             let frame = good.then(|| {
-                self.buffers.bytes()[self.next * BUFFER..self.next * BUFFER + length - 4].to_vec()
+                take(&self.buffers.bytes()[self.next * BUFFER..self.next * BUFFER + length - 4])
             });
             self.offer(self.next);
             self.next = (self.next + 1) % DESCRIPTORS;

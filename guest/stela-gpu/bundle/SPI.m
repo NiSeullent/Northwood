@@ -49,10 +49,10 @@
 
 @implementation StelaGPUBuffer (SPI)
 
-/* This device makes no buffer of an IOSurface. */
+/* The IOSurface the buffer lies in, NULL for other buffers. */
 - (IOSurfaceRef)iosurface
 {
-	return NULL;
+	return _surface;
 }
 
 @end

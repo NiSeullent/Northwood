@@ -6,7 +6,7 @@
 //! Windows requires, and a USB is erased by writing setup's own layout to
 //! its whole disk, with its volumes locked and dismounted.
 use super::{
-    Bus, Cpu, Disk, DiskFacts, FileSystem, Host, Partition, PartitionInfo, UsbBluetooth, Volume,
+    Bus, Cpu, Disk, DiskFacts, FileSystem, Host, Partition, PartitionInfo, Volume,
     drive_names::{self, disk_number, partition_number, pci_device},
 };
 use anyhow::{Context, Result, ensure};
@@ -887,29 +887,8 @@ impl Host for System {
     }
 
     fn network_adapters(&self) -> Result<Vec<(u16, u16)>> {
-        // The network adapter device class, wired and wireless.
+        // This device class includes wired and wireless adapters.
         const NET: GUID = GUID::from_u128(0x4d36e972_e325_11ce_bfc1_08002be10318);
         pci_devices(&NET, "network adapters")
-    }
-
-    fn bluetooth_controllers(&self) -> Result<Vec<UsbBluetooth>> {
-        // The Bluetooth device class: radios, whose USB ones are named by
-        // their device or interface instance, and enumerated services,
-        // which are not USB devices.
-        const BLUETOOTH: GUID = GUID::from_u128(0xe0cbf06c_cd8b_4647_bb8a_263b43f0f974);
-        let mut found = Vec::new();
-        for (instance, compatible) in class_devices(&BLUETOOTH, "Bluetooth radios")? {
-            if let Some((vendor, product)) = drive_names::usb_device(&instance) {
-                let controller = UsbBluetooth {
-                    vendor,
-                    product,
-                    vendor_interface: drive_names::vendor_hci_interface(&compatible),
-                };
-                if !found.contains(&controller) {
-                    found.push(controller);
-                }
-            }
-        }
-        Ok(found)
     }
 }

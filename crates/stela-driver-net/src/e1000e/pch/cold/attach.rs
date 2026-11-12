@@ -307,6 +307,9 @@ impl Link for Pch {
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         self.link.receive()
     }
+    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
+        self.link.receive_reusing(frame)
+    }
 }
 
 #[cfg(test)]

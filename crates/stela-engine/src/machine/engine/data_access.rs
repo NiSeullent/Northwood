@@ -183,11 +183,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // per retry, and every retry repeats the call's work.
         if refused.is_some() {
             let current = self.cpu.tlbi_current();
-            self.tlb_maintained(
-                mmu::tlbi::Reach::All,
-                mmu::tlbi::Everywhere::NonGlobal,
-                current.asid,
-            );
+            // A regime without ASIDs gives up everything.
+            let everywhere = current
+                .asid
+                .map_or(mmu::tlbi::Everywhere::All, mmu::tlbi::Everywhere::NonGlobal);
+            self.tlb_maintained(mmu::tlbi::Reach::All, everywhere, current.asid);
         }
     }
 
@@ -773,5 +773,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             Translated::Mapped(translation) => self.host.read_ram(translation.physical, bytes),
             _ => false,
         }
+    }
+
+    /// Read `bytes.len()` bytes of guest RAM at physical `address`, for
+    /// diagnostics after a stop (the panic region): `false` when it reaches
+    /// no RAM; nothing is faulted or changed.
+    pub fn read_physical(&mut self, address: u64, bytes: &mut [u8]) -> bool {
+        self.host.read_ram(address, bytes)
     }
 }

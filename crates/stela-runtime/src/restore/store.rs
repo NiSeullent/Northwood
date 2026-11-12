@@ -24,6 +24,7 @@ use super::{
 };
 use alloc::{
     borrow::Cow,
+    boxed::Box,
     collections::{BTreeMap, VecDeque},
     string::{String, ToString},
     vec::Vec,
@@ -32,7 +33,6 @@ use sha2::{Digest, Sha384};
 use stela_contracts::refuse;
 use stela_crypto::Sha256;
 use {
-    stela_formats::payload::MemberRead,
     stela_formats::payload::PayloadManifest,
     stela_formats::payload::Purpose,
     stela_formats::payload::ReadAt,
@@ -128,7 +128,7 @@ impl Cursors {
         };
         archive
             .read_member_resuming(reader, entry, &mut progress, offset, output)
-            .map_err(payload)?;
+            .map_err(|error| source_error(reader, error))?;
         if let Some(progress) = progress
             && progress.produced() < entry.bytes
         {
@@ -154,9 +154,34 @@ pub struct Store<R> {
     block_count: usize,
     verify: Verify,
     cursors: Cursors,
+    /// The member scan a pending read stopped ([`Store::verify`]).
+    scan: Option<Box<Scan>>,
+}
+/// A member's SHA-256 scan in progress: where it is in the member and what
+/// it has hashed, so a read that runs out of time costs no re-read.
+struct Scan {
+    path: String,
+    progress: Progress,
+    sha256: Sha256,
+    sha384: Sha384,
+    hashes: Vec<[u8; 32]>,
+    /// The block being filled, and how far.
+    block: Vec<u8>,
+    filled: usize,
+    /// Bytes hashed so far.
+    total: u64,
 }
 fn payload(error: impl core::fmt::Debug) -> Error {
     Error::Payload(refuse!("payload: {error}", ?error))
+}
+/// A failed read of `reader`: [`Error::Pending`] when the source only ran
+/// out of the time it may wait (`ReadAt::blocked`), so the caller asks
+/// again later, else the payload's refusal.
+fn source_error<R: ReadAt>(reader: &mut R, error: impl core::fmt::Debug) -> Error {
+    match reader.blocked() {
+        true => Error::Pending,
+        false => payload(error),
+    }
 }
 impl<R: ReadAt> Store<R> {
     /// `selected` is supplied by the inventory (20 for the acceptance input),
@@ -255,6 +280,7 @@ impl<R: ReadAt> Store<R> {
             block_count: 0,
             verify: Verify::Full,
             cursors: Cursors::default(),
+            scan: None,
         })
     }
     pub fn manifest(&self) -> &PayloadManifest {
@@ -497,35 +523,76 @@ impl<R: ReadAt> Store<R> {
         if blocks > MAX_BLOCKS - self.block_count {
             return Err(Error::Limit("payload hash index"));
         }
-        let mut stream = self
-            .archive
-            .open_member(&mut self.reader, &entry)
-            .map_err(payload)?;
-        let mut hash = Sha256::new();
-        let mut hash384 = Sha384::new();
-        let mut hashes = Vec::new();
-        let mut buffer = vec![0; BLOCK_BYTES];
-        let mut total = 0u64;
-        loop {
-            let mut done = 0;
-            while done < buffer.len() {
-                let n = stream.read(&mut buffer[done..]).map_err(payload)?;
-                if n == 0 {
-                    break;
-                }
-                done += n;
+        // A scan a pending read stopped goes on where it stopped; any other
+        // member's is dropped.
+        let mut scan = match self.scan.take() {
+            Some(scan) if scan.path == path => scan,
+            _ => {
+                let progress = self
+                    .archive
+                    .start_member(&mut self.reader, &entry)
+                    .map_err(|error| source_error(&mut self.reader, error))?;
+                Box::new(Scan {
+                    path: path.into(),
+                    progress,
+                    sha256: Sha256::new(),
+                    sha384: Sha384::new(),
+                    hashes: Vec::new(),
+                    block: vec![0; BLOCK_BYTES],
+                    filled: 0,
+                    total: 0,
+                })
             }
-            if done == 0 {
+        };
+        loop {
+            let at = scan.filled;
+            let n =
+                match self
+                    .archive
+                    .pump(&mut self.reader, &mut scan.progress, &mut scan.block[at..])
+                {
+                    Ok(n) => n,
+                    Err(error) => {
+                        let error = source_error(&mut self.reader, error);
+                        if matches!(error, Error::Pending) {
+                            self.scan = Some(scan);
+                        }
+                        return Err(error);
+                    }
+                };
+            scan.filled += n;
+            if n != 0 && scan.filled < BLOCK_BYTES {
+                continue;
+            }
+            if scan.filled == 0 {
                 break;
             }
-            total += done as u64;
-            if total > member.bytes {
+            let done = core::mem::take(&mut scan.filled);
+            scan.total += done as u64;
+            if scan.total > member.bytes {
                 return Err(Error::Invalid("member exceeds inventory"));
             }
-            hash.update(&buffer[..done]);
-            hash384.update(&buffer[..done]);
-            hashes.push(Sha256::digest(&buffer[..done]).into());
+            let Scan {
+                sha256: hash,
+                sha384: hash384,
+                hashes,
+                block,
+                ..
+            } = &mut *scan;
+            hash.update(&block[..done]);
+            hash384.update(&block[..done]);
+            hashes.push(Sha256::digest(&block[..done]).into());
+            if n == 0 {
+                break;
+            }
         }
+        let Scan {
+            sha256: hash,
+            sha384: hash384,
+            hashes,
+            total,
+            ..
+        } = *scan;
         if total != member.bytes || hex::encode(hash.finalize()) != sha256 {
             return Err(Error::Payload(refuse!(
                 "{path}: immutable SHA-256/length mismatch",

@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:45:00 +0000
+Subject: [PATCH] fix(nouveau): keep smaller pages' page tables linked when a
+ large-page unmap or release runs after their reference, so a range rebound
+ at another page size stays mapped
+
+---
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c | 168
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.h | 5
+ 2 files changed, 169 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c
+index a329efe6637881c79c65e23f24562c47a404bce2..02718c8e445c40b269e03a4a24b0763461954258 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c
+@@ -51,6 +51,8 @@
+ 		} else {
+ 			lpte = pten;
+ 		}
++	} else if (desc->type == PGD) {
++		lpte = pten;
+ 	}
+ 
+ 	pgt = kzalloc_flex(*pgt, pte, lpte);
+@@ -135,6 +137,65 @@
+ 	}
+ }
+ 
++/* The address of entry @ptei of the table at level @lvl on the iterator's
++ * path, and in *@size the bytes one entry covers.
++ */
++static u64
++nvkm_vmm_iter_addr(const struct nvkm_vmm_iter *it, int lvl, u32 ptei, u64 *size)
++{
++	u32 shift = it->page->shift;
++	u64 addr = 0;
++	int l;
++
++	for (l = 0; l < lvl; l++)
++		shift += it->desc[l].bits;
++	for (l = it->max; l > lvl; l--)
++		addr = (addr | it->pte[l]) << it->desc[l - 1].bits;
++	*size = 1ULL << shift;
++	return (addr | ptei) << shift;
++}
++
++/* Whether PDE @pdei of the directory @pgd, described by @desc, holds a large
++ * page's PTE that a map wrote after the PDE of its child page tables.
++ */
++static inline bool
++nvkm_vmm_pde_large(const struct nvkm_vmm_desc *desc, struct nvkm_vmm_pt *pgd,
++		   u32 pdei)
++{
++	return desc->type == PGD && pgd->pte[pdei].s.lpte_valid;
++}
++
++/* Excludes maps and unmaps while page-table references change a PDE.
++ *
++ * Raw VMMs take references under mutex.ref and map under mutex.map, from
++ * different jobs, so a PDE written for a reference must not race a map that
++ * writes a large page into the same directory entry. Nothing holds
++ * mutex.map while it takes mutex.ref, so this order cannot deadlock. Other
++ * VMMs reference and map under one lock already.
++ */
++static inline void
++nvkm_vmm_pde_lock(struct nvkm_vmm *vmm)
++{
++	if (vmm->managed.raw)
++		mutex_lock(&vmm->mutex.map);
++}
++
++static inline void
++nvkm_vmm_pde_unlock(struct nvkm_vmm *vmm)
++{
++	if (vmm->managed.raw)
++		mutex_unlock(&vmm->mutex.map);
++}
++
++/* Whether PDE @pdei of the directory @pgd has child page tables. */
++static inline bool
++nvkm_vmm_pde_tables(struct nvkm_vmm_pt *pgd, u32 pdei)
++{
++	struct nvkm_vmm_pt *pgt = pgd->pde[pdei];
++
++	return !NVKM_VMM_PDE_INVALID(pgt) && (pgt->pt[0] || pgt->pt[1]);
++}
++
+ static void
+ nvkm_vmm_unref_pdes(struct nvkm_vmm_iter *it)
+ {
+@@ -150,9 +211,25 @@
+ 	it->lvl++;
+ 	if (--pgd->refs[0]) {
+ 		const struct nvkm_vmm_desc_func *func = desc[it->lvl].func;
++
++		nvkm_vmm_pde_lock(vmm);
+ 		/* PD has other valid PDEs, so we need a proper update. */
+ 		TRA(it, "PDE unmap %s", nvkm_vmm_desc_type(&desc[it->lvl - 1]));
+ 		pgt->pt[type] = NULL;
++		if (nvkm_vmm_pde_large(&desc[it->lvl], pgd, pdei)) {
++			u64 size, addr = nvkm_vmm_iter_addr(it, it->lvl, pdei, &size);
++
++			/* A map of large pages wrote over this PDE after the
++			 * release of these page tables was queued: the entry
++			 * is the large page's now, so leave it and only drop
++			 * the page tables.
++			 */
++			nvkm_printk(&vmm->mmu->subdev, INFO, info_ratelimited,
++				    "vmm: release of page_shift %u page tables at 0x%llx-0x%llx kept the large page mapped over them\n",
++				    it->page->shift, addr, addr + size);
++			if (!pgt->refs[!type])
++				pgd->pde[pdei] = pgt->sparse ? NVKM_VMM_PDE_SPARSE : NULL;
++		} else
+ 		if (!pgt->refs[!type]) {
+ 			/* PDE no longer required. */
+ 			if (pgd->pt[0]) {
+@@ -181,6 +258,7 @@
+ 		/* GPU may have cached the PTs, flush before freeing. */
+ 		nvkm_vmm_flush_mark(it);
+ 		nvkm_vmm_flush(it);
++		nvkm_vmm_pde_unlock(vmm);
+ 	} else {
+ 		/* PD has no valid PDEs left, so we can just destroy it. */
+ 		nvkm_vmm_unref_pdes(it);
+@@ -241,6 +319,14 @@
+ 
+ 		while (pteb < ptei) {
+ 			pgt->pte[pteb].s.spte_valid = false;
++			if (pgt->pte[pteb].s.lpte_valid) {
++				/* A large-page mapping took the LPTE after
++				 * these SPTEs' release was queued: it may be
++				 * mapped already, so a sparse LPTE must not
++				 * replace it.
++				 */
++				TRA(it, "LPTE %05x: kept", pteb);
++			} else
+ 			if (pgt->pte[pteb].s.sparse) {
+ 				TRA(it, "LPTE %05x: U -> S", pteb);
+ 				pair->func->sparse(vmm, pgt->pt[0], pteb, 1);
+@@ -496,9 +582,19 @@
+ 	}
+ 
+ done:
+-	TRA(it, "PDE write %s", nvkm_vmm_desc_type(desc));
+-	it->desc[it->lvl].func->pde(it->vmm, pgd, pdei);
+-	nvkm_vmm_flush_mark(it);
++	/* While the entry holds a large page that is still mapped, the PDE
++	 * waits for the large page's unmap or a map of these page tables,
++	 * whichever runs first: taking page tables must not unmap pages.
++	 */
++	nvkm_vmm_pde_lock(vmm);
++	if (nvkm_vmm_pde_large(&it->desc[it->lvl], pgd, pdei)) {
++		TRA(it, "PDE write %s deferred", nvkm_vmm_desc_type(desc));
++	} else {
++		TRA(it, "PDE write %s", nvkm_vmm_desc_type(desc));
++		it->desc[it->lvl].func->pde(it->vmm, pgd, pdei);
++		nvkm_vmm_flush_mark(it);
++	}
++	nvkm_vmm_pde_unlock(vmm);
+ 	return true;
+ }
+ 
+@@ -554,6 +650,51 @@
+ 	}
+ }
+ 
++/* Clear large-page PTEs in a page directory, writing the PDE instead where
++ * an entry has child page tables.
++ *
++ * A directory entry holds either a large page's PTE (GP100's 2 MiB pages in
++ * PD0) or the PDE of the dual page tables below it. A map with smaller pages
++ * takes its page tables when it is submitted, and an earlier unmap of large
++ * pages over the same range may run after that: clearing the entry then
++ * would cut the newer mapping's page tables off the tree, while nvkm still
++ * holds them as referenced.
++ */
++static void
++nvkm_vmm_clr_pdes(struct nvkm_vmm_iter *it, struct nvkm_vmm_pt *pgd,
++		  struct nvkm_mmu_pt *pt, u32 pdei, u32 pdes,
++		  nvkm_vmm_pxe_func CLR_PTES)
++{
++	const struct nvkm_vmm_desc_func *func = it->desc->func;
++
++	while (pdes) {
++		const bool tables = nvkm_vmm_pde_tables(pgd, pdei);
++		u32 n, i;
++
++		for (n = 1; n < pdes; n++) {
++			if (nvkm_vmm_pde_tables(pgd, pdei + n) != tables)
++				break;
++		}
++
++		if (tables) {
++			u64 size, addr = nvkm_vmm_iter_addr(it, 0, pdei, &size);
++
++			nvkm_printk(&it->vmm->mmu->subdev, INFO, info_ratelimited,
++				    "vmm: unmap of page_shift %u at 0x%llx-0x%llx kept the PDEs of smaller pages' page tables mapped there\n",
++				    it->page->shift, addr, addr + n * size);
++			TRA(it, "PDE %05x: kept over page tables %d PDEs", pdei, n);
++			for (i = 0; i < n; i++)
++				func->pde(it->vmm, pgd, pdei + i);
++		} else {
++			CLR_PTES(it->vmm, pt, pdei, n);
++		}
++		for (i = 0; i < n; i++)
++			pgd->pte[pdei + i].s.lpte_valid = false;
++		pdei += n;
++		pdes -= n;
++	}
++}
++
+ static inline u64
+ nvkm_vmm_iter(struct nvkm_vmm *vmm, const struct nvkm_vmm_page *page,
+ 	      u64 addr, u64 size, const char *name, bool ref, bool pfn,
+@@ -614,14 +755,33 @@
+ 				if (!nvkm_vmm_ref_hwpt(&it, pgd, pdei))
+ 					goto fail;
+ 			}
++
++			/* A map of smaller pages takes the entry back from a
++			 * large page mapped over the same range before it.
++			 */
++			if (MAP_PTES &&
++			    nvkm_vmm_pde_large(&desc[it.lvl], pgd, pdei)) {
++				TRA(&it, "PDE write %s over large page",
++				    nvkm_vmm_desc_type(&desc[it.lvl - 1]));
++				pgd->pte[pdei].s.lpte_valid = false;
++				desc[it.lvl].func->pde(vmm, pgd, pdei);
++				nvkm_vmm_flush_mark(&it);
++			}
+ 		}
+ 
+ 		/* Handle PTE updates. */
+ 		if (!REF_PTES || REF_PTES(&it, pfn, ptei, ptes)) {
+ 			struct nvkm_mmu_pt *pt = pgt->pt[type];
+ 			if (MAP_PTES || CLR_PTES) {
+-				if (MAP_PTES)
++				if (MAP_PTES) {
+ 					MAP_PTES(vmm, pt, ptei, ptes, map);
++					if (desc->type == PGD) {
++						for (u32 i = 0; i < ptes; i++)
++							pgt->pte[ptei + i].s.lpte_valid = true;
++					}
++				} else if (desc->type == PGD)
++					nvkm_vmm_clr_pdes(&it, pgt, pt, ptei,
++							  ptes, CLR_PTES);
+ 				else if (desc->type == LPT && pgt->refs[1])
+ 					nvkm_vmm_clr_lptes(&it, pgt, pt, ptei,
+ 							   ptes, CLR_PTES);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.h b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.h
+index 4ec0a3a211690f732f3c47cf569e7361a08d113b..5fc1f958ea4132072207a23247e1147b169266f6 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.h
+@@ -54,6 +54,11 @@
+ 	 * there are valid SPTEs in the same address-range.
+ 	 *
+ 	 * This information is used to manage LPTE state transitions.
++	 *
++	 * Page directories have one entry for each PDE too, where only
++	 * lpte_valid is used: the entry holds a large page's PTE (GP100's
++	 * 2 MiB pages in PD0, for one) written by a map, rather than the
++	 * PDE of the child page tables in pde[].
+ 	 */
+ 	union nvkm_pte_tracker pte[];
+ };

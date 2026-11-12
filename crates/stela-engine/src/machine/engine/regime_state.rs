@@ -13,7 +13,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return;
         }
         if pointer_key(register) {
-            return self.forget_derived();
+            return self.forget_pointer_derived();
         }
         if !stored(register) {
             return self.derived_changed();
@@ -91,6 +91,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn forget_derived(&mut self) {
         self.timers = None;
         self.mirrors.transitions.forget();
+        self.forget_pstate_derived();
+    }
+
+    /// [`Self::forget_derived`] after a write of PAC's inputs alone
+    /// (`Changes::pointer`): GENTER and GEXIT go between EL2 and its guarded
+    /// level, where every PAC input is the same register (APCTL's EL2
+    /// level, SCTLR_EL2, the EL2 keys, TCR_EL2, no trap), so the service the
+    /// engine reopens after either is the one native code keeps across it,
+    /// and their records stay. SVC and ERET records, whose two levels' PAC
+    /// use may differ, go.
+    pub(super) fn forget_pointer_derived(&mut self) {
+        self.timers = None;
+        self.mirrors
+            .transitions
+            .forget_but(&[transition::GUARDED_ENTER, transition::GUARDED_EXIT]);
         self.forget_pstate_derived();
     }
 

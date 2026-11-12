@@ -203,7 +203,7 @@ pub(super) const BOOT_DIRECTORY: &str = "stela/boot";
 
 /// The active layout's boot-bundle build directory on `volume`.
 pub(super) fn build_directory_in(volume: &Path, layout: Layout, build: &str) -> PathBuf {
-    volume.join(layout.data_path(DATA_BOOT)).join(build)
+    super::join_slashed(volume, &layout.data_path(DATA_BOOT)).join(build)
 }
 
 #[cfg(test)]

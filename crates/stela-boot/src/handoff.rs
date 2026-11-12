@@ -47,6 +47,11 @@ pub struct Handoff {
     /// The partition holding the USB's boot log the loader keeps
     /// (`log_file`), which the engine writes on to.
     pub log_partition: Option<[u8; 16]>,
+    /// Where the firmware found the disk Stela started from
+    /// (`pci_io::disk_location`), as text, for the account a failed disk
+    /// search gives.
+    pub boot_disk: [u8; BOOT_DISK_BYTES],
+    pub boot_disk_bytes: usize,
     /// TSC ticks per second (`firmware::tsc_hz`).
     pub tsc_hz: u64,
     /// How `tsc_hz` was found.
@@ -158,5 +163,18 @@ impl RtcReading {
     /// The Unix seconds at TSC `tsc`, carried forward at `tsc_hz`.
     pub fn unix_seconds_at(&self, tsc: u64, tsc_hz: u64) -> u64 {
         self.utc.seconds + tsc.saturating_sub(self.tsc_after) / tsc_hz
+    }
+}
+
+/// The most [`Handoff::boot_disk`] holds.
+pub const BOOT_DISK_BYTES: usize = 128;
+
+impl Handoff {
+    /// [`Self::boot_disk`] as text, when the loader found it.
+    pub fn boot_disk(&self) -> Option<&str> {
+        let bytes = self.boot_disk.get(..self.boot_disk_bytes)?;
+        core::str::from_utf8(bytes)
+            .ok()
+            .filter(|text| !text.is_empty())
     }
 }

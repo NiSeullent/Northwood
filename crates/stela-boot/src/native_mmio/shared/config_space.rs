@@ -8,15 +8,6 @@ mod containment;
 pub(super) use containment::PciSlots;
 pub(crate) use containment::{ContainedPci, ContainmentError};
 
-/// Name the ECAM check that refused the configuration census, once per boot:
-/// the census error itself carries no bus.
-fn report_ecam_refusal(why: core::fmt::Arguments<'_>) {
-    static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if !REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        crate::output::arguments(format_args!("HOST PCI ECAM refused: {why}\n"));
-    }
-}
-
 pub(crate) struct ConfigScope {
     pending: ManuallyDrop<Box<Pending>>,
     close: Option<AdmissionClose>,
@@ -255,32 +246,12 @@ impl Source {
         }
         let bits = self.platform.space.physical_bits;
         let original = EcamInventory::validate(&windows, bits)?;
-        let windows = original.root_windows(wire.roots()).inspect_err(|error| {
-            report_ecam_refusal(format_args!(
-                "the root bridges' buses are not each in one MCFG window ({error:?}): MCFG {:?}, root buses {:?}",
-                windows
-                    .iter()
-                    .map(|w| (w.segment, w.start_bus, w.end_bus))
-                    .collect::<Vec<_>>(),
-                wire.roots()
-                    .iter()
-                    .filter(|root| root.space == 2)
-                    .map(|root| (root.segment, root.bridge, root.flags, root.minimum, root.maximum, root.length))
-                    .collect::<Vec<_>>(),
-            ));
-        })?;
+        let windows = original.root_windows(wire.roots())?;
         let geometry = EcamInventory::validate(&windows, bits)?;
         for (index, window) in windows.iter().enumerate() {
             for bus in window.start_bus..=window.end_bus {
                 let (_, span) = geometry.subset(index, bus..=bus, wire.roots())?;
-                if let Some((start, kind, attributes)) =
-                    wire.memory_conflict(span.start(), span.end())
-                {
-                    report_ecam_refusal(format_args!(
-                        "bus {:04x}:{bus:02x} at {:#x} overlaps a memory map entry at {start:#x} of type {kind} attributes {attributes:#x}",
-                        window.segment,
-                        span.start(),
-                    ));
+                if !wire.excludes_memory(span.start(), span.end()) {
                     return Err(Error::OutsideResource.into());
                 }
             }

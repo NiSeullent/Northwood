@@ -878,6 +878,41 @@ pub(crate) fn test(
     true
 }
 
+/// Truncate each `source_lane_bytes` lane of `source` to its low half, into
+/// consecutive lanes of the low quadword of `destination`, clearing its high
+/// quadword: VPMOVWB (AVX-512 BW and VL), VPMOVDW or VPMOVQD (F and VL).
+/// The DIT profile keeps its reviewed recipe. No EFLAGS or memory.
+pub(crate) fn truncating_narrow(
+    code: &mut Code,
+    source_lane_bytes: u8,
+    destination: u8,
+    source: u8,
+    target: TargetCpu,
+) -> bool {
+    let required = match source_lane_bytes {
+        2 => TargetCpu::Avx512f.with_avx512vl().with_avx512bw(),
+        4 | 8 => TargetCpu::Avx512f.with_avx512vl(),
+        _ => return false,
+    };
+    if !target.supports(required) || target.data_independent_timing() {
+        return false;
+    }
+    let opcode = match source_lane_bytes {
+        2 => 0x30,
+        4 => 0x33,
+        _ => 0x35,
+    };
+    // ModRM.reg names the wide source and r/m the narrow destination.
+    code.asm().evex(
+        masked(Map::M0f38, Pp::Pf3, false, 0, false),
+        opcode,
+        source,
+        0,
+        Rm::Xmm(destination),
+    );
+    true
+}
+
 /// Saturating narrows of `source_lane_bytes` lanes need AVX-512 VL with BW
 /// for halfword sources (VPMOVSWB) and F for wider ones, the lane compare's
 /// extensions for the saturation mask and SSE4.1 to re-extend.
@@ -2078,7 +2113,14 @@ mod tests {
             };
             let baseline = compile(TargetCpu::X86_64_V3);
             let extended = compile(TargetCpu::X86_64_V4);
-            assert_ne!(baseline, extended, "{word:#010x} uses VPMOVS or VPMOVUS");
+            // Vector shift narrows of signed H and S lanes use one host pack
+            // and a VPTEST for QC on both tiers.
+            const VPTEST: [u8; 4] = [0xc4, 0xe2, 0x79, 0x17];
+            let packed = extended.windows(4).any(|bytes| bytes == VPTEST);
+            assert!(
+                baseline != extended || packed,
+                "{word:#010x} uses VPMOVS or VPMOVUS"
+            );
             let [baseline, extended] = [&baseline, &extended].map(|code| Native::new(code));
             for sample in 0..48 {
                 let mut state = GuestState::default();

@@ -699,6 +699,27 @@ impl Link for E1000e {
     }
 
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        self.receive_frame(<[u8]>::to_vec)
+    }
+
+    /// The stack's receive path: the frame is copied into its reused
+    /// buffer, so a received frame allocates nothing.
+    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
+        self.receive_frame(|bytes| {
+            frame.clear();
+            frame.extend_from_slice(bytes);
+        })
+        .map(|received| received.is_some())
+    }
+}
+
+impl E1000e {
+    /// The next good whole frame the controller wrote back, passed to
+    /// `take` while its buffer is still held.
+    fn receive_frame<T>(
+        &mut self,
+        mut take: impl FnMut(&[u8]) -> T,
+    ) -> Result<Option<T>, LinkError> {
         if let Some(error) = &self.timing_failure {
             return Err(LinkError::Pci(error.clone()));
         }
@@ -737,7 +758,7 @@ impl Link for E1000e {
                 && eop
                 && errors & RX_FRAME_ERRORS == 0
                 && (HEADER..=MAX_FRAME).contains(&length);
-            let frame = good.then(|| self.receive.buffer(index)[..length].to_vec());
+            let frame = good.then(|| take(&self.receive.buffer(index)[..length]));
             self.dropping_receive = !eop;
             self.offer_receive(index);
             self.receive.advance();

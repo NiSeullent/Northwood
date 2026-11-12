@@ -27,6 +27,21 @@ pub const fn picoseconds(seconds: u64) -> u64 {
     seconds.saturating_mul(PICOSECONDS_PER_SECOND)
 }
 
+/// How long XNU's debugger cross-call waits for every PE (`debug-ack`),
+/// in seconds. XNU's default, 60 ms, is short for PEs that answer at their
+/// next exit. It must end well before the watchdog mechanism a panic arms
+/// ([`WATCHDOG_MECHANISM_SECONDS`]): a PE that never answers (one parked
+/// in SPTM because another CPU owns the panic) holds the panicking PE in
+/// this wait, and only after it does XNU count PEs in SPTM as answered
+/// ("found CPU %d in SPTM") and print the panic. A wait as long as the
+/// mechanism's lets the reset come first, with no panic text.
+pub const DEBUG_ACK_SECONDS: u64 = 2;
+
+/// The watchdog mechanism's timeout: `AppleARMWatchdogTimer::
+/// _armWatchdogMechanism` arms uptime plus 10 s, rounded down to whole
+/// seconds, so the reset may come as little as 9 s after the arm.
+pub const WATCHDOG_MECHANISM_SECONDS: u64 = 10;
+
 /// The timeouts by which one core times another's lock hold.
 pub const LOCK_TIMEOUTS: [&str; 3] = ["ticket-lock", "lock", "lock-panic"];
 
@@ -194,6 +209,17 @@ mod tests {
         assert!((100_000_000..4_000_000_000).contains(&first), "{first}");
         let again = measure_core_hz(1_000_000_000);
         assert!(first.abs_diff(again) < first / 4, "{first} then {again}");
+    }
+
+    #[test]
+    fn the_debugger_cross_call_gives_up_long_before_the_watchdog_mechanism() {
+        // The panic's own printing, a nested SPTM query per silent PE and
+        // the paniclog flush need time after the wait, within the 9 s the
+        // rounded-down mechanism deadline may leave.
+        let shortest_mechanism = WATCHDOG_MECHANISM_SECONDS - 1;
+        assert!(DEBUG_ACK_SECONDS * 4 <= shortest_mechanism);
+        // Still far above XNU's 60 ms default and a 0.5 s engine exit.
+        assert!(picoseconds(DEBUG_ACK_SECONDS) >= 1_000_000_000_000);
     }
 
     #[test]

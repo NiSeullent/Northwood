@@ -357,9 +357,10 @@ fn el2_trap(machine: &mut TestMachine, word: u32) -> u64 {
 }
 
 /// FEAT_CSV2: the host isolates branch predictions at each change of the
-/// guest's context (its table bases with their ASIDs, CONTEXTIDR and
-/// the VMID), and only then: not at exceptions and returns within one
-/// address space, nor at a write that keeps the value.
+/// guest's context (its table bases with their ASIDs and the VMID), and
+/// only then: not at exceptions and returns within one address space, nor
+/// at a write that keeps the value, nor at a CONTEXTIDR write, which Arm's
+/// hardware-described context leaves out.
 #[test]
 fn guest_context_changes_isolate_branch_predictions() {
     const TTBR0_EL1: Encoding = Encoding::new(3, 0, 2, 0, 0);
@@ -395,7 +396,7 @@ fn guest_context_changes_isolate_branch_predictions() {
             (1, TTBR0_EL1, 1 << 48 | 0x8000, true),
             (1, TTBR0_EL1, 1 << 48 | 0x8000, false),
             (1, TTBR1_EL1, 0xc000, true),
-            (1, CONTEXTIDR_EL1, 7, true),
+            (1, CONTEXTIDR_EL1, 7, false),
         ],
     );
     // An exception from EL0 to EL1 and the return keep the context.
@@ -419,7 +420,7 @@ fn guest_context_changes_isolate_branch_predictions() {
 }
 
 #[test]
-fn contextidr_updates_live_debug_and_predictions_without_forgetting_cached_controls() {
+fn contextidr_updates_live_debug_without_isolating_or_forgetting_cached_controls() {
     const CONTEXTIDR_EL1: Encoding = Encoding::new(3, 0, 13, 0, 1);
     let mut machine = machine_on(Chip::AppleM2, &[]);
     machine.cpu.pstate = Pstate {
@@ -456,8 +457,8 @@ fn contextidr_updates_live_debug_and_predictions_without_forgetting_cached_contr
     machine
         .system_instruction(access(false, CONTEXTIDR_EL1, 1))
         .unwrap();
-    assert_eq!(machine.host.isolations, isolations + 1);
-    assert_eq!(machine.host.regimes.len(), regimes + 1);
+    assert_eq!(machine.host.isolations, isolations);
+    assert_eq!(machine.host.regimes.len(), regimes);
     assert_eq!(machine.timers, Some(Some(400)));
     assert!(machine.floating_point.is_some());
     assert!(machine.memory_checks.is_some());

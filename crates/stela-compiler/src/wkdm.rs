@@ -142,7 +142,83 @@ pub fn result(status: Status, units: Option<usize>, single_value: bool, populati
 
 /// Set bits in `bytes`.
 pub fn population(bytes: &[u8]) -> u32 {
-    bytes.iter().map(|byte| byte.count_ones()).sum()
+    // Eight bytes per count: a page is 2048 counts, not 16384, and one
+    // POPCNT each where the host has it.
+    let (chunks, rest) = bytes.as_chunks::<8>();
+    let wide = if popcnt::available() {
+        popcnt::count(chunks)
+    } else {
+        population_words(chunks)
+    };
+    wide + rest.iter().map(|byte| byte.count_ones()).sum::<u32>()
+}
+
+/// The set bits of `chunks`, in whatever instructions the caller's target
+/// features allow.
+#[inline(always)]
+fn population_words(chunks: &[[u8; 8]]) -> u32 {
+    chunks
+        .iter()
+        .map(|chunk| u64::from_ne_bytes(*chunk).count_ones())
+        .sum()
+}
+
+/// The POPCNT tier of [`population`]: the baseline x86-64 target counts
+/// bits in about 15 instructions per word without it.
+mod popcnt {
+    use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
+
+    /// 0 not asked yet, 1 absent, 2 present.
+    static PRESENT: AtomicU8 = AtomicU8::new(0);
+
+    pub(super) fn available() -> bool {
+        match PRESENT.load(Relaxed) {
+            0 => {
+                let present = detect();
+                PRESENT.store(if present { 2 } else { 1 }, Relaxed);
+                present
+            }
+            known => known == 2,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn detect() -> bool {
+        // Leaf 1 exists on every x86-64 processor; ECX bit 23 is POPCNT.
+        core::arch::x86_64::__cpuid(1).ecx & (1 << 23) != 0
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn detect() -> bool {
+        false
+    }
+
+    pub(super) fn count(chunks: &[[u8; 8]]) -> u32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: `available` saw POPCNT in CPUID before any caller
+            // reaches this.
+            unsafe { with_popcnt(chunks) }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            super::population_words(chunks)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt")]
+    unsafe fn with_popcnt(chunks: &[[u8; 8]]) -> u32 {
+        super::population_words(chunks)
+    }
+
+    #[cfg(test)]
+    pub(super) fn both(chunks: &[[u8; 8]]) -> (u32, Option<u32>) {
+        (
+            super::population_words(chunks),
+            available().then(|| count(chunks)),
+        )
+    }
 }
 
 #[cfg(test)]

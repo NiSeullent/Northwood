@@ -85,6 +85,8 @@ pub(super) const TX_INTER_FRAME_GAP: u32 = 3 << 24;
 pub(super) const TX_AUTO_FIFO: u32 = 1 << 7;
 /// PHYstatus link bit (Linux `LinkStatus`).
 pub(super) const LINK_STATUS: u8 = 0x02;
+/// PHYstatus `TBI_Enable`, on the 8169 family alone.
+pub(super) const TBI_ENABLE: u8 = 0x80;
 /// Clause 22 BMCR restart and BMSR link/autonegotiation-complete bits.
 pub(super) const MII_STATUS: u16 = 1;
 pub(super) const BMCR_RESTART_AUTONEGOTIATION: u16 = 1 << 9;

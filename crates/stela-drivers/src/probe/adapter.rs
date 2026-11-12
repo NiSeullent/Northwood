@@ -5,6 +5,7 @@ use crate::{
     net::{
         self, Link, LinkError, Mac,
         alx::Alx,
+        atl1c::Atl1c,
         e1000e::{E1000e, pch::cold::attach as pch},
         igb::Igb,
         igc::Igc,
@@ -111,6 +112,7 @@ adapters! {
     Pch(Box<pch::Pch>), "e1000e", unscheduled;
     Igb(Igb), "igb", unscheduled;
     Alx(Alx), "alx", unscheduled;
+    Atl1c(Atl1c), "atl1c", unscheduled;
     Realtek(Realtek), "realtek", unscheduled;
     Usb(UsbNet), "usb-cdc", unscheduled;
     UsbVendor(UsbEthernet), device, unscheduled;

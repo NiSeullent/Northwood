@@ -72,14 +72,7 @@ const RAW: [(&str, &[u8]); 4] = [
 /// `jnz` back, `ret`; for `callret`, then the `ret` the calls reach.
 fn raw_code(kernel: usize) -> Vec<u8> {
     let (_, op) = RAW[kernel];
-    let mut code = Vec::new();
-    for _ in 0..8 {
-        code.extend_from_slice(op);
-    }
-    code.extend([0x48, 0xff, 0xcf, 0x0f, 0x85]);
-    let back = -(code.len() as i32 + 4);
-    code.extend(back.to_le_bytes());
-    code.push(0xc3);
+    let mut code = loop_code(op);
     if kernel == 0 {
         // Each call's rel32: the `ret` after the loop's.
         let target = code.len();
@@ -90,6 +83,72 @@ fn raw_code(kernel: usize) -> Vec<u8> {
         code.push(0xc3);
     }
     code
+}
+
+/// `op` eight times, `dec rdi`, `jnz` back, `ret`.
+fn loop_code(op: &[u8]) -> Vec<u8> {
+    let mut code = Vec::new();
+    for _ in 0..8 {
+        code.extend_from_slice(op);
+    }
+    code.extend([0x48, 0xff, 0xcf, 0x0f, 0x85]);
+    let back = -(code.len() as i32 + 4);
+    code.extend(back.to_le_bytes());
+    code.push(0xc3);
+    code
+}
+
+/// `HOST BRANCH`'s kernels: an indirect jump to the next instruction (the
+/// same target every time, so a predicting core predicts it) and a direct
+/// jump to the next instruction.
+const BRANCH: [&[u8]; 2] = [
+    // lea r9, [rip + 3]; jmp r9
+    &[0x4c, 0x8d, 0x0d, 0x03, 0, 0, 0, 0x41, 0xff, 0xe1],
+    // jmp +0
+    &[0xe9, 0, 0, 0, 0],
+];
+/// `HOST BRANCH`'s bursts, and the loop iterations (eight jumps each) of
+/// one: about 0.4 ms in all where an indirect jump costs 3 ns.
+const BRANCH_BURSTS: usize = 256;
+const BRANCH_LOOPS: u64 = 64;
+/// Code bytes for one `HOST BRANCH` kernel.
+const BRANCH_BYTES: usize = 256;
+
+/// Print `HOST BRANCH`: this core's best ns per predicted indirect jump and
+/// per direct jump over short bursts (a burst no interruption spoiled), so
+/// every boot log, bare metal too, shows whether indirect jumps are
+/// predicted on this host (FACTS item 11 measured 14 cycles each in a
+/// guest). Under a millisecond, once, on the boot PE.
+pub(crate) fn host_branch(host: &mut impl Host) {
+    let Ok(installed) = host.install(&[0xcc; BRANCH_BYTES]) else {
+        output::arguments(format_args!(
+            "HOST BRANCH unavailable: no room in the host's code space\n"
+        ));
+        return;
+    };
+    let hz = local::state().tsc_hz.max(1);
+    let mut ns = [0.0_f64; 2];
+    for (slot, op) in BRANCH.iter().enumerate() {
+        let code = loop_code(op);
+        let mut bytes = alloc::vec![0xcc_u8; BRANCH_BYTES];
+        bytes[..code.len()].copy_from_slice(&code);
+        host.patch(installed, &bytes);
+        let mut data = 0_u64;
+        type Raw = unsafe extern "sysv64" fn(u64, *mut u64);
+        // SAFETY: just installed: a loop of `loops` rounds of jumps within
+        // its own code that touches no memory, then returns.
+        let run: Raw = unsafe { core::mem::transmute(installed.0) };
+        let mut best = u64::MAX;
+        for _ in 0..BRANCH_BURSTS {
+            let started = rdtsc();
+            // SAFETY: as above.
+            unsafe { run(BRANCH_LOOPS, &mut data) };
+            best = best.min(rdtsc().wrapping_sub(started));
+        }
+        ns[slot] = best as f64 * 1e9 / hz as f64 / (BRANCH_LOOPS * 8) as f64;
+    }
+    let line = stela_boot_core::chain_check::host_branch_line(ns[0], ns[1]);
+    output::arguments(format_args!("{line}\n"));
 }
 
 #[derive(Clone, Copy)]

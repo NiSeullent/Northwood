@@ -282,6 +282,11 @@ const PORT_POWER_US: u64 = 20_000;
 const DEBOUNCE_STEP_US: u64 = 25_000;
 const DEBOUNCE_STABLE_US: u64 = 100_000;
 const DEBOUNCE_TIMEOUT_US: u64 = 2_000_000;
+/// How long a root port must show no connection after the controller's
+/// reset before it counts as empty: a USB 3 link retrains and a USB 2 device
+/// signals its connection again within a few hundred ms. All ports share
+/// it, so a controller with no device spends this once.
+const CONNECT_SETTLE_US: u64 = 500_000;
 /// Linux `PORT_INIT_TRIES`: resets and enumerations a port gets.
 const PORT_INIT_TRIES: usize = 4;
 const ADDRESS_RECOVERY_US: u64 = 2_000;

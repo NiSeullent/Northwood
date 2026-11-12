@@ -232,18 +232,23 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// and keeps its neighbour. Counts the pages the ITLB lacked in the
     /// context apart from the new keys of pages it held.
     pub(super) fn translate_page(&mut self, pc: u64, key: u64) {
-        self.take_page(pc, key, true);
+        let global = self.fetched_global(pc);
+        self.take_page(pc, key, true, global);
     }
 
     /// [`Self::translate_page`], counting a page the ITLB lacked as a miss
     /// when `missed` (a fetch's) and as a refill when not
-    /// ([`Self::refill_pages`]).
-    fn take_page(&mut self, pc: u64, key: u64, missed: bool) {
+    /// ([`Self::refill_pages`]). `global` marks a page whose walk ended in
+    /// a global leaf ([`chain::LookupEntry::global_page`]).
+    fn take_page(&mut self, pc: u64, key: u64, missed: bool, global: bool) {
         let half = chain::half(pc);
         let context = self.chain.contexts()[half];
         let page = pc & !(FETCH_PAGE - 1);
         let slot = self.itlb.page_slot(pc, context);
-        let entry = chain::LookupEntry::page(page, context, key);
+        let entry = match global {
+            true => chain::LookupEntry::global_page(page, context, key),
+            false => chain::LookupEntry::page(page, context, key),
+        };
         let held = self.itlb.find(slot, page, context);
         if held == entry {
             return;
@@ -453,7 +458,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn refill_pages(&mut self, el: u8, context: Variant) {
         let generation = self.translation_generation;
         for pc in core::mem::take(&mut self.refills) {
-            let Some((physical, guarded)) = self.quiet_fetch_physical(pc) else {
+            let Some((physical, guarded, global)) = self.quiet_fetch_physical(pc) else {
                 continue;
             };
             if self.translation_generation != generation {
@@ -468,7 +473,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let variant = self.page_variant(current, physical);
             if let Some(id) = self.known_variant(variant) {
                 let key = self.block_key(physical, id);
-                self.take_page(pc, key, false);
+                self.take_page(pc, key, false, global);
             }
         }
     }
@@ -570,6 +575,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let context = stored
             .is_some()
             .then(|| self.stored_context(variant, &preparation, page));
+        // Compiled at another PC of the same page content before: proven
+        // once compiled here ([`super::rebase`]).
+        let mut prove = false;
         if let (Some((key, record)), Some(context)) = (&stored, &context) {
             // The machine's buffers take the entry's relocated code: an
             // install from the store allocates nothing.
@@ -626,6 +634,45 @@ impl<H: Host, D: Devices> Machine<H, D> {
                         )
                         .map(Some);
                 }
+            }
+            // The same page content, compiled at another address of this
+            // boot: its proven entry, rebased to this page.
+            match self.code.rebases.look(key, offset as u16, context, pc) {
+                super::rebase::Found::Entry(entry) => {
+                    if entry.input.len() > available && !whole {
+                        return Ok(None);
+                    }
+                    let mut relocated = core::mem::take(&mut self.relocated);
+                    if entry.relocate(page, source, &mut relocated) {
+                        if usize::from(entry.source_bytes) > available {
+                            self.relocated = relocated;
+                            return Ok(None);
+                        }
+                        self.code.rebases.hit();
+                        self.count_store_source(StoreSource::Rebased);
+                        let origin = Arc::new(recovery::StoredOrigin {
+                            key: *key,
+                            context: *context,
+                            page,
+                            preparation: preparation.clone(),
+                            kept: Some(entry.clone()),
+                        });
+                        let installed = self
+                            .install(
+                                pc,
+                                physical,
+                                variant,
+                                source,
+                                recovery::Template::stored(&entry, &relocated, origin),
+                            )
+                            .map(Some);
+                        self.relocated = relocated;
+                        return installed;
+                    }
+                    self.relocated = relocated;
+                }
+                super::rebase::Found::Prove => prove = true,
+                super::rebase::Found::Compile => {}
             }
         }
         let started = self.host.counter();
@@ -688,6 +735,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
             compiled,
             preparation,
         ));
+        if prove
+            && !self.host.memory_low()
+            && let (Some((key, _)), Some(context)) = (&stored, &context)
+        {
+            let proving = self.host.counter();
+            let entry = Offer::prove_block(
+                &emission.block,
+                &emission.input,
+                page,
+                pc,
+                *context,
+                &emission.preparation,
+            );
+            self.code.rebases.keep(key, offset as u16, context, entry);
+            self.statistics.compile_ticks += self.host.counter().wrapping_sub(proving);
+        }
         // An offer is kept until the store proves it. With memory low the
         // store holds no more for proof, but the other PEs still take the
         // block: this one retains the emission anyway, and each reuse saves
@@ -966,6 +1029,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 code_bytes,
                 terminal_pc,
                 terminal,
+                (last / INSTRUCTION as usize) as u32,
             ));
         }
         // The record keeps a bit per successor; any more stay exits.
@@ -999,7 +1063,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .recovery()
             .insert(slot, compiled.clone().installed());
         let mut cache = shared.cache_at(board::LockSite::Install);
-        self.census_installed(&mut cache, pc, physical, variant, installed_bytes);
+        self.census_installed(
+            &mut cache,
+            pc,
+            physical,
+            variant,
+            installed_bytes,
+            instructions,
+        );
         // Another PE installed the block meanwhile: the first install wins,
         // and this one's code stays unreachable until its part goes.
         if let Some(held) = cache.index.get(&shared.blocks, pc, physical, id) {
@@ -1113,10 +1184,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
-    /// Count an install of `bytes` of code of the block at `pc`, `physical`
-    /// and `variant`, and with step timing on, why it was needed
-    /// ([`install_census`]). A shared board keeps one census, under its
-    /// lock (`cache`), and its blocks are never elsewhere.
+    /// Count an install of `bytes` of code for `instructions` guest
+    /// instructions of the block at `pc`, `physical` and `variant`, and
+    /// with step timing on, why it was needed ([`install_census`]). A
+    /// shared board keeps one census, under its lock (`cache`), and its
+    /// blocks are never elsewhere.
     pub(super) fn census_installed(
         &mut self,
         cache: &mut board::Cache,
@@ -1124,10 +1196,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         physical: u64,
         variant: Variant,
         bytes: usize,
+        instructions: usize,
     ) {
         let causes = &mut self.install_causes;
         causes.installs += 1;
         causes.installed_bytes += bytes as u64;
+        causes.guest_instructions += instructions as u64;
+        if pc >> 63 != 0 {
+            causes.upper_bytes += bytes as u64;
+            causes.upper_instructions += instructions as u64;
+        }
         if self.step_timing.is_none() {
             self.census = None;
             return;
@@ -1247,13 +1325,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// `code`, through a thunk that completes `word` at `pc`, if it is MRS
     /// of a [`MIRRORED`] register, from its cell in [`Self::mirrors`] while
     /// it is readable (`x86_64::register_read`); the thunk's direct exit to
-    /// the next instruction.
+    /// the next instruction. `before` instructions of the block precede it.
     pub(super) fn complete_mirrored_read_natively(
         &mut self,
         code: NativeCode,
         native: &[u8],
         pc: u64,
         word: u32,
+        before: u32,
     ) -> Option<Successor> {
         let site = native.len().checked_sub(chain::DIRECT_EXIT_BYTES)?;
         if !chain::is_direct_exit(&native[site..], GuestAddress(pc), ExitKind::System) {
@@ -1274,8 +1353,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 register_read::event_wait_thunk(pc, cell)
             }
         } else if data_barrier(pc, word) {
-            let cell = cell_place(DATA_BARRIER);
-            register_read::barrier_thunk(GuestAddress(pc), cell)
+            register_read::barrier_thunk(GuestAddress(pc), BARRIER)
         } else if let Some(rt) = code_page_invalidation(word).filter(|&rt| rt != ZERO_REGISTER) {
             let cell = cell_place(CODE_PAGE);
             register_read::code_page_thunk(GuestAddress(pc), rt, cell)
@@ -1286,6 +1364,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
             register_read::stack_select_thunk(GuestAddress(pc), select, cell, current, sp0)
         } else if let Some((index, rt)) = written_register(pc, word) {
             self.stored_write_thunk(GuestAddress(pc), index, rt)
+        } else if let Some(rt) = table_base_write(pc, word) {
+            let cell = cell_place(TABLE_BASE_KEPT);
+            let written = self.register_fixed_bits(SystemRegister::TTBR0_EL1);
+            register_read::unchanged_write_thunk(GuestAddress(pc), rt, cell, written)
+        } else if let Some((kept, rt)) = permission_write_word(word) {
+            let all = register_read::Written {
+                keep: u64::MAX,
+                set: 0,
+            };
+            register_read::unchanged_write_thunk(GuestAddress(pc), rt, cell_place(kept), all)
         } else if let Some((index, rt)) = guarded_written_register(pc, word) {
             let cell = cell_place(index);
             let all = register_read::Written {
@@ -1301,6 +1389,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 self.clock.native(self.host.tsc_counter()?);
                 let count = Place::new(Anchor::Count, 0);
                 register_read::count_thunk(GuestAddress(pc), rt, cell, count)
+            } else if index == COUNTER_MIRRORS[0]
+                && let Some(tsc) = self.host.tsc_counter()
+            {
+                self.clock.native(tsc);
+                let count = Place::new(Anchor::Count, 0);
+                let plain = cell_place(CYCLES_PLAIN);
+                register_read::cycle_counter_thunk(GuestAddress(pc), rt, cell, plain, CYCLES, count)
+            } else if index == COUNTER_MIRRORS[1] {
+                // Its block's instructions before it have retired, and the
+                // chain counts the blocks native code left: what the
+                // engine's exit here would retire before it reads.
+                let plain = cell_place(INSTRUCTIONS_PLAIN);
+                register_read::instruction_counter_thunk(
+                    GuestAddress(pc),
+                    rt,
+                    cell,
+                    plain,
+                    INSTRUCTION_COUNTER,
+                    before,
+                )?
             } else if index == DAIF_MIRROR && self.native_system().exclusive {
                 register_read::mask_read_thunk(GuestAddress(pc), rt, cell)
             } else {
@@ -1320,6 +1428,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 epoch,
                 count,
             )
+        } else if let Some((access, rt)) = timer_word(word) {
+            self.clock.native(self.host.tsc_counter()?);
+            let access = match access {
+                TimerWord::Value => register_read::TimerAccess::WriteValue,
+                TimerWord::Compare => register_read::TimerAccess::WriteCompare,
+                TimerWord::ControlRead => register_read::TimerAccess::ReadControl,
+                TimerWord::ControlWrite => register_read::TimerAccess::WriteControl(
+                    self.register_fixed_bits(SystemRegister::CNTHV_CTL_EL2),
+                ),
+            };
+            register_read::timer_thunk(GuestAddress(pc), rt, access, TIMER)
         } else if let Some(access) = mrs_access(pc, word) {
             self.stored_read_thunk(pc, access)?
         } else {

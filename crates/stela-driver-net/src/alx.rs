@@ -445,6 +445,37 @@ impl<R: Registers> Link for Alx<R> {
     }
 
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        self.receive_frame(|bytes| {
+            let mut data = Vec::new();
+            data.try_reserve_exact(bytes.len()).ok()?;
+            data.extend_from_slice(bytes);
+            Some(data)
+        })
+    }
+
+    /// The stack's receive path: the frame is copied into its reused
+    /// buffer, so a received frame allocates nothing once it has grown.
+    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
+        self.receive_frame(|bytes| {
+            frame
+                .try_reserve(bytes.len().saturating_sub(frame.len()))
+                .ok()?;
+            frame.clear();
+            frame.extend_from_slice(bytes);
+            Some(())
+        })
+        .map(|received| received.is_some())
+    }
+}
+
+impl<R: Registers> Alx<R> {
+    /// The next good frame the controller returned, passed to `take` while
+    /// its buffer is still held; `take` answers `None` when it cannot store
+    /// the frame.
+    fn receive_frame<T>(
+        &mut self,
+        mut take: impl FnMut(&[u8]) -> Option<T>,
+    ) -> Result<Option<T>, LinkError> {
         self.checked()?;
         self.carrier_now()?;
         let mut cleaned = 0;
@@ -469,11 +500,13 @@ impl<R: Registers> Link for Alx<R> {
             } else {
                 let length = ((status & RRD_PKTLEN) as usize).saturating_sub(FCS);
                 if (super::HEADER..=MAX_FRAME).contains(&length) {
-                    let mut data = Vec::new();
-                    data.try_reserve_exact(length).map_err(|_| {
-                        LinkError::Adapter(format!("{} receive allocation failed", self.location))
-                    })?;
-                    data.extend_from_slice(&self.queues.free.buffer(index)[..length]);
+                    let data =
+                        take(&self.queues.free.buffer(index)[..length]).ok_or_else(|| {
+                            LinkError::Adapter(format!(
+                                "{} receive allocation failed",
+                                self.location
+                            ))
+                        })?;
                     frame = Some(data);
                 }
             }

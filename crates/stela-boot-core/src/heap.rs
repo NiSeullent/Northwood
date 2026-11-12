@@ -67,6 +67,34 @@ fn passed_peak(carved: usize) {
     }
 }
 
+/// Called with the payload address and bytes of each free-list allocation
+/// of at least [`TRACKED_BYTES`] when it is made (`true`) and when it is
+/// freed (`false`), outside the heap's lock: it must neither allocate nor
+/// wait. The boot keeps their allocating stacks, so each large block on the
+/// heap names its code.
+static LARGE_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// The least allocation [`LARGE_HOOK`] hears of: a few hundred live at most,
+/// rare enough that the hook costs nothing measurable.
+pub const TRACKED_BYTES: usize = 4 << 20;
+
+/// Sets the hook [`LARGE_HOOK`] calls.
+pub fn set_large_hook(hook: fn(usize, usize, bool)) {
+    LARGE_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn tracked(pointer: *mut u8, bytes: usize, allocated: bool) {
+    if bytes < TRACKED_BYTES || pointer.is_null() {
+        return;
+    }
+    let hook = LARGE_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_large_hook` stores a nonzero value, a
+        // `fn(usize, usize, bool)`.
+        let hook: fn(usize, usize, bool) = unsafe { core::mem::transmute(hook) };
+        hook(pointer as usize, bytes, allocated);
+    }
+}
+
 const PAGE_BYTES: usize = 4096;
 /// A block's boundary tag, at its start: the address of the block before it
 /// and its own size, a multiple of [`GRANULE`] whose low bits hold [`FREE`]
@@ -323,6 +351,8 @@ struct State {
     /// The part of `carved` in the reserve.
     carved_reserve: usize,
     peak: usize,
+    /// The most carved since [`Heap::mark`].
+    marked_peak: usize,
     /// Allocations the bins served.
     carves: u64,
     /// Live allocations the bins served: count and bytes by [`large_bucket`].
@@ -408,6 +438,15 @@ impl State {
                 (*following).previous = block as usize;
                 (*following).size = (*following).size & !PREVIOUS_FREE | free;
             }
+        }
+    }
+
+    /// Raise the high-water marks to the carved bytes.
+    fn note_carved(&mut self) {
+        self.marked_peak = self.marked_peak.max(self.carved);
+        if self.carved > self.peak {
+            self.peak = self.carved;
+            passed_peak(self.carved);
         }
     }
 
@@ -513,6 +552,7 @@ impl Heap {
                 carved: 0,
                 carved_reserve: 0,
                 peak: 0,
+                marked_peak: 0,
                 carves: 0,
                 large: [(0, 0); LARGE_BUCKETS],
             }),
@@ -708,6 +748,9 @@ impl Heap {
         // shared body checks initialization before accessing backing storage.
         let block = unsafe { allocate_locked(&mut *self.state.get(), layout, class(layout)) };
         drop(guard);
+        if class(layout).is_none() {
+            tracked(block, layout.size(), true);
+        }
         block
     }
 
@@ -773,6 +816,7 @@ impl Heap {
         if !block.is_null() {
             // SAFETY: the selected full payload is exclusively owned and live.
             unsafe { block.write_bytes(0, layout.size()) };
+            tracked(block, layout.size(), true);
         }
         block
     }
@@ -1000,6 +1044,23 @@ impl Heap {
             .sum()
     }
 
+    /// Start a new high-water mark of the carved bytes, for
+    /// [`Self::marked_peak`]: the bytes carved now.
+    pub fn mark(&self) -> usize {
+        let _guard = self.lock();
+        // SAFETY: the guard excludes every other state access.
+        let state = unsafe { &mut *self.state.get() };
+        state.marked_peak = state.carved;
+        state.carved
+    }
+
+    /// The most bytes carved at once since the last [`Self::mark`].
+    pub fn marked_peak(&self) -> usize {
+        let _guard = self.lock();
+        // SAFETY: the guard excludes metadata writers.
+        unsafe { (*self.state.get()).marked_peak }
+    }
+
     /// The heap's usage, walking the free list for its largest extent.
     pub fn usage(&self) -> Usage {
         let _guard = self.lock();
@@ -1150,8 +1211,13 @@ unsafe impl GlobalAlloc for Heap {
         if block.is_null() {
             self.failures.fetch_add(1, Ordering::Relaxed);
             failure::report(self, layout);
-        } else if let Some(cpu) = cpu {
-            self.count_own(cpu, layout, class, true);
+        } else {
+            if let Some(cpu) = cpu {
+                self.count_own(cpu, layout, class, true);
+            }
+            if class.is_none() {
+                tracked(block, layout.size(), true);
+            }
         }
         block
     }
@@ -1167,6 +1233,9 @@ unsafe impl GlobalAlloc for Heap {
                 restore_interrupts(flags);
                 return;
             }
+        }
+        if class.is_none() {
+            tracked(pointer, layout.size(), false);
         }
         let _guard = self.lock();
         // SAFETY: this live acquire/release guard excludes every metadata
@@ -1225,6 +1294,8 @@ unsafe impl GlobalAlloc for Heap {
                     self.count_own(cpu, layout, None, false);
                     self.count_own(cpu, new_layout, None, true);
                 }
+                tracked(pointer, layout.size(), false);
+                tracked(pointer, new_size, true);
                 return pointer;
             }
         }
@@ -1297,10 +1368,7 @@ unsafe fn resize_large(state: &mut State, pointer: *mut u8, new_size: usize) -> 
         if block as usize >= state.floor {
             state.carved_reserve = state.carved_reserve - old_bytes + new_bytes;
         }
-        if state.carved > state.peak {
-            state.peak = state.carved;
-            passed_peak(state.carved);
-        }
+        state.note_carved();
     }
     true
 }
@@ -1377,10 +1445,7 @@ unsafe fn take(state: &mut State, block: *mut Header, user: usize, payload: usiz
             state.carved_reserve += used_end - head;
         }
     }
-    if state.carved > state.peak {
-        state.peak = state.carved;
-        passed_peak(state.carved);
-    }
+    state.note_carved();
     user as *mut u8
 }
 

@@ -216,13 +216,18 @@ fn adjacent_vector_pairs_forward_both_sources_and_keep_each_access() {
             checks,
             target.with_data_independent_timing(),
         );
-        assert_eq!(grouped.native.source_map, fallback.native.source_map);
         assert_eq!(grouped.native.source_map.len(), 2);
         assert_eq!(grouped.native.source_map[1].0, next);
-        assert_eq!(
-            grouped.native.x86_64_code.len() + reload.len(),
-            fallback.native.x86_64_code.len()
-        );
+        // A system-mode block keeps both vectors in host registers
+        // (`vector_cache`), whose stores before the second access replace
+        // the commits.
+        if profile == BlockProfile::ORDINARY {
+            assert_eq!(grouped.native.source_map, fallback.native.source_map);
+            assert_eq!(
+                grouped.native.x86_64_code.len() + reload.len(),
+                fallback.native.x86_64_code.len()
+            );
+        }
         assert!(!has_reload(&grouped.native));
         assert!(has_reload(&fallback.native));
         assert!(has_reload(

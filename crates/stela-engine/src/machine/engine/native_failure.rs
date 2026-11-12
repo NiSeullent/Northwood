@@ -112,7 +112,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let code = &self.code;
         let held = slot < code.blocks.len();
         let block = code.blocks.get(slot);
-        let record = held.then(|| code.blocks.record(slot));
+        let record = held.then(|| code.blocks.try_record(slot)).flatten();
         let part = code.arena.as_ref().zip(block).and_then(|(arena, block)| {
             let offset = block.code.0.checked_sub(arena.window.exec)?;
             Some(offset / arena.part_bytes)

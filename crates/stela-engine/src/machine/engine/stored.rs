@@ -289,7 +289,7 @@ impl Offer {
         Self::prove_block(&block, input, page, pc, context, preparation)
     }
 
-    fn prove_block(
+    pub(super) fn prove_block(
         block: &CompiledBlock,
         input: &[u8],
         page: u64,
@@ -489,6 +489,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 origin: Some(origin),
                 ..
             }) if origin.page == page
+                && origin.kept.is_none()
                 && origin.context == context
                 && Arc::ptr_eq(&origin.preparation, preparation) =>
             {
@@ -500,6 +501,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     context,
                     page,
                     preparation: preparation.clone(),
+                    kept: None,
                 });
                 if let Some(kept) = kept {
                     kept.origin = Some(origin.clone());

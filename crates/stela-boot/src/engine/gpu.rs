@@ -835,7 +835,7 @@ impl GpuViews {
 }
 
 fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, ServiceError> {
-    use stela_loader::host_firmware::{recipes, requirements::Inventory};
+    use stela_loader::host_firmware::{bundle, recipes, requirements::Inventory};
     let chip = gpu::nouveau_chip::Chip::from_boot0(boot0).ok_or(ServiceError::Refused(
         "the GPU's PMC chipset is unsupported",
     ))?;
@@ -857,10 +857,32 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
     .map_err(|_| ServiceError::Refused("the GPU firmware target is invalid"))?;
     let plan = recipes::Plan::select(&inventory)
         .map_err(|_| ServiceError::Refused("the GPU firmware recipe cannot be selected"))?;
+    // SAFETY: the reference count is never given back, so the catalog
+    // stays allocated for every image borrowed from it for the boot.
+    let stored: &'static Catalog = unsafe { &*Arc::into_raw(catalog.clone()) };
+    let mut bindings = Vec::new();
     let mut available = false;
     for selection in plan.selections() {
         let request = &selection.request;
-        match catalog.load(request.view()) {
+        // An exact binding, else the bundle's file by its pinned digest.
+        let found = match stored.load(request.view()) {
+            Err(error) if error.kind == FirmwareError::Missing => {
+                let name = bundle::name(selection.recipe.image.sha256);
+                match stored.load(stela_drivers::firmware::Requirement {
+                    name: &name,
+                    target: bundle::TARGET,
+                    minimum_bytes: request.minimum_bytes,
+                }) {
+                    Err(stored_error) if stored_error.kind == FirmwareError::Missing => Err(error),
+                    other => other,
+                }
+            }
+            other => other,
+        };
+        if let Ok(image) = found {
+            bindings.push((image, request));
+        }
+        match found {
             Ok(image) => {
                 selection
                     .recipe
@@ -888,11 +910,18 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
     }
     if !available {
         output::arguments(format_args!(
-            "GPU {name}: `stela setup host-firmware fetch --gpu {name}` supplies the pinned firmware\n"
+            "GPU {name}: the USB's firmware bundle lacks this chip's files; `stela setup repair` \
+             completes it\n"
         ));
         return Err(ServiceError::Refused(NO_FIRMWARE));
     }
-    PciFirmware::new(target, catalog, names.into_boxed_slice())
+    // Each file under the exact name and target nouveau asks for.
+    let catalog = Catalog::rebind_all(bindings.iter().map(|(image, request)| {
+        let view = request.view();
+        (*image, view.name, view.target)
+    }))
+    .map_err(|_| ServiceError::Refused("the GPU firmware cannot be bound to its requests"))?;
+    PciFirmware::new(target, Arc::new(catalog), names.into_boxed_slice())
         .map_err(|_| ServiceError::Refused("the GPU firmware image names are invalid"))
 }
 
@@ -1052,6 +1081,11 @@ fn claim(
     views
         .check(&mut function)
         .map_err(|error| cold_refusal(address, gpu::cold::Error::Views(error)))?;
+    if let Some(chip) =
+        gpu::nouveau_chip::Chip::from_boot0(boot0).filter(|chip| chip.waits_for_firmware_boot())
+    {
+        wait_for_firmware_boot(services, &resources[0], chip)?;
+    }
     // SAFETY: this scoped BAR observation was the sole user of the UC mapping.
     unsafe { views.registers.retire() }.map_err(ServiceError::Mapping)?;
     let capabilities = function
@@ -1109,6 +1143,120 @@ fn claim(
     })
 }
 
+/// Read one BAR0 register through a scoped read-only page of `registers`,
+/// or `None` when it cannot be mapped or read.
+fn read_register(
+    services: &dyn NativeServices,
+    registers: &owned::Resource,
+    offset: usize,
+) -> Option<u32> {
+    let page = offset & !(PAGE as usize - 1);
+    let mut window = services
+        .authority()
+        .ok()?
+        .map(
+            registers.clone(),
+            page,
+            PAGE as usize,
+            CacheAttribute::Uncached,
+            Protection::ReadOnly,
+        )
+        .ok()?;
+    let value = window.read32(offset - page).ok();
+    // SAFETY: the read above was this scoped mapping's only use.
+    unsafe { window.retire() }.ok()?;
+    value
+}
+
+/// After the claim's function-level reset a Turing-to-Ada GPU's own firmware
+/// runs devinit again. nouveau reads the VBIOS before it waits for that
+/// (`firmware_boot`), so wait here first, by nouveau's bound, and print what
+/// the start of the old boot flow depends on: the firmware boot, WPR2 (which
+/// FWSEC-FRTS sets) and the VBIOS window the PRAMIN shadow reads.
+/// `GPU AD107: firmware boot completed after N polls: gfw=… plm=… wpr2=…-…
+/// display_fuse=… vbios_window=…`, or `did not complete` and a refusal.
+fn wait_for_firmware_boot(
+    services: &dyn NativeServices,
+    registers: &owned::Resource,
+    chip: &gpu::nouveau_chip::Chip,
+) -> Result<(), ServiceError> {
+    use gpu::nouveau_chip::firmware_boot::{self, Error as BootError};
+    let page = firmware_boot::PRIV_LEVEL_MASK & !(PAGE as usize - 1);
+    let mut window = services
+        .authority()?
+        .map(
+            registers.clone(),
+            page,
+            PAGE as usize,
+            CacheAttribute::Uncached,
+            Protection::ReadOnly,
+        )
+        .map_err(ServiceError::Mapping)?;
+    let timer = services.minimum_delay()?;
+    let result = firmware_boot::wait(
+        |offset| {
+            window
+                .read32(offset - page)
+                .map_err(|_| "a register read failed")
+        },
+        |micros| timer.wait_us(micros).map_err(|_| "the timer failed"),
+    );
+    // SAFETY: the polls above were this scoped mapping's only use.
+    unsafe { window.retire() }.map_err(ServiceError::Mapping)?;
+    let read = |offset| read_register(services, registers, offset);
+    let hex =
+        |value: Option<u32>| value.map_or_else(|| String::from("unread"), |v| format!("{v:#010x}"));
+    // nouveau's PRAMIN shadow reads the window only with the display fused
+    // on (`shadowramin.c` `pramin_init`: 0x820c04 from GA100, else 0x021c04).
+    let fuse = read(match chip.architecture {
+        gpu::nouveau_chip::Architecture::Turing => 0x02_1c04,
+        _ => 0x82_0c04,
+    });
+    let window = fuse
+        .filter(|fuse| fuse & 1 == 0)
+        .and_then(|_| read(0x62_5f04));
+    let state = format!(
+        "wpr2={}-{} display_fuse={} vbios_window={}",
+        hex(read(0x1f_a824)),
+        hex(read(0x1f_a828)),
+        hex(fuse),
+        hex(window),
+    );
+    match result {
+        Ok(reading) => {
+            output::arguments(format_args!(
+                "GPU {}: firmware boot completed after {} polls: gfw={:#010x} plm={:#010x} {state}\n",
+                chip.name, reading.polls, reading.progress, reading.priv_level_mask
+            ));
+            Ok(())
+        }
+        Err(BootError::Timeout(reading)) => {
+            output::arguments(format_args!(
+                "GPU {}: firmware boot did not complete after its reset in {} polls of {} us: \
+                 gfw={:#010x} (expected low byte {:#04x}) plm={:#010x} (expected bit 0) {state}\n",
+                chip.name,
+                reading.polls,
+                firmware_boot::POLL_MICROS,
+                reading.progress,
+                firmware_boot::COMPLETED,
+                reading.priv_level_mask
+            ));
+            Err(ServiceError::Refused(
+                "the GPU's firmware boot did not complete after its reset",
+            ))
+        }
+        Err(BootError::Access(error)) => {
+            output::arguments(format_args!(
+                "GPU {}: firmware boot wait stopped: {error}\n",
+                chip.name
+            ));
+            Err(ServiceError::Refused(
+                "the GPU's firmware boot registers could not be read",
+            ))
+        }
+    }
+}
+
 fn cold_refusal(
     address: stela_drivers::bus::pci::Address,
     error: gpu::cold::Error,
@@ -1142,6 +1290,18 @@ pub(super) fn claim_all(
         device: adapter.device,
         reason,
     };
+    for adapter in adapters
+        .iter()
+        .filter(|adapter| adapter.vendor != gpu::Vendor::Nvidia)
+    {
+        output::arguments(format_args!(
+            "GPU {} vendor={:?} device={:04x} unused: {}\n",
+            adapter.address,
+            adapter.vendor,
+            adapter.device,
+            adapter.unavailable_reason()
+        ));
+    }
     let nvidia = adapters
         .iter()
         .filter(|adapter| adapter.vendor == gpu::Vendor::Nvidia);
@@ -2050,7 +2210,13 @@ pub(super) fn pump() {
                 serving,
             );
             steps += 1;
-            if super::service::shutdown_pending() || host::rdtsc().wrapping_sub(started) >= budget {
+            // A core spinning for the host drivers' lock this pump holds
+            // (a disk or input call) takes it after this step; the rest
+            // stays pending for the next pump.
+            if super::service::shutdown_pending()
+                || host::rdtsc().wrapping_sub(started) >= budget
+                || super::storage::host_drivers_wanted()
+            {
                 if !gpu.events.pending.swap(true, Ordering::AcqRel) {
                     PENDING_SINCE.store(host::rdtsc(), Ordering::Release);
                 }
@@ -2195,7 +2361,7 @@ pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
         longest.join("/"),
         names = PumpPart::NAMES.join("/"),
     );
-    let linux = linux_report(take(&PUMPS.steps));
+    let linux = linux_report(take(&PUMPS.steps), tsc_hz);
     Some(pumps + &linux + &nvkm)
 }
 
@@ -2221,8 +2387,13 @@ struct LinuxCounts {
 /// high-resolution) and work items that ran in the environment, most first,
 /// by function as an offset in this image (`other:N` for the rest), the tasks
 /// a timeout woke by the work item or thread function they ran (`-` for
-/// neither) and in all, and the Linux steps the pumps ran.
-fn linux_report(steps: u64) -> String {
+/// neither) and in all, and the Linux steps the pumps ran. Then
+/// `step_us=select/body/after empty_us=N empties=N scans=N locks=N clocks=N`:
+/// the work dispatchers' time (all runtimes) in steps that ran a task (entry to the switch, the
+/// task's run, return to exit), its time and count of steps that found
+/// nothing, its job-slot scans for idle tasks, its queue locks, and the
+/// native clock's samples.
+fn linux_report(steps: u64, tsc_hz: u64) -> String {
     /// Functions listed per kind.
     const TOP: usize = 4;
     unsafe extern "C" {
@@ -2271,12 +2442,23 @@ fn linux_report(steps: u64) -> String {
         }
         line
     };
+    let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
+    let step = stela_drivers::platform::work::step_counts::take();
     format!(
-        "\nGPU LINUX timers={} works={} sleepers={} timeouts={} steps={steps}",
+        "\nGPU LINUX timers={} works={} sleepers={} timeouts={} steps={steps} \
+         step_us={}/{}/{} empty_us={} empties={} scans={} locks={} clocks={}",
         list(&counts.timers),
         list(&counts.works),
         list(&counts.sleepers),
         counts.timeouts.swap(0, Ordering::Relaxed),
+        micros(step.select),
+        micros(step.body),
+        micros(step.after),
+        micros(step.empty),
+        step.empty_steps,
+        step.scans,
+        step.locks,
+        crate::native_clock::SAMPLES.swap(0, Ordering::Relaxed),
     )
 }
 

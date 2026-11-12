@@ -1,34 +1,118 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
+# Format the workspace and run host tests without building the UEFI image.
 name: x86 host checks
 
 on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
   group: host-checks-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Keep each branch push's result and cancel superseded pull request runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
+  format:
+    if: github.event.deleted != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # No later step pushes, and a pull request's code runs here.
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Format
+        run: |
+          # Every crate, as cargo xtask check formats them.
+          cargo fmt --all -- --check
+          for crate in crates/stela-boot crates/stela-mesa crates/stela-mesa/std; do
+            cargo fmt --manifest-path "$crate/Cargo.toml" -- --check
+          done
+
   x86:
     if: github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    env:
-      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - name: Check formatting
-        run: cargo fmt -p stela-boot-core -p stela-drivers -p northwood -p northwood-config -- --check
       - name: Lint host code and tests
         run: cargo clippy --locked -p stela-boot-core -p stela-drivers -p northwood -p northwood-config --all-targets
       - name: Run host tests
         run: cargo test --locked -p stela-boot-core -p stela-drivers -p northwood -p northwood-config
       - name: Check promoted MMIO RAM contention
         run: cargo test --locked -p stela-engine --lib promoted_device_site_uses_only_current_canonical_ram_admission
+
+  check:
+    if: github.event.deleted != true
+    name: check (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: linux
+            os: ubuntu-22.04
+          - system: windows
+            os: windows-2025
+          - system: macos
+            os: macos-26
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # No later step pushes, and a pull request's code runs here.
+          persist-credentials: false
+
+      - name: Put LLVM on PATH
+        run: |
+          # Mbed TLS takes -mllvm --disable-select-optimize, LLVM 15 and newer.
+          case "$RUNNER_OS" in
+            Windows) printf '%s\n' 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH" ;;
+            Linux)
+              [[ -d /usr/lib/llvm-15/bin ]] || { sudo apt-get update -q && sudo apt-get install -y -q clang-15; }
+              echo /usr/lib/llvm-15/bin >> "$GITHUB_PATH"
+              ;;
+          esac
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-ci-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-ci-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustc --version
+          clang --version | head -1
+
+      - name: Clippy
+        run: cargo clippy --locked -p stela-cli --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked -p stela-cli --lib

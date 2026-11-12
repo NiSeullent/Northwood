@@ -262,6 +262,25 @@ const G14X_CORE_MASKS: [u64; 3] = [0xe0_1500, 0xe0_1504, 0xe0_1508];
 /// The initdata root magic of the G13G, G13X and G14G kexts.
 pub const MAGIC_G13_G14G: u64 = 0x0c8a_6342_8392_04c8;
 
+/// Initdata root magics of later kext interface revisions whose layouts the
+/// models have not been checked against, as `(build, family, magic)`.
+///
+/// Known (26B123 Mac14,3 kernelcache, the `movk #0x0c8a, lsl #48` of
+/// `AGXArmFirmware::initFirmwareData` at file offset 0x1b67818; 26A434's is
+/// at 0x1b5b368): the 26B123 G14G kext writes `0x0c8a_8342_8392_04c8`, and
+/// the same function reads and writes its objects at fields moved by 8 bytes
+/// (for example +0x888 to +0x8a0, +0x600 to +0x608, size 0x1078 to 0x1088).
+pub const UNCHECKED_INITDATA: &[(&str, &str, u64)] = &[("26B123", "G14G", 0x0c8a_8342_8392_04c8)];
+
+/// The `(build, family)` whose unchecked kext interface revision writes
+/// `magic` as its initdata root's first word.
+pub fn unchecked_initdata(magic: u64) -> Option<(&'static str, &'static str)> {
+    UNCHECKED_INITDATA
+        .iter()
+        .find(|&&(_, _, known)| known == magic)
+        .map(|&(build, family, _)| (build, family))
+}
+
 /// Whether the model implements a family's interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interface {
@@ -624,6 +643,19 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unchecked_initdata_revision_is_no_modeled_familys_magic() {
+        for &(build, family, magic) in UNCHECKED_INITDATA {
+            assert!(
+                GPUS.iter()
+                    .all(|gpu| gpu.family.initdata_magic != Some(magic))
+            );
+            assert!(GPUS.iter().any(|gpu| gpu.family.name == family));
+            assert_eq!(unchecked_initdata(magic), Some((build, family)));
+        }
+        assert_eq!(unchecked_initdata(MAGIC_G13_G14G), None);
+    }
 
     #[test]
     fn every_census_gpu_is_named_once() {

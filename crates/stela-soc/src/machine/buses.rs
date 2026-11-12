@@ -137,6 +137,9 @@ impl AppleDevices {
         let device = self.bus.add(Box::new(S5lUart::new(console, irq)));
         self.map(device, ranges)
             .map_err(|error| refuse!("UART placement: {error}", ?error))?;
+        // The UART has no DMA (UCON refuses its DMA modes) and no master's
+        // registers: its writes leave the masters' state alone.
+        self.quiet.push(device);
         self.register_power_device(first.physical, device, false)
     }
 

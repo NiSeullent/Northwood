@@ -51,8 +51,13 @@ const FORMS: [u32; 30] = [
 ];
 
 /// Inline on every target from the fields: FCVTN, FCVTN2 and FCVT Hd, Sn;
-/// FCVTZS and FCVTZU 8H, 4H and H; SCVTF and UCVTF 8H, 4H and H.
-const FIELD_RECIPES: [u32; 12] = [
+/// FCVT{N,M,P,A,Z}{S,U} 8H, 4H and H; SCVTF and UCVTF 8H, 4H and H.
+const FIELD_RECIPES: [u32; 17] = [
+    0x4e79_a820,
+    0x0e79_b820,
+    0x6ef9_a820,
+    0x4e79_c820,
+    0x5e79_a820,
     0x0e21_6820,
     0x4e21_6820,
     0x1e23_c020,

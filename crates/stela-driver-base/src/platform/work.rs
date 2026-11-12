@@ -55,6 +55,8 @@ pub mod scheduling;
 #[cfg(target_arch = "x86_64")]
 pub mod service;
 #[cfg(target_arch = "x86_64")]
+pub mod step_counts;
+#[cfg(target_arch = "x86_64")]
 mod terminal;
 
 #[cfg(all(target_arch = "x86_64", feature = "linux-kernel"))]
@@ -414,6 +416,8 @@ impl<const N: usize> Queue<N> {
         }))
     }
     fn lock(&self) -> Result<Guard<'_, N>, WorkError> {
+        #[cfg(target_arch = "x86_64")]
+        step_counts::add(&step_counts::STEP_COUNTS.locks, 1);
         let flags = self.cpu.save_disable()?;
         if self
             .held
@@ -563,16 +567,6 @@ impl<const N: usize> Queue<N> {
             return Err(WorkError::InvalidTicket);
         }
         guard.state().completed(ticket.sequence)
-    }
-    #[cfg(target_arch = "x86_64")]
-    fn next(
-        &self,
-        lane: Lane,
-        geometry: stack_requirement::Geometry,
-    ) -> Result<Option<(usize, Job)>, WorkError> {
-        self.lock()?
-            .state()
-            .select_job(lane, geometry, self.abandoned.load(Ordering::Acquire))
     }
     #[cfg(target_arch = "x86_64")]
     fn finish(

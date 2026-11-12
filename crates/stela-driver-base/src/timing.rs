@@ -51,6 +51,7 @@ impl Timing<Clock> {
     }
 
     /// [`Clock::wait`] on the nominal clock: a deadline, not a minimum.
+    #[track_caller]
     pub fn wait(&self, us: u64, ready: impl FnMut() -> bool) -> bool {
         self.nominal.wait(us, ready)
     }

@@ -266,6 +266,9 @@ pub struct Ans {
     /// await room in their queues.
     completed: VecDeque<Completed>,
     linear: bool,
+    /// LINEAR as the boot chain hands the controller over, which a power-on
+    /// after a power loss starts from again.
+    boot_linear: bool,
     /// I/O queue attributes at 0x1210: 0's-based SQ entries in bits 15:0
     /// and CQ entries in bits 31:16, as AQA. Both writers size their rings
     /// one larger than the field: `AppleANS2CGv2Controller::SetupIOQARegister`
@@ -351,6 +354,7 @@ impl Ans {
             look: 0,
             completed: VecDeque::new(),
             linear: false,
+            boot_linear: false,
             queue_attributes: None,
             modesel: 0,
             auto_queue: false,
@@ -554,6 +558,7 @@ impl Ans {
     /// it, writes no linear register either.
     pub fn handed_off_linear(mut self) -> Self {
         self.linear = true;
+        self.boot_linear = true;
         self
     }
 
@@ -951,10 +956,14 @@ impl Ans {
             self.completed.remove(index);
             self.update_irq(port.access);
         }
+        // Discards still queued for a pause in transfers go to the disk
+        // before the shutdown completes: its flush does not send them, and
+        // the guest was told their blocks read as deallocated.
         if self.shutdown
             && self.pending.is_empty()
             && self.inflight.is_empty()
             && self.completed.is_empty()
+            && !self.medium.device.discarding()
         {
             self.medium.device.flush().map_err(|_| {
                 refuse(
@@ -972,20 +981,82 @@ impl Ans {
     }
 }
 
+impl Ans {
+    /// Whether the controller may lose power: its driver's shutdown
+    /// notification completed (CSTS.SHST, which `run` sets only once every
+    /// accepted command has completed and the backing flushed) and it owns
+    /// no command or discard since.
+    fn clean_for_power_loss(&self) -> Result<()> {
+        if self.status & SHUTDOWN_COMPLETE == 0 || self.shutdown {
+            return Err(refuse!(
+                "ANS power loss before its driver's shutdown notification completed"
+            ));
+        }
+        if self.outstanding().next().is_some() || self.medium.device.discarding() {
+            return Err(refuse!(
+                "ANS power loss with commands or discards outstanding"
+            ));
+        }
+        Ok(())
+    }
+
+    /// A power loss after a clean shutdown: every register, queue, feature,
+    /// tunable table and uncommitted download is gone, as on a controller the
+    /// boot chain has just handed over. The medium and the committed boot
+    /// image persist in NAND and LINEAR returns to the hand-off's value, so a
+    /// power-on brings the controller up as at boot.
+    fn lose_power(&mut self) {
+        self.config = 0;
+        self.status = 0;
+        self.interrupt_mask = 0;
+        self.aqa = 0;
+        self.queues = [Queue::default(); 2];
+        self.tcb_bases = [0; 2];
+        self.nvmmu_control = NVMMU_CONTROL;
+        self.valid.fill(false);
+        self.submitted.fill(0);
+        self.linear = self.boot_linear;
+        self.queue_attributes = None;
+        self.modesel = 0;
+        self.auto_queue = false;
+        self.shutdown = false;
+        self.features = Self::default_features(&self.medium);
+        self.device_time = None;
+        self.download = bfh::Download::default();
+        self.tunables = tunables::Tables::default();
+        self.last_submission = None;
+    }
+
+    /// A power loss: the rail drops without retention, from on or from a
+    /// retained power-down.
+    fn loses_power(&self, proposed: LifecycleState) -> bool {
+        (self.lifecycle.powered || self.lifecycle.retention)
+            && !proposed.powered
+            && !proposed.retention
+    }
+}
+
 impl Lifecycle for Ans {
     fn check_lifecycle(&self, proposed: LifecycleState) -> Result<()> {
-        if proposed.reset && !self.lifecycle.reset || !proposed.powered && !proposed.retention {
+        if proposed.reset && !self.lifecycle.reset {
             // CC.EN reset is modeled separately in configure(). The PMGR
             // bank includes the protected linear/NVMMU handoff, loader and
             // NAND firmware state: CC reset does not prove their rail/reset
             // persistence. Keep all commands/completions owned on refusal.
             return Err(refuse!(
-                "ANS physical reset or nonretained power loss requires protected register and NAND firmware restore semantics"
+                "ANS physical reset requires protected register and NAND firmware restore semantics"
             ));
+        }
+        if self.loses_power(proposed) {
+            // Keep all commands/completions owned on refusal.
+            self.clean_for_power_loss()?;
         }
         Ok(())
     }
     fn set_lifecycle(&mut self, proposed: LifecycleState, access: &mut Access<'_>) {
+        if self.loses_power(proposed) {
+            self.lose_power();
+        }
         self.lifecycle = proposed;
         self.update_irq(access);
     }

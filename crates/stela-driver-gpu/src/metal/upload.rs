@@ -105,7 +105,10 @@ impl UploadArena {
                 if chunk.size < length || !chunk.address.is_multiple_of(alignment) {
                     return Err(Error::OutOfMemory);
                 }
-                self.chunks.push((chunk, Vec::new()));
+                // Room for a whole default chunk (or this upload) up front,
+                // so filling it never reallocates and recopies the bytes.
+                let capacity = chunk.size.min(length.max(CHUNK_BYTES)) as usize;
+                self.chunks.push((chunk, Vec::with_capacity(capacity)));
                 0
             }
         };

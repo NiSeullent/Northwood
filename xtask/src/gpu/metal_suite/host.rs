@@ -156,6 +156,28 @@ fn iosurface(plan: &mut Plan, library: &str, rng: &mut Random) {
     );
 }
 
+/// A buffer over an IOSurface's memory: the CPU fills the surface, a kernel
+/// adds to each word in place, and the CPU reads the sums through the
+/// surface. The buffer names its surface and is shared with the CPU.
+fn iosurface_buffer(plan: &mut Plan, library: &str, rng: &mut Random) {
+    let words = 256usize;
+    let add = 0x0101_0101u32;
+    let input: Vec<u32> = (0..words).map(|_| rng.u32()).collect();
+    let sums: Vec<u32> = input.iter().map(|v| v.wrapping_add(add)).collect();
+    plan.add(
+        Case::host(
+            "host.iosurface_buffer",
+            library,
+            json!({"kind": "iosurface_buffer", "words": words, "add": add}),
+        )
+        .buffer(Buffer::data("in", 0, u32s(&input)).unbound())
+        .buffer(Buffer::zeroed("out", 0, words * 4).unbound())
+        .buffer(props(3))
+        .output(Output::exact("out", Dtype::U32, u32s(&sums)))
+        .output(Output::exact("props", Dtype::U32, u32s(&[1, 1, 0]))),
+    );
+}
+
 /// Surfaces of Apple's private two-plane RGB formats (540, 541 and 542 for
 /// 4:2:0, 4:2:2 and 4:4:4): green bytes in the first plane, blue and red
 /// pairs in the second. A kernel reads each texel and samples each at its
@@ -1633,6 +1655,7 @@ pub fn build(plan: &mut Plan) {
     properties(plan, &library, &mut Random::new(1302));
     iosurface(plan, &library, &mut rng);
     two_plane(plan, &library, &mut Random::new(1303));
+    iosurface_buffer(plan, &library, &mut Random::new(1320));
     two_plane_render(plan, &library, &mut Random::new(1304));
     two_plane_ten_bit(plan, &library, &mut Random::new(1305));
     share(plan, &library, &mut rng);

@@ -258,6 +258,13 @@ impl State {
         let seconds = self.seconds(running.started);
         let millis = self.millis(running.started);
         let mut text = running.title;
+        // A failed step keeps what it was on, such as the PCI function a
+        // probe stopped in: before the engine resumes the boot log, the
+        // screen is the only record of it.
+        if matches!(mark, Mark::Failed) && !running.detail.is_empty() {
+            text.push_str(" at ");
+            text.push_str(&running.detail);
+        }
         match (result.is_empty(), seconds) {
             (true, 0) => {}
             (true, seconds) => text.push_str(&format!(" ({seconds} s)")),

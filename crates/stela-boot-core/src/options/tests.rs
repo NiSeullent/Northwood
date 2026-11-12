@@ -82,6 +82,24 @@ fn single_user_needs_a_preboot_selection() {
 }
 
 #[test]
+fn a_bundle_repair_is_a_preboot_macos_boot() {
+    use stela_loader::boot_selection::BUNDLE_REPAIR_OPTION;
+    let repair = round_trip(&format!("--system --preboot {DISK} {BUNDLE_REPAIR_OPTION}"));
+    assert!(repair.bundle_repair);
+    assert!(!round_trip(&format!("--system --preboot {DISK}")).bundle_repair);
+    assert_eq!(
+        System::parse(&format!("--system {BUNDLE_REPAIR_OPTION}")),
+        Err(Error::Constraint(Constraint::PrebootSelection))
+    );
+    assert_eq!(
+        System::parse(&format!(
+            "--system --preboot {DISK} {BUNDLE_REPAIR_OPTION} --upgrade"
+        )),
+        Err(Error::Constraint(Constraint::BundleRepairSelection))
+    );
+}
+
+#[test]
 fn scanout_mirror_round_trips() {
     assert!(!round_trip("--system").scanout_mirror);
     assert!(round_trip(&format!("--system {SCANOUT_MIRROR}")).scanout_mirror);

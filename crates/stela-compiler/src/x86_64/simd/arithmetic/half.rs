@@ -5,7 +5,9 @@ use crate::x86_64::asm::{
     vector_extensions::{self, HalfOpcode},
 };
 use alloc::{vec, vec::Vec};
+mod packed;
 mod product;
+mod zero;
 
 use super::super::super::isa::ShiftOpcode;
 use super::super::numerical::{
@@ -29,6 +31,8 @@ const SECOND_HALF_WORD: u8 = 0x55;
 const NATIVE_SIGN: u8 = 2;
 /// Half lanes in the low qword.
 const QWORD_LANES: u8 = 4;
+/// The aligned stack slot holding the caller MXCSR around a Half quotient.
+const MXCSR_SLOT_BYTES: i8 = 16;
 
 fn compact_even_words(code: &mut Code, source: u8) {
     packed_imm(code, Host::ShuffleLowWord, source, source, EVEN_HALF_WORDS);
@@ -111,7 +115,15 @@ fn operation(operation: BinaryOperation) -> (ArithmeticOpcode, lanes::ResultSign
         BinaryOperation::AbsoluteDifference => {
             (ArithmeticOpcode::Subtract, lanes::ResultSign::Absolute)
         }
-        BinaryOperation::Divide => unreachable!("Half division retains its terminal helper"),
+        // The Double quotient of two normal Halves rounds once more, but
+        // stays on the same side of every Half rounding boundary: an inexact
+        // quotient a/b lies at least 2^-23 (relative) from any number of 12
+        // significant bits ((a - m*b)/b with integer fields), far beyond the
+        // Double rounding error of 2^-53. Its discarded bits are then never
+        // all zero and never an exact tie, so the Half result and its
+        // inexact status are those of the exact quotient under every
+        // rounding mode.
+        BinaryOperation::Divide => (ArithmeticOpcode::Divide, lanes::ResultSign::Preserve),
     }
 }
 
@@ -180,6 +192,10 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress, target:
         emit_native(code, operand, pc);
         return;
     }
+    if packed::supports(operand, target) {
+        packed::emit(code, operand, pc);
+        return;
+    }
     let mut helper = Vec::new();
     let mut rollback = Vec::new();
     let packed_product = product::supports(operand);
@@ -192,6 +208,11 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress, target:
     test_control(code, FPCR_EXCEPTION_ENABLE_MASK);
     helper.push(branch(code, Condition::NotZero));
     prepare_inputs(code, operand);
+    let zero_lanes = zero::supported(operand);
+    if zero_lanes {
+        prepare_vector_input_range(code, Format::Half);
+        zero::substitute(code, operand, &mut helper);
+    }
     prepare_vector_input_range(code, Format::Half);
     for source in [lanes::LEFT, lanes::RIGHT] {
         vector_exponent_range(code, Format::Half, operand.shape, source);
@@ -213,10 +234,24 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress, target:
             lanes::widen_lane(code);
         }
         // Normal H sums/differences need at most 41 significant bits, products 22.
-        // Nonzero results are normal Double values, exact under every caller MXCSR.
+        // Nonzero results are normal Double values, exact under every caller
+        // MXCSR; a quotient rounds once, harmlessly (`operation`).
         // Cancellation zero and unsafe Half outputs roll back before guest effects.
         let (opcode, sign) = operation(operand.operation);
         packed(code, Host::MoveAligned, lanes::RESULT, lanes::LEFT);
+        // An inexact quotient raises host precision status, which the
+        // caller's MXCSR must not keep: save and restore it around DIVSD.
+        let divide = operand.operation == BinaryOperation::Divide;
+        if divide {
+            let mut asm = code.asm();
+            asm.alu_imm8(
+                crate::x86_64::asm::Alu::Sub,
+                crate::x86_64::asm::Size::Qword,
+                Gpr::Rsp,
+                MXCSR_SLOT_BYTES,
+            );
+            asm.stmxcsr(crate::x86_64::asm::Mem::base(Gpr::Rsp, 0));
+        }
         emit_opcode_to(
             code,
             Format::Double,
@@ -225,6 +260,16 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress, target:
             lanes::RESULT,
             lanes::RIGHT,
         );
+        if divide {
+            let mut asm = code.asm();
+            asm.ldmxcsr(crate::x86_64::asm::Mem::base(Gpr::Rsp, 0));
+            asm.alu_imm8(
+                crate::x86_64::asm::Alu::Add,
+                crate::x86_64::asm::Size::Qword,
+                Gpr::Rsp,
+                MXCSR_SLOT_BYTES,
+            );
+        }
         lanes::pack_lane(code, &mut rollback, lanes::RoundingPolicy::Fpcr, sign);
         lanes::finish_lanes(
             code,
@@ -234,6 +279,9 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress, target:
             &rollback,
             pc,
         );
+    }
+    if zero_lanes {
+        zero::merge(code, operand);
     }
     lanes::commit_inexact(code);
     if operand.shape == Shape::Scalar && !matches!(operand.inputs, Inputs::PairwiseScalar { .. }) {

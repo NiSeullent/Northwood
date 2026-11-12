@@ -152,6 +152,8 @@ fn a_write_keeps_its_blocks_from_a_later_batch() {
     assert!(disk.submit(1, write(2), 0).is_none());
     release(&log, 0);
     assert_eq!(disk.poll(0).len(), 1);
+    assert_eq!(log.started().len(), 1, "no batch while transfers run");
+    assert!(disk.poll(DISCARD_QUIET).is_empty());
     assert_eq!(
         log.started().last().unwrap(),
         &Command::Discard {
@@ -208,4 +210,48 @@ fn a_disk_that_refuses_a_discard_hears_no_more() {
     disk.discard(0, 2);
     assert!(!disk.discarding());
     assert!(disk.diagnostic(0).contains("refused=Some"));
+}
+
+#[test]
+fn discards_wait_for_a_pause_in_guest_transfers() {
+    let (mut disk, log) = queued(256, false);
+    assert!(disk.submit(1, write(40), 100).is_none());
+    disk.discard(0, 8);
+    release(&log, 0);
+    assert_eq!(disk.poll(200).len(), 1);
+    // The transfer completed at 200: the batch waits for the pause, and the
+    // model looks again when it ends.
+    assert!(disk.poll(200 + DISCARD_QUIET - 1).is_empty());
+    assert_eq!(log.started().len(), 1);
+    assert_eq!(disk.next_look(300), 200 + DISCARD_QUIET);
+    // A read meanwhile restarts the pause.
+    let read = Request::Read {
+        lba: 50,
+        bytes: 4096,
+    };
+    assert!(disk.submit(2, read, 1_000).is_none());
+    release(&log, 1);
+    assert_eq!(disk.poll(1_000).len(), 1);
+    assert!(disk.poll(200 + DISCARD_QUIET).is_empty());
+    assert_eq!(log.started().len(), 2);
+    assert!(disk.poll(1_000 + DISCARD_QUIET).is_empty());
+    assert!(matches!(
+        log.started().last(),
+        Some(Command::Discard { .. })
+    ));
+}
+
+#[test]
+fn a_flush_that_waits_for_discards_sends_them_without_a_pause() {
+    let (mut disk, log) = queued(256, true);
+    assert!(disk.submit(1, write(40), 0).is_none());
+    disk.discard(0, 8);
+    release(&log, 0);
+    assert_eq!(disk.poll(10).len(), 1);
+    assert!(disk.submit(2, Request::Flush, 20).is_none());
+    assert!(disk.poll(20).is_empty());
+    assert!(matches!(
+        log.started().last(),
+        Some(Command::Discard { .. })
+    ));
 }

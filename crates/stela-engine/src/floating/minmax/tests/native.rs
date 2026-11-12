@@ -139,8 +139,9 @@ fn eligible(state: &GuestState, operand: &Operand) -> bool {
         (0..count).all(|lane| {
             let bits = read_lane(&state.v[usize::from(source)], format.bits(), lane);
             let exponent = bits & exponent_mask(format);
-            (exponent != 0 && exponent != exponent_mask(format))
-                || (format != Format::Half && bits & !sign_mask(format) == 0)
+            let magnitude = bits & !sign_mask(format);
+            (exponent != 0 && magnitude <= exponent_mask(format))
+                || (format != Format::Half && magnitude == 0)
         })
     };
     match *operand {
@@ -207,7 +208,7 @@ fn check(mapping: &Mapping, operand: &Operand, mut state: GuestState, caller: u3
 }
 
 #[test]
-fn signed_zero_and_normal_selection_match_full_helper_state() {
+fn signed_zero_normal_and_infinite_selection_match_full_helper_state() {
     let host = stela_compiler::x86_64::modeled::host();
     let targets = [
         TargetCpu::Baseline,
@@ -261,6 +262,14 @@ fn signed_zero_and_normal_selection_match_full_helper_state() {
                     (one, one),
                     (1 << fraction_bits(format), one),
                     (maximum_normal(format), maximum_normal(format) | sign),
+                    (exponent_mask(format), one),
+                    (exponent_mask(format) | sign, one | sign),
+                    (exponent_mask(format), exponent_mask(format) | sign),
+                    (exponent_mask(format) | sign, exponent_mask(format) | sign),
+                    (exponent_mask(format), exponent_mask(format)),
+                    (maximum_normal(format), exponent_mask(format)),
+                    (exponent_mask(format) | sign, 0),
+                    (sign, exponent_mask(format)),
                 ] {
                     for flags in 0..32 {
                         let mut fpcr = 0;
@@ -316,7 +325,9 @@ fn signed_zero_and_normal_selection_match_full_helper_state() {
                                     maximum_normal(format),
                                     one + 1,
                                     (one + 1) | sign,
-                                ][(position + pattern) % 8]
+                                    exponent_mask(format),
+                                    exponent_mask(format) | sign,
+                                ][(position + pattern) % 10]
                             };
                             write_lane(
                                 &mut state.v[usize::from(source)],
@@ -366,9 +377,8 @@ fn exceptional_active_lanes_and_enables_exit_before_any_effect() {
             1,
             sign | 1,
             (1 << fraction_bits(format)) - 1,
-            maximum,
-            maximum | sign,
             maximum | 1,
+            maximum | sign | 1,
             maximum | (1 << (fraction_bits(format) - 1)),
             if format == Format::Double {
                 0x0000_0001_0000_0000

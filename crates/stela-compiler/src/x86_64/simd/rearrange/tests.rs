@@ -209,3 +209,54 @@ fn single_table_groups_share_indices_until_the_guest_overwrites_them() {
         }
     }
 }
+
+#[test]
+fn constants_load_their_exact_bytes_and_ones_runs_take_two_instructions() {
+    let mut patterns: Vec<[u8; 16]> = alloc::vec![[0; 16], [0xff; 16]];
+    for lane in [1u8, 2, 4, 8] {
+        let bits = u32::from(lane) * 8;
+        let mask = u64::MAX >> (64 - bits);
+        for value in [
+            1u64,
+            0x7f,
+            0x80,
+            0xfe,
+            1 << (bits - 1),
+            (1 << (bits - 1)) - 1,
+            1 << (bits - 2),
+            0x5a5a_5a5a_5a5a_5a5a,
+            u64::MAX << 3,
+        ] {
+            let bytes = (value & mask).to_le_bytes();
+            patterns.push(core::array::from_fn(|i| bytes[i % usize::from(lane)]));
+        }
+    }
+    patterns.push(core::array::from_fn(|i| i as u8));
+    patterns.push(core::array::from_fn(|i| if i < 8 { 0xff } else { 0 }));
+    for bytes in patterns {
+        for xmm in [0, 1, 4, 6] {
+            let mut code = Code::new();
+            constant(&mut code, xmm, bytes);
+            let length = code.len();
+            commit(&mut code, 9, xmm);
+            let mut state = GuestState::default();
+            native::run(&code, &mut state);
+            assert_eq!(
+                state.v[9].map(u64::to_le_bytes).concat(),
+                bytes,
+                "{bytes:02x?} in xmm{xmm}"
+            );
+            if ones_run(&bytes).is_some() {
+                // PCMPEQD and an immediate shift: four and five bytes.
+                assert!(length <= 9, "{bytes:02x?}: {length} bytes");
+            }
+        }
+    }
+    // One per dword lane, the rounding bit of a rounding shift.
+    let one_per_dword: [u8; 16] = core::array::from_fn(|i| u8::from(i % 4 == 0));
+    assert_eq!(
+        ones_run(&one_per_dword),
+        Some((Some(ShiftOpcode::RightDword), 31))
+    );
+    assert_eq!(ones_run(&[0x7f; 16]), None);
+}

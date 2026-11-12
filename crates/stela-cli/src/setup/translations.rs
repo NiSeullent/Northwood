@@ -89,7 +89,7 @@ fn legacy_layout() -> Layout {
 
 impl Store {
     pub(super) fn directory(&self) -> PathBuf {
-        self.volume.join(self.layout.data_path(DATA_STORE))
+        super::join_slashed(&self.volume, &self.layout.data_path(DATA_STORE))
     }
 
     fn config_text(&self) -> String {

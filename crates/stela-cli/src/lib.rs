@@ -61,8 +61,9 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Create a macOS installer USB interactively, or manage an existing USB.
     Setup(Box<setup::Setup>),
-    /// Print every boot log stela.efi kept on a disk image or a raw partition:
-    /// it finds each machine-state partition, or SSD partition tail, itself.
+    /// Print every boot log stela.efi kept: without FILE, the USB's own log
+    /// and each install's, read straight from this computer's disks; with
+    /// FILE, those on a disk image, device, raw partition or boot.log copy.
     BootLog(boot_log::BootLog),
     /// Summarize recorded Linux PCI and USB inventories as a Markdown report.
     Report(report::Report),

@@ -201,14 +201,51 @@ pub(in crate::engine) fn run_job(boot: bool) -> bool {
         0
     };
     shared().iter().any(|service| {
-        if boot {
-            service.run_job(older)
-        } else {
-            // SAFETY: an AP's host work between slices, which holds nothing
-            // its interrupts' handlers take; they save the vector state.
-            unsafe { with_interrupts(|| service.run_job(older)) }
+        if !service.jobs_waiting() {
+            return false;
         }
+        let run = || {
+            if boot {
+                service.run_job(older)
+            } else {
+                // SAFETY: an AP's host work between slices, which holds nothing
+                // its interrupts' handlers take; they save the vector state.
+                unsafe { with_interrupts(|| service.run_job(older)) }
+            }
+        };
+        measured_job(run)
     })
+}
+
+/// The most the heap's carved bytes rose during one job since the last
+/// `GPU JOBS` line, and the carved bytes that job started from.
+static JOB_RISE: AtomicU64 = AtomicU64::new(0);
+static JOB_RISE_FROM: AtomicU64 = AtomicU64::new(0);
+/// Set while a processor measures the job it runs.
+static MEASURING: AtomicBool = AtomicBool::new(false);
+
+/// Runs `run`, and when it ran a job, keeps how far the heap's carved
+/// bytes rose above where they were: a compile's own peak, as jobs run one
+/// at a time, with what other processors carved meanwhile. One processor
+/// measures at a time, as the heap keeps one mark.
+fn measured_job(run: impl FnOnce() -> bool) -> bool {
+    if MEASURING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return run();
+    }
+    let from = crate::ALLOCATOR.mark();
+    let ran = run();
+    if ran {
+        let rise = crate::ALLOCATOR.marked_peak().saturating_sub(from) as u64;
+        if rise > JOB_RISE.load(Ordering::Relaxed) {
+            JOB_RISE.store(rise, Ordering::Relaxed);
+            JOB_RISE_FROM.store(from as u64, Ordering::Relaxed);
+        }
+    }
+    MEASURING.store(false, Ordering::Release);
+    ran
 }
 
 /// Runs `body` with this processor's interrupts on.
@@ -336,43 +373,56 @@ fn report_peaks() {
     }
 }
 
-/// Whether this boot is single-user: macOS starts no Metal client, and a
-/// maintenance installation may put the plugin in place.
-static SINGLE_USER: AtomicBool = AtomicBool::new(false);
-
-pub(super) fn single_user(single_user: bool) {
-    SINGLE_USER.store(single_user, Ordering::Relaxed);
-}
-
 /// What the kext found of the Metal plugin, the bundle whose code this boot's
 /// trust cache lists. A multi-user boot's Metal clients cannot start without
-/// it, so the boot stops with the remedy rather than let WindowServer fail.
-/// The stop is an orderly power-off, not a fatal one: the GPUs' firmware is
-/// running by now, and only the boot CPU's service, outside Linux's
-/// callbacks, unloads it before the reset that would otherwise take down the
-/// card's link.
+/// it. A missing plugin, whose directories a kext cannot create, is repaired
+/// once by a single-user boot the engine drives (`bundle_repair`): this boot
+/// restarts into it. Otherwise the boot stops with the remedy rather than let
+/// WindowServer fail. The stop and the restart are orderly, not fatal: the
+/// GPUs' firmware is running by now, and only the boot CPU's service,
+/// outside Linux's callbacks, unloads it before the reset that would
+/// otherwise take down the card's link.
 fn bundle(report: BundleReport) {
-    let single_user = SINGLE_USER.load(Ordering::Relaxed);
-    match report {
-        BundleReport::Current => {
-            output::arguments(format_args!("GPU StelaGPU.bundle is this stela.efi's\n"));
-        }
-        BundleReport::Updated => {
+    use super::super::bundle_repair;
+    use stela_boot_core::bundle_repair::{Decision, Report};
+    let decided = bundle_repair::decide(match report {
+        BundleReport::Current => Report::Current,
+        BundleReport::Updated => Report::Updated,
+        BundleReport::Missing => Report::Missing,
+        BundleReport::Failed => Report::Failed,
+    });
+    match (decided, report) {
+        (Decision::Continue(_), BundleReport::Updated) => {
             output::arguments(format_args!(
                 "GPU StelaGPU.bundle updated to this stela.efi's\n"
             ));
         }
-        BundleReport::Missing | BundleReport::Failed if single_user => {
+        (Decision::Continue(_), _) => {
+            output::arguments(format_args!("GPU StelaGPU.bundle is this stela.efi's\n"));
+        }
+        (Decision::Log, _) => {
             output::arguments(format_args!(
                 "GPU StelaGPU.bundle is not installed ({report:?}); this single-user boot may install it\n"
             ));
         }
-        BundleReport::Missing => stop(
-            "StelaGPU.bundle is not installed in /Library/GPUBundles, and a kext cannot create \
-             its directories: boot macOS once with --single-user and run \
-             stela-gpu-maintenance install there",
+        (Decision::Repair, _) => {
+            output::arguments(format_args!(
+                "GPU StelaGPU.bundle is not installed and a kext cannot create its \
+                 directories; restarting once into a single-user boot that creates them\n"
+            ));
+            super::super::service::request_restart();
+        }
+        (Decision::StopMissing { attempted: true }, _) => stop(
+            "StelaGPU.bundle is still not installed in /Library/GPUBundles after the automatic \
+             single-user repair (its BUNDLE REPAIR lines say how it went): boot macOS once with \
+             --single-user and install it there by hand",
         ),
-        BundleReport::Failed => stop(
+        (Decision::StopMissing { attempted: false }, _) => stop(
+            "StelaGPU.bundle is not installed in /Library/GPUBundles, a kext cannot create \
+             its directories, and without the machine state's NVRAM no automatic repair can be \
+             recorded: boot macOS once with --single-user and install it there by hand",
+        ),
+        (Decision::StopFailed, _) => stop(
             "the StelaGPU kext could not install StelaGPU.bundle; its StelaGPU lines above say why",
         ),
     }
@@ -695,7 +745,7 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
         if jobs.ran != 0 || jobs.deferred != 0 {
             output::arguments(format_args!(
                 "GPU JOBS ran={} total_us={} longest_us={} longest_queued_us={} deferred={} \
-                 repeated={} forced={} waiting={}\n",
+                 repeated={} forced={} waiting={} heap_rise={}M from={}M\n",
                 jobs.ran,
                 micros(jobs.ticks),
                 micros(jobs.longest),
@@ -704,6 +754,8 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
                 jobs.repeated,
                 jobs.forced,
                 service.jobs_waiting(),
+                JOB_RISE.swap(0, Ordering::Relaxed) >> 20,
+                JOB_RISE_FROM.load(Ordering::Relaxed) >> 20,
             ));
         }
     }

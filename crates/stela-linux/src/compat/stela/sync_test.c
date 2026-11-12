@@ -141,9 +141,89 @@ static void irq_works(void)
 	assert(!stela_linux_atomic_callback_active());
 }
 
+/* irq_work a workqueue item raises in process context runs in its hard
+ * interrupt context once the item returns, before the worker's next item and
+ * before a task the item woke: the order the retained runner gave it, with no
+ * runner step. An item that waits for its own irq_work runs it at its park. */
+static char trace[8];
+static unsigned int trace_length;
+static struct irq_work raised;
+static struct work_struct raising, queued_after, self_waiting;
+static DECLARE_COMPLETION(raising_done);
+
+static void note(char mark)
+{
+	assert(trace_length < sizeof(trace));
+	trace[trace_length++] = mark;
+}
+
+static void run_raised(struct irq_work *work)
+{
+	assert(work == &raised && in_hardirq() && irqs_disabled() && !in_task());
+	assert(stela_linux_atomic_callback_active());
+	note('I');
+}
+
+static void run_queued_after(struct work_struct *work)
+{
+	assert(work == &queued_after);
+	note('B');
+}
+
+static void run_raising(struct work_struct *work)
+{
+	unsigned long flags;
+
+	assert(work == &raising && (current->flags & PF_WQ_WORKER));
+	note('A');
+	local_irq_save(flags);
+	assert(irq_work_queue(&raised));
+	local_irq_restore(flags);
+	assert(queue_work(system_wq, &queued_after));
+	complete(&raising_done);
+	note('a');
+}
+
+static void run_self_waiting(struct work_struct *work)
+{
+	assert(work == &self_waiting);
+	assert(irq_work_queue(&raised));
+	irq_work_sync(&raised);
+	assert(!irq_work_is_busy(&raised));
+	note('S');
+}
+
+static void worker_irq_works(void)
+{
+	struct workqueue_struct *unbound = alloc_ordered_workqueue("stela-irq-work", 0);
+
+	assert(unbound);
+	init_irq_work(&raised, run_raised);
+	INIT_WORK(&raising, run_raising);
+	INIT_WORK(&queued_after, run_queued_after);
+	INIT_WORK(&self_waiting, run_self_waiting);
+	assert(queue_work(unbound, &raising));
+	wait_for_completion(&raising_done);
+	note('W');
+	flush_work(&raising);
+	flush_work(&queued_after);
+	irq_work_sync(&raised);
+	assert(trace_length == 5 && !memcmp(trace, "AaI", 3));
+	/* The woken task and the later item both follow the irq_work. */
+	assert(memchr(trace + 3, 'B', 2) && memchr(trace + 3, 'W', 2));
+	assert(!irq_work_needs_cpu());
+	trace_length = 0;
+	assert(queue_work(unbound, &self_waiting));
+	flush_work(&self_waiting);
+	assert(trace_length == 2 && !memcmp(trace, "IS", 2));
+	assert(!irq_work_needs_cpu() && !irq_work_is_busy(&raised));
+	destroy_workqueue(unbound);
+}
+
 void stela_linux_sync_test(void)
 {
 	rwsem();
 	workers();
 	irq_works();
+	worker_irq_works();
 }

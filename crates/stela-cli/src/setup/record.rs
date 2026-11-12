@@ -793,6 +793,11 @@ pub(super) fn interrupted(host: &dyn Host, esp: &Path, usb: &Path) -> Option<Rec
 /// Replace the record through a synced sibling file, so a stop at any point
 /// leaves the previous record or this one whole: the record is the journal
 /// every interrupted setup and update is resumed from.
+///
+/// It spells each path on the USB the way a read does ([`rebase`]), however
+/// the path was built: `stela/boot` joined whole keeps its `/` where the
+/// system writes `\`, and a record just made would differ from the same
+/// record read and written again.
 pub(super) fn write_record(esp: &Path, record: &Record) -> Result<()> {
     let current = mutation_layout(esp)?;
     ensure!(
@@ -802,7 +807,10 @@ pub(super) fn write_record(esp: &Path, record: &Record) -> Result<()> {
     );
     let path = esp.join(record.layout.esp_path(layout::RECORD));
     fs::create_dir_all(path.parent().unwrap())?;
-    let mut record = record.clone();
+    let mut value = serde_json::to_value(record)?;
+    rebase(&mut value, &record.esp, &record.volume);
+    // Through the record again: its fields keep their order in the file.
+    let mut record: Record = serde_json::from_value(value)?;
     record.schema_version = RECORD_SCHEMA;
     let mut bytes = serde_json::to_vec_pretty(&record)?;
     bytes.push(b'\n');
@@ -832,10 +840,13 @@ mod rebase_tests {
         assert_eq!(value["esp"], "/media/user/EFI");
         assert_eq!(value["volume"], "/media/user/STELA1");
         assert_eq!(
-            value["bundle_directory"],
-            "/media/user/STELA1/stela/boot/27A1"
+            Path::new(value["bundle_directory"].as_str().unwrap()),
+            Path::new("/media/user/STELA1/stela/boot/27A1")
         );
-        assert_eq!(value["created_directories"][0], "/media/user/STELA1/stela");
+        assert_eq!(
+            Path::new(value["created_directories"][0].as_str().unwrap()),
+            Path::new("/media/user/STELA1/stela")
+        );
         // Another path that only starts alike, and the boot options, stay.
         assert_eq!(value["created_directories"][1], "/run/media/root/STELATE");
         assert_eq!(
@@ -864,6 +875,9 @@ mod rebase_tests {
         });
         rebase(&mut value, Path::new("/b"), Path::new("/b"));
         assert_eq!(value["volume"], "/b");
-        assert_eq!(value["bundle_directory"], "/b/stela/boot/27A1");
+        assert_eq!(
+            Path::new(value["bundle_directory"].as_str().unwrap()),
+            Path::new("/b/stela/boot/27A1")
+        );
     }
 }

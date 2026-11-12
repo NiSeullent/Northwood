@@ -26,6 +26,12 @@ mod extrema_scale;
     any(target_os = "macos", target_os = "linux")
 ))]
 mod fast_conversion_tests;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux")
+))]
+mod fast_float_tests;
 mod floating;
 mod fused;
 pub(in crate::x86_64) mod half;
@@ -46,12 +52,24 @@ pub(crate) mod memory_checked;
 mod minmax;
 pub(in crate::x86_64) mod numerical;
 pub(in crate::x86_64) mod precision;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux")
+))]
+mod product_nan_tests;
 mod products;
 pub(super) mod rearrange;
 mod reductions;
 mod refinement;
 mod rounding;
 pub(super) use rounding::kernel as rounding_kernel;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux")
+))]
+mod recipe_tests;
 mod saturating;
 mod sha1;
 pub(super) mod sha256;
@@ -64,6 +82,7 @@ mod sm4;
 mod sqrt;
 mod structure_checked;
 mod structure_memory;
+mod three;
 mod widening;
 
 /// Fixed-width SIMD memory routing; checked bodies never use private-RAM emitters.
@@ -110,13 +129,180 @@ fn vector_memory(vector: u8) -> Mem {
     Mem::base_disp32(Gpr::Rdi, vector_offset(vector) as i32)
 }
 
+/// Write guest vector `vector` from `xmm`: to its home where the block
+/// keeps vectors in registers ([`super::vector_cache`]), else to the state.
 fn commit(code: &mut Code, vector: u8, xmm: u8) {
+    if code.vector_cache().writes_through() {
+        code.discard_vector(vector);
+    } else if code.vector_cache().active() {
+        let host = code.allocate_vector(vector);
+        if host != xmm {
+            code.asm_unguarded().sse(
+                Some(0x66),
+                &[0x0f, 0x6f],
+                host,
+                crate::x86_64::asm::Rm::Xmm(xmm),
+            );
+        }
+        code.mark_vector_dirty(vector);
+        return;
+    }
     // GuestState has only 8-byte alignment; V0 begins at byte264.
     Host::StoreUnaligned.emit(code, xmm, vector_memory(vector), crate::TargetCpu::Baseline);
 }
 
+/// Copy guest vector `vector` to `xmm`, which the caller may then change:
+/// from its home, if it has one, else from the state.
 fn read_vector(code: &mut Code, vector: u8, xmm: u8) {
+    if let Some(host) = code.vector_home(vector) {
+        packed(code, Host::MoveAligned, xmm, host);
+        return;
+    }
     Host::LoadUnaligned.emit(code, xmm, vector_memory(vector), crate::TargetCpu::Baseline);
+}
+
+/// A register that holds guest vector `vector` for reading only: its
+/// home, which it gets here where the block keeps vectors in registers
+/// ([`super::vector_cache`]), else `scratch` loaded from the state. The
+/// caller never writes the register returned.
+fn vector_source(code: &mut Code, vector: u8, scratch: u8) -> u8 {
+    if let Some(host) = code.vector_home(vector) {
+        return host;
+    }
+    if code.vector_cache().active() {
+        let host = code.allocate_vector(vector);
+        code.asm_unguarded()
+            .sse(Some(0xf3), &[0x0f, 0x6f], host, vector_memory(vector));
+        return host;
+    }
+    read_vector(code, vector, scratch);
+    scratch
+}
+
+/// Where a recipe writes guest vector `vector`'s new value
+/// ([`vector_destination`], [`vector_accumulator`]): `xmm`, the vector's
+/// home, which the recipe's last instruction writes whole, or the recipe's
+/// scratch register, which [`finish`] commits.
+#[derive(Debug, Clone, Copy)]
+struct Destination {
+    vector: u8,
+    xmm: u8,
+    /// The scratch register the caller offered, distinct from every
+    /// source register it still reads unless equal to `xmm`.
+    scratch: u8,
+}
+
+impl Destination {
+    /// Whether `xmm` is the vector's home.
+    const fn home(&self) -> bool {
+        self.xmm >= super::vector_cache::FIRST_HOST
+    }
+}
+
+/// The register a recipe writes guest vector `vector`'s whole new value to
+/// with its last instruction, after reading every source: its home where
+/// the block keeps vectors in registers (and commits do not go to the
+/// state), else `scratch`. Every source is taken before this call: the
+/// home's old value is gone, and [`super::vector_cache`] refuses to hand
+/// it out again before [`finish`].
+fn vector_destination(code: &mut Code, vector: u8, scratch: u8) -> Destination {
+    let cache = code.vector_cache();
+    let xmm = if cache.active() && !cache.writes_through() {
+        code.begin_vector_write(vector, true)
+    } else {
+        scratch
+    };
+    Destination {
+        vector,
+        xmm,
+        scratch,
+    }
+}
+
+/// [`vector_destination`] holding the vector's current value, for a recipe
+/// that reads and then writes it in place (an accumulator, an inserted
+/// half): its home, loaded if new, else `scratch` loaded.
+fn vector_accumulator(code: &mut Code, vector: u8, scratch: u8) -> Destination {
+    let cache = code.vector_cache();
+    let xmm = if cache.active() && !cache.writes_through() {
+        let loaded = code.vector_cache().peek(vector).is_some();
+        let host = code.begin_vector_write(vector, false);
+        if !loaded {
+            code.asm_unguarded()
+                .sse(Some(0xf3), &[0x0f, 0x6f], host, vector_memory(vector));
+        }
+        host
+    } else {
+        read_vector(code, vector, scratch);
+        scratch
+    };
+    Destination {
+        vector,
+        xmm,
+        scratch,
+    }
+}
+
+/// End the write of `destination`: its home is newer than the state, or
+/// the scratch register is committed.
+fn finish(code: &mut Code, destination: Destination) {
+    if destination.home() {
+        code.end_vector_write(destination.vector);
+    } else {
+        commit(code, destination.vector, destination.xmm);
+    }
+}
+
+/// `destination` = `result`, all 16 bytes (`bytes` 16) or the low 8 with
+/// the high cleared (`bytes` 8), then [`finish`].
+fn finish_from(code: &mut Code, destination: Destination, result: u8, bytes: u8) {
+    if bytes == 8 {
+        packed(code, Host::MoveQword, destination.xmm, result);
+    } else {
+        debug_assert_eq!(bytes, 16);
+        if destination.xmm != result {
+            packed(code, Host::MoveAligned, destination.xmm, result);
+        }
+    }
+    finish(code, destination);
+}
+
+/// `destination` = `left op right` (16 bytes), the last instruction: one
+/// VEX form, or a copy and the SSE form, swapping the sources of a
+/// `commutative` operation that would overwrite its right source, else
+/// through the destination's scratch register.
+fn binary(
+    code: &mut Code,
+    opcode: SimdOpcode,
+    destination: Destination,
+    left: u8,
+    right: u8,
+    commutative: bool,
+    target: crate::TargetCpu,
+) {
+    let xmm = destination.xmm;
+    if xmm == left {
+        // The legacy form in place.
+        opcode.register(code, xmm, right, target);
+    } else if three::vex(target) || xmm != right {
+        three::three(code, opcode, xmm, left, right, target);
+    } else if commutative {
+        three::three(code, opcode, xmm, right, left, target);
+    } else {
+        three::three(code, opcode, destination.scratch, left, right, target);
+        packed(code, Host::MoveAligned, xmm, destination.scratch);
+    }
+    finish(code, destination);
+}
+
+/// Guest vector `vector` as a source operand of an instruction that may
+/// take memory without an alignment requirement (VEX, EVEX): its home, if
+/// it has one, else its slot in the state.
+fn vector_operand(code: &mut Code, vector: u8) -> crate::x86_64::asm::Rm {
+    match code.vector_home(vector) {
+        Some(host) => crate::x86_64::asm::Rm::Xmm(host),
+        None => vector_memory(vector).into(),
+    }
 }
 
 fn packed(code: &mut Code, opcode: SimdOpcode, destination: u8, source: u8) {
@@ -300,10 +486,12 @@ pub(super) fn numerical_always_exits(operation: &crate::aarch64::FloatingPointOp
                 operand.format == Format::Half && !half_integer::from_integer_inline(operand)
             }
             Operand::ToInteger { operand, rounding } => {
-                operand.format == Format::Half
-                    && !half_integer::to_integer_inline(operand, *rounding)
-                    || *rounding == IntegerRounding::NearestAway
+                if operand.format == Format::Half {
+                    !half_integer::to_integer_inline(operand)
+                } else {
+                    *rounding == IntegerRounding::NearestAway
                         && !integer_conversion::nearest_away_inline(operand)
+                }
             }
             Operand::JavaScript { .. } => false,
         },
@@ -357,7 +545,7 @@ pub(super) fn emit_numerical_split(
             complex::emit(code, operand, pc, target)
         }
         crate::aarch64::FloatingPointOperation::Comparison(operand) => {
-            comparison::emit(code, operand, pc)
+            comparison::emit(code, operand, pc, target)
         }
         crate::aarch64::FloatingPointOperation::ExtremaScale(operand) => {
             extrema_scale::emit(code, operand, pc, target);
@@ -409,6 +597,162 @@ pub(super) fn emit_for_target(
     emit_after(code, operand, target, checks, None, None);
 }
 
+/// Whether `operand` keeps the block's vector homes
+/// ([`super::vector_cache`]): its recipe reaches V only through
+/// [`read_vector`], [`vector_source`], [`vector_operand`] and [`commit`] and
+/// names only the scratch registers XMM0 to XMM7. Accesses store the dirty
+/// homes before their fault sites.
+pub(super) fn vector_use(operand: &Operand, target: crate::TargetCpu) -> super::block::VectorUse {
+    use super::block::VectorUse::*;
+    match operand {
+        Operand::Integer { .. }
+        | Operand::Compare { .. }
+        | Operand::MoveImmediate { .. }
+        | Operand::Product(_)
+        | Operand::Saturate(_)
+        | Operand::Halving(_)
+        | Operand::Reduce(_)
+        | Operand::Immediate(crate::aarch64::simd::immediates::Operand::Constant { .. }) => Keep,
+        Operand::Immediate(crate::aarch64::simd::immediates::Operand::LaneMove(lane))
+        | Operand::Rearrange(lane) => rearrange::vector_use(lane, target),
+        // The register forms and scalar saturating shifts stage lanes
+        // through the state (`shifts::register_shift`).
+        Operand::Shift(shift) => match shift.kind {
+            crate::aarch64::simd::shifts::Kind::Register { .. } => Settle,
+            crate::aarch64::simd::shifts::Kind::SaturatingImmediate { .. }
+                if shift.bytes <= shift.lane_bytes =>
+            {
+                Settle
+            }
+            _ => Keep,
+        },
+        Operand::Memory { .. } | Operand::MemoryPair { .. } | Operand::MemoryRegisterOffset(_) => {
+            Flush
+        }
+        _ => Settle,
+    }
+}
+
+/// CMEQ, CMGT (by register or zero) and CMLT #0 that one PCMPEQ/PCMPGT
+/// computes, from the sources where they are into the destination; returns
+/// whether it emitted the comparison.
+#[allow(clippy::too_many_arguments)]
+fn single_compare(
+    code: &mut Code,
+    operation: Comparison,
+    destination: u8,
+    left: u8,
+    right: Option<u8>,
+    bytes: u8,
+    lane_bytes: u8,
+    target: crate::TargetCpu,
+) -> bool {
+    let opcode = match (operation, lane_bytes) {
+        (Comparison::Equal, 1) => Host::EqualByte,
+        (Comparison::Equal, 2) => Host::EqualWord,
+        (Comparison::Equal, 4) => Host::EqualDword,
+        (Comparison::Equal, _) => Host::EqualQword,
+        (Comparison::Greater | Comparison::LessZero, 1) => Host::GreaterByte,
+        (Comparison::Greater | Comparison::LessZero, 2) => Host::GreaterWord,
+        (Comparison::Greater | Comparison::LessZero, 4) => Host::GreaterDword,
+        (Comparison::Greater | Comparison::LessZero, _) => Host::GreaterQword,
+        _ => return false,
+    };
+    if target < opcode.requires() {
+        return false;
+    }
+    let left_xmm = vector_source(code, left, 0);
+    let right_xmm = match right {
+        Some(right) => vector_source(code, right, 1),
+        None => {
+            packed(code, Host::Xor, 1, 1);
+            1
+        }
+    };
+    // CMLT #0 is 0 > x.
+    let (first, second) = if operation == Comparison::LessZero {
+        (right_xmm, left_xmm)
+    } else {
+        (left_xmm, right_xmm)
+    };
+    let commutative = operation == Comparison::Equal;
+    if bytes == 8 {
+        three::three(code, opcode, 2, first, second, target);
+        let destination = vector_destination(code, destination, 2);
+        finish_from(code, destination, 2, 8);
+        return true;
+    }
+    // XMM2 is free and distinct from both sources.
+    let destination = vector_destination(code, destination, 2);
+    binary(
+        code,
+        opcode,
+        destination,
+        first,
+        second,
+        commutative,
+        target,
+    );
+    true
+}
+
+/// AND, ORR (and MOV, its alias with equal sources), EOR, ADD and SUB from
+/// the sources where they are into the destination: one VEX instruction
+/// writes a 16-byte result to the destination's home.
+#[allow(clippy::too_many_arguments)]
+fn integer_binary(
+    code: &mut Code,
+    operation: IntegerOperation,
+    destination: u8,
+    left: u8,
+    right: u8,
+    bytes: u8,
+    lane_bytes: u8,
+    target: crate::TargetCpu,
+) {
+    use IntegerOperation::*;
+    let left_xmm = vector_source(code, left, 0);
+    if operation == Orr && left == right {
+        let destination = vector_destination(code, destination, 0);
+        finish_from(code, destination, left_xmm, bytes);
+        return;
+    }
+    let right_xmm = vector_source(code, right, 1);
+    let (opcode, commutative) = match operation {
+        And => (Host::And, true),
+        Orr => (Host::Or, true),
+        Eor => (Host::Xor, true),
+        Add => (
+            match lane_bytes {
+                1 => Host::AddByte,
+                2 => Host::AddWord,
+                4 => Host::AddDword,
+                8 => Host::AddQword,
+                _ => unreachable!("reviewed lane size"),
+            },
+            true,
+        ),
+        Sub => (subtract_opcode(lane_bytes), false),
+        _ => unreachable!("a binary integer operation"),
+    };
+    if bytes == 8 {
+        three::three(code, opcode, 0, left_xmm, right_xmm, target);
+        let destination = vector_destination(code, destination, 0);
+        finish_from(code, destination, 0, 8);
+        return;
+    }
+    let destination = vector_destination(code, destination, 0);
+    binary(
+        code,
+        opcode,
+        destination,
+        left_xmm,
+        right_xmm,
+        commutative,
+        target,
+    );
+}
+
 /// [`emit_for_target`] with guest vectors already held whole in XMM0, or
 /// in XMM0 and XMM1 for a pair transfer.
 pub(super) fn emit_after(
@@ -445,7 +789,7 @@ pub(super) fn emit_after(
             ref lane @ crate::aarch64::simd::rearrange::Operand::Extract {
                 source, byte: 0, ..
             },
-        ) if xmm0 == Some(source) => rearrange::extract(code, lane, true),
+        ) if xmm0 == Some(source) => rearrange::extract(code, lane, true, target),
         Operand::Immediate(ref operand) => immediates::emit(code, operand, target),
         Operand::Halving(ref operand) => halving::emit(code, operand, target),
         Operand::Product(ref operand) => products::emit(code, operand, target),
@@ -462,6 +806,18 @@ pub(super) fn emit_after(
             lane_bytes,
         } => {
             use Comparison::*;
+            if single_compare(
+                code,
+                operation,
+                destination,
+                left,
+                right,
+                bytes,
+                lane_bytes,
+                target,
+            ) {
+                return;
+            }
             // AVX-512 compares unsigned lanes without a bias (CMHI through
             // `greater`) and tests lanes directly. Signed relations keep one
             // SSE compare, inverted where needed: a mask round trip is slower.
@@ -517,26 +873,46 @@ pub(super) fn emit_after(
             use IntegerOperation::*;
             // MOV is the ORR alias with two identical sources.
             let copy = operation == Orr && left == right;
+            if copy || matches!(operation, And | Orr | Eor | Add | Sub) {
+                integer_binary(
+                    code,
+                    operation,
+                    destination,
+                    left,
+                    right,
+                    bytes,
+                    lane_bytes,
+                    target,
+                );
+                return;
+            }
             // Stage the sources before writing any overlapping V register.
             read_vector(code, left, 0);
             let mut result = 0;
+            // The right source, which these operations only read, stays in
+            // its home where it has one.
+            let mut right_xmm = 1;
             if !copy && !matches!(operation, Abs | Neg) {
-                read_vector(code, right, 1);
+                if matches!(operation, And | Orr | Eor | Add | Sub | Bsl | Bit) {
+                    right_xmm = vector_source(code, right, 1);
+                } else {
+                    read_vector(code, right, 1);
+                }
             }
             match operation {
-                And => packed(code, Host::And, 0, 1),
+                And => packed(code, Host::And, 0, right_xmm),
                 Bic => {
                     packed(code, Host::AndNot, 1, 0);
                     result = 1;
                 }
                 Orr if copy => {}
-                Orr => packed(code, Host::Or, 0, 1),
+                Orr => packed(code, Host::Or, 0, right_xmm),
                 Orn => {
                     packed(code, Host::EqualDword, 2, 2); // pcmpeqd: all ones, including dirty Q=0 upper bits
                     packed(code, Host::Xor, 1, 2);
                     packed(code, Host::Or, 0, 1);
                 }
-                Eor => packed(code, Host::Xor, 0, 1),
+                Eor => packed(code, Host::Xor, 0, right_xmm),
                 Bsl | Bit | Bif => {
                     // Ternary inputs are left, right and the old destination.
                     let table = match operation {
@@ -545,27 +921,21 @@ pub(super) fn emit_after(
                         Bif => 0xb8,
                         _ => unreachable!(),
                     };
-                    if !vector_extensions::ternary(
-                        code,
-                        0,
-                        1,
-                        vector_memory(destination),
-                        table,
-                        target,
-                    ) {
-                        read_vector(code, destination, 2);
+                    let old = vector_operand(code, destination);
+                    if !vector_extensions::ternary(code, 0, right_xmm, old, table, target) {
+                        let old = vector_source(code, destination, 2);
                         if operation == Bsl {
-                            packed(code, Host::Xor, 0, 1);
-                            packed(code, Host::And, 0, 2);
-                            packed(code, Host::Xor, 0, 1);
+                            packed(code, Host::Xor, 0, right_xmm);
+                            packed(code, Host::And, 0, old);
+                            packed(code, Host::Xor, 0, right_xmm);
                         } else {
-                            packed(code, Host::Xor, 0, 2);
+                            packed(code, Host::Xor, 0, old);
                             if operation == Bit {
-                                packed(code, Host::And, 0, 1);
-                                packed(code, Host::Xor, 0, 2);
+                                packed(code, Host::And, 0, right_xmm);
+                                packed(code, Host::Xor, 0, old);
                             } else {
                                 packed(code, Host::AndNot, 1, 0);
-                                packed(code, Host::Xor, 1, 2);
+                                packed(code, Host::Xor, 1, old);
                                 result = 1;
                             }
                         }
@@ -581,9 +951,9 @@ pub(super) fn emit_after(
                         _ => unreachable!("reviewed lane size"),
                     },
                     0,
-                    1,
+                    right_xmm,
                 ),
-                Sub => packed(code, subtract_opcode(lane_bytes), 0, 1),
+                Sub => packed(code, subtract_opcode(lane_bytes), 0, right_xmm),
                 Neg => {
                     packed(code, Host::Xor, 1, 1);
                     packed(code, subtract_opcode(lane_bytes), 1, 0);
@@ -725,10 +1095,21 @@ pub(super) fn xmm0_after(
     operand: &Operand,
     code: &[u8],
     held: Option<u8>,
+    homes: &super::vector_cache::VectorCache,
 ) -> Option<u8> {
+    let cached = homes.active();
     let mut committed = |vector: u8| {
         scratch.clear();
-        commit(scratch, vector, 0);
+        match homes.peek(vector) {
+            // The commit to a home from XMM0.
+            Some(host) => scratch.asm_unguarded().sse(
+                Some(0x66),
+                &[0x0f, 0x6f],
+                host,
+                crate::x86_64::asm::Rm::Xmm(0),
+            ),
+            None => commit(scratch, vector, 0),
+        }
         code.ends_with(scratch).then_some(vector)
     };
     match *operand {
@@ -747,6 +1128,8 @@ pub(super) fn xmm0_after(
             destination,
             ..
         }) => committed(destination),
+        // With vectors in host registers, a transfer may use the home.
+        Operand::Memory { .. } | Operand::MemoryRegisterOffset(_) if cached => None,
         Operand::Memory {
             load,
             bytes,
@@ -766,6 +1149,13 @@ pub(super) fn xmm0_after(
 pub(super) fn xmm0_load(scratch: &mut Code, vector: u8) -> &[u8] {
     scratch.clear();
     read_vector(scratch, vector, 0);
+    scratch
+}
+
+/// [`read_vector`]'s bytes for a vector whose home is `host` into XMM0.
+pub(super) fn xmm0_home_load(scratch: &mut Code, host: u8) -> &[u8] {
+    scratch.clear();
+    packed(scratch, Host::MoveAligned, 0, host);
     scratch
 }
 

@@ -493,12 +493,13 @@ impl<R: Registers, T: Timer, C: ConfigSpace> Aqtion<R, T, C> {
         self.tx_tail = next;
         Ok(())
     }
-    fn poll_rx(&mut self) -> Result<Option<Vec<u8>>> {
+    /// Copy the next good frame into `frame`; true when one arrived.
+    fn poll_rx(&mut self, frame: &mut Vec<u8>) -> Result<bool> {
         for _ in 0..COUNT {
             let Some((kind, status, length)) =
                 self.memory.as_ref().unwrap().receive_status(self.rx_head)?
             else {
-                return Ok(None);
+                return Ok(false);
             };
             let end = status & 2 != 0;
             let good = !self.dropping
@@ -507,27 +508,23 @@ impl<R: Registers, T: Timer, C: ConfigSpace> Aqtion<R, T, C> {
                 && kind & 0x1000 == 0
                 && status & 0xf000 == 0
                 && (HEADER..=MAX_FRAME).contains(&length);
-            let frame = if good {
-                Some(
-                    self.memory
-                        .as_ref()
-                        .unwrap()
-                        .receive_bytes(self.rx_head, length)?,
-                )
-            } else {
-                None
-            };
+            if good {
+                self.memory
+                    .as_ref()
+                    .unwrap()
+                    .receive_bytes(self.rx_head, length, frame)?;
+            }
             self.dropping = !end;
             let index = self.rx_head;
             self.memory.as_mut().unwrap().offer(index)?;
             self.rx_head = (index + 1) % COUNT;
             // Tail names the first unoffered descriptor; one slot remains reserved.
             self.hw().set(registers::RX_TAIL, 0, index as u32)?;
-            if frame.is_some() {
-                return Ok(frame);
+            if good {
+                return Ok(true);
             }
         }
-        Ok(None)
+        Ok(false)
     }
 }
 impl<R: Registers, T: Timer, C: ConfigSpace> Link for Aqtion<R, T, C> {
@@ -547,8 +544,14 @@ impl<R: Registers, T: Timer, C: ConfigSpace> Link for Aqtion<R, T, C> {
             .map_err(adapter)
     }
     fn receive(&mut self) -> core::result::Result<Option<Vec<u8>>, LinkError> {
+        let mut frame = Vec::new();
+        Ok(self.receive_reusing(&mut frame)?.then_some(frame))
+    }
+    /// The stack's receive path: the frame is copied into its reused
+    /// buffer, so a received frame allocates nothing.
+    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> core::result::Result<bool, LinkError> {
         self.healthy().map_err(adapter)?;
-        self.poll_rx()
+        self.poll_rx(frame)
             .inspect_err(|_| self.state = State::Faulted)
             .map_err(adapter)
     }

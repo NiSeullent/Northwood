@@ -751,6 +751,13 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Link for Ethernet<R, D> {
         Ok(())
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        let mut frame = Vec::new();
+        Ok(self.receive_reusing(&mut frame)?.then_some(frame))
+    }
+    /// The stack's receive path: the frame is copied into its reused
+    /// buffer, so a received frame allocates nothing. On an error the
+    /// buffer is unchanged.
+    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
         self.check().map_err(|e| self.error(e))?;
         self.update_link().map_err(|e| self.error(e))?;
         for _ in 0..DESCRIPTORS {
@@ -764,7 +771,7 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Link for Ethernet<R, D> {
                         return Err(self.error(error));
                     }
                 }
-                return Ok(None);
+                return Ok(false);
             }
             fence(Ordering::Acquire);
             let length = usize::from(self.receive.descriptors.read::<u16>(base + 12));
@@ -773,16 +780,16 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Link for Ethernet<R, D> {
                 && eop
                 && status & RX_ERRORS == 0
                 && (14 + FCS_BYTES..=MAX_FRAME + FCS_BYTES).contains(&length);
-            let frame = if good {
-                let mut data = Vec::new();
-                data.try_reserve_exact(length - FCS_BYTES).map_err(|_| {
-                    LinkError::Adapter("PCH Ethernet receive allocation failed".into())
-                })?;
-                data.extend_from_slice(&self.receive.buffer(index)[..length - FCS_BYTES]);
-                Some(data)
-            } else {
-                None
-            };
+            if good {
+                let length = length - FCS_BYTES;
+                frame
+                    .try_reserve_exact(length.saturating_sub(frame.len()))
+                    .map_err(|_| {
+                        LinkError::Adapter("PCH Ethernet receive allocation failed".into())
+                    })?;
+                frame.clear();
+                frame.extend_from_slice(&self.receive.buffer(index)[..length]);
+            }
             self.discard_rx = !eop;
             self.offer(index);
             if let Some(tail) = self.receive.offered(index) {
@@ -792,8 +799,8 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Link for Ethernet<R, D> {
                 }
             }
             self.next_rx = (index + 1) % DESCRIPTORS;
-            if frame.is_some() {
-                return Ok(frame);
+            if good {
+                return Ok(true);
             }
         }
         if let Some(tail) = self.receive.idle() {
@@ -802,7 +809,7 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Link for Ethernet<R, D> {
                 return Err(self.error(error));
             }
         }
-        Ok(None)
+        Ok(false)
     }
 }
 

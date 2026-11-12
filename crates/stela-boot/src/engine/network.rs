@@ -28,7 +28,7 @@ use stela_drivers::{
     usb::xhci::SlotId,
 };
 use stela_runtime::net::{
-    HttpPost, HttpRequest, HttpTransfer, NetError, Stack, TlsUnavailable, Transfer,
+    Backoff, HttpPost, HttpRequest, HttpTransfer, NetError, Stack, TlsUnavailable, Transfer,
     stack::DOWNLOAD_BUFFER,
 };
 use stela_soc::machine::AppleDevices;
@@ -602,11 +602,18 @@ pub struct Shared(pub Rc<RefCell<HostNetwork>>);
 
 /// The restore client's way to Apple's signing service (TSS): one POST
 /// at a time, moved along by each host service without waiting, so no
-/// guest processor stalls while Apple answers.
+/// guest processor stalls while Apple answers. A transient failure is asked
+/// again after a pause ([`Backoff`]), waited out across service steps.
 pub struct Signing {
     network: Shared,
     /// The POST in flight and the body it sends.
     exchange: Option<(Vec<u8>, HttpPost)>,
+    /// The body whose last attempt failed, and when it is tried again.
+    retry: Option<(Vec<u8>, Backoff)>,
+    /// The counter origin of the retry clock.
+    origin: u64,
+    /// Whether a request has gone to the network yet (said once on serial).
+    announced: bool,
 }
 
 impl Signing {
@@ -614,7 +621,39 @@ impl Signing {
         Self {
             network,
             exchange: None,
+            retry: None,
+            origin: output::now(),
+            announced: false,
         }
+    }
+}
+
+/// After a failed attempt at `body`: keep it for a later attempt when the
+/// failure is transient and attempts remain, else the failure.
+fn retry_after(
+    retry: &mut Option<(Vec<u8>, Backoff)>,
+    body: &[u8],
+    error: NetError,
+    now_ms: u64,
+) -> stela_runtime::restore::Result<Option<Vec<u8>>> {
+    let mut backoff = match retry.take() {
+        Some((sent, backoff)) if sent == body => backoff,
+        _ => Backoff::new(),
+    };
+    let attempt = backoff.attempt();
+    match backoff.failed(&error, now_ms) {
+        Some(wait) => {
+            output::arguments(format_args!(
+                "TSS RETRY attempt={attempt} next_in_ms={wait}: {error}\n"
+            ));
+            *retry = Some((body.to_vec(), backoff));
+            Ok(None)
+        }
+        None => Err(stela_runtime::restore::Error::Transport(refuse!(
+            "signing request after {attempts} attempts: {error}",
+            attempts = attempt as usize,
+            %error
+        ))),
     }
 }
 
@@ -627,9 +666,7 @@ impl stela_runtime::restore::tss::Transport for Signing {
         content_type: &str,
         body: &[u8],
     ) -> stela_runtime::restore::Result<Option<Vec<u8>>> {
-        let failed = |error: NetError| {
-            stela_runtime::restore::Error::Transport(refuse!("signing request: {error}", %error))
-        };
+        let now_ms = output::millis_since(self.origin);
         let mut network = self.network.0.borrow_mut();
         if let Some((sent, _)) = &self.exchange
             && sent != body
@@ -637,14 +674,27 @@ impl stela_runtime::restore::tss::Transport for Signing {
             let (_, post) = self.exchange.take().unwrap();
             network.close_post(post);
         }
+        if let Some((sent, backoff)) = &self.retry {
+            if sent != body {
+                self.retry = None;
+            } else if !backoff.ready(now_ms) {
+                return Ok(None);
+            }
+        }
         let (_, post) = match &mut self.exchange {
             Some(exchange) => exchange,
             None => {
+                if !self.announced {
+                    self.announced = true;
+                    output::arguments(format_args!(
+                        "TSS NETWORK a signing request the USB does not answer goes to {host} with this machine's ECID, the restore's nonces and its component hashes\n"
+                    ));
+                }
                 let url = format!("http://{host}{path}");
-                let post = network
-                    .open_post(&url, headers, content_type, body)
-                    .map_err(failed)?;
-                self.exchange.insert((body.to_vec(), post))
+                match network.open_post(&url, headers, content_type, body) {
+                    Ok(post) => self.exchange.insert((body.to_vec(), post)),
+                    Err(error) => return retry_after(&mut self.retry, body, error, now_ms),
+                }
             }
         };
         let result = network.read_post(post);
@@ -653,7 +703,18 @@ impl stela_runtime::restore::tss::Transport for Signing {
         }
         let (_, post) = self.exchange.take().unwrap();
         network.close_post(post);
-        result.map_err(failed)
+        match result {
+            Err(error) => retry_after(&mut self.retry, body, error, now_ms),
+            answer => {
+                self.retry = None;
+                answer.map_err(|error| {
+                    stela_runtime::restore::Error::Transport(refuse!(
+                        "signing request: {error}",
+                        %error
+                    ))
+                })
+            }
+        }
     }
 }
 
@@ -687,6 +748,8 @@ pub struct GuestNetwork {
     /// Late adapters can wait for the guest hub to acknowledge a disconnect.
     available: VecDeque<RootLink>,
     up: Option<bool>,
+    /// The guest adapter's counters at the last status, for [`Self::report`].
+    counters: stela_soc::machine::UsbNetworkCounters,
     /// The first link refusal, reported once.
     refused: bool,
     /// Frames read from the host adapter that the guest's receive queue
@@ -718,6 +781,7 @@ impl GuestNetwork {
             root: links.root,
             available: VecDeque::new(),
             up: None,
+            counters: Default::default(),
             refused: false,
             received: VecDeque::new(),
         }
@@ -794,6 +858,9 @@ impl GuestNetwork {
     /// Report the guest's link state as `status` gives it.
     pub fn status(&mut self, status: Option<(bool, stela_soc::machine::UsbNetworkCounters)>) {
         let up = status.is_some_and(|(up, _)| up);
+        if let Some((_, counters)) = status {
+            self.counters = counters;
+        }
         if self.up != Some(up) {
             self.up = Some(up);
             let counters = status.map(|(_, counters)| counters).unwrap_or_default();
@@ -802,6 +869,28 @@ impl GuestNetwork {
                 if up { "up" } else { "down" }
             ));
         }
+    }
+
+    /// The beat report's line: the frames the guest adapter moved each way
+    /// and dropped (oversized, filtered and overflowed), so a run shows
+    /// whether traffic moves.
+    pub fn report(&self) {
+        let counters = self.counters;
+        output::arguments(format_args!(
+            "GUEST NETWORK frames link={} to_host={} to_guest={} drops={} oversized={} \
+             filtered={} overflowed={}\n",
+            match self.up {
+                Some(true) => "up",
+                Some(false) => "down",
+                None => "unknown",
+            },
+            counters.to_host,
+            counters.to_guest,
+            counters.oversized + counters.filtered + counters.overflowed,
+            counters.oversized,
+            counters.filtered,
+            counters.overflowed
+        ));
     }
 
     /// Read frames from the host adapter while the guest's receive queue

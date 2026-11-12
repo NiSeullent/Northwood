@@ -12,11 +12,18 @@ use stela_driver_core::firmware::{Catalog, Provenance, Resource, Target};
 
 /// Native host capability, independent of the guest bundle/options schema.
 /// Revision 1 permits 16 MiB per image and 64 MiB in all, revision 2 permits
-/// 64 MiB per image, and revision 3 permits 256 MiB in all. Each keeps schema 1
-/// and 64 images; changing these requires a revision.
-pub const MOUNT_CAPABILITY: [u8; 21] = *b"STELA-HOST-FIRMWARE\0\x03";
+/// 64 MiB per image, and revision 3 permits 256 MiB in all. Revision 4 keeps
+/// revision 3's limits and also reads the complete bundle ([`bundle`]) from
+/// the USB's data volume. Each keeps schema 1 and 64 images; changing these
+/// requires a revision.
+pub const MOUNT_CAPABILITY: [u8; 21] = *b"STELA-HOST-FIRMWARE\0\x04";
 pub fn supports_mount(image: &[u8]) -> bool {
     MountLimits::from_image(image).is_some()
+}
+
+/// Whether the EFI image reads the complete bundle ([`bundle::MANIFEST`]).
+pub fn reads_bundle(image: &[u8]) -> bool {
+    MountLimits::from_image(image).is_some_and(|limits| limits.revision >= 4)
 }
 
 /// Bounds advertised by an EFI image, independent of manifest schema 1.
@@ -24,6 +31,7 @@ pub fn supports_mount(image: &[u8]) -> bool {
 pub struct MountLimits {
     max_image_bytes: usize,
     max_total_bytes: usize,
+    revision: u8,
 }
 
 impl MountLimits {
@@ -34,7 +42,7 @@ impl MountLimits {
                 continue;
             }
             match marker[20] {
-                1..=3 => revision = revision.max(marker[20]),
+                1..=4 => revision = revision.max(marker[20]),
                 // Never interpret an unknown mount contract as an older one.
                 _ => return None,
             }
@@ -43,14 +51,17 @@ impl MountLimits {
             1 => Some(Self {
                 max_image_bytes: 16 * 1024 * 1024,
                 max_total_bytes: 64 * 1024 * 1024,
+                revision,
             }),
             2 => Some(Self {
                 max_image_bytes: MAX_IMAGE_BYTES,
                 max_total_bytes: 64 * 1024 * 1024,
+                revision,
             }),
-            3 => Some(Self {
+            3 | 4 => Some(Self {
                 max_image_bytes: MAX_IMAGE_BYTES,
                 max_total_bytes: MAX_TOTAL_BYTES,
+                revision,
             }),
             _ => None,
         }
@@ -89,6 +100,7 @@ pub const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_LABEL_BYTES: usize = 256;
 pub const MAX_PATH_BYTES: usize = 240;
 
+pub mod bundle;
 pub mod recipes;
 pub mod requirements;
 

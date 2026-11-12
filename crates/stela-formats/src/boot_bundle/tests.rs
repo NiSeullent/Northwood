@@ -452,6 +452,68 @@ fn the_mac_reports_the_installed_dram_above_the_backed_range() -> Result<(), Bun
     Ok(())
 }
 
+/// iBoot's carveouts are blank when the regions load, whatever the DRAM held
+/// before: one carveout holds a region, as the loaded-object carveout holds
+/// the boot manifest, and one holds nothing.
+#[test]
+fn carveouts_are_blanked_before_the_regions_load() -> Result<(), BundleError> {
+    let kernel = [0xaa; 100];
+    let tree = [0x11; 20];
+    let json = manifest_json(&kernel, &tree);
+    let mut manifest = Manifest::parse(json.as_bytes())?;
+    let placed = |base: u64, bytes: u64| schema::Placed {
+        id: 0x4c,
+        base,
+        bytes,
+    };
+    manifest.carveouts = vec![placed(BASE, 0xc000), placed(BASE + 0x10_0000, 0xc000)];
+    let files: BTreeMap<&str, &[u8]> =
+        BTreeMap::from([("kernel.img", &kernel[..]), ("devicetree.adt", &tree[..])]);
+    let mut entropy = |buffer: &mut [u8]| {
+        buffer.fill(0x42);
+        Ok(())
+    };
+    let mut ram = vec![0xffu8; FRAME_BYTES as usize];
+    let verified = manifest.verify(&|name| files.get(name).copied())?;
+    verified.load(&machine(), &mut entropy, &mut |pa, bytes| {
+        write_into(&mut ram, pa, bytes)
+    })?;
+    // The regions were written after the blanking, into the first carveout.
+    assert_eq!(&ram[..100], &kernel);
+    assert_eq!(&ram[0x4000..0x4008], &FRAME_BYTES.to_le_bytes());
+    let loaded = manifest
+        .regions
+        .iter()
+        .map(|region| region.guest_pa + region.memory_bytes - BASE)
+        .max()
+        .unwrap() as usize;
+    assert!(loaded < 0xc000);
+    assert!(ram[loaded..0xc000].iter().all(|&b| b == 0));
+    assert_eq!(ram[0xc000], 0xff);
+    assert_eq!(ram[0x10_0000 - 1], 0xff);
+    assert!(ram[0x10_0000..0x10_c000].iter().all(|&b| b == 0));
+    assert_eq!(ram[0x10_c000], 0xff);
+
+    // A carveout that is not backed guest DRAM refuses the load before
+    // anything is written.
+    for (base, bytes) in [
+        (BASE + FRAME_BYTES - 0x4000, 0x8000),
+        (BASE - 0x4000, 0x8000),
+        (u64::MAX - 0x3fff, 0x8000),
+    ] {
+        manifest.carveouts = vec![placed(base, bytes)];
+        let verified = manifest.verify(&|name| files.get(name).copied())?;
+        let mut writes = 0;
+        let refused = verified.load(&machine(), &mut entropy, &mut |_, _| {
+            writes += 1;
+            true
+        });
+        assert!(matches!(refused, Err(BundleError::Machine(_))), "{base:#x}");
+        assert_eq!(writes, 0, "{base:#x}");
+    }
+    Ok(())
+}
+
 #[test]
 fn verifies_loads_and_patches_into_guest_ram() -> Result<(), BundleError> {
     let kernel = [0xaa; 100];

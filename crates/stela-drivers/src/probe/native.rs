@@ -87,6 +87,26 @@ pub(super) enum Kind {
     Usb4,
 }
 
+impl Kind {
+    /// The driver this kind attaches with, as the boot log names it.
+    pub(super) fn driver(self) -> &'static str {
+        match self {
+            Self::Tg3 => "tg3 Ethernet",
+            Self::Aqtion => "atlantic Ethernet",
+            Self::Vmd => "Intel VMD storage",
+            Self::Sfh => "AMD sensor hub",
+            Self::Ish => "Intel sensor hub",
+            Self::IntelWifi => "iwlwifi Wi-Fi (with --wifi)",
+            Self::MediatekWifi => "mt7925 Wi-Fi (with --wifi)",
+            Self::RealtekWifi => "rtw88 Wi-Fi (with --wifi)",
+            Self::IntelBluetooth => "Intel PCIe Bluetooth",
+            Self::Bcm4377 => "bcm4377 Bluetooth",
+            Self::Hda => "HD Audio",
+            Self::Usb4 => "USB4/Thunderbolt NHI",
+        }
+    }
+}
+
 /// A PCI bridge the scan passed.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Bridge {

@@ -91,6 +91,10 @@ pub(super) struct Mirrors {
     /// `value` the interrupt epoch they reflect
     /// ([`Machine::refresh_interrupt_status`]).
     pub(super) interrupt_status: register_read::Cell,
+    /// What a native DSB checks (`x86_64::register_read::barrier_thunk`):
+    /// open while this PE has no maintenance outstanding, whatever its
+    /// state or derived state ([`Machine::open_barrier`]).
+    pub(super) barrier: register_read::Cell,
     /// The records native GENTER and GEXIT complete from
     /// (`x86_64::transition`), indexed by `state`, which they move.
     pub(super) transitions: transition::Table,
@@ -102,6 +106,20 @@ pub(super) struct Mirrors {
     /// was entered, which the engine takes when it returns
     /// ([`Machine::take_thread_switches`]).
     pub(super) switches: register_read::SwitchLog,
+    /// Nonzero while the engine holds an exclusive monitor of its own
+    /// (`Cpu::monitor`) or the PE's monitor and event register live in its
+    /// canonical memory, set as native code is entered: native ERET then
+    /// leaves clearing and signalling them to the engine.
+    pub(super) monitor: u64,
+    /// The performance monitor's cycle counter as native code is entered
+    /// ([`Machine::enter_cycles`]), from which a cycle counter read computes
+    /// the count where only its cell's value went stale.
+    pub(super) cycles: register_read::CycleCounter,
+    /// The performance monitor's instruction counter as native code is
+    /// entered ([`Machine::enter_cycles`]), from which an instruction
+    /// counter read computes the count where only its cell's value went
+    /// stale.
+    pub(super) instructions: register_read::InstructionCounter,
 }
 
 /// Where native code finds the cell at `index` of the PE's state.
@@ -115,6 +133,9 @@ pub(super) const SELECTED: Place = Place::new(Anchor::Mirrors, offset_of!(Mirror
 /// Where native code finds [`Mirrors::interrupt_status`].
 pub(super) const INTERRUPT_STATUS: Place =
     Place::new(Anchor::Mirrors, offset_of!(Mirrors, interrupt_status));
+
+/// Where native code finds [`Mirrors::barrier`].
+pub(super) const BARRIER: Place = Place::new(Anchor::Mirrors, offset_of!(Mirrors, barrier));
 
 /// MRS ISR_EL1 to Xt, Rt in bits 4:0.
 pub(super) const READ_INTERRUPT_STATUS: u32 = 0xd538_c100;
@@ -138,25 +159,128 @@ pub(super) const CODE_PAGE: usize = STACK_SELECT + 1;
 /// completed plainly in the state on a host that keeps PAN in RFLAGS.AC.
 pub(super) const PAN_WRITES: usize = CODE_PAGE + 1;
 
-/// The cell of DSB (`x86_64::register_read::barrier_thunk`), open from one's
-/// completion until this PE has maintenance for another to complete.
-pub(super) const DATA_BARRIER: usize = PAN_WRITES + 1;
-
 /// The cells of SEVL and WFE (`x86_64::register_read::send_event_thunk`,
 /// `event_wait_thunk`), open on the event register once one completed
 /// plainly in the state; WFE completes natively only when an event is set.
-pub(super) const SEND_EVENT: usize = DATA_BARRIER + 1;
+pub(super) const SEND_EVENT: usize = PAN_WRITES + 1;
 pub(super) const EVENT_WAIT: usize = SEND_EVENT + 1;
 
+/// The cell of MSR TTBR0_EL1 (`x86_64::register_read::unchanged_write_thunk`),
+/// open on the storage a plain write reached: a write of the value the
+/// register holds completes natively and changes nothing, any other exits.
+/// A kernel rewrites the same table base at most switches into a thread of
+/// the address space it already runs.
+pub(super) const TABLE_BASE_KEPT: usize = EVENT_WAIT + 1;
+
+/// TTBR0_EL1 (TTBR0_EL2 at EL2 with E2H).
+pub(super) const TABLE_BASE: Encoding = Encoding::new(3, 0, 2, 0, 0);
+
+/// The cells of the EL2 virtual timer's compare and control
+/// (`x86_64::register_read::timer_thunk`), whose `value`s are the addresses
+/// of CNTHV_CVAL_EL2's and CNTHV_CTL_EL2's storage. An access of CNTV_TVAL,
+/// CNTV_CVAL or CNTV_CTL that completes plainly opens both, only where
+/// such an access always reaches that channel with no offset: at EL2,
+/// outside a guarded level, with HCR_EL2.E2H set (Arm `AArch64_CNTV_*`
+/// redirect to CNTHV_*), on a chip whose one timer bank counts the system
+/// count unscaled (before the M3: `timer::agt`). No CNTHCTL_EL2 trap applies
+/// at EL2.
+pub(super) const TIMER_COMPARE: usize = TABLE_BASE_KEPT + 1;
+pub(super) const TIMER_CONTROL: usize = TIMER_COMPARE + 1;
+
+/// Where native timer accesses find the channel and the engine's words.
+pub(super) const TIMER: register_read::TimerPlaces = register_read::TimerPlaces {
+    compare: cell_place(TIMER_COMPARE),
+    control: cell_place(TIMER_CONTROL),
+    lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
+    count: Place::new(Anchor::Count, 0),
+};
+
+/// MSR CNTV_TVAL_EL0, CNTV_CTL_EL0 and CNTV_CVAL_EL0, and MRS
+/// CNTV_CTL_EL0, with Rt in bits 4:0.
+const TIMER_VALUE_WRITE: u32 = 0xd51b_e300;
+const TIMER_CONTROL_WRITE: u32 = 0xd51b_e320;
+const TIMER_COMPARE_WRITE: u32 = 0xd51b_e340;
+const TIMER_CONTROL_READ: u32 = 0xd53b_e320;
+
+/// What a native timer access of `word` does, and Rt, if `word` is one:
+/// [`TimerWord`].
+pub(super) fn timer_word(word: u32) -> Option<(TimerWord, u8)> {
+    let access = match word & !31 {
+        TIMER_VALUE_WRITE => TimerWord::Value,
+        TIMER_CONTROL_WRITE => TimerWord::ControlWrite,
+        TIMER_COMPARE_WRITE => TimerWord::Compare,
+        TIMER_CONTROL_READ => TimerWord::ControlRead,
+        _ => return None,
+    };
+    Some((access, (word & 31) as u8))
+}
+
+/// The timer accesses native code completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TimerWord {
+    Value,
+    Compare,
+    ControlWrite,
+    ControlRead,
+}
+
+/// The cell that says the cycle counter's read is plain in the state
+/// (`x86_64::register_read::cycle_counter_thunk`): it opens with the
+/// counter's own cell ([`COUNTER_MIRRORS`]) and closes only with every cell,
+/// as plainness follows from System registers and PSTATE alone, while a
+/// native transition closes the counter's cell because its value, the
+/// count, went stale.
+pub(super) const CYCLES_PLAIN: usize = TIMER_CONTROL + 1;
+
+/// Where native code finds [`Mirrors::cycles`].
+pub(super) const CYCLES: Place = Place::new(Anchor::Mirrors, offset_of!(Mirrors, cycles));
+
+/// The cell that says the instruction counter's read is plain in the state
+/// (`x86_64::register_read::instruction_counter_thunk`), as
+/// [`CYCLES_PLAIN`] is the cycle counter's.
+pub(super) const INSTRUCTIONS_PLAIN: usize = CYCLES_PLAIN + 1;
+
+/// Where native code finds [`Mirrors::instructions`].
+pub(super) const INSTRUCTION_COUNTER: Place =
+    Place::new(Anchor::Mirrors, offset_of!(Mirrors, instructions));
+
+/// The cells of MSR SPRR_PERM_EL0 and MSR SPRR_PERM_EL1
+/// (`x86_64::register_read::unchanged_write_thunk`), open on the storage a
+/// plain write reached in the state: a write of the value the register
+/// holds completes natively and changes nothing (no access changes, as the
+/// engine's own write of it finds), any other exits. A kernel writes the
+/// user permissions at each return to a thread and the kernel ones around
+/// each write of protected data, mostly with the value they hold. A write
+/// whose model refused it closes them ([`Machine::register_refused`]).
+pub(super) const PERMISSION_KEPT: [usize; 2] = [INSTRUCTIONS_PLAIN + 1, INSTRUCTIONS_PLAIN + 2];
+
+/// The [`PERMISSION_KEPT`] cell of the MSR `word`, and Rt, if it writes
+/// SPRR_PERM_EL0 or SPRR_PERM_EL1.
+pub(super) fn permission_write_word(word: u32) -> Option<(usize, u8)> {
+    const MSR_SPRR_PERM_EL0: u32 = 0xd51e_f1a0;
+    const MSR_SPRR_PERM_EL1: u32 = 0xd51e_f1c0;
+    let kept = match word & !31 {
+        MSR_SPRR_PERM_EL0 => PERMISSION_KEPT[0],
+        MSR_SPRR_PERM_EL1 => PERMISSION_KEPT[1],
+        _ => return None,
+    };
+    Some((kept, (word & 31) as u8))
+}
+
 /// The cell of the first of the [`STORED_WRITES`].
-const STORED_WRITE_CELLS: usize = EVENT_WAIT + 1;
+const STORED_WRITE_CELLS: usize = PERMISSION_KEPT[1] + 1;
 
 /// The IMPLEMENTATION DEFINED registers that a store completes writes of
 /// that get a cell of their own the first time code naming them is installed
 /// ([`Machine::stored_write_cell`]), open on the register's value once a
 /// write completes plainly. A kernel writes them around each thread switch.
-/// When there are more, the rest take System exits.
-pub(super) const STORED_WRITES: usize = 32;
+/// When there are more, the rest take System exits. Numbers go in install
+/// order and never free, and boot installs writes of dozens of tuning,
+/// control and counter registers (26A434 XNU alone writes over 40 stored
+/// ones) before the first thread switch, so room for the ones a kernel
+/// writes at every switch (thread keys, SPRR's field registers) must
+/// outlast those.
+pub(super) const STORED_WRITES: usize = 128;
 
 const CELLS: usize = STORED_WRITE_CELLS + STORED_WRITES;
 
@@ -177,7 +301,7 @@ pub(super) const MASK_WRITES: usize = MIRRORED.len() + STORED_CELLS;
 /// together (`Machine::open_pointers`). TPIDR_EL1's also update its open
 /// read cells in every state and log the thread switch for the engine's
 /// diagnostics ([`THREAD_SWITCH`]).
-pub(super) const WRITTEN: [(Encoding, SystemRegister); 17] = [
+pub(super) const WRITTEN: [(Encoding, SystemRegister); 18] = [
     (Encoding::new(3, 0, 4, 0, 1), SystemRegister::ELR_EL1),
     (Encoding::new(3, 0, 4, 0, 0), SystemRegister::SPSR_EL1),
     (STACK_ZERO, SystemRegister::SP_EL0),
@@ -197,6 +321,7 @@ pub(super) const WRITTEN: [(Encoding, SystemRegister); 17] = [
     (Encoding::new(3, 0, 2, 2, 3), SystemRegister::APDBKeyHi_EL1),
     (Encoding::new(3, 0, 2, 3, 0), SystemRegister::APGAKeyLo_EL1),
     (Encoding::new(3, 0, 2, 3, 1), SystemRegister::APGAKeyHi_EL1),
+    (CONTEXT_ID, SystemRegister::CONTEXTIDR_EL1),
     (registers::encodings::TPIDR_EL1, SystemRegister::TPIDR_EL1),
 ];
 
@@ -222,6 +347,12 @@ pub(super) const THREAD_SWITCH: register_read::ThreadSwitch = register_read::Thr
     log: Place::new(Anchor::Mirrors, offset_of!(Mirrors, switches)),
 };
 
+/// CONTEXTIDR_EL1 (CONTEXTIDR_EL2 at EL2 with E2H), which a kernel writes
+/// at each thread or address space switch: only debug and trace read it,
+/// context-aware breakpoints live from its storage, and it is not part of
+/// the prediction context (`PredictionContext`).
+pub(super) const CONTEXT_ID: Encoding = Encoding::new(3, 0, 13, 0, 1);
+
 /// SP_EL0, plain only with SP_ELx selected.
 pub(super) const STACK_ZERO: Encoding = Encoding::new(3, 0, 4, 1, 0);
 
@@ -235,9 +366,13 @@ impl Default for Mirrors {
             selected: 0,
             fields: [0; 3],
             interrupt_status: register_read::Cell::default(),
+            barrier: register_read::Cell::default(),
             transitions: transition::Table::default(),
             lines_until: 0,
             switches: register_read::SwitchLog::default(),
+            monitor: 0,
+            cycles: register_read::CycleCounter::default(),
+            instructions: register_read::InstructionCounter::default(),
         }
     }
 }
@@ -256,6 +391,12 @@ pub(super) const TRANSITIONS: transition::Places = transition::Places {
     interrupt_status: INTERRUPT_STATUS,
     lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
     count: Place::new(Anchor::Count, 0),
+    monitor: Place::new(Anchor::Mirrors, offset_of!(Mirrors, monitor)),
+    pointer_tags: super::pointer::TAGS,
+    pointer_generation: Place::new(
+        Anchor::Pointer,
+        offset_of!(super::pointer::PointerService, generation),
+    ),
 };
 const _: () = assert!(size_of::<usize>() == size_of::<u64>());
 
@@ -362,7 +503,8 @@ impl Mirrors {
             readable: 1,
             value: address,
         };
-        self.close(DATA_BARRIER);
+        // The DSB that ends the run of lines closes the cell again.
+        self.barrier = register_read::Cell::default();
     }
 
     /// Another IC IVAU of the page could do more.
@@ -380,8 +522,8 @@ impl Mirrors {
 
 /// System registers whose writes leave the derived caches intact.
 /// Exception registers and thread pointers are read when used. TTBR0
-/// changes translation, and CONTEXTIDR changes prediction identity and
-/// live debug matches. Their writes still synchronize the host regime.
+/// changes translation, and its write still synchronizes the host regime.
+/// CONTEXTIDR changes only live debug matches, which read it when checked.
 pub(super) fn stored(register: SystemRegister) -> bool {
     use SystemRegister::*;
     matches!(
@@ -581,6 +723,19 @@ pub(super) fn written_register(pc: u64, word: u32) -> Option<(usize, u8)> {
     let instruction = block::decode_system_mode_instruction(GuestAddress(pc), word).ok()??;
     match instruction.operation {
         SystemOperation::Register(access) => Some((written(access)?, access.rt())),
+        _ => None,
+    }
+}
+
+/// Xt of the MSR TTBR0_EL1 `word` at `pc`, if it is one.
+pub(super) fn table_base_write(pc: u64, word: u32) -> Option<u8> {
+    let instruction = block::decode_system_mode_instruction(GuestAddress(pc), word).ok()??;
+    match instruction.operation {
+        SystemOperation::Register(access)
+            if access.encoding() == TABLE_BASE && access.direction() == Direction::Write =>
+        {
+            Some(access.rt())
+        }
         _ => None,
     }
 }

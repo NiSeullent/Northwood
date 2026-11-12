@@ -69,6 +69,10 @@ fn setup_with(
         Route::StelaFirmwareStudy,
     )
     .unwrap();
+    (d, harness())
+}
+/// The guest side up to its HardwareInfo reply.
+fn harness() -> Harness {
     let mut h = Harness {
         streams: BTreeMap::from([
             (PORT, Memory::new(vec![], 3)),
@@ -98,9 +102,9 @@ fn setup_with(
             ]),
         )]),
     );
-    (d, h)
+    h
 }
-fn restoring(d: &mut Driver<stela_formats::payload::test_support::Memory, u16>, h: &mut Harness) {
+fn restoring<R: ReadAt>(d: &mut Driver<R, u16>, h: &mut Harness) {
     for _ in 0..100 {
         assert!(d.poll(h).is_pending());
     }
@@ -342,4 +346,95 @@ fn write_failure_is_sticky_and_no_final_ack_can_follow() {
     assert!(matches!(d.poll(&mut h), Poll::Ready(Err(_))));
     assert!(h.streams[&PORT].output.is_empty());
     assert_ne!(d.session.phase(), Phase::Complete);
+}
+
+/// A network source bounded once the guest runs: its next `stalls` reads
+/// run out of the time they may wait.
+struct Stalling {
+    source: stela_formats::payload::test_support::Memory,
+    stalls: usize,
+    reads: usize,
+    blocked: bool,
+}
+impl ReadAt for Stalling {
+    type Error = &'static str;
+    fn len(&self) -> u64 {
+        self.source.len()
+    }
+    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> core::result::Result<(), Self::Error> {
+        self.reads += 1;
+        if self.stalls > 0 {
+            self.stalls -= 1;
+            self.blocked = true;
+            return Err("the read's time ran out");
+        }
+        self.source.read_at(offset, buffer)
+    }
+    fn blocked(&mut self) -> bool {
+        core::mem::take(&mut self.blocked)
+    }
+}
+/// A driver over a scanned (unrecorded) inventory, which `prepare` reads.
+fn stalling_driver() -> Driver<Stalling, u16> {
+    use super::super::store::{
+        Store,
+        tests::{ERASE, parts},
+    };
+    let (source, manifest) = parts(b"payload", true, &[], &[], ERASE);
+    let reader = Stalling {
+        source,
+        stalls: 0,
+        reads: 0,
+        blocked: false,
+    };
+    let store = Store::open(reader, manifest, 0).unwrap();
+    Driver::new(Answers::new(store), Route::StelaFirmwareStudy).unwrap()
+}
+/// The control messages the driver wrote, decoded.
+fn sent(h: &mut Harness) -> Vec<Value> {
+    let s = h.streams.get_mut(&PORT).unwrap();
+    let mut out = Memory::new(core::mem::take(&mut s.output), 1 << 20);
+    let mut f = Framed::new(Endian::Big, Limits::default());
+    let mut messages = Vec::new();
+    while out.at < out.input.len() {
+        messages.push(receive(&mut f, &mut out).unwrap());
+    }
+    messages
+}
+fn starts(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.get("RestoreOptions").is_some())
+        .count()
+}
+
+#[test]
+fn a_pending_first_read_starts_the_restore_once() {
+    let mut d = stalling_driver();
+    let mut h = harness();
+    // Reads are bounded from here, and the store's first ones run out of
+    // time.
+    d.answers.store.reader_mut().stalls = 3;
+    restoring(&mut d, &mut h);
+    assert!(d.failed().is_none(), "{:?}", d.failed());
+    assert_eq!(d.answers.store.reader_mut().stalls, 0);
+    let messages = sent(&mut h);
+    // The type query, the HardwareInfo query and one StartRestore.
+    assert_eq!(starts(&messages), 1, "{messages:?}");
+    assert_eq!(messages.len(), 3, "{messages:?}");
+}
+
+#[test]
+fn a_store_prepared_before_the_guest_reads_nothing_at_the_start() {
+    let mut d = stalling_driver();
+    let mut h = harness();
+    // Prepared while reads are unbounded, before the guest starts.
+    d.answers.store.prepare().unwrap();
+    let reader = d.answers.store.reader_mut();
+    let before = reader.reads;
+    reader.stalls = usize::MAX;
+    restoring(&mut d, &mut h);
+    assert!(d.failed().is_none(), "{:?}", d.failed());
+    assert_eq!(d.answers.store.reader_mut().reads, before);
+    assert_eq!(starts(&sent(&mut h)), 1);
 }

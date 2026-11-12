@@ -8,7 +8,8 @@
 //! of its own and blocks in `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` for the next
 //! point, waiting for its submission too. Its own handle keeps the syncobj
 //! alive whatever becomes of the device, and each wait ends within
-//! [`WAIT_NS`] so a waiter a newer device or the stop replaced leaves.
+//! [`WAIT_NS`] while work is outstanding, else [`IDLE_WAIT_NS`], so a
+//! waiter a newer device or the stop replaced leaves.
 //!
 //! Each point it sees signaled goes straight to the device's service
 //! (`SharedService::completed_through`), which tells the guest at once even
@@ -58,8 +59,16 @@ pub(super) fn watching() -> bool {
     generation != 0 && WATCHING.load(Ordering::Acquire) == generation
 }
 
-/// The longest one wait lasts.
+/// The longest one wait lasts while the service awaits a completion: a
+/// stalled timeline is noticed after it.
 const WAIT_NS: u64 = 100_000_000;
+/// The longest one wait lasts while the service awaits none. A wait ends
+/// as soon as its point signals, whatever its timeout, and waits for the
+/// point's submission too, so a longer one loses no completion; an idle
+/// desktop then wakes the waiter once a second instead of ten times, each
+/// wake about 1 ms of the boot PE. A submission during an idle wait that
+/// never signals is noticed after this instead of [`WAIT_NS`].
+const IDLE_WAIT_NS: u64 = 1_000_000_000;
 /// Failed waits in a row after which a waiter leaves: its syncobj or file
 /// is unusable.
 const FAILURES: u32 = 8;
@@ -134,14 +143,16 @@ pub(super) fn start(fd: c_int, service: usize, timeline: u64) {
     }
 }
 
-/// Every waiter leaves within [`WAIT_NS`]: the GPUs stop.
+/// Every waiter leaves within [`IDLE_WAIT_NS`]: the GPUs stop.
 pub(super) fn stop() {
     GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 /// The longest the stop waits for the waiters to close their files: one
-/// wait of [`WAIT_NS`], its syncobj's destruction and the file's release.
-const GONE_NS: u64 = 500_000_000;
+/// wait of [`IDLE_WAIT_NS`], its syncobj's destruction and the file's
+/// release.
+const GONE_NS: u64 = IDLE_WAIT_NS + 400_000_000;
+const _: () = assert!(WAIT_NS <= IDLE_WAIT_NS && GONE_NS > IDLE_WAIT_NS);
 
 /// Has every waiter leave and waits, within [`GONE_NS`], until each closed
 /// its file, so its nouveau client is freed before the GPU stops; says
@@ -196,10 +207,15 @@ fn wait(file: c_int, handle: u32, watch: &Watch) {
     while GENERATION.load(Ordering::Acquire) == generation && failures < FAILURES {
         let mut point = next;
         let mut handles = handle;
+        let timeout = if gate::awaits_completion(watch.service) {
+            WAIT_NS
+        } else {
+            IDLE_WAIT_NS
+        };
         let mut request = TimelineWait {
             handles: ptr::from_mut(&mut handles) as u64,
             points: ptr::from_mut(&mut point) as u64,
-            timeout_nsec: client::now_ns().saturating_add(WAIT_NS) as i64,
+            timeout_nsec: client::now_ns().saturating_add(timeout) as i64,
             count_handles: 1,
             flags: WAIT_FOR_SUBMIT,
             first_signaled: 0,

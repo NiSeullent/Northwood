@@ -92,6 +92,12 @@ pub trait ReadAt {
         self.len() == 0
     }
     fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), Self::Error>;
+    /// Whether the last failed read only ran out of the time it may wait,
+    /// as a network source's read bounded for its caller does: the same
+    /// read later goes on from what arrived meanwhile. Asking clears it.
+    fn blocked(&mut self) -> bool {
+        false
+    }
 }
 
 /// A borrowed source, so one disk can be opened as several containers in
@@ -105,6 +111,10 @@ impl<R: ReadAt + ?Sized> ReadAt for &mut R {
 
     fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), Self::Error> {
         (**self).read_at(offset, buffer)
+    }
+
+    fn blocked(&mut self) -> bool {
+        (**self).blocked()
     }
 }
 

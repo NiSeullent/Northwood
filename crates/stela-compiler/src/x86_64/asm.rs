@@ -37,6 +37,12 @@ pub(crate) struct Asm<'a> {
     /// The locals a fault recovers from their hosts ([`super::pinned::Span`]).
     dirty: super::pinned::Dirty,
     linked_block: Option<u64>,
+    /// Host XMM registers that hold guest vectors
+    /// ([`super::vector_cache`]): no instruction emitted here writes one.
+    guarded: u32,
+    /// Whether a guest vector's only current value is in a host register,
+    /// which no fault site may then be.
+    vectors_dirty: bool,
 }
 
 impl<'a> Asm<'a> {
@@ -66,6 +72,8 @@ impl<'a> Asm<'a> {
             locals: None,
             dirty: Default::default(),
             linked_block: None,
+            guarded: 0,
+            vectors_dirty: false,
         }
     }
     /// [`Self::new`] for code that keeps guest registers in host registers
@@ -134,12 +142,24 @@ impl<'a> Asm<'a> {
             });
         }
     }
+    /// Refuse to write `xmm` where it holds a guest vector
+    /// ([`super::vector_cache`]): a recipe names it only as a source.
+    pub(crate) fn guard_vector(&self, xmm: u8) {
+        assert!(
+            self.guarded & 1 << xmm == 0,
+            "xmm{xmm} holds a guest vector of the block"
+        );
+    }
     fn fault_site(
         &mut self,
         site: crate::block::RecoverySite,
         stack: Option<u8>,
         emit: impl FnOnce(&mut Self),
     ) {
+        assert!(
+            !self.vectors_dirty,
+            "a fault site with V registers only in XMM"
+        );
         let start = self.len();
         let instructions = self.instructions;
         emit(self);
@@ -197,9 +217,23 @@ impl<'a> Asm<'a> {
     /// REX when a register needs it, `opcode` and ModRM.
     pub(crate) fn sse(&mut self, prefix: Option<u8>, opcode: &[u8], xmm: u8, rm: impl Into<Rm>) {
         assert!(xmm < 16, "legacy SSE cannot name extended vector registers");
+        self.guard_vector(xmm);
         let rm = rm.into();
         assert!(!matches!(rm, Rm::Xmm(register) if register >= 16));
         self.legacy(Size::Dword, prefix, opcode, xmm, false, rm);
+    }
+    /// [`Self::sse`] of a form whose ModRM.reg register is a source (a
+    /// store), which may name a register holding a guest vector.
+    pub(crate) fn sse_reading(
+        &mut self,
+        prefix: Option<u8>,
+        opcode: &[u8],
+        xmm: u8,
+        rm: impl Into<Rm>,
+    ) {
+        let guarded = core::mem::replace(&mut self.guarded, 0);
+        self.sse(prefix, opcode, xmm, rm);
+        self.guarded = guarded;
     }
     /// [`Self::sse`] with an 8-bit immediate.
     pub(crate) fn sse_imm(

@@ -73,6 +73,7 @@ fn an_empty_root_port_is_skipped_without_waiting() {
     let mut waits = 0;
     let settled = debounce_ports_with_delay(
         3,
+        0,
         |_| {
             samples += 1;
             Ok((false, false))
@@ -86,12 +87,34 @@ fn an_empty_root_port_is_skipped_without_waiting() {
     assert_eq!((samples, waits), (3, 0));
 }
 
+/// After a controller reset a device may connect only some time later:
+/// one that connects 300 ms after the first sample is debounced and found,
+/// and an empty port is declared empty after the settle window.
+#[test]
+fn a_root_port_that_connects_after_the_reset_is_found_within_the_settle_window() {
+    let mut elapsed = [0u64; 2];
+    let settled = debounce_ports_with_delay(
+        2,
+        CONNECT_SETTLE_US,
+        |port| {
+            let connected = port == 0 && elapsed[port] >= 300_000;
+            let changed = connected && elapsed[port] == 300_000;
+            elapsed[port] += DEBOUNCE_STEP_US;
+            Ok((connected, changed))
+        },
+        || Ok(()),
+    );
+    assert_eq!(settled[0], Ok((true, 300_000 + DEBOUNCE_STABLE_US)));
+    assert_eq!(settled[1], Ok((false, CONNECT_SETTLE_US)));
+}
+
 #[test]
 fn connected_root_ports_debounce_in_one_window() {
     let mut first = [true; 4];
     let mut waits = 0;
     let settled = debounce_ports_with_delay(
         4,
+        0,
         |port| {
             // Port 2 is empty; the others connect with a change.
             let changed = core::mem::replace(&mut first[port], false);
@@ -116,6 +139,7 @@ fn a_bouncing_root_port_settles_late_and_a_flapping_one_times_out_alone() {
     let mut samples = [0usize; 3];
     let settled = debounce_ports_with_delay(
         3,
+        0,
         |port| {
             samples[port] += 1;
             let n = samples[port];
@@ -141,7 +165,7 @@ fn a_bouncing_root_port_settles_late_and_a_flapping_one_times_out_alone() {
     assert_eq!(settled[2], Ok((true, DEBOUNCE_STABLE_US)));
     // A failed wait fails every port still settling.
     assert_eq!(
-        debounce_ports_with_delay(2, |_| Ok((true, true)), || Err(BlockError::Timeout)),
+        debounce_ports_with_delay(2, 0, |_| Ok((true, true)), || Err(BlockError::Timeout)),
         [Err(BlockError::Timeout), Err(BlockError::Timeout)]
     );
 }

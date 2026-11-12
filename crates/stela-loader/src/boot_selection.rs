@@ -95,6 +95,15 @@ pub const OTA_FAILURE_REASON: &[u8] = b"ota-failure-reason";
 pub const UPGRADE_FAILURE: &[u8] = b"failed to execute upgrade command from iBoot";
 /// The variables LLB removes with `one-time-boot-command`.
 pub const FAILURE_REASONS: [&[u8]; 2] = [b"iboot-failure-reason", b"iboot-failure-reason-str"];
+/// Stela's own record of the automatic repair of a missing Metal plugin
+/// (`stela_boot_core::bundle_repair`), in `system`: [`BUNDLE_REPAIR_PENDING`]
+/// asks the next macOS boot to be the repair's single-user maintenance boot,
+/// which sets it to [`BUNDLE_REPAIR_ATTEMPTED`] before it boots, so a failed
+/// or interrupted repair is never retried by itself. The engine removes it
+/// once a boot finds the plugin installed.
+pub const BUNDLE_REPAIR: &[u8] = b"stela-bundle-repair";
+pub const BUNDLE_REPAIR_PENDING: &[u8] = b"pending";
+pub const BUNDLE_REPAIR_ATTEMPTED: &[u8] = b"attempted";
 const TRUE: &[u8] = b"true";
 const FALSE: &[u8] = b"false";
 /// `8-4-4-4-12` hexadecimal digits.
@@ -336,6 +345,9 @@ pub struct Selection {
     /// The boot disk holds System Recovery in its RecoveryOSContainer
     /// (`--system-recovery`); otherwise a recoveryOS boot is refused.
     pub system_on_disk: bool,
+    /// A macOS boot that is the automatic Metal plugin repair's maintenance
+    /// boot (`--bundle-repair`), which [`BUNDLE_REPAIR`] asked for.
+    pub bundle_repair: bool,
 }
 
 impl Selection {
@@ -352,6 +364,9 @@ impl Selection {
     pub fn missing_boot_media(&mut self) {
         if matches!(self.target, Target::MacOs { .. }) {
             self.target = Target::SystemRecovery;
+            // The repair waits for a macOS boot, as for any recoveryOS one.
+            self.bundle_repair = false;
+            self.assigned.retain(|(name, _)| *name != BUNDLE_REPAIR);
             self.reasons
                 .push("missing-boot-media: the boot disk holds no installed system".into());
         }
@@ -402,6 +417,7 @@ pub fn select(variables: &Variables) -> Result<Selection> {
         notes: Vec::new(),
         paired_on_disk: false,
         system_on_disk: false,
+        bundle_repair: false,
     };
     if let Some(value) = lookup(variables, AUTO_BOOT)
         && !flag(AUTO_BOOT, value)?
@@ -502,6 +518,18 @@ pub fn select(variables: &Variables) -> Result<Selection> {
             Some(Command::Fsboot | Command::PostUpgrade) | None => Target::MacOs { safe: false },
         };
     check_volume(&selection)?;
+    // Only a macOS boot repairs: a recoveryOS boot leaves the request for
+    // the next one.
+    if matches!(selection.target, Target::MacOs { .. })
+        && let Some(value) = lookup(variables, BUNDLE_REPAIR)
+        && strip(value) == BUNDLE_REPAIR_PENDING
+    {
+        selection.reasons.push(shown(BUNDLE_REPAIR, value));
+        selection
+            .assigned
+            .push((BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED));
+        selection.bundle_repair = true;
+    }
     Ok(selection)
 }
 
@@ -579,14 +607,18 @@ pub const RECOVERY_MODE_REFUSAL: &str = "NVRAM holds the machine in iBoot's reco
 /// How [`route`]'s refusal of a recoveryOS boot of a disk without one
 /// starts.
 pub const NO_RECOVERY_REFUSAL: &str = "NVRAM boots recoveryOS";
+/// A macOS boot that is the automatic Metal plugin repair's single-user
+/// maintenance boot ([`BUNDLE_REPAIR`]).
+pub const BUNDLE_REPAIR_OPTION: &str = "--bundle-repair";
 /// What the engine is told only by NVRAM.
-const NVRAM_OPTIONS: [&str; 6] = [
+const NVRAM_OPTIONS: [&str; 7] = [
     BOOT_VOLUME_OPTION,
     SAFE_BOOT_OPTION,
     UPGRADE_OPTION,
     PAIRED_RECOVERY_OPTION,
     SYSTEM_RECOVERY_OPTION,
     BOOT_COMMAND_OPTION,
+    BUNDLE_REPAIR_OPTION,
 ];
 
 /// The engine options for `selection` (none when NVRAM was not read): a
@@ -644,9 +676,17 @@ pub fn route(options: &str, selection: Option<&Selection>) -> Result<(String, St
             if safe {
                 extra.push(SAFE_BOOT_OPTION.into());
             }
+            if selection.bundle_repair {
+                extra.push(BUNDLE_REPAIR_OPTION.into());
+            }
             format!(
-                "macOS{} ({reasons})",
-                if safe { " in safe mode" } else { "" }
+                "macOS{}{} ({reasons})",
+                if safe { " in safe mode" } else { "" },
+                if selection.bundle_repair {
+                    ", single-user to repair the Metal plugin"
+                } else {
+                    ""
+                }
             )
         }
         Target::Upgrade => {

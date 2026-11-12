@@ -23,7 +23,7 @@ use core::{
     cell::Cell,
     panic::Location,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 use stela_boot_core::staged_disk::{self, DiskWorker};
 use stela_contracts::refuse;
@@ -200,22 +200,69 @@ fn try_lock_host_drivers() -> bool {
         .is_ok()
 }
 
-/// Take the host drivers' lock, counting the wait.
+/// Cores spinning for [`HOST_DRIVERS`] now ([`host_drivers_wanted`]).
+static HOST_DRIVERS_WAITERS: AtomicU32 = AtomicU32::new(0);
+
+/// Whether a core waits for the host drivers' lock now: a holder that runs
+/// work in steps (the GPU pump) ends its turn at the next step boundary
+/// instead of at its budget, leaving the rest pending.
+pub(super) fn host_drivers_wanted() -> bool {
+    HOST_DRIVERS_WAITERS.load(Ordering::Relaxed) != 0
+}
+
+/// Where the current holder of [`HOST_DRIVERS`] took it, for the report
+/// of a wait that overran.
+static HOST_DRIVERS_SITE: AtomicPtr<Location<'static>> = AtomicPtr::new(ptr::null_mut());
+
+/// The longest wait for [`HOST_DRIVERS`], in seconds: longer than the
+/// longest single timeout of a host driver (a controller's 60 s ready
+/// wait), so only a holder that never lets go reaches it.
+const HOST_DRIVERS_WAIT_SECONDS: u64 = 90;
+
+/// Take the host drivers' lock, counting the wait. A wait past
+/// [`HOST_DRIVERS_WAIT_SECONDS`] stops the mount with a report naming the
+/// holder instead of spinning forever.
 fn lock_host_drivers() -> u64 {
     if try_lock_host_drivers() {
         return 0;
     }
-    let started = super::host::rdtsc();
-    while HOST_DRIVERS
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        // A driver holding this lock can be retiring an aperture mapping.
-        // An interrupt cannot reach this waiter if it entered with IF clear.
-        crate::native_mmio::shootdown::service();
-        core::hint::spin_loop();
-    }
-    let waited = super::host::rdtsc().wrapping_sub(started);
+    // An unknown rate is taken as a fast one, so the bound only grows.
+    let hz = match crate::firmware::tsc_hz() {
+        0 => 10_000_000_000,
+        hz => hz,
+    };
+    HOST_DRIVERS_WAITERS.fetch_add(1, Ordering::Relaxed);
+    let spun = stela_boot_core::bounded_spin::spin(
+        || {
+            HOST_DRIVERS
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        },
+        super::host::rdtsc,
+        hz.saturating_mul(HOST_DRIVERS_WAIT_SECONDS),
+        || {
+            // A driver holding this lock can be retiring an aperture mapping.
+            // An interrupt cannot reach this waiter if it entered with IF clear.
+            crate::native_mmio::shootdown::service();
+            core::hint::spin_loop();
+        },
+    );
+    HOST_DRIVERS_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    let waited = match spun {
+        stela_boot_core::bounded_spin::Spin::Taken(waited) => waited,
+        stela_boot_core::bounded_spin::Spin::Overrun(waited) => {
+            let site = HOST_DRIVERS_SITE.load(Ordering::Relaxed);
+            // SAFETY: only `enter_locked` stores, a `&'static Location`.
+            let site = unsafe { site.as_ref() };
+            output::fatal(format_args!(
+                "host drivers lock not released after {} ms: held from {} on the processor \
+                 with gs {:#x}",
+                u128::from(waited) * 1000 / u128::from(hz),
+                site.map_or_else(|| String::from("unknown"), |site| format!("{site}")),
+                HOST_DRIVERS_GS.load(Ordering::Relaxed),
+            ))
+        }
+    };
     HOST_DRIVERS_WAITED[0].fetch_add(waited, Ordering::Relaxed);
     HOST_DRIVERS_WAITED[1].fetch_max(waited, Ordering::Relaxed);
     waited
@@ -328,6 +375,10 @@ impl RestoreRoot {
         // owner while IF0 excludes its own IRQ/reentrant root transition.
         let gs = unsafe { crate::cpu::msr::GS_BASE.read() };
         HOST_DRIVERS_GS.store(gs, Ordering::Release);
+        HOST_DRIVERS_SITE.store(
+            ptr::from_ref(Location::caller()).cast_mut(),
+            Ordering::Relaxed,
+        );
         // A context or the host's state says so without a read of CR4, which
         // a hypervisor may intercept: disks are polled here thousands of times
         // a second.
@@ -594,6 +645,9 @@ static STEPPED: AtomicU64 = AtomicU64::new(0);
 const FALLBACK_MILLIS: u64 = 1;
 /// A completion the disk has not shown is looked for after this long.
 const LOST_MILLIS: u64 = 1;
+/// The time one step takes before it leaves the rest to the next, unless
+/// a single call of the host disk takes longer.
+const STEP_MICROS: u64 = 1000;
 /// How long a fruitless look at a signalling disk excuses the next ones
 /// while no core took a doorbell: a few of an NVMe read's latency.
 const LOOK_WINDOW_MICROS: u64 = 20;
@@ -661,8 +715,11 @@ fn step(worker: &DiskWorker) -> Option<staged_disk::Step> {
     SEEN_DOORBELLS.store(super::host::doorbells(), Ordering::Relaxed);
     let now = super::host::fresh_counter();
     STEPPED.store(now, Ordering::Relaxed);
+    // A step ends once it has had its time: the rest waits for the next.
+    let budget = super::host::COUNTER_HZ / 1_000_000 * STEP_MICROS;
+    let mut over = || super::host::fresh_counter().wrapping_sub(now) >= budget;
     Some(timed(DiskPart::Step, || {
-        worker.step(now, super::host::COUNTER_HZ / 1000 * LOST_MILLIS)
+        worker.step_within(now, super::host::COUNTER_HZ / 1000 * LOST_MILLIS, &mut over)
     }))
 }
 
@@ -921,6 +978,9 @@ pub struct Selection<'a> {
     /// With `--external-disks`, the guest hub's free ports, which every disk
     /// left over fills in probe order.
     pub external: Option<usize>,
+    /// Where the firmware found the disk Stela started from
+    /// (`Handoff::boot_disk`), for the account of a failed search.
+    pub boot_disk: Option<&'a str>,
 }
 
 /// Open the explicitly selected partitions in the loader's identity root
@@ -932,9 +992,10 @@ pub struct Selection<'a> {
 /// # Safety
 /// The handoff describes this running machine, only this service uses its
 /// reserved DMA pages, `root` is the loader's root, and it and the window
-/// remain live for the boot. The owned work dispatcher already holds
-/// its RestoreRoot/host-driver guard and this is a real admitted continuation;
-/// acquiring that non-reentrant guard again is forbidden.
+/// remain live for the boot. The caller already holds the
+/// RestoreRoot/host-driver guard: the owned work dispatcher in a real admitted
+/// continuation, or the boot processor on its own stack when no owned stack
+/// exists; acquiring that non-reentrant guard again is forbidden.
 pub unsafe fn open(
     handoff: &Handoff,
     captures: PlatformCaptures,
@@ -955,6 +1016,7 @@ pub unsafe fn open(
         wifi,
         policy,
         external,
+        boot_disk,
     } = *selection;
     if let Some(serial) = usb_disks
         .iter()
@@ -965,8 +1027,15 @@ pub unsafe fn open(
             serial
         ));
     }
-    // SAFETY: the caller owns the handoff's DMA pages and controllers.
-    let mut dma = unsafe { RegionAllocator::new(handoff.dma.clone()) };
+    // The drivers reach their DMA memory through the physmap, which every
+    // engine root keeps in its window, never through the identity map only
+    // the loader root has: a driver call outside the loader root, such as a
+    // transfer timeout's cancel, then reads its context instead of faulting.
+    // SAFETY: the caller owns the handoff's DMA pages and controllers; the
+    // loader refused a DMA range its physmap does not cover (`system::memory`).
+    let mut dma = unsafe {
+        RegionAllocator::with_cpu_offset(handoff.dma.clone(), crate::layout::physical(0))
+    };
     let firmware =
         super::firmware_requests::Requests::new(stela_drivers::probe::handoff_provider(handoff));
     // SAFETY: the loader mapped these ranges uncached and identity-mapped.
@@ -1011,6 +1080,88 @@ pub unsafe fn open(
     // HD Audio controllers stay attached for the boot; no guest audio device
     // consumes them yet.
     Vec::leak(core::mem::take(&mut devices.hda_hosts));
+    // A USB device can connect, train its link and answer its first
+    // commands after its controller's start looked at the ports: the
+    // partitions this boot needs are waited for while the USB hosts report
+    // news, as Linux finds such a device later through a port change.
+    let required: Vec<Named> = targets
+        .iter()
+        .map(|target| Named::Disk((*target).clone()))
+        .chain(medium.map(Named::Unique))
+        .chain(preboot.map(|target| Named::Disk(target.clone())))
+        .chain(fdr.map(Named::Host))
+        .collect();
+    let waited = {
+        let clock = handoff.clock;
+        let mut late = Vec::new();
+        let usb_hosts = &mut devices.usb_hosts;
+        let dma = &mut dma;
+        let mut announced = false;
+        let waited = storage::wait_for_named(
+            &mut devices.disks,
+            &required,
+            storage::PATIENCE,
+            &mut || clock.now_us(),
+            &mut || {
+                if !announced {
+                    announced = true;
+                    output::arguments(format_args!(
+                        "HOST DISKS waiting for a partition this boot needs\n"
+                    ));
+                    crate::status::progress("waiting for the USB devices");
+                }
+                let mut arrival = storage::Arrival::default();
+                for host in usb_hosts.iter_mut() {
+                    let mut changes = host.poll(&mut *dma, firmware);
+                    firmware.report();
+                    for device in &changes.removed {
+                        output::arguments(format_args!("USB removed {}\n", device.location));
+                    }
+                    for device in &changes.added.devices {
+                        output::arguments(format_args!("USB added {}\n", device.location));
+                    }
+                    arrival.news |= !changes.removed.is_empty()
+                        || !changes.added.devices.is_empty()
+                        || !changes.added.failures.is_empty();
+                    arrival.disks.extend(
+                        core::mem::take(&mut changes.added.disks)
+                            .into_iter()
+                            .map(|disk| Box::new(disk) as Box<dyn BlockDevice>),
+                    );
+                    late.push(changes.added);
+                }
+                arrival
+            },
+            &mut |us| clock.delay(us),
+        );
+        for found in late {
+            devices.absorb_usb(None, found, firmware);
+        }
+        waited
+    };
+    if waited.looks != 0 {
+        output::arguments(format_args!(
+            "HOST DISKS waited {} ms, {} looks, {} disks arrived, {}\n",
+            waited.waited_us / 1000,
+            waited.looks,
+            waited.arrived,
+            if waited.missing.is_none() {
+                "all found"
+            } else {
+                "still missing"
+            }
+        ));
+    }
+    // The log only: the serials stay off the screen.
+    for (named, reported) in storage::serial_fallbacks(&mut devices.disks, &required) {
+        output::arguments(format_args!(
+            "HOST DISK no disk reports serial {named:?}; its partition GUID is on the disk reporting {reported:?}, which is taken\n"
+        ));
+    }
+    if let Some((at, _)) = &waited.missing {
+        let role = role_of(*at, targets.len(), medium.is_some(), preboot.is_some());
+        account(&devices, role, waited.waited_us, boot_disk);
+    }
     for host in &devices.usb4_hosts {
         let usb4::Connection::Firmware { icm, ready, early } = host.connection() else {
             continue;
@@ -1030,6 +1181,17 @@ pub unsafe fn open(
     }
     for (address, error) in &devices.failures {
         crate::storage::report_failure(*address, error);
+    }
+    for (address, expiry) in &devices.abandoned {
+        let at = expiry
+            .at
+            .map_or(alloc::string::String::from("unknown"), |at| {
+                alloc::format!("{}:{}", at.file(), at.line())
+            });
+        output::arguments(format_args!(
+            "HOST DEVICE pci={address} abandoned after {} ms at step {at}\n",
+            expiry.budget_us / 1000
+        ));
     }
     for (location, error) in &devices.platform_failures {
         output::arguments(format_args!("PLATFORM FAILED {location}: {error}\n"));
@@ -1295,6 +1457,128 @@ pub unsafe fn open(
         disks: host_disks,
         power: core::mem::take(&mut devices.power),
     })
+}
+
+/// What the required partition at `at` of `open`'s list is for.
+fn role_of(at: usize, targets: usize, medium: bool, preboot: bool) -> &'static str {
+    let medium_at = targets;
+    let preboot_at = medium_at + usize::from(medium);
+    let fdr_at = preboot_at + usize::from(preboot);
+    match at {
+        at if at < targets => "the partition chosen for the Mac's SSD",
+        at if medium && at == medium_at => "the USB stick's data partition (install files)",
+        at if preboot && at == preboot_at => "the installed macOS system",
+        at if at == fdr_at => "the stick's FDR storage partition",
+        _ => "a partition this boot needs",
+    }
+}
+
+/// The few lines a failed disk search leaves on the screen, its only
+/// record then: what is missing, where the firmware had found the stick,
+/// each controller and disk Stela's drivers found. No serial numbers.
+fn account(
+    devices: &stela_drivers::probe::Devices,
+    role: &str,
+    waited_us: u64,
+    boot_disk: Option<&str>,
+) {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Not found after {} s: {role}.",
+        waited_us.div_ceil(1_000_000)
+    ));
+    match boot_disk {
+        Some(at) => lines.push(format!("The firmware started Stela from {at}.")),
+        None => lines.push(String::from(
+            "Where the firmware found the stick is unknown.",
+        )),
+    }
+    let mut controllers: Vec<(stela_drivers::bus::pci::Address, Vec<u8>, usize)> = Vec::new();
+    for (address, probe) in &devices.usb_port_probes {
+        let at = match controllers.iter().position(|(a, ..)| a == address) {
+            Some(at) => at,
+            None => {
+                controllers.push((*address, Vec::new(), 0));
+                controllers.len() - 1
+            }
+        };
+        if probe.connected {
+            controllers[at].1.push(probe.port);
+        } else {
+            controllers[at].2 += 1;
+        }
+    }
+    for (address, connected, empty) in &controllers {
+        let ports: Vec<String> = connected.iter().map(|port| format!("{port}")).collect();
+        lines.push(format!(
+            "USB {address}: devices on ports [{}], {empty} empty.",
+            ports.join(" ")
+        ));
+    }
+    for (address, error) in &devices.failures {
+        if crate::storage::may_hold_disks(error) {
+            lines.push(format!("{address} failed: {error}."));
+        }
+    }
+    for (address, class, why) in &devices.unsupported {
+        if class[0] == 0x01 || class[..2] == [0x0c, 0x03] {
+            lines.push(format!("{address} not driven: {why}."));
+        }
+    }
+    if let Some((location, error)) = devices.usb_failures.first() {
+        lines.push(format!(
+            "USB failures: {}, first {location}: {}.",
+            devices.usb_failures.len(),
+            stela_drivers::usb::xhci::explain(error)
+        ));
+    }
+    let disks: Vec<String> = devices
+        .disks
+        .iter()
+        .map(|disk| {
+            let identity = disk.identity();
+            let bytes = identity
+                .blocks
+                .saturating_mul(u64::from(identity.block_size));
+            format!(
+                "{:?} {} {} GB {}-byte blocks",
+                identity.transport,
+                identity.model.trim(),
+                bytes / 1_000_000_000,
+                identity.block_size
+            )
+        })
+        .collect();
+    let firmware_block = boot_disk
+        .and_then(|at| at.rsplit_once(" block="))
+        .and_then(|(_, block)| block.parse::<u32>().ok());
+    let usb: Vec<u32> = devices
+        .disks
+        .iter()
+        .map(|disk| disk.identity())
+        .filter(|identity| matches!(identity.transport, stela_drivers::block::Transport::Usb))
+        .map(|identity| identity.block_size)
+        .collect();
+    if let Some(block) = firmware_block
+        && !usb.is_empty()
+        && !usb.contains(&block)
+    {
+        lines.push(format!(
+            "The firmware read the stick with {block}-byte blocks; no USB disk found here uses them."
+        ));
+    }
+    if disks.is_empty() {
+        lines.push(String::from("Disks found: none."));
+    } else {
+        lines.push(format!("Disks found: {}.", disks.join("; ")));
+    }
+    lines.push(String::from(
+        "The boot log on the USB stick does not have this part; this screen is its only record.",
+    ));
+    for line in &lines {
+        output::arguments(format_args!("HOST DISKS {line}\n"));
+        crate::status::info(line);
+    }
 }
 
 /// A partition [`open`] leaves out when it cannot be opened.

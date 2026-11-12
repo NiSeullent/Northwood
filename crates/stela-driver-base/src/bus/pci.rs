@@ -798,6 +798,29 @@ impl<C: ConfigSpace> Function<C> {
         )?;
         Ok(())
     }
+    /// Give up a device whose driver stopped getting answers: MSI and MSI-X
+    /// off, INTx disabled and bus mastering off, so it can neither write
+    /// memory nor interrupt. Memory decoding stays as it was.
+    pub fn abandon(&mut self) -> Result<(), BlockError> {
+        let interrupts = self.interrupts()?;
+        let mut config = transaction::Transaction::new(&mut self.config);
+        if let Some(msi) = interrupts.msi {
+            let offset = u16::from(msi.offset) + 2;
+            let control = config.read16(offset)?;
+            config.write16(offset, control & !MSI_ENABLE)?;
+        }
+        if let Some(msix) = interrupts.msix {
+            let offset = u16::from(msix.offset) + 2;
+            let control = config.read16(offset)?;
+            config.write16(offset, control & !MSIX_ENABLE)?;
+        }
+        let command = config.read16(regs::COMMAND)?;
+        config.write16(
+            regs::COMMAND,
+            command & !regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE,
+        )?;
+        Ok(())
+    }
     /// Keep all vectors masked while programming. A failed callback retains
     /// that masked original state; it cannot authorize cleanup effects or retry.
     pub fn enable_msix<T>(

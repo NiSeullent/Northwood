@@ -1106,7 +1106,10 @@ fn a_call_the_tables_refuse_gives_up_every_translation_of_the_callers_asid() {
     let mut machine = board(&[], serve(u64::MAX - 0xfff), Vec::new());
     let forgets = machine.statistics.lookup_forgets[0];
     machine.device_transfer(0).unwrap();
-    assert_eq!(machine.host.reaches, [(Reach::All, Everywhere::NonGlobal)]);
+    assert_eq!(
+        machine.host.reaches,
+        [(Reach::All, Everywhere::NonGlobal(0))]
+    );
     assert!(machine.statistics.lookup_forgets[0] > forgets);
 }
 
@@ -2414,6 +2417,9 @@ fn an_evicted_blocks_successor_box_and_index_list_serve_the_next_block() {
     let causes = machine.install_causes();
     assert_eq!((causes.installs, causes.thrash, causes.first), (5, 1, 4));
     assert!(causes.installed_bytes > 0 && causes.evicted_bytes > 0);
+    // One branch per block, all in the lower half.
+    assert_eq!(causes.guest_instructions, 5);
+    assert_eq!((causes.upper_bytes, causes.upper_instructions), (0, 0));
 }
 
 #[test]
@@ -2760,6 +2766,36 @@ fn ic_ivau_forgets_its_pages_blocks_and_ic_iallu_every_block() {
     machine.system_instruction(IC_IALLU).unwrap();
     assert!(machine.code.cache().index.is_empty());
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 1);
+}
+
+/// A block ending with SVC counts the SVC among its instructions: the
+/// engine path's System exit retires the words before it and the SVC's
+/// completion the SVC, and a native transition thunk's exit (a return to
+/// the vector, as `transition_branch` names it) retires the whole block, so
+/// both paths retire the same count.
+#[test]
+fn native_transition_exits_retire_the_transition_word() {
+    const SVC: u32 = 0xd400_1001; // svc #0x80
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    let (mut engine, mut native) = (machine(&[ADD, SVC]), machine(&[ADD, SVC]));
+    let base = engine.cpu.pc;
+    engine.host.exits = vec![NativeExit::Exit {
+        next_pc: base + 4,
+        kind: ExitKind::System as u64,
+    }];
+    let retired = engine.cpu.retired;
+    engine.step().unwrap();
+    assert_eq!(engine.code.blocks[0].instructions, 2);
+    assert_eq!(engine.cpu.retired, retired + 2);
+    let vector = engine.cpu.pc;
+    native.host.exits = vec![NativeExit::Exit {
+        next_pc: vector,
+        kind: ExitKind::Return as u64,
+    }];
+    let retired = native.cpu.retired;
+    native.step().unwrap();
+    assert_eq!(native.cpu.pc, vector);
+    assert_eq!(native.cpu.retired, retired + 2);
 }
 
 /// A side exit retires what ran of its block, in the engine and in the
@@ -3383,7 +3419,7 @@ fn lookup_contexts_follow_translation_inputs_and_outlive_a_return_to_them() {
     let aside1 = |machine: &mut Machine<FakeHost, NoDevices>| {
         machine.tlb_maintained(
             mmu::tlbi::Reach::Nothing,
-            mmu::tlbi::Everywhere::NonGlobal,
+            mmu::tlbi::Everywhere::NonGlobal(0),
             None,
         )
     };
@@ -3411,7 +3447,7 @@ fn lookup_contexts_follow_translation_inputs_and_outlive_a_return_to_them() {
             machine.private_fetches[1] = true;
             machine.tlb_maintained(
                 mmu::tlbi::Reach::Nothing,
-                mmu::tlbi::Everywhere::NonGlobal,
+                mmu::tlbi::Everywhere::NonGlobal(0),
                 None,
             )
         },
@@ -3457,6 +3493,24 @@ fn fetched_leaf_filters_allocate_once_for_each_used_half() {
     assert_eq!(machine.fetched_sizes, [0x4000, 0]);
     assert_eq!(machine.fetched_leaves[0].len(), FETCHED_LEAVES / 64);
     assert_ne!(machine.fetched_leaves[0].as_ptr(), upper);
+}
+
+/// Forgetting a half's contexts zeroes its filter of fetched leaves, by
+/// the words fetches set while they are few and whole past them.
+#[test]
+fn forgetting_contexts_zeroes_the_fetched_leaf_filter_by_its_set_words() {
+    let mut machine = machine(&[]);
+    for count in [3, FETCHED_WORDS as u64 + 1000] {
+        for page in 0..count {
+            machine.fetched_through(0, page * 0x4000, 0x4000, false);
+        }
+        assert!(machine.fetched_leaves[0].iter().any(|&word| word != 0));
+        assert_eq!(machine.fetched_words[0].is_none(), count > 3);
+        machine.forget_spaces(0..=0, 1);
+        assert!(machine.fetched_leaves[0].iter().all(|&word| word == 0));
+        assert_eq!(machine.fetched_words[0].as_deref(), Some(&[][..]));
+        assert_eq!(machine.fetched_sizes[0], 0);
+    }
 }
 
 #[test]
@@ -3550,9 +3604,10 @@ fn block_entries_survive_a_tlbi_all() {
     // had its salt.
     let slot = machine.itlb.page_slot(BASE, after);
     assert_eq!(slot, machine.itlb.page_slot(BASE, before));
+    let entry = machine.itlb.entry(slot);
     assert_eq!(
-        machine.itlb.entry(slot),
-        chain::LookupEntry::page(BASE & !(FETCH_PAGE - 1), after, key)
+        (entry.pc, entry.key, entry.entry),
+        (BASE & !(FETCH_PAGE - 1), after, key)
     );
 }
 
@@ -3683,10 +3738,11 @@ fn two_address_spaces_mapping_one_frame_share_an_entry() {
     assert_eq!(machine.statistics.fetches[1], fetches[1] + 1);
     assert_eq!(machine.statistics.fetches[4], fetches[4]);
     assert_eq!(table_entries(&machine), entries);
-    // The ITLB holds the page in both contexts, with the one key.
+    // The ITLB holds the page in both contexts, with the one key and the
+    // mark of its global leaf.
     for context in [first, second] {
         let held = machine.itlb.entry(machine.itlb.page_slot(BASE, context));
-        assert_eq!(held, chain::LookupEntry::page(BASE, context, key));
+        assert_eq!(held, chain::LookupEntry::global_page(BASE, context, key));
     }
     // An IC IVAU of the frame forgets the entry for both: the next fetch
     // in either compiles the page again.
@@ -3971,7 +4027,8 @@ fn steady_state_transfers_between_pages_stay_in_the_dispatchers() {
 }
 
 /// A TLBI by VA of one process leaves the other processes' ITLB entries of
-/// the same VAs, however wide its span, unless a global page shares them.
+/// the same VAs, however wide its span, but those made through a global
+/// leaf.
 #[test]
 fn a_tlbi_by_va_and_asid_leaves_the_entries_of_other_asids() {
     use mmu::tlbi::{Everywhere, Reach};
@@ -4012,9 +4069,16 @@ fn a_tlbi_by_va_and_asid_leaves_the_entries_of_other_asids() {
     tlbi(&mut machine);
     assert_eq!(held(&machine), [false, true]);
     assert_eq!(machine.statistics.lookup_forgets[2], 2);
-    // A global page in the span is every process's.
+    // A global page in the span leaves the other process's non-global
+    // entry of it, and its global entry is every process's.
     machine.fetched_through(0, PC, 0x4000, true);
     fill(&mut machine);
+    tlbi(&mut machine);
+    assert_eq!(held(&machine), [false, true]);
+    machine.itlb.set(
+        machine.itlb.page_slot(PC, six),
+        chain::LookupEntry::global_page(PC, six, 1),
+    );
     tlbi(&mut machine);
     assert_eq!(held(&machine), [false, false]);
 }
@@ -4032,6 +4096,7 @@ fn a_tlbi_drops_the_cached_fetches_of_the_pages_it_reaches_alone() {
             page,
             physical: page,
             guarded: false,
+            global: true,
             el: 0,
             epoch,
         });
@@ -4356,8 +4421,8 @@ fn tlbis_reach_their_address_range_or_asid_without_a_regime_change() {
                 Reach::Containing(high),
                 Everywhere::Addresses(Reach::Containing(high))
             ),
-            (Reach::Nothing, Everywhere::NonGlobal),
-            (Reach::All, Everywhere::NonGlobal),
+            (Reach::Nothing, Everywhere::NonGlobal(3)),
+            (Reach::All, Everywhere::NonGlobal(0)),
             (range, Everywhere::Addresses(range)),
             (Reach::All, Everywhere::All),
         ]
@@ -6576,6 +6641,46 @@ fn idle_polling_follows_how_long_waits_last() {
     assert_eq!(machine.idle_poll, 0);
 }
 
+/// A wait's idle time splits into the halt-poll spin and the host halt:
+/// `halt_ticks` holds only the halt (FakeHost's halt adds 1000 counts).
+#[test]
+fn a_wait_counts_its_host_halt_apart_from_its_poll() {
+    use super::parallel::{Hub, Kick};
+    struct NoKick;
+    impl Kick for NoKick {
+        fn kick(&self, _pe: usize) {}
+    }
+    const WFIT_X1: u32 = 0xd503_1021;
+    // Serialized: no poll, the whole wait is the halt.
+    let mut machine = machine_on(stela_contracts::Chip::AppleM4, &[]);
+    machine.cpu.state.x[1] = 500;
+    wait(&mut machine, WFIT_X1).unwrap();
+    let statistics = &machine.statistics;
+    assert_eq!(
+        (statistics.sleep_ticks, statistics.halt_ticks),
+        (1000, 1000)
+    );
+    // Parallel with a poll of 300 counts read 10 apart: the poll spins
+    // first, and only the halt after it is halted time.
+    let mut machine = machine_on(stela_contracts::Chip::AppleM4, &[]);
+    let hub = Hub::new(1, NoKick);
+    hub.set_live(0, true);
+    machine.enter_parallel(hub).unwrap();
+    machine.host.counter_step = 10;
+    machine.idle_poll = 300;
+    // The timeout falls past the poll, inside the one halt.
+    machine.cpu.state.x[1] = 800;
+    wait(&mut machine, WFIT_X1).unwrap();
+    let statistics = &machine.statistics;
+    assert_eq!(statistics.waits, 1, "{statistics:?}");
+    assert!(
+        (1000..1100).contains(&statistics.halt_ticks),
+        "{statistics:?}"
+    );
+    let spun = statistics.sleep_ticks - statistics.halt_ticks;
+    assert!((300..400).contains(&spun), "{statistics:?}");
+}
+
 /// A RETAB's PAC thunk ends its completion with the exit to the target
 /// in RAX, which the first return through it redirects into a lookup.
 /// Neither the check failures after a block's last exit nor a side exit
@@ -6944,6 +7049,54 @@ fn stored_reads_complete_natively_from_the_live_register() {
     let offset = core::mem::offset_of!(GuestState, fpcr);
     let thunk = register_read::frame_thunk(GuestAddress(base + 4), 8, cell, offset);
     assert_eq!(fp.host.installed.last(), Some(&thunk.code));
+}
+
+/// APCTL_EL1, which the kernel reads before each write around its PAC
+/// sections, reads its level's word as stored: a plain read opens a stored
+/// cell on that word, which sees later writes (themselves still exits, which
+/// reopen the PAC service), and each level's cell names its own word.
+#[test]
+fn apctl_reads_complete_natively_from_the_levels_word() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const MRS: u32 = 0xd53c_f088; // mrs x8, apctl_el1
+    const MSR: u32 = 0xd51c_f089; // msr apctl_el1, x9
+    let mut machine = machine(&[ADD, MRS, ADD]);
+    let base = machine.cpu.pc;
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: base + 8,
+        kind: ExitKind::Fallthrough as u64,
+    }];
+    machine.step().unwrap();
+    assert_eq!(
+        machine.stored_reads.to_vec(),
+        [registers::encodings::APCTL_EL1]
+    );
+    let index = MIRRORED.len();
+    let thunk = register_read::stored_thunk(GuestAddress(base + 4), 8, cell_place(index));
+    assert_eq!(machine.host.installed.last(), Some(&thunk.code));
+    for el in [2, 1] {
+        machine.cpu.pstate = Pstate::reset(el);
+        machine.derived_changed();
+        let level = usize::from(el) - 1;
+        machine.cpu.apple.apctl[level] = 0x11 + level as u64;
+        machine.cpu.pc = base + 4;
+        machine.system_instruction(MRS).unwrap();
+        assert_eq!(machine.cpu.state.x[8], 0x11 + level as u64);
+        let open = machine.mirrors[index];
+        let word = &machine.cpu.apple.apctl[level] as *const u64 as u64;
+        assert_eq!(
+            open,
+            register_read::Cell {
+                readable: 1,
+                value: word
+            }
+        );
+        machine.cpu.state.x[9] = 0x10;
+        machine.system_instruction(MSR).unwrap();
+        assert_eq!(machine.mirrors[index], open);
+        // SAFETY: the PE's APCTL word, read as the thunk reads it.
+        assert_eq!(unsafe { *(open.value as *const u64) }, 0x10);
+    }
 }
 
 #[test]
@@ -7339,6 +7492,58 @@ fn keys_native_code_wrote_reopen_together_at_the_next_pac_exit() {
     assert_eq!(machine.pointer.tags[usize::from(ib)], open(ib));
 }
 
+/// An SPRR_PERM_EL0 write at EL2 of the host keeps open the read cell of
+/// every state whose read names the same register: EL0 under TGE reads what
+/// an engine-path read there returns; without TGE EL0's read names the EL1&0
+/// register and its cell closes.
+#[test]
+fn sprr_perm_el0_writes_keep_the_cells_of_states_reading_the_same_register() {
+    const MRS: u32 = 0xd53e_f1a8; // mrs x8, sprr_perm_el0
+    const MSR: u32 = 0xd51e_f1a9; // msr sprr_perm_el0, x9
+    const MSR_SPRR_CONFIG: u32 = 0xd51e_f109; // msr sprr_config_el1, x9
+    const HCR_E2H: u64 = 1 << 34;
+    for tge in [true, false] {
+        let mut machine = machine(&[MRS]);
+        let hcr = HCR_E2H | u64::from(tge) << HCR_TGE;
+        machine.cpu.registers.set(SystemRegister::HCR_EL2, 0, hcr);
+        machine.cpu.set_pstate(Pstate::reset(2));
+        machine.derived_changed();
+        machine.cpu.state.x[9] = 1;
+        machine.system_instruction(MSR_SPRR_CONFIG).unwrap();
+        machine.cpu.state.x[9] = 0x10;
+        machine.system_instruction(MSR).unwrap();
+        // A read opens EL2's cell; EL0's is open on the old value.
+        machine.system_instruction(MRS).unwrap();
+        let el0 = mirror_state(0, false);
+        machine.mirrors.banks[el0][SPRR_PERM_MIRROR] = register_read::Cell {
+            readable: 1,
+            value: 0x10,
+        };
+        machine.cpu.pc = BASE;
+        machine.cpu.state.x[9] = 0x30;
+        machine.system_instruction(MSR).unwrap();
+        let cell = machine.mirrors.banks[el0][SPRR_PERM_MIRROR];
+        if tge {
+            assert_eq!(
+                cell,
+                register_read::Cell {
+                    readable: 1,
+                    value: 0x30
+                }
+            );
+            // What the engine reads at EL0 is what the kept cell holds.
+            machine.cpu.set_pstate(Pstate::reset(0));
+            let read = decode_register(MRS).unwrap();
+            assert_eq!(
+                machine.cpu.apple_access(read, 0),
+                RegisterOutcome::Read(0x30)
+            );
+        } else {
+            assert_eq!(cell.readable, 0, "EL0 reads the EL1&0 register");
+        }
+    }
+}
+
 #[test]
 fn sprr_perm_el0_writes_reopen_its_open_cell() {
     const MRS: u32 = 0xd53e_f1a8; // mrs x8, sprr_perm_el0
@@ -7385,7 +7590,9 @@ fn sprr_perm_el0_writes_reopen_its_open_cell() {
             value: 0x30
         }
     );
-    assert_eq!(machine.mirrors.banks[0][SPRR_PERM_MIRROR].readable, 0);
+    // EL0 of the host reads the same register, so its cell stays open on
+    // the new value (`user_permission_register`).
+    assert_eq!(machine.mirrors.banks[0][SPRR_PERM_MIRROR].value, 0x30);
     machine.system_instruction(MRS).unwrap();
     assert_eq!(machine.cpu.state.x[8], 0x30);
     assert_eq!(machine.mirrors[thread].readable, 1);
@@ -9151,9 +9358,14 @@ fn upper_occupancy_lists_the_mapped_level_one_ranges_and_outermost_blocks() {
 }
 
 mod arena;
+mod context_id;
+mod cycles_native;
 mod exits;
 mod floating_point_traps;
+mod instructions_native;
+mod native_exceptions;
 mod one_sided;
+mod permission_kept;
 mod process_switching;
 mod pstate_features;
 mod recovery;
@@ -9161,8 +9373,10 @@ mod retire_cost;
 mod shared_code;
 mod sharing;
 mod stage2_syndrome;
+mod table_base;
 mod tagged;
 mod thread_switch;
+mod timer_native;
 
 #[test]
 fn host_work_holds_the_shared_count_only_for_a_pe_stopped_in_the_kernel() {

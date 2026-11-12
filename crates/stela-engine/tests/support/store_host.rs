@@ -14,6 +14,13 @@ use stela_engine::{
 const PAGE: usize = 4096;
 const PAGES: usize = 4;
 const BYTES: usize = PAGE * PAGES;
+/// Inaccessible bytes reserved on each side of a region. Native code
+/// reaches guest addresses as host addresses, so an access the guest's
+/// tables do not map must fault in the host too: past an unguarded region
+/// it read or wrote whatever the process had mapped there (another
+/// region, an engine allocation), which corrupted the run at random.
+/// Every test loop walks from inside its region in steps far below this.
+const GUARD: usize = 16 * PAGE;
 
 struct Region {
     address: u64,
@@ -21,9 +28,12 @@ struct Region {
 }
 impl Drop for Region {
     fn drop(&mut self) {
-        // SAFETY: this owner allocated the complete OS mapping and all clones
-        // keeping its address have dropped before this final Rc owner.
-        assert_eq!(unsafe { libc::munmap(self.address as *mut _, BYTES) }, 0);
+        let reservation = (self.address - GUARD as u64) as *mut libc::c_void;
+        // SAFETY: this owner reserved the complete OS mapping, guards
+        // included, and all clones keeping its address have dropped before
+        // this final Rc owner.
+        let unmapped = unsafe { libc::munmap(reservation, GUARD + BYTES + GUARD) };
+        assert_eq!(unmapped, 0);
     }
 }
 impl Region {
@@ -62,23 +72,33 @@ impl Region {
 pub struct Mapping(pub u64, Rc<Region>);
 impl Mapping {
     pub fn new() -> Result<Self> {
-        // SAFETY: a fresh private RW mapping, never a fixed-address overwrite.
-        let pointer = unsafe {
+        // SAFETY: a fresh private reservation, never a fixed-address
+        // overwrite: inaccessible guards around the region's bytes.
+        let reservation = unsafe {
             libc::mmap(
                 core::ptr::null_mut(),
-                BYTES,
-                libc::PROT_READ | libc::PROT_WRITE,
+                GUARD + BYTES + GUARD,
+                libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,
                 -1,
                 0,
             )
         };
         ensure!(
-            pointer != libc::MAP_FAILED,
-            "map test RAM: {}",
+            reservation != libc::MAP_FAILED,
+            "reserve test RAM: {}",
             std::io::Error::last_os_error()
         );
-        let address = pointer as u64;
+        let address = reservation as u64 + GUARD as u64;
+        // SAFETY: the region's bytes inside the reservation just made.
+        if unsafe { libc::mprotect(address as *mut _, BYTES, libc::PROT_READ | libc::PROT_WRITE) }
+            != 0
+        {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: the reservation above, which nothing else refers to.
+            unsafe { libc::munmap(reservation, GUARD + BYTES + GUARD) };
+            anyhow::bail!("map test RAM: {error}");
+        }
         let mapping = Self(
             address,
             Rc::new(Region {

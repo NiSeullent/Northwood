@@ -625,8 +625,14 @@ fn held(refusal: Refusal) -> &'static str {
         Refusal::NoRecovery { installed: true } => {
             "NVRAM asks for a recoveryOS the SSD lacks. Install macOS erases the SSD."
         }
+        Refusal::Stale(stale) => stale.screen(),
         _ => "The Mac's last install did not finish: choose Install macOS again.",
     }
+}
+
+/// Log which case makes the chosen disk stale, once per check.
+fn log_stale(stale: stela_boot_core::chosen_disk::Stale) {
+    output::arguments(format_args!("CHOSEN DISK stale: {}\n", stale.case()));
 }
 
 /// Why the default boot, `options`, can only wait for a restore, checked
@@ -643,6 +649,10 @@ pub fn held_at_start(options: &[u8]) -> Option<&'static str> {
         Err(refusal @ Refusal::BlankDisk) => (Some(held(refusal)), "no macOS installed yet"),
         Err(refusal @ Refusal::RecoveryMode) => (Some(held(refusal)), "an install did not finish"),
         Err(refusal @ Refusal::NoRecovery { .. }) => (Some(held(refusal)), "no recoveryOS to boot"),
+        Err(Refusal::Stale(stale)) => {
+            log_stale(stale);
+            (Some(stale.screen()), stale.reason())
+        }
         _ => (None, ""),
     };
     crate::status::done(found);
@@ -677,6 +687,9 @@ pub(crate) fn boot(
             Ok(routed) => break (routed, northwood.unwrap_or_default()),
             Err(Refusal::Other(error)) => output::fatal(error),
             Err(refusal) => {
+                if let Refusal::Stale(stale) = &refusal {
+                    log_stale(*stale);
+                }
                 selected = crate::choice::hold(&mut volume, held(refusal)).unwrap_or_else(|| {
                     output::fatal(
                         "the machine can only be restored and this volume has no startup \
@@ -898,6 +911,19 @@ fn load(
     let engine_entry =
         layout::image() + (crate::engine::entry as *const () as u64 - image.start as u64);
 
+    let mut boot_disk = [0u8; crate::handoff::BOOT_DISK_BYTES];
+    let mut boot_disk_bytes = 0;
+    if let Some(location) = crate::installer::boot_disk_location() {
+        output::arguments(format_args!(
+            "BOOT DISK the firmware found it at {location}\n"
+        ));
+        let mut take = location.len().min(boot_disk.len());
+        while !location.is_char_boundary(take) {
+            take -= 1;
+        }
+        boot_disk[..take].copy_from_slice(&location.as_bytes()[..take]);
+        boot_disk_bytes = take;
+    }
     crate::status::done("");
     let boot_heap = crate::ALLOCATOR.usage();
     output::arguments(format_args!(
@@ -1019,6 +1045,8 @@ fn load(
             log_partition: log.map(|guid| guid.0),
             volume_log,
             boot_esp,
+            boot_disk,
+            boot_disk_bytes,
             tsc_hz,
             tsc_source: crate::firmware::tsc_source(),
             tsc_tolerance_ppm: crate::firmware::tsc_tolerance_ppm(),

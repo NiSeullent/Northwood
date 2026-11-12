@@ -139,21 +139,23 @@ impl Memory {
         let kind = self.rx.mapping.read_coherent_u32(index * DESCRIPTOR)?;
         Ok(Some((kind, status as u16, (status >> 16) as usize)))
     }
-    pub fn receive_bytes(&self, index: usize, length: usize) -> Result<Vec<u8>> {
+    /// Copy a completed frame into `frame`, reusing its allocation. On an
+    /// error `frame` is unchanged.
+    pub fn receive_bytes(&self, index: usize, length: usize, frame: &mut Vec<u8>) -> Result<()> {
         let start = index * BUFFER;
         // SAFETY: receive_status observed DD for this descriptor. The
         // device cannot access this page again before offer() and RX tail.
         unsafe { self.rx_data.mapping.sync_for_cpu(start..start + BUFFER) }?;
         let p = self.rx_data.cpu.address(start, length)?;
-        let mut frame = Vec::new();
         frame
-            .try_reserve_exact(length)
+            .try_reserve_exact(length.saturating_sub(frame.len()))
             .map_err(|_| Error::Memory(crate::bus::dma::memory::MemoryError::OutOfMemory))?;
+        frame.clear();
         for i in 0..length {
             // SAFETY: completed, checked packet range, no live DMA.
             frame.push(unsafe { p.as_ptr().add(i).read_volatile() });
         }
-        Ok(frame)
+        Ok(())
     }
     pub fn retire(&mut self) -> Result<()> {
         // Revoke rebuild before any invalidation. A failed unmap may

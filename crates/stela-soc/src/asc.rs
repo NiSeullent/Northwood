@@ -614,6 +614,7 @@ impl MmioDevice for Asc {
             self.outbox.extend(sent);
             self.update_lines(access);
             result.map_err(|reason| refuse(NAME, 0, Width::Double, Direction::Read, reason))?;
+            return Ok(None);
         }
         self.update_lines(access);
         Ok(None)

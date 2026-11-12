@@ -118,23 +118,12 @@ impl Wire {
             r.end <= first || end <= r.start || matches!(r.kind, 0 | 5 | 6 | 9 | 10 | 11 | 13)
         })
     }
-    /// Whether every map entry overlapping `first..end` leaves the range to
-    /// devices: reserved or MMIO. EFI_MEMORY_RUNTIME is no refusal: an
-    /// EDK2-derived firmware lists MMIO in its map only when it carries that
-    /// attribute (DxeCore CoreGetMemoryMap), so the MCFG window and MADT
-    /// IOAPICs of real PCs carry it. After ExitBootServices this boot calls
-    /// runtime services only for its terminal ResetSystem, and the loader
-    /// root maps runtime MMIO uncached like every native mapping.
     pub(super) fn excludes_memory(&self, first: u64, end: u64) -> bool {
-        self.memory_conflict(first, end).is_none()
-    }
-    /// The first map entry overlapping `first..end` that is not left to
-    /// devices, as (start, kind, attributes).
-    pub(super) fn memory_conflict(&self, first: u64, end: u64) -> Option<(u64, u32, u64)> {
-        self.memory()
-            .iter()
-            .find(|r| r.start < end && first < r.end && !matches!(r.kind, 0 | 11))
-            .map(|r| (r.start, r.kind, r.attributes))
+        self.memory().iter().all(|r| {
+            r.end <= first
+                || end <= r.start
+                || (matches!(r.kind, 0 | 11) && r.attributes & (1 << 63) == 0)
+        })
     }
 }
 

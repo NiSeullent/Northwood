@@ -10,8 +10,8 @@ use crate::{
 };
 
 mod policy;
-pub(super) use policy::select_pci;
 pub use policy::{DriverPolicy, ForcedDriver, Mode, PciId, Resolution, resolve_pci};
+pub(super) use policy::{Selection, select_pci};
 
 /// The host subsystem served by a registered module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +100,7 @@ enum Route {
 }
 
 pub(super) struct Entry {
-    manifest: Manifest,
+    pub(super) manifest: Manifest,
     matches: fn(&Identity) -> bool,
     pre_exit_claim: bool,
     route: Route,
@@ -287,6 +287,9 @@ static REGISTRY: &[Entry] = &[
     ),
     entry!("AtherosEth", "alx", Ethernet, net::alx::matches_identity, legacy alx;
         "crates/stela-driver-net/src/alx.rs", B "GPL-2.0-or-later AND ISC", none
+    ),
+    entry!("AtherosEth", "atl1c", Ethernet, net::atl1c::matches_identity, legacy atl1c;
+        "crates/stela-driver-net/src/atl1c.rs", B "GPL-2.0-or-later", none
     ),
     entry!("RealtekEth", "r8169", Ethernet, net::realtek::matches_identity, legacy realtek;
         "crates/stela-driver-net/src/realtek.rs", B "GPL-2.0-only AND GPL-2.0-or-later", "r8169 MAC revision"

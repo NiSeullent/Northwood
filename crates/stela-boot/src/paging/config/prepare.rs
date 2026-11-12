@@ -122,12 +122,10 @@ impl Prepared {
             .map_err(|error| Error::Firmware(error.status()))?;
         let mut exclusions = Vec::new();
         for entry in map.entries() {
-            // Runtime MMIO stays a device range, as in the native capture's
-            // excludes_memory: EDK2 lists MMIO only with EFI_MEMORY_RUNTIME.
             let device = matches!(
                 entry.ty,
                 boot::MemoryType::RESERVED | boot::MemoryType::MMIO
-            );
+            ) && entry.att.bits() & (1 << 63) == 0;
             if device || entry.page_count == 0 {
                 continue;
             }

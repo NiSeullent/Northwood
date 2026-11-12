@@ -598,10 +598,22 @@ impl<'a, R: Registers, T: Timer> Hardware<'a, R, T> {
     /// observed link either way. A failed PHY exchange reports no link, as
     /// Linux's watchdog treats it; an absent function is a register error.
     pub(super) fn check_for_copper_link(&mut self) -> Result<Option<Negotiated>, BlockError> {
-        let link = match self
-            .phy_read(PHY_STATUS)
-            .and_then(|_| self.phy_read(PHY_STATUS))
-        {
+        self.copper_link(2)
+    }
+
+    /// The same check repeated after one that found no link, with no link
+    /// change since: that check's read cleared the latched-low bit, so one
+    /// read gives the present state.
+    pub(super) fn recheck_copper_link(&mut self) -> Result<Option<Negotiated>, BlockError> {
+        self.copper_link(1)
+    }
+
+    fn copper_link(&mut self, status_reads: usize) -> Result<Option<Negotiated>, BlockError> {
+        let first = self.phy_read(PHY_STATUS);
+        let status = (1..status_reads).fold(first, |read, _| {
+            read.and_then(|_| self.phy_read(PHY_STATUS))
+        });
+        let link = match status {
             Ok(status) => status & MII_LINK != 0,
             Err(BlockError::Device { status: u32::MAX }) => {
                 return Err(BlockError::Device { status: u32::MAX });

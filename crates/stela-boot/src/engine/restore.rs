@@ -160,6 +160,21 @@ impl ReadAt for Source {
     fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<()> {
         self.reader.read_at(offset, buffer)
     }
+    fn blocked(&mut self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.borrow_mut().blocked())
+    }
+}
+
+impl Source {
+    /// Bound every later read of a remote image ([`Remote::bound`]): the
+    /// service reads it on a PE whose guest CPU waits meanwhile.
+    fn bound(&mut self) {
+        if let Some(remote) = &self.remote {
+            remote.borrow_mut().bound();
+        }
+    }
 }
 
 /// The restore inventory the loader read.
@@ -200,6 +215,90 @@ pub fn staged_answers(handoff: &Handoff) -> Option<stela_runtime::restore::tss::
         .ok()
 }
 
+/// Whether the staged answers file is the one the bundle lists: its SHA-256
+/// matches `bundle.json`'s. A bundle that lists no digest for it passes.
+fn staged_file_intact(handoff: &Handoff) -> bool {
+    use stela_formats::boot_bundle::{MANIFEST_FILE, Manifest};
+    use stela_runtime::restore::tss::staged::FILE;
+    let (Some(json), Some(bytes)) = (
+        inventory_file(handoff, MANIFEST_FILE),
+        inventory_file(handoff, FILE),
+    ) else {
+        return true;
+    };
+    let Ok(manifest) = Manifest::parse(json) else {
+        return true;
+    };
+    match manifest.files.iter().find(|file| file.name == FILE) {
+        Some(file) if !file.sha256.is_empty() => file
+            .sha256
+            .eq_ignore_ascii_case(&stela_formats::sha256(bytes)),
+        _ => true,
+    }
+}
+
+/// The staged answers' dry run (`tss::staged::Set::check`): rebuild the
+/// install's three signing requests and check each stored answer. A set that
+/// does not fit stops the boot when no network can answer instead.
+fn check_staged(
+    handoff: &Handoff,
+    set: &stela_runtime::restore::tss::staged::Set,
+    restore: &stela_runtime::restore::store::Identity,
+    identities: &[stela_runtime::restore::store::Identity],
+    ecid: u64,
+    ap_ticket: &[u8],
+    network: bool,
+) {
+    use stela_runtime::restore::{
+        Error,
+        answers::installed_identity,
+        tss::staged::{Kind, Setup},
+    };
+    let checked = if !staged_file_intact(handoff) {
+        Err((
+            Kind::RecoveryRoot,
+            Error::Invalid("the staged answers file differs from the SHA-256 the bundle lists"),
+        ))
+    } else {
+        match (&set.policy_nonce, installed_identity(identities, restore)) {
+            (Some(nonce), Ok(installed)) => set.check(&Setup {
+                restore,
+                installed: &installed,
+                ecid,
+                ap_ticket,
+                policy_nonce: nonce,
+            }),
+            (None, _) => Err((
+                Kind::RecoveryPolicy,
+                Error::Invalid("no staged recoveryOS policy nonce"),
+            )),
+            (_, Err(error)) => Err((Kind::Cryptex, error)),
+        }
+    };
+    let Err((kind, error)) = checked else {
+        output::arguments(format_args!(
+            "TSS STAGED checked 3 answers match this install\n"
+        ));
+        return;
+    };
+    output::arguments(format_args!(
+        "TSS STAGED mismatch kind={} before the install: {error}\n",
+        kind.name()
+    ));
+    if network {
+        crate::status::info(
+            "The USB's signing answers do not match this install; Apple's signing server answers over the network instead.",
+        );
+    } else {
+        output::fatal(format_args!(
+            "The USB's signing answers do not match this macOS install ({}), and there is no network. \
+             Run `stela setup repair --fetch` on another computer, or connect Ethernet and start again. \
+             The install did not start and the disk is unchanged.",
+            kind.name()
+        ));
+    }
+}
+
 pub struct Experiment {
     usb: UsbId,
     driver: Driver<Source, MuxStream>,
@@ -235,6 +334,9 @@ pub struct Services {
     pub signer: Option<stela_runtime::restore::tss::Signer>,
     pub fdr_storage: Option<Box<dyn BlockDevice>>,
     pub network: Option<network::Shared>,
+    /// Whether a signing request the staged answers do not hold can reach
+    /// Apple's signing server over the host network.
+    pub signing_network: bool,
 }
 
 /// libimobiledevice uses one 1 MiB buffer per direction. Keep the same finite
@@ -625,8 +727,10 @@ impl Experiment {
             signer,
             fdr_storage,
             network,
+            signing_network,
         } = services;
         let manifest = inventory(handoff)?;
+        let remote = source.remote.is_some();
         let purpose = match mode {
             Mode::Update => Purpose::Update,
             Mode::Install | Mode::DevelopmentInstall | Mode::Study => Purpose::Erase,
@@ -725,6 +829,32 @@ impl Experiment {
             let booted = inventory_file(handoff, BOOT_MANIFEST_FILE)
                 .ok_or(refuse!("install: the bundle has no boot manifest"))?;
             answers.boot_with(booted.to_vec()).map_err(|error| refuse!("install: the bundle's boot manifest is not personalized for this machine: {error}", %error))?;
+            // Before the guest starts, so before the install erases anything.
+            // A partial set is a network install's (`open_host` opened one),
+            // and an update's requests are not the ones staged.
+            let staged = staged_answers(handoff);
+            let used = stela_runtime::restore::tss::staged::Use::of(
+                staged.as_ref(),
+                mode == Mode::Update,
+                remote,
+            );
+            if used == stela_runtime::restore::tss::staged::Use::Update {
+                output::arguments(format_args!(
+                    "TSS STAGED not used: an update's signing requests are not the staged erase install's\n"
+                ));
+            }
+            if let Some(set) = staged.filter(|_| used.checks()) {
+                let ecid = answers.signer.as_ref().map_or(0, |signer| signer.ecid);
+                check_staged(
+                    handoff,
+                    &set,
+                    answers.store.identity(),
+                    answers.store.identities(),
+                    ecid,
+                    booted,
+                    signing_network,
+                );
+            }
         }
         // Serve the system-image content-key GET from the inventory's keys.
         answers
@@ -736,6 +866,17 @@ impl Experiment {
             answers.clock = Some(Box::new(move || {
                 wall.unix_seconds_at(super::host::rdtsc(), hz)
             }));
+        }
+        if remote {
+            // Reads are unbounded until the guest runs (`work`/`prefetch`
+            // bound them), so what StartRestore needs is read here, not on
+            // a serving PE where a slow first byte leaves it pending.
+            // Recorded hashes (every remote inventory the CLI writes) need
+            // no read; a scanned inventory reads its hashed members once.
+            answers
+                .store
+                .prepare()
+                .map_err(|error| refuse!("restore store: {error}", %error))?;
         }
         let driver = Driver::new(answers, route)
             .map_err(|error| refuse!("restore driver: {error}", %error))?;
@@ -770,6 +911,7 @@ impl Experiment {
     /// guest's devices: [`Self::poll`] then only copies it to the guest.
     pub fn prefetch(&mut self) {
         if !self.terminal {
+            self.driver.answers.store.reader_mut().bound();
             self.driver.prefetch(PREFETCH_CHUNKS);
         }
     }
@@ -779,6 +921,7 @@ impl Experiment {
     /// which every PE's device access would otherwise wait out.
     pub fn work(&mut self) {
         if !self.terminal {
+            self.driver.answers.store.reader_mut().bound();
             self.driver.work();
         }
     }

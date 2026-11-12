@@ -1,6 +1,6 @@
 //! Half <-> 16-bit integer conversions from the fields, in SSE2 integer
-//! lanes on every x86 tier: FCVTZS/FCVTZU and SCVTF/UCVTF, vector 4H/8H and
-//! SIMD scalar H, without fixed-point scaling.
+//! lanes on every x86 tier: FCVT{N,A,P,M,Z}{S,U} and SCVTF/UCVTF, vector
+//! 4H/8H and SIMD scalar H, without fixed-point scaling.
 //!
 //! No host FP status is raised and MXCSR is untouched: the only host FP
 //! instructions are CVTDQ2PS of 16-bit integers and CVTTPS2DQ of powers of
@@ -67,9 +67,10 @@ fn applies(target: TargetCpu) -> bool {
     !vector_extensions::half_supported(target) && !target.data_independent_timing()
 }
 
-/// Whether FCVTZS/FCVTZU `operand` has the field recipe on some target.
-pub(super) fn to_integer_inline(operand: &IntegerConversion, mode: IntegerRounding) -> bool {
-    mode == IntegerRounding::TowardZero && simd_halves(operand).is_some()
+/// Whether FCVT{N,A,P,M,Z}{S,U} `operand` has the field recipe on some
+/// target; every rounding the instruction names has one.
+pub(super) fn to_integer_inline(operand: &IntegerConversion) -> bool {
+    simd_halves(operand).is_some()
 }
 
 /// Whether SCVTF/UCVTF `operand` has the field recipe on some target.
@@ -134,14 +135,17 @@ fn fallback_if_any(code: &mut Code, mask: u8, fallback: &mut Vec<usize>) {
     fallback.push(branch(code, Condition::NotZero));
 }
 
-/// FCVTZS/FCVTZU from Half to 16-bit lanes. A lane with biased exponent E
-/// and significand M (hidden bit included) has the value M * 2^(E-25); for
-/// E >= 15 its truncation is (M * 2^(E-15)) >> 10, with the product below
-/// 2^26 in a high and low word, and the dropped bits are the low ten of the
-/// low word. E < 15 truncates to zero. NaN, infinite and nonzero subnormal
-/// lanes (whose FZ16 flushing decides IXC), and lanes out of the integer
-/// range (IOC), take the helper; -32768 does too.
-fn emit_to(code: &mut Code, operand: &IntegerConversion, pc: GuestAddress) {
+/// FCVT{N,A,P,M,Z}{S,U} from Half to 16-bit lanes. A lane with biased
+/// exponent E and significand M (hidden bit included) has the value
+/// M * 2^(E-25); for E >= 15 its truncation is (M * 2^(E-15)) >> 10, with
+/// the product below 2^26 in a high and low word, and the dropped bits are
+/// the low ten of the low word. E < 15 truncates to zero. The other
+/// roundings then add one to the magnitude (`round_magnitudes`). NaN,
+/// infinite and nonzero subnormal lanes (whose FZ16 flushing decides IXC),
+/// and lanes out of the integer range (IOC), take the helper; -32768 does
+/// too. A lane is inexact exactly when bits were dropped, whatever the
+/// rounding.
+fn emit_to(code: &mut Code, operand: &IntegerConversion, mode: IntegerRounding, pc: GuestAddress) {
     const MAGNITUDE: u8 = 2;
     const EXPONENT: u8 = 3;
     const BAD: u8 = 4;
@@ -222,6 +226,9 @@ fn emit_to(code: &mut Code, operand: &IntegerConversion, pc: GuestAddress) {
     packed(code, Host::AndNot, BAD, RESULT);
     // RESULT = the truncated magnitudes, zero below one.
     packed(code, Host::MoveAligned, RESULT, BAD);
+    if mode != IntegerRounding::TowardZero {
+        round_magnitudes(code, mode, signed, &mut fallback);
+    }
     // Inexact lanes: dropped product bits at E >= 15, a nonzero magnitude
     // below one. Reuse BAD's complement: recompute the below-one lanes.
     word_constant(code, BAD, HALF_EXPONENT_BIAS as u16);
@@ -251,6 +258,92 @@ fn emit_to(code: &mut Code, operand: &IntegerConversion, pc: GuestAddress) {
     commit_inexact(code);
     write_halves(code, register, shape, RESULT);
     finish(code, fallback, pc);
+}
+
+/// Add one to the truncated magnitudes in RESULT where `mode` rounds them
+/// up, from the input in INPUT, its magnitude in XMM2 and the low product
+/// word in XMM7, which stay; XMM3 to XMM6 and EAX are clobbered.
+///
+/// At E >= 15 the dropped bits are R = the low ten bits of the product: the
+/// even-ties rounding adds one when R + (truncation & 1) passes one half
+/// (0x200), the away-ties one when R reaches it, the directed ones when R is
+/// nonzero and the sign is the rounding's. Below one (E < 15, a truncation
+/// of zero) the same tests run on the magnitude moved so that one half
+/// (0x3800) meets the same thresholds, and on the plain magnitude for the
+/// directed roundings. No rounded magnitude leaves the integer: fractions
+/// exist only below 2^10. An unsigned lane that is negative with a nonzero
+/// rounded magnitude (IOC) takes the helper.
+fn round_magnitudes(
+    code: &mut Code,
+    mode: IntegerRounding,
+    signed: bool,
+    fallback: &mut Vec<usize>,
+) {
+    const MAGNITUDE: u8 = 2;
+    const EXPONENT: u8 = 3;
+    const UP: u8 = 4;
+    const SCRATCH: u8 = 5;
+    const DROPPED: u8 = 6;
+    const LOW: u8 = 7;
+    const ONE_HALF: u16 = 0x3800;
+    const HALF_DROPPED: u16 = 1 << (HALF_FRACTION_BITS - 1);
+    let nearest = matches!(
+        mode,
+        IntegerRounding::NearestEven | IntegerRounding::NearestAway
+    );
+    // UP = the lanes below one.
+    packed(code, Host::MoveAligned, EXPONENT, MAGNITUDE);
+    ShiftOpcode::RightWord.emit(code, EXPONENT, HALF_FRACTION_BITS);
+    word_constant(code, UP, HALF_EXPONENT_BIAS as u16);
+    packed(code, Host::GreaterWord, UP, EXPONENT);
+    packed(code, Host::MoveAligned, DROPPED, LOW);
+    word_constant(code, SCRATCH, (1 << HALF_FRACTION_BITS) - 1);
+    packed(code, Host::And, DROPPED, SCRATCH);
+    if mode == IntegerRounding::NearestEven {
+        packed(code, Host::MoveAligned, SCRATCH, RESULT);
+        ShiftOpcode::LeftWord.emit(code, SCRATCH, 15);
+        ShiftOpcode::RightWord.emit(code, SCRATCH, 15);
+        packed(code, Host::AddWord, DROPPED, SCRATCH);
+    }
+    packed(code, Host::MoveAligned, EXPONENT, MAGNITUDE);
+    if nearest {
+        word_constant(code, SCRATCH, ONE_HALF - HALF_DROPPED);
+        packed(code, Host::SubWord, EXPONENT, SCRATCH);
+    }
+    packed(code, Host::And, EXPONENT, UP);
+    packed(code, Host::AndNot, UP, DROPPED);
+    packed(code, Host::Or, UP, EXPONENT);
+    let threshold = match mode {
+        IntegerRounding::NearestEven => HALF_DROPPED,
+        IntegerRounding::NearestAway => HALF_DROPPED - 1,
+        _ => 0,
+    };
+    if threshold == 0 {
+        packed(code, Host::Xor, SCRATCH, SCRATCH);
+    } else {
+        word_constant(code, SCRATCH, threshold);
+    }
+    // UP = the lanes whose magnitude rounds up.
+    packed(code, Host::GreaterWord, UP, SCRATCH);
+    if !nearest {
+        packed(code, Host::MoveAligned, SCRATCH, INPUT);
+        ShiftOpcode::ArithmeticWord.emit(code, SCRATCH, 15);
+        if mode == IntegerRounding::TowardPositive {
+            packed(code, Host::AndNot, SCRATCH, UP);
+        } else {
+            packed(code, Host::And, SCRATCH, UP);
+        }
+        packed(code, Host::MoveAligned, UP, SCRATCH);
+    }
+    packed(code, Host::SubWord, RESULT, UP);
+    if !signed {
+        packed(code, Host::MoveAligned, SCRATCH, INPUT);
+        ShiftOpcode::ArithmeticWord.emit(code, SCRATCH, 15);
+        packed(code, Host::Xor, EXPONENT, EXPONENT);
+        packed(code, Host::EqualWord, EXPONENT, RESULT);
+        packed(code, Host::AndNot, EXPONENT, SCRATCH);
+        fallback_if_any(code, EXPONENT, fallback);
+    }
 }
 
 /// SCVTF/UCVTF from 16-bit lanes to Half under FPCR nearest-even: each lane
@@ -314,7 +407,8 @@ fn finish(code: &mut Code, fallback: Vec<usize>, pc: GuestAddress) {
     resolve(code, done, end);
 }
 
-/// Emit FCVTZS/FCVTZU `operand` when the field recipe applies on `target`.
+/// Emit FCVT{N,A,P,M,Z}{S,U} `operand` when the field recipe applies on
+/// `target`.
 pub(super) fn try_to_integer(
     code: &mut Code,
     operand: &IntegerConversion,
@@ -322,10 +416,10 @@ pub(super) fn try_to_integer(
     pc: GuestAddress,
     target: TargetCpu,
 ) -> bool {
-    if !to_integer_inline(operand, mode) || !applies(target) {
+    if !to_integer_inline(operand) || !applies(target) {
         return false;
     }
-    emit_to(code, operand, pc);
+    emit_to(code, operand, mode, pc);
     true
 }
 
