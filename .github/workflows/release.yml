@@ -247,6 +247,26 @@ jobs:
           printf 'northwood.efi: %s bytes\nsha256 %s\n' \
             "$(stat -c %s dist/northwood.efi)" "$(sha256sum dist/northwood.efi | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Check memory admission in QEMU
+        id: memory-matrix
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/diag-')
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-system-x86 ovmf
+          cargo xtask boot memory-matrix --image dist/northwood.efi \
+            --output "$RUNNER_TEMP/northwood-memory-matrix" --timeout 45
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && (steps.memory-matrix.outcome == 'success' || steps.memory-matrix.outcome == 'failure') }}
+        with:
+          name: northwood-memory-matrix
+          path: |
+            ${{ runner.temp }}/northwood-memory-matrix/matrix.json
+            ${{ runner.temp }}/northwood-memory-matrix/*/run.json
+            ${{ runner.temp }}/northwood-memory-matrix/*/serial.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
       - uses: actions/upload-artifact@v4
         with:
           name: northwood-efi
