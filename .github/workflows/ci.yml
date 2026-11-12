@@ -30,3 +30,5 @@ jobs:
         run: cargo clippy --locked -p stela-boot-core -p stela-drivers -p northwood -p northwood-config --all-targets
       - name: Run host tests
         run: cargo test --locked -p stela-boot-core -p stela-drivers -p northwood -p northwood-config
+      - name: Check promoted MMIO RAM contention
+        run: cargo test --locked -p stela-engine --lib promoted_device_site_uses_only_current_canonical_ram_admission

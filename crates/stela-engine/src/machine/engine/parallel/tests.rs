@@ -1,4 +1,4 @@
-use super::super::LocalRegisters;
+use super::super::{LocalRegisters, Stop};
 use super::*;
 use core::sync::atomic::AtomicUsize;
 
