@@ -19,6 +19,7 @@ use stela_drivers::{
 };
 use stela_loader::host_firmware::{recipes, requirements::Inventory};
 
+mod cnvi;
 mod glk_attachment;
 mod lpss_attachment;
 
@@ -182,6 +183,7 @@ struct BootDevice {
     glk_attachment: glk_attachment::Attachment,
     lpss_id: Option<u16>,
     lpss_attachment: lpss_attachment::Attachment,
+    cnvi: cnvi::Observations,
     inconsistent: bool,
     outcomes: BTreeSet<Outcome>,
 }
@@ -242,7 +244,17 @@ impl BootDevice {
                 && self.glk_id.is_none_or(|glk| glk == identity.device)
                 && identity.class[0] == 3
         };
+        let matches_cnvi = |identity: &Identity| {
+            (identity.vendor, identity.device) == (0x8086, 0x31dc)
+                && identity.class[..2] == [2, 0x80]
+        };
         !self.inconsistent
+            && (!self.cnvi.observed()
+                || !observed_glk
+                    && self.lpss_id.is_none()
+                    && self.class.is_none_or(|class| class == [2, 0x80, 0])
+                    && self.identity.as_ref().is_none_or(matches_cnvi)
+                    && pci.is_none_or(matches_cnvi))
             && self.lpss_id.is_none_or(|device| {
                 let matches_lpss =
                     |identity: &Identity| (identity.vendor, identity.device) == (0x8086, device);
@@ -269,6 +281,7 @@ impl BootDevice {
             .chain(self.glk_memory.map(GlkMemory::describe))
             .chain(self.glk_attachment.describe())
             .chain(self.lpss_attachment.describe())
+            .chain(self.cnvi.describe())
             .collect::<Vec<_>>()
             .join("; ")
     }
@@ -634,6 +647,8 @@ fn boot_observations(input: &[u8]) -> Result<BootReport> {
             } else {
                 device.lpss_attachment.observe(record);
             }
+        } else if let Some((slot, record)) = cnvi::parse(line) {
+            boot.pci.entry(slot).or_default().cnvi.observe(record);
         } else if let Some((path, outcome)) = observed_acpi(line) {
             boot.acpi.entry(path.into()).or_default().insert(outcome);
         }
@@ -817,7 +832,12 @@ fn render(
                 )?;
             } else {
                 let id = agreed
-                    .and_then(|entry| entry.glk_id.or(entry.lpss_id))
+                    .and_then(|entry| {
+                        entry
+                            .glk_id
+                            .or(entry.lpss_id)
+                            .or(entry.cnvi.observed().then_some(0x31dc))
+                    })
                     .map_or_else(String::new, |device| format!("8086:{device:04x}"));
                 write!(
                     report,
@@ -894,6 +914,38 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cnvi_firmware_and_runtime_stay_in_their_own_boot() {
+        let firmware = b"\
+=== STELA BOOT 7 ===\n\
+DEVICE PCI 0000:00:0c.0 8086:31dc class=028000 inventory=IntelWiFi.nwdrv (iwlwifi)\n\
+HOST WIFI CNVI PCI pci=0000:00:0c.0 power=Ok(0) memory_decode=true bus_master=true bar0_bus=0xa1310000 bar0_host=0xa1310000 bar0_bytes=16384 source=uefi-pci-io\n\
+HOST WIFI CNVI CSR pci=0000:00:0c.0 hw_rev=0x00000312 rf_id=0x00105110 gp=0x08040000 identity=Ok(()) awake=Err(ClockUnavailable)\n\
+HOST WIFI CNVI DMAR pci=0000:00:0c.0 direct_units=[] include_all_units=[fed65000] direct_reserved=0 scope=firmware-listing\n";
+        let boot = boot_observations(firmware).unwrap();
+        let output = render(None, None, Some(&boot)).unwrap();
+        assert!(output.contains("CNVi UEFI PCI D0") && output.contains("ClockUnavailable"));
+        assert!(output.contains("include-all units [fed65000]"));
+        assert!(!output.contains("post-EBS DMA"));
+
+        let runtime = b"\
+=== STELA BOOT 8 ===\n\
+HOST WIFI CNVI ROOT pci=0000:00:0c.0 rid=0x0060 role=Physical unit=0xfed65000 takeover=taken initial=window allows=true blocked_fabric=false initial_lines=false claim=not-attempted\n\
+HOST WIFI CNVI ROOT pci=0000:00:0d.0 rid=0x0060 role=Physical unit=0xfed65000 takeover=not-taken claim=not-attempted\n";
+        let boot = boot_observations(&[firmware.as_slice(), runtime].concat()).unwrap();
+        let output = render(None, None, Some(&boot)).unwrap();
+        assert!(
+            output.contains("CNVi post-EBS DMA RID 0x0060")
+                && output.contains("claim not attempted")
+        );
+        assert!(!output.contains("ClockUnavailable") && !output.contains("0000:00:0d.0"));
+
+        let pci = [parse_pci("00:0c.0 Ethernet controller [0200]: Intel [8086:100e]").unwrap()];
+        let output = render(Some(&pci), None, Some(&boot)).unwrap();
+        assert!(output.contains("Conflicting PCI identity or class"));
+        assert!(!output.contains("CNVi post-EBS DMA"));
+    }
 
     #[test]
     fn numeric_inputs_keep_only_device_fields() {
