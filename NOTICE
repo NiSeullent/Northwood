@@ -686,7 +686,7 @@ crates/stela-driver-net/src/wifi/intel/firmware/legacy/phy_db.rs: Intel 9000
     drivers/net/wireless/intel/iwlwifi/fw/api/commands.h,
     drivers/net/wireless/intel/iwlwifi/iwl-phy-db.c,
     drivers/net/wireless/intel/iwlwifi/iwl-trans.c
-crates/stela-driver-net/src/wifi/intel/firmware/legacy/aux.rs: Intel 9000
+crates/stela-driver-net/src/wifi/intel/firmware/legacy/aux_station.rs: Intel 9000
   first AUX queue and internal station command and status formats
     Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0 OR BSD-3-Clause
     drivers/net/wireless/intel/iwlwifi/fw/api/commands.h,
