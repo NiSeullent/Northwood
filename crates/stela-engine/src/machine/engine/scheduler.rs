@@ -15,6 +15,7 @@ pub(super) fn native_instruction_incomplete(step: &Step) -> bool {
         Err(Stop::Unsupported(Requirement {
             kind: RequirementKind::NativePreparation(_)
                 | RequirementKind::NativeRamServiceBusy
+                | RequirementKind::DeviceSiteRamServiceBusy
                 | RequirementKind::NonresidentRam { .. }
                 | RequirementKind::RamTransfer { .. },
             ..

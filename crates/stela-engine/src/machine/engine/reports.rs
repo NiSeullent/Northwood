@@ -90,6 +90,8 @@ pub enum RequirementKind {
     NativePreparation(String),
     /// A registered RAM service excluded entry before native code executed.
     NativeRamServiceBusy,
+    /// A registered RAM service excluded a promoted device site's walk.
+    DeviceSiteRamServiceBusy,
 }
 
 impl fmt::Display for Requirement {
@@ -178,6 +180,9 @@ impl fmt::Display for Requirement {
                 "native preparation: {}",
                 super::NativeEntryError::RamServiceBusy
             )?,
+            RequirementKind::DeviceSiteRamServiceBusy => {
+                f.write_str("promoted device site: registered RAM memory service busy")?
+            }
         }
         if let Some(syndrome) = self.syndrome {
             write!(f, " esr={syndrome:#x}")?;

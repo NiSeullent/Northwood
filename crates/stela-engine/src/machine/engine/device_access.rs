@@ -1,7 +1,7 @@
 //! One recovered cohort, one stop, and ordered consuming bus accesses.
 use super::*;
 use crate::memory::{
-    domain::MemoryExecutionLoan,
+    domain::{ExecutionLoanAttempt, MemoryExecutionLoan},
     system_ram::{DescriptorReader, REGISTERED_FRAME_BYTES, RamPageKind, RegisteredSystemRam},
 };
 use shared_memory::RecoveredDeviceAccess;
@@ -418,7 +418,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         {
             return Ok(None);
         }
-        let execution = ram.cpu_execution_loan().map_err(|_| ram_refused())?;
+        // Only this pre-walk refusal is resumable. A successful walk may
+        // publish descriptor updates, and device completion may consume I/O.
+        let execution = match ram.try_cpu_execution_loan().map_err(|_| ram_refused())? {
+            ExecutionLoanAttempt::Acquired(loan) => loan,
+            ExecutionLoanAttempt::ServiceBusy => {
+                return Err(RequirementKind::DeviceSiteRamServiceBusy);
+            }
+        };
         let binding = ram.cpu_binding(&execution).map_err(|_| ram_refused())?;
         if expected_generation.is_some_and(|expected| binding.generation() != expected) {
             return Err(ram_refused());

@@ -246,7 +246,11 @@ fn promoted_device_site_uses_only_current_canonical_ram_admission() {
     let generation = ram.generation().unwrap();
 
     // strb w0, [x1], #1; ret. Learn the actual promotion through its fault.
-    let mut machine = board(&[0x3800_1420, 0xd65f_03c0], Registers::default(), Vec::new());
+    let mut machine = board(
+        &[0x3800_1420, 0xd65f_03c0, 0xa900_2909, 0xd65f_03c0],
+        Registers::default(),
+        Vec::new(),
+    );
     machine.cpu.state.x[0] = VALUE;
     machine.cpu.state.x[1] = DEVICE;
     let (_, offset) =
@@ -321,7 +325,10 @@ fn promoted_device_site_uses_only_current_canonical_ram_admission() {
     machine.cpu.pc = BASE;
     machine.cpu.state.x[1] = RAM;
     machine.host.exits.push(exit(BASE, ExitKind::System));
-    machine.host.exits.push(exit(BASE + 4, ExitKind::Fallthrough));
+    machine
+        .host
+        .exits
+        .push(exit(BASE + 4, ExitKind::Fallthrough));
     machine.step().unwrap();
     assert!(machine.host.exits.is_empty());
     assert_eq!(machine.cpu.pc, BASE + 4);
@@ -330,4 +337,36 @@ fn promoted_device_site_uses_only_current_canonical_ram_admission() {
     assert!(machine.code.blocks.iter().any(|(_, block)| {
         block.pc == BASE && machine.variants[block.variant.0 as usize].single
     }));
+
+    // stp x9, x10, [x8]. A live service must stop both mailbox stores.
+    let pc = BASE + 8;
+    machine.learn_device_site(pc);
+    machine.cpu.pc = pc;
+    machine.cpu.state.x[8] = HOLE;
+    machine.cpu.state.x[9] = VALUE;
+    machine.cpu.state.x[10] = VALUE + 1;
+    let site = machine.device_sites[&pc];
+    let retired = machine.cpu.retired;
+    let service = ram.try_service().unwrap().unwrap();
+    machine.host.exits.push(exit(pc, ExitKind::System));
+    let Err(Stop::Unsupported(report)) = machine.step() else {
+        panic!("RAM service must prevent the promoted pair store");
+    };
+    assert_eq!(report.kind, RequirementKind::DeviceSiteRamServiceBusy);
+    assert_eq!(report.pc, pc);
+    assert_eq!(machine.cpu.pc, pc);
+    assert_eq!(machine.cpu.retired, retired);
+    assert_eq!(machine.cpu.state.x[8], HOLE);
+    assert_eq!(machine.devices.accesses.len(), 2);
+    assert_eq!(machine.device_sites[&pc], site);
+    drop(service);
+
+    machine.host.exits.push(exit(pc, ExitKind::System));
+    machine.step().unwrap();
+    assert_eq!(machine.cpu.pc, pc + 4);
+    assert_eq!(machine.cpu.retired, retired + 1);
+    assert_eq!(
+        &machine.devices.accesses[2..],
+        &[(HOLE, 8, Some(VALUE)), (HOLE + 8, 8, Some(VALUE + 1))]
+    );
 }

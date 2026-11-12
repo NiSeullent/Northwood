@@ -206,7 +206,11 @@ impl Pe {
         // A budget or host-service yield does not show that admission
         // succeeded. Keep the same deadline until guest execution advances.
         let mut ram_busy_since = None;
+        let mut ram_resumed = false;
         let mut reported_ram_retry = false;
+        let mut site_retry_pc = None;
+        let mut site_resumed_pc = None;
+        let mut reported_site_retry = false;
         loop {
             let limit = machine.statistics.blocks + SLICE;
             let retired = machine.cpu.retired;
@@ -214,28 +218,46 @@ impl Pe {
                 blocks: limit,
                 host_ticks: Some(slice_ticks),
             });
-            if machine.cpu.retired != retired
-                && ram_busy_since.take().is_some()
-                && !reported_ram_retry
-            {
-                output::arguments(format_args!(
-                    "PARALLEL PE {pe} resumed after registered RAM service busy\n"
-                ));
-                reported_ram_retry = true;
+            if machine.cpu.retired != retired {
+                ram_resumed |= ram_busy_since.take().is_some() && !reported_ram_retry;
+                if let Some(pc) = site_retry_pc.take() {
+                    site_resumed_pc = Some(pc);
+                }
             }
-            if let Stop::Unsupported(Requirement {
-                kind: RequirementKind::NativeRamServiceBusy,
-                ..
-            }) = &stop
+            if let Stop::Unsupported(Requirement { pc, kind, .. }) = &stop
+                && matches!(
+                    kind,
+                    RequirementKind::NativeRamServiceBusy
+                        | RequirementKind::DeviceSiteRamServiceBusy
+                )
             {
                 let now = host::fresh_counter();
                 let since = *ram_busy_since.get_or_insert(now);
                 if now.wrapping_sub(since) < slice_ticks {
+                    if matches!(kind, RequirementKind::DeviceSiteRamServiceBusy)
+                        && !reported_site_retry
+                        && site_resumed_pc.is_none()
+                    {
+                        site_retry_pc.get_or_insert(*pc);
+                    }
                     // The next scheduler pass drains Hub mail and can park
                     // this PE for the BSP. No native block or RAM loan is live.
                     machine.host.relax();
                     continue;
                 }
+            }
+            if ram_resumed {
+                output::arguments(format_args!(
+                    "PARALLEL PE {pe} resumed after registered RAM service busy\n"
+                ));
+                ram_resumed = false;
+                reported_ram_retry = true;
+            }
+            if let Some(pc) = site_resumed_pc.take() {
+                output::arguments(format_args!(
+                    "PARALLEL PE {pe} resumed after promoted device site RAM service busy pc={pc:#x}\n"
+                ));
+                reported_site_retry = true;
             }
             #[cfg(feature = "native-profile")]
             if step_timing {
