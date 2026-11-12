@@ -270,6 +270,10 @@ impl AppleDevices {
             Controller::V2(id)
         };
         self.aic = Some(device);
+        // The AIC starts no DMA and holds no master's registers: its
+        // writes (unmasks after each acknowledge, software IRQs, routes,
+        // timestamps) change only interrupt state, which its lines carry.
+        self.quiet.push(id);
         if matches!(device, Controller::V2(_)) {
             self.register_power_device(physical, id, false)?;
         }

@@ -192,7 +192,7 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress, target:
         emit_native(code, operand, pc);
         return;
     }
-    if packed::supports(operand, target) {
+    if packed::supports(target) {
         packed::emit(code, operand, pc);
         return;
     }

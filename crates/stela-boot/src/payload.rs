@@ -772,7 +772,9 @@ fn ata_text(handle: Handle, range: core::ops::Range<usize>) -> Option<String> {
     for pair in text.as_chunks_mut::<2>().0 {
         pair.swap(0, 1);
     }
-    trimmed(&text)
+    // As Stela's AHCI driver reads the field, so both name the disk alike.
+    let text = stela_drivers::block::ascii(&text);
+    (!text.is_empty()).then_some(text)
 }
 
 /// GUID entropy for a new table: the disk, the time and a counter. These

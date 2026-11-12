@@ -26,7 +26,7 @@ use stela_drivers::gpu::metal::{
     compiler::{self, AirCompiler},
     device::{lifecycle::QuiesceStatus, pass_times},
     error::Error,
-    native::{ExportedMemory, Loader, MemoryExporter, NativeBackend, Refusals, vk},
+    native::{ExportedMemory, Loader, MemoryExporter, NativeBackend, Refusals, pipeline_store, vk},
     nvidia::{
         Attachment,
         open::{Gpu, OpenError, open, reopen},
@@ -730,6 +730,19 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
             micros(total),
             micros(longest),
             micros(blocked),
+        ));
+    }
+    // Pipelines created through the pipeline store's cache: found there, or
+    // compiled by the driver, and the driver's time for each.
+    let store = pipeline_store::take_lookups();
+    if store.hits != 0 || store.misses != 0 {
+        output::arguments(format_args!(
+            "GPU STORE hits={} misses={} hit_us={} miss_us={} miss_longest_us={}\n",
+            store.hits,
+            store.misses,
+            store.hit_ns / 1000,
+            store.miss_ns / 1000,
+            store.miss_longest_ns / 1000,
         ));
     }
     // Where the time of the slowest operations went, phase by phase.

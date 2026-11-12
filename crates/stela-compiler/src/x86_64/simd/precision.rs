@@ -6,9 +6,9 @@ use super::numerical::{
     ArithmeticOpcode, Condition, INPUT_MINIMUM_EXPONENT, MINIMUM_EXPONENT_VECTOR,
     RESULT_MINIMUM_EXPONENT, Rounding, branch, clear_scalar, commit_inexact, environment_round,
     exponent_range, jump, prepare_half_result_range, prepare_vector_input_range,
-    prepare_vector_result_range, read_numerical_vector, reject_other_status, resolve,
-    restore_environment, scalar_range_or_zero, single_vector_arithmetic, test_control,
-    vector_exponent_range, vector_normal_or_zero_range,
+    prepare_vector_result_range, read_numerical_vector, reject_other_status,
+    reject_other_status_but_underflow, resolve, restore_environment, scalar_range_or_zero,
+    single_vector_arithmetic, test_control, vector_exponent_range, vector_normal_or_zero_range,
 };
 use super::{Host, commit, encode::guest, packed, read_vector, vector_offset};
 use crate::x86_64::asm::FloatLanes;
@@ -20,8 +20,8 @@ use crate::{
     aarch64::{
         FloatingPointOperation, Instruction, Operation,
         floating::{
-            FPCR_AHP, FPCR_EXCEPTION_ENABLE_MASK, FPCR_NEP, FPCR_ROUNDING_MASK,
-            FPCR_ROUNDING_SHIFT, Format, precision::PrecisionRounding,
+            FPCR_AH, FPCR_AHP, FPCR_EXCEPTION_ENABLE_MASK, FPCR_NEP, FPCR_ROUNDING_MASK,
+            FPCR_ROUNDING_SHIFT, Format, UNDERFLOW, precision::PrecisionRounding,
         },
         simd::{
             arithmetic::Shape,
@@ -504,6 +504,55 @@ fn emit_narrow(
     }
 }
 
+/// After a vector narrowing of normal or zero Single lanes in SOURCE_VECTOR
+/// to Half in RESULT_VECTOR, which VCVTPS2PH rounds correctly to the
+/// subnormal grid and to zero: EDX = UFC when a lane was tiny and inexact.
+/// Arm (FPCR.AH zero) finds a lane tiny before rounding, below 2^-14,
+/// which compares the input's magnitude field, and inexact where the Half
+/// widened back (exactly) differs from the input. FZ16 flushes no result of
+/// a conversion and FZ no normal input; FPCR.AH, whose tininess follows
+/// rounding, takes `helper` when a lane is tiny. Clobbers EAX and XMM2 to
+/// XMM5; ECX survives.
+fn narrow_half_underflow(code: &mut Code, helper: &mut Vec<usize>, target: TargetCpu) {
+    const TINY: u8 = 2;
+    const SCRATCH: u8 = 3;
+    const MAGNITUDE: u8 = 4;
+    const WIDE: u8 = 5;
+    const SINGLE_MAGNITUDE: u32 = u32::MAX >> 1;
+    /// 2^-14, Half's least normal, as Single.
+    const HALF_MINIMUM_NORMAL: u32 = 0x3880_0000;
+    dword_constant(code, SCRATCH, SINGLE_MAGNITUDE);
+    packed(code, Host::MoveAligned, MAGNITUDE, SOURCE_VECTOR);
+    packed(code, Host::And, MAGNITUDE, SCRATCH);
+    packed(code, Host::Xor, TINY, TINY);
+    packed(code, Host::EqualDword, TINY, MAGNITUDE);
+    dword_constant(code, SCRATCH, HALF_MINIMUM_NORMAL);
+    packed(code, Host::GreaterDword, SCRATCH, MAGNITUDE);
+    // Nonzero and below the least normal.
+    packed(code, Host::AndNot, TINY, SCRATCH);
+    code.asm().alu(Alu::Xor, Size::Dword, Rdx, Rdx);
+    Host::ByteSignMask.register(code, 0, TINY, TargetCpu::Baseline);
+    code.asm().test(Size::Dword, Rax, Rax);
+    let none = branch(code, Condition::Zero);
+    test_control(code, FPCR_AH);
+    helper.push(branch(code, Condition::NotZero));
+    Host::ConvertHalfToSingle.register(code, WIDE, RESULT_VECTOR, target);
+    packed(code, Host::EqualDword, WIDE, SOURCE_VECTOR);
+    packed(code, Host::AndNot, WIDE, TINY);
+    Host::ByteSignMask.register(code, 0, WIDE, TargetCpu::Baseline);
+    let mut asm = code.asm();
+    asm.test(Size::Dword, Rax, Rax);
+    asm.setcc(Cond::Ne, Rdx);
+    asm.shift_imm(
+        ShiftOp::Shl,
+        Size::Dword,
+        Rdx,
+        UNDERFLOW.trailing_zeros() as u8,
+    );
+    let end = code.len();
+    resolve(code, none, end);
+}
+
 /// VCVTPS2PH narrows Single in one rounding, and AVX512-FP16's VCVTSD2SH
 /// narrows Double. The DIT profile keeps its reviewed recipe.
 pub(super) fn half_narrowing_supported(mode: PrecisionMode, target: TargetCpu) -> bool {
@@ -527,9 +576,10 @@ pub(super) fn half_narrowing_supported(mode: PrecisionMode, target: TargetCpu) -
 }
 
 /// Narrow to Half under the guards of the Half arithmetic path: normal inputs
-/// (and zero vector lanes), and a helper for other status or a result below exponent 2, so x86's
-/// tininess rule never decides a guest result. FPCR.AHP selects a format the
-/// host lacks.
+/// (and zero vector lanes), and a helper for other status or, for a scalar,
+/// a result below exponent 2, so x86's tininess rule never decides a guest
+/// result. A vector narrows tiny lanes too ([`narrow_half_underflow`]).
+/// FPCR.AHP selects a format the host lacks.
 fn emit_narrow_half(
     code: &mut Code,
     operand: &PrecisionOperand,
@@ -583,25 +633,29 @@ fn emit_narrow_half(
         );
     }
     restore_environment(code);
-    helper.push(reject_other_status(code));
-    prepare_vector_input_range(code, Format::Half);
-    prepare_half_result_range(code);
     if scalar.is_some() {
+        helper.push(reject_other_status(code));
+        prepare_vector_input_range(code, Format::Half);
+        prepare_half_result_range(code);
         vector_exponent_range(code, Format::Half, Shape::Scalar, result);
+        helper.push(branch(code, Condition::NotZero));
     } else {
-        // A zero result came from a zero lane: a nonzero one rounded to zero
-        // raised underflow, which took the helper above.
-        vector_normal_or_zero_range(
-            code,
-            Format::Half,
-            Shape::Vector64,
-            result,
-            NARROW_ZERO_SCRATCH,
-        );
+        // Normal or zero inputs: an overflow is the only other status a
+        // result may raise, and the host's underflow (tininess after
+        // rounding) is not Arm's, which the lanes give.
+        helper.push(reject_other_status_but_underflow(code));
+        narrow_half_underflow(code, &mut helper, target);
     }
-    helper.push(branch(code, Condition::NotZero));
     helper_section(code, &helper, pc);
     commit_inexact(code);
+    if scalar.is_none() {
+        code.asm().alu(
+            Alu::Or,
+            Size::Dword,
+            guest(core::mem::offset_of!(crate::GuestState, fpsr) as u32),
+            Rdx,
+        );
+    }
     match operand.mode {
         PrecisionMode::Narrow { upper: true, .. } => {
             read_vector(code, operand.destination, SOURCE_VECTOR);

@@ -49,6 +49,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
         let contexts = self.contexts(el, context);
         self.chain.set_contexts(contexts);
+        if !self.dropped_refills.is_empty() {
+            self.refill_dropped(contexts);
+        }
         if !self.refills.is_empty() {
             self.refill_pages(el, context);
         }
@@ -443,6 +446,43 @@ impl<H: Host, D: Devices> Machine<H, D> {
         for pages in self.pending_refills.values_mut() {
             pages.sort_unstable();
             pages.dedup();
+        }
+    }
+
+    /// Keep the page `page` a TLBI by VA dropped of the live context
+    /// `context` for the next fetch in that context to walk again
+    /// ([`Self::refill_dropped`]): a TLBI that changed a mapping is mostly
+    /// followed by a fetch of the page through its new one. At most
+    /// [`REFILLS_PER_CONTEXT`] pages of [`DROPPED_CONTEXTS`] contexts; the
+    /// lists of contexts that went give way.
+    pub(super) fn keep_dropped(
+        dropped: &mut BTreeMap<u64, Vec<u64>>,
+        live: impl Fn(u64) -> bool,
+        context: u64,
+        page: u64,
+    ) {
+        if !dropped.contains_key(&context) && dropped.len() >= DROPPED_CONTEXTS {
+            dropped.retain(|&number, _| live(number));
+            if dropped.len() >= DROPPED_CONTEXTS {
+                return;
+            }
+        }
+        let pages = dropped.entry(context).or_default();
+        if pages.len() < REFILLS_PER_CONTEXT && !pages.contains(&page) {
+            pages.push(page);
+        }
+    }
+
+    /// Queue for [`Self::refill_pages`] the pages TLBIs by VA dropped of the
+    /// contexts the fetch now runs in (`contexts`, by half): each walks in
+    /// the translation that dropped it, now changed or not. Context numbers
+    /// are never reused, so a list of a context that went matches no fetch.
+    fn refill_dropped(&mut self, contexts: [u64; 2]) {
+        for (half, context) in contexts.into_iter().enumerate() {
+            if let Some(pages) = self.dropped_refills.remove(&context) {
+                self.refills
+                    .extend(pages.into_iter().filter(|&page| chain::half(page) == half));
+            }
         }
     }
 
@@ -1346,14 +1386,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let cell = cell_place(PAN_WRITES);
             register_read::pan_thunk(GuestAddress(pc), pan, cell)
         } else if let Some(send) = event_instruction(pc, word) {
-            let (pc, cell) = (GuestAddress(pc), cell_place(EVENT_WAIT));
             if send {
-                register_read::send_event_thunk(pc, cell_place(SEND_EVENT))
+                register_read::send_event_thunk(GuestAddress(pc), EVENTS)
             } else {
-                register_read::event_wait_thunk(pc, cell)
+                register_read::event_wait_thunk(GuestAddress(pc), EVENTS)
             }
         } else if data_barrier(pc, word) {
             register_read::barrier_thunk(GuestAddress(pc), BARRIER)
+        } else if clear_exclusive(pc, word) {
+            register_read::clear_exclusive_thunk(GuestAddress(pc), CLEAR_EXCLUSIVE)
         } else if let Some(rt) = code_page_invalidation(word).filter(|&rt| rt != ZERO_REGISTER) {
             let cell = cell_place(CODE_PAGE);
             register_read::code_page_thunk(GuestAddress(pc), rt, cell)
@@ -1854,6 +1895,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
 /// The most pages one forgotten context leaves to walk again
 /// ([`Machine::refill_after`]).
 const REFILLS_PER_CONTEXT: usize = 512;
+/// The contexts whose pages TLBIs by VA dropped that a PE keeps for refill
+/// ([`Machine::keep_dropped`]).
+const DROPPED_CONTEXTS: usize = 64;
 
 /// The bits of [`Machine::itlb_seen`]: 64 KiB, which tens of thousands of
 /// pages a desktop's processes run fill to a few percent; it starts over

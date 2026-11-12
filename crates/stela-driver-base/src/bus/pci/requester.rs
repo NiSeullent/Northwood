@@ -54,6 +54,40 @@ pub enum ClaimError {
     UnsupportedVersion { id: u16, version: u8 },
     UnsupportedPcieType(u8),
 }
+/// A plain sentence for the boot log.
+impl core::fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use super::access::Register;
+        match *self {
+            Self::Config(error) => write!(f, "{error}"),
+            Self::Mapping(error) => write!(f, "its configuration space is unavailable ({error:?})"),
+            Self::AlreadyBound => f.write_str("it is already claimed"),
+            Self::IdentityChanged => f.write_str("its identity changed since the census"),
+            Self::ReadFailed { offset } => {
+                write!(f, "the {} reads all ones (no response)", Register(offset))
+            }
+            Self::Active { offset } => write!(f, "the {} shows it still active", Register(offset)),
+            Self::MalformedCapability { offset } => {
+                write!(f, "its capability at {offset:#x} is malformed")
+            }
+            Self::UnsupportedHeader(kind) => write!(f, "its header type {kind} is unsupported"),
+            Self::UnsupportedRole(role) => write!(f, "its role is unsupported ({role:?})"),
+            Self::UnsupportedCapability { id, extended } => write!(
+                f,
+                "its {}capability {id:#x} has an unsupported layout",
+                if extended { "extended " } else { "" }
+            ),
+            Self::UnsupportedVersion { id, version } => write!(
+                f,
+                "its extended capability {id:#x} has unsupported version {version}"
+            ),
+            Self::UnsupportedPcieType(kind) => {
+                write!(f, "its PCI Express port type {kind:#x} is unsupported")
+            }
+        }
+    }
+}
+
 impl From<super::ConfigError> for ClaimError {
     fn from(error: super::ConfigError) -> Self {
         Self::Config(error)
@@ -422,7 +456,10 @@ pub fn validate_stopped<C: ConfigSpace>(function: &mut Function<C>) -> Result<()
     if header & 0x7f != 0 {
         return Err(ClaimError::UnsupportedHeader(header & 0x7f));
     }
-    if inactive(config, regs::COMMAND, regs::COMMAND_MASTER)? & regs::COMMAND_INTX_DISABLE == 0 {
+    let command = inactive(config, regs::COMMAND, regs::COMMAND_MASTER)?;
+    if command & regs::COMMAND_INTX_DISABLE == 0
+        && regs::intx_disable_required(config.read8(regs::INTERRUPT_PIN)?)
+    {
         return Err(ClaimError::Active {
             offset: regs::COMMAND,
         });

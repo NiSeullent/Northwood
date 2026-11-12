@@ -2,7 +2,7 @@
 //! or a cache-policy bit never grants this ownership or DMA coherency.
 use crate::vtd::VtdError;
 use stela_drivers::bus::pci::{
-    CapabilityError, ConfigSpace, Function, owned::OwnedConfig, requester::RequesterBinding,
+    CapabilityError, ConfigSpace, Function, owned::OwnedConfig, regs, requester::RequesterBinding,
 };
 
 pub struct RequesterClaim {
@@ -141,8 +141,11 @@ impl RequesterClaim {
         if id == u32::MAX || command == u16::MAX {
             return Err(VtdError::RegisterRead);
         }
+        let intx_quiet = command & regs::COMMAND_INTX_DISABLE != 0
+            || !regs::intx_disable_required(function.config().read8(regs::INTERRUPT_PIN)?);
         if id != expected
-            || command & (4 | 1 << 10) != 1 << 10
+            || command & regs::COMMAND_MASTER != 0
+            || !intx_quiet
             || function.config().read8(0x0e)? & 0x7f != 0
         {
             return Err(VtdError::Busy);
@@ -306,6 +309,8 @@ mod tests {
         let mut c = Config([0; 1024]);
         c.0[0] = 0x11e8_1234;
         c.0[1] = 1 << 10;
+        // Interrupt Pin INTA.
+        c.0[0x3c / 4] = 1 << 8;
         Function::new(
             Address {
                 segment: 0,
@@ -325,6 +330,17 @@ mod tests {
             f.config().write16(4, bad).unwrap();
             assert!(RequesterClaim::validate_stopped(&mut f).is_err());
         }
+        // Without an INTx pin a hardwired-clear INTx Disable is quiet; Bus
+        // Master still refuses.
+        f.config().write8(0x3d, 0).unwrap();
+        f.config().write16(4, 0).unwrap();
+        assert_eq!(RequesterClaim::validate_stopped(&mut f), Ok(()));
+        f.config().write16(4, 4).unwrap();
+        assert_eq!(
+            RequesterClaim::validate_stopped(&mut f),
+            Err(VtdError::Busy)
+        );
+        f.config().write8(0x3d, 1).unwrap();
         f.config().write16(4, 1 << 10).unwrap();
         f.config().write32(0, 0x11e9_1234).unwrap();
         assert_eq!(

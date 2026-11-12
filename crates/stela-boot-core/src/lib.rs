@@ -89,6 +89,7 @@ pub mod worker_bindings;
 pub mod writeback_placement;
 pub mod xstate;
 
+pub mod firmware_map;
 pub mod firmware_pci;
 
 pub mod ecam;

@@ -1281,7 +1281,7 @@ pub(super) struct Refused {
 pub(super) fn claim_all(
     services: &dyn NativeServices,
     adapters: &[gpu::Adapter],
-    gop: Result<Option<crate::pci_io::FramebufferSource>, &'static str>,
+    gop: Result<Option<crate::pci_io::FramebufferSource>, String>,
     catalog: Option<&Arc<Catalog>>,
 ) -> (Vec<Claimed>, Vec<Refused>) {
     use stela_boot_core::gpu_status::Reason;
@@ -1318,18 +1318,28 @@ pub(super) fn claim_all(
     }
     let mut claimed = Vec::new();
     let mut refused = Vec::new();
+    let source = match gop {
+        Ok(source) => source,
+        Err(why) => {
+            for adapter in nvidia {
+                output::arguments(format_args!("GPU {} refused: {why}\n", adapter.address));
+                refused.push(refused_as(adapter, Reason::Other));
+            }
+            return (claimed, refused);
+        }
+    };
     for adapter in nvidia {
-        let result = gop.map_err(ServiceError::Refused).and_then(|source| {
-            let catalog =
-                catalog.ok_or(ServiceError::Refused("no approved GPU firmware catalogue"))?;
-            claim(
-                services,
-                adapter,
-                claimed.len() as u32,
-                source,
-                catalog.clone(),
-            )
-        });
+        let result = catalog
+            .ok_or(ServiceError::Refused("no approved GPU firmware catalogue"))
+            .and_then(|catalog| {
+                claim(
+                    services,
+                    adapter,
+                    claimed.len() as u32,
+                    source,
+                    catalog.clone(),
+                )
+            });
         match result {
             Ok(function) => claimed.push(function),
             Err(error) => {
@@ -2251,6 +2261,10 @@ pub(super) fn pump() {
         Look::No => {}
     }
     lap(PumpPart::Look);
+    // The pipelines the device added go to the store's file, queued a
+    // piece at a time.
+    #[cfg(feature = "nvk")]
+    super::pipelines::step();
     let took = host::rdtsc().wrapping_sub(started);
     PUMPS.ticks.fetch_add(took, Ordering::Relaxed);
     PUMPS.longest.fetch_max(took, Ordering::Relaxed);

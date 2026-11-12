@@ -16,6 +16,9 @@ struct Control {
     offset: u16,
     original: u16,
     disabled: u16,
+    /// Bits of `disabled` the function may leave clear (see
+    /// regs::command_optional_bits); every other bit must read back exactly.
+    optional: u16,
 }
 
 /// This plan describes PCI-level controls only. It conveys no physical
@@ -33,10 +36,14 @@ impl Plan {
                 offset: regs::COMMAND,
             });
         }
+        // INTx Disable is asked of every function and required of those
+        // with an INTx pin; Bus Master must read back clear on all of them.
+        let pin = read(regs::INTERRUPT_PIN, 1)? as u8;
         plan.push(
             regs::COMMAND,
             command,
             command & !regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE,
+            regs::command_optional_bits(pin),
         )?;
 
         let mut express = false;
@@ -108,10 +115,16 @@ impl Plan {
                 ConfigFailure::UnqualifiedControl,
             )));
         }
-        self.push(offset, original, original & !clear)
+        self.push(offset, original, original & !clear, 0)
     }
 
-    fn push(&mut self, offset: u16, original: u16, disabled: u16) -> Result<(), ClaimError> {
+    fn push(
+        &mut self,
+        offset: u16,
+        original: u16,
+        disabled: u16,
+        optional: u16,
+    ) -> Result<(), ClaimError> {
         if self.0.iter().any(|control| control.offset == offset) {
             return Err(ClaimError::MalformedCapability { offset });
         }
@@ -122,6 +135,7 @@ impl Plan {
             offset,
             original,
             disabled,
+            optional,
         });
         Ok(())
     }
@@ -143,6 +157,7 @@ impl Plan {
             verify(
                 control.offset,
                 control.original,
+                0,
                 config.read16(control.offset)?,
             )?;
         }
@@ -158,7 +173,7 @@ impl Plan {
                 };
                 config
                     .read16(control.offset)
-                    .and_then(|observed| verify(control.offset, control.disabled, observed))
+                    .and_then(|observed| control.verify_disabled(observed))
                     .map_err(|error| with_prefix(error, effect))?;
             }
         }
@@ -171,7 +186,7 @@ impl Plan {
         mut read: impl FnMut(u16) -> Result<u16, ConfigError>,
     ) -> Result<(), ConfigError> {
         for control in &self.0 {
-            verify(control.offset, control.disabled, read(control.offset)?)?;
+            control.verify_disabled(read(control.offset)?)?;
         }
         Ok(())
     }
@@ -192,8 +207,17 @@ fn record_capability(
     Ok(())
 }
 
-fn verify(offset: u16, expected: u16, observed: u16) -> Result<(), ConfigError> {
-    if expected != observed {
+impl Control {
+    /// A stopped control reads back its disabled value; an optional bit may
+    /// read back clear instead.
+    fn verify_disabled(&self, observed: u16) -> Result<(), ConfigError> {
+        verify(self.offset, self.disabled, self.optional, observed)
+    }
+}
+
+/// Compare every bit outside `optional`.
+fn verify(offset: u16, expected: u16, optional: u16, observed: u16) -> Result<(), ConfigError> {
+    if (expected ^ observed) & !optional != 0 {
         return Err(ConfigError::before_effect(ConfigFailure::Readback {
             offset,
             width: 2,

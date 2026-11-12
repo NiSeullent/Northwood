@@ -236,14 +236,14 @@ mod numerical {
                     );
                     runtime.register_code(GuestAddress(BASE), source.clone())?;
                     let mut thread = input(nep);
-                    // Zero is outside the guarded native Half domain, so this
+                    // An infinity is outside every native Half domain, so this
                     // instruction takes its interior helper without replaying
                     // the completed prefix or prematurely executing the suffix.
-                    thread.registers.v[5][0] &= !0xffff;
+                    thread.registers.v[5][0] = thread.registers.v[5][0] & !0xffff | 0x7c00;
                     let mut prefix = thread.registers.clone();
                     prefix.x[0] += 1;
                     publish(&mut prefix, 0, 1, 0x40400000, 32);
-                    publish(&mut prefix, 3, 4, 0x3c00, 16);
+                    publish(&mut prefix, 3, 4, 0x7c00, 16);
                     // SAFETY: the test program reads and writes only its own registered guest data,
                     // and nothing else mutates it.
                     let first = unsafe { runtime.run(&mut thread, Some(GuestAddress(STOP)), 1)? };

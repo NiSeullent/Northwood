@@ -534,6 +534,21 @@ pub fn barrier_thunk(pc: GuestAddress, cell: Place) -> Thunk {
     finish(code, miss, pc)
 }
 
+/// The thunk completing CLREX at `pc` while the cell at `cell` is open and
+/// the word its `value` points at is zero, that is while the PE's local
+/// monitor lives in the frame alone: it clears the frame's monitor; else it
+/// exits at `pc` for the engine to clear the rest. It also clobbers RCX.
+pub fn clear_exclusive_thunk(pc: GuestAddress, cell: Place) -> Thunk {
+    let (mut code, closed) = open(cell);
+    let mut asm = Asm::new(&mut code);
+    asm.mov_load(Size::Qword, Gpr::Rcx, Mem::base_disp8(Gpr::Rax, VALUE));
+    asm.alu_imm8(Alu::Cmp, Size::Qword, Mem::base(Gpr::Rcx, 0), 0);
+    let held = asm.jcc(Cond::Ne);
+    let bytes = frame_field(core::mem::offset_of!(GuestState, exclusive_bytes));
+    asm.mov_rm_imm32(Size::Dword, bytes, 0);
+    finish_unless(code, [closed, held], pc)
+}
+
 /// The thunk completing SEVL at `pc` while the cell at `cell` is open: it
 /// sets the event register, the byte the cell's `value` points at, else
 /// exits at `pc`. It also clobbers RCX and RDX.

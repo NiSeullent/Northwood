@@ -417,6 +417,38 @@ impl Discard {
     }
 }
 
+/// The branch-kind exits [`Statistics::branch_misses`] counts: fallthrough,
+/// direct, indirect, call and return, `ExitKind`'s first five.
+pub const BRANCH_KINDS: usize = 5;
+/// [`BranchMiss`]'s reasons and the count of runs with a transition.
+pub const BRANCH_REASONS: usize = BranchMiss::COUNT + 1;
+
+/// Why a run ended at a branch-kind exit instead of transferring
+/// ([`Statistics::branch_misses`]), checked in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BranchMiss {
+    /// The chain budget was spent (or the slice left none).
+    Spent,
+    /// A notification moved the interrupt epoch: a gate took the exit.
+    Interrupt,
+    /// The exit had no link or dispatcher yet.
+    Unlinked,
+    /// The ITLB held no translation of the target's page in the current
+    /// context.
+    Itlb,
+    /// The block table held no entry of the target with that key.
+    Table,
+    /// The entry refused the exit's BTYPE.
+    Btype,
+    /// The table would have given the target: a stale cell, stamp or
+    /// context in the probe.
+    Found,
+}
+
+impl BranchMiss {
+    pub(super) const COUNT: usize = Self::Found as usize + 1;
+}
+
 /// How a fetch began ([`Statistics::fetch_paths`]): through the ITLB and the
 /// block table without a walk, with BTYPE zero or with an entry that admits
 /// the PE's BTYPE; or, leaving that path, because the ITLB lacked the page
@@ -639,6 +671,10 @@ pub struct Statistics {
     /// Why GENTER, GEXIT, SVC and ERET took the engine path, by kind
     /// (`x86_64::transition`) and `transitions::miss` reason.
     pub transition_misses: [[u64; super::transitions::miss::REASONS]; transition::KINDS],
+    /// Why runs ended at a branch-kind exit, by kind (fallthrough, direct,
+    /// indirect, call, return) and [`BranchMiss`] reason; the last slot
+    /// counts those of each kind whose run made a native transition.
+    pub branch_misses: [[u64; BRANCH_REASONS]; BRANCH_KINDS],
     /// AMX moves completed inside blocks (`x86_64::amx_transfer`) and by
     /// the engine's service.
     pub amx_moves: [u64; 2],
@@ -748,6 +784,7 @@ impl core::ops::AddAssign for Statistics {
             native_transitions,
             engine_transitions,
             transition_misses,
+            branch_misses,
             line_queries,
             line_ticks,
             compiled_instructions,
@@ -825,6 +862,14 @@ impl core::ops::AddAssign for Statistics {
             .as_flattened_mut()
             .iter_mut()
             .zip(transition_misses.as_flattened())
+        {
+            *total += count;
+        }
+        for (total, count) in self
+            .branch_misses
+            .as_flattened_mut()
+            .iter_mut()
+            .zip(branch_misses.as_flattened())
         {
             *total += count;
         }

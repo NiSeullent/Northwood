@@ -261,6 +261,8 @@ fn main() -> Status {
     drop(firmware_root);
     let options = firmware::options(&mut volume).unwrap_or_else(|e| output::fatal(e));
     let options = choice::resolve(&mut volume, options);
+    // A stop the USB's log could not keep last time reaches it now.
+    selection::carry_failure_record(&options);
     status::done("");
     let held = system::held_at_start(&options);
     let selected = choice::choose(&mut volume, options, held);

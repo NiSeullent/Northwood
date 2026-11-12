@@ -19,6 +19,7 @@ use crate::{
 };
 use alloc::{format, string::String, vec::Vec};
 use core::{arch::asm, ops::Range, ptr::NonNull};
+use stela_boot_core::firmware_map::{self, RuntimeMapping};
 use stela_boot_core::options::{DEFAULT_WIFI_KEY, System};
 use stela_contracts::refuse;
 use stela_engine::machine::mmu::placement::Placement;
@@ -502,14 +503,11 @@ impl Inputs {
     }
 }
 
-/// `EFI_MEMORY_RUNTIME`: the region stays the firmware's after boot
-/// services, for its runtime services.
-const RUNTIME_ATTRIBUTE: u64 = 1 << 63;
-
 /// The firmware's runtime regions, and its `ResetSystem` service: zero when
 /// the system table has none.
 struct Runtime {
-    regions: Vec<(u64, u64, MemoryType)>,
+    /// (start, end, mapping) of each runtime region.
+    regions: Vec<(u64, u64, RuntimeMapping)>,
     reset: u64,
 }
 
@@ -521,10 +519,11 @@ impl Runtime {
             boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| refuse!("no memory map"))?;
         let regions = map
             .entries()
-            .filter(|entry| entry.att.bits() & RUNTIME_ATTRIBUTE != 0)
+            .filter(|entry| entry.att.bits() & firmware_map::MEMORY_RUNTIME != 0)
             .map(|entry| {
                 let start = entry.phys_start;
-                (start, start + entry.page_count * PAGE, entry.ty)
+                let mapping = firmware_map::runtime_mapping(entry.ty.0, entry.att.bits());
+                (start, start + entry.page_count * PAGE, mapping)
             })
             .collect();
         let reset = uefi::table::system_table_raw().map_or(0, |table| {
@@ -545,12 +544,13 @@ impl Runtime {
     fn code(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
         self.regions
             .iter()
-            .filter(|&&(_, _, kind)| runtime_code(kind))
+            .filter(|&&(_, _, mapping)| mapping == RuntimeMapping::Code)
             .map(|&(start, end, _)| (start, end, PRESENT | WRITABLE))
     }
 
-    /// Map the runtime regions outside RAM by identity: device registers
-    /// uncached, anything else write-back, code RWX and the rest RW+NX. A
+    /// Map the runtime regions outside RAM by identity: MMIO and regions
+    /// the firmware does not mark write-back capable uncached, the rest
+    /// write-back, code RWX and the rest RW+NX. A
     /// region overlapping RAM, which the identity map holds, or the storage
     /// registers, mapped already, is left as it is.
     fn map(
@@ -560,7 +560,7 @@ impl Runtime {
         ram: &[(usize, usize)],
         devices: &[Range<u64>],
     ) -> Result<()> {
-        for &(start, end, kind) in &self.regions {
+        for &(start, end, mapping) in &self.regions {
             let overlaps = ram.iter().any(|r| (r.0 as u64) < end && start < r.1 as u64)
                 || devices
                     .iter()
@@ -568,10 +568,10 @@ impl Runtime {
             if overlaps {
                 continue;
             }
-            let attributes = match kind {
-                MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE => NX | UNCACHED,
-                _ if runtime_code(kind) => 0,
-                _ => NX,
+            let attributes = match mapping {
+                RuntimeMapping::Uncached => NX | UNCACHED,
+                RuntimeMapping::Code => 0,
+                RuntimeMapping::WriteBack => NX,
             };
             for page in (start..end).step_by(PAGE as usize) {
                 tables::map_page(frames, root, page, page, PRESENT | WRITABLE | attributes)?;
@@ -579,13 +579,6 @@ impl Runtime {
         }
         Ok(())
     }
-}
-
-fn runtime_code(kind: MemoryType) -> bool {
-    matches!(
-        kind,
-        MemoryType::RUNTIME_SERVICES_CODE | MemoryType::PAL_CODE
-    )
 }
 
 /// Identity-map the storage controllers' registers uncached; none may

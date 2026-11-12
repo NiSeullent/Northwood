@@ -167,6 +167,8 @@ fn chained_load_case(branch: u32, btype: u8, landing_pad: bool) {
         // A page becomes guarded through a TLBI, which forgets its
         // translation.
         machine.forget_lookups(mmu::tlbi::Reach::Containing(BASE), None);
+        // The remap is the fetch cache's alone: no refill walks the tables.
+        machine.dropped_refills.clear();
         let slot = (target_pc / FETCH_PAGE) as usize % FETCH_CACHE;
         machine.fetch[slot].as_mut().unwrap().guarded = true;
         let Ok(Fetched::Block(current_entry)) = machine.fetch_block(BASE, false) else {

@@ -1425,9 +1425,7 @@ fn open_gpus(
     let heap_bytes = heap.end - heap.start;
     crate::status::begin("Starting the GPU");
     let gop = if handoff.screen.is_some() {
-        mmio.verified_framebuffer()
-            .map(Some)
-            .ok_or("the firmware framebuffer PCI source was unavailable")
+        mmio.verified_framebuffer().map(Some)
     } else {
         Ok(None)
     };
@@ -2508,6 +2506,10 @@ fn start_platform(
             }
             Err(error) => {
                 output::arguments(format_args!("HOST PCI containment unavailable: {error}\n"));
+                mmio.refuse_framebuffer(format!(
+                    "the firmware framebuffer's PCI function could not be checked because PCI \
+                     containment failed: {error}"
+                ));
                 None
             }
         }
@@ -2516,24 +2518,37 @@ fn start_platform(
         .as_ref()
         .and_then(|pci| pci.device_ids().ok())
         .unwrap_or_default();
-    if let Some(screen) = handoff.screen {
-        match (&contained_pci, screen.pci_source) {
+    if let (Some(screen), Some(mmio)) = (handoff.screen, native_mmio) {
+        let refusal = match (&contained_pci, screen.pci_source) {
             (Some(pci), Some(source)) => {
                 // SAFETY: the original parked PCI fabric still excludes all
                 // competing configuration writers at this point in startup.
                 match unsafe { pci.check_framebuffer(source) } {
-                    Ok(()) => output::arguments(format_args!(
-                        "HOST GOP PCI source {} BAR{} observed before and after firmware exit\n",
-                        source.address,
-                        source.bar.index()
-                    )),
-                    Err(error) => output::arguments(format_args!(
-                        "HOST GOP PCI source {} changed or unavailable: {error:?}\n",
+                    Ok(()) => {
+                        output::arguments(format_args!(
+                            "HOST GOP PCI source {} BAR{} observed before and after firmware \
+                             exit\n",
+                            source.address,
+                            source.bar.index()
+                        ));
+                        None
+                    }
+                    Err(error) => Some(format!(
+                        "the firmware framebuffer's PCI function {} changed across firmware \
+                         exit or cannot be read ({error:?})",
                         source.address
                     )),
                 }
             }
-            _ => output::arguments(format_args!("HOST GOP PCI source unavailable\n")),
+            (Some(_), None) => Some(String::from(
+                "the firmware named no PCI function for its framebuffer",
+            )),
+            // The containment failure is kept and logged above.
+            (None, _) => None,
+        };
+        if let Some(refusal) = refusal {
+            output::arguments(format_args!("HOST GOP PCI source unavailable: {refusal}\n"));
+            mmio.refuse_framebuffer(refusal);
         }
     }
     #[cfg(feature = "diagnostics")]
@@ -2845,6 +2860,12 @@ fn start_devices(
             let owned_drivers = drivers.cloned();
             let acpi_quirks = options.northwood.as_ref().map(|config| config.acpi.clone());
             let boot_disk = handoff.boot_disk().map(alloc::string::String::from);
+            // `--nor` naming the `--storage` partition keeps the machine
+            // state in its tail, where a failed start leaves its record.
+            let owned_state = options
+                .storage
+                .clone()
+                .filter(|_| options.nor.is_some() && options.nor == options.storage);
             // Each PCI function's start has its own budget
             // (`stela_drivers::probe::DEVICE_START_US`) and is given up past
             // it; this whole bound only catches a stall outside every
@@ -2883,6 +2904,7 @@ fn start_devices(
                             policy: policy.pci(),
                             external,
                             boot_disk: boot_disk.as_deref(),
+                            state: owned_state.as_ref(),
                         },
                     )
                 }
@@ -2921,8 +2943,14 @@ fn start_devices(
                 power,
             } = opened
                 .unwrap_or_else(|error| output::fatal(error))
-                .unwrap_or_else(|error| {
+                .unwrap_or_else(|refused| {
+                    let error = refused.refusal;
                     output::arguments(format_args!("host storage refusal: {error}\n"));
+                    // The USB's log, when its disk was found, keeps the
+                    // step's lines before the stop.
+                    if let Some(log) = refused.log {
+                        crate::log_file::resume(log);
+                    }
                     output::fatal(format_args!("host storage could not be opened: {error}"))
                 });
             if let Some(acpi) = host_acpi {
@@ -3033,6 +3061,8 @@ fn start_devices(
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {
                 translations::set_partition(store);
+                #[cfg(feature = "nvk")]
+                super::pipelines::prepare();
             }
             fdr_device = fdr;
             if usb.firmware_missing() {

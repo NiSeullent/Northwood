@@ -17,6 +17,10 @@ use {
     super::system::helpers::effective_nvx, stela_contracts::Feature,
 };
 
+/// The reservation word of a PE without canonical memory: its local
+/// monitor lives in the frame and in [`Cpu::monitor`] alone.
+static NO_RESERVATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// How often [`Cpu::note_ctrr_locks`] looks again for a CTRR group that was
 /// not locked: a cluster's groups lock once, while its PEs start.
 const CTRR_LOOKS: u8 = 64;
@@ -518,6 +522,24 @@ impl Cpu {
     }
     pub fn has_canonical_memory(&self) -> bool {
         self.canonical_memory.is_some()
+    }
+    /// Where native ERET reads whether the canonical local reservation is
+    /// held: nonzero while it is, and always zero without canonical memory.
+    pub fn reservation_word(&self) -> u64 {
+        self.canonical_memory
+            .as_ref()
+            .map_or(&NO_RESERVATION as *const _ as u64, |memory| {
+                memory.reservation_word()
+            })
+    }
+    /// Whether clearing the local monitor would change anything outside the
+    /// frame: the engine's monitor, or a canonical reservation.
+    pub fn holds_exclusive(&self) -> bool {
+        self.monitor.is_some()
+            || self
+                .canonical_memory
+                .as_ref()
+                .is_some_and(|memory| memory.holds_reservation())
     }
 
     /// Present an identification that withholds the chip's features in

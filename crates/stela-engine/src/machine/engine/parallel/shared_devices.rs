@@ -93,6 +93,18 @@ pub(super) fn register_bit(encoding: Encoding) -> Option<usize> {
 }
 
 impl<D: Devices> Board<D> {
+    /// Host work done outside the devices' lock completed something they
+    /// should look at: the home machine takes its next transfer at once,
+    /// which publishes their real deadline again. Told as a line change, which
+    /// its sleep checks, so a wake sent just before it marks itself asleep
+    /// is not lost.
+    pub(super) fn call_home(&self) {
+        let home = self.hub.home.load(Ordering::Acquire);
+        self.dma.store(0, Ordering::Release);
+        self.hub.lines_changed_unwoken(home);
+        self.hub.wake(home);
+    }
+
     pub(super) fn lock(&self, call: Call) -> Held<'_, D> {
         let (state, since, waited) = match self.devices.try_lock() {
             Ok(state) => (state, self.hub.ticks(), 0),
@@ -353,12 +365,18 @@ impl<D: Devices> Drop for Held<'_, D> {
         // A PE inside its run loop leaves that work, which can wait on a
         // host device, to the next release by a PE outside it or to the
         // host's own service: meanwhile it would read no mail, and every
-        // maintenance broadcast would wait for it.
-        if self.board.hub.serves_released(self.pe) && self.board.hub.kick.released() {
-            self.board.dma.store(0, Ordering::Release);
-            self.board
-                .hub
-                .wake(self.board.hub.home.load(Ordering::Acquire));
+        // maintenance broadcast would wait for it. A PE outside it for a
+        // guest exit (a storage doorbell's) hands the work to a PE that
+        // sleeps waiting for an interrupt, whose idle core does it at its
+        // host service, and goes on with its guest; with none asleep it does
+        // the work itself, as before.
+        let hub = &self.board.hub;
+        if hub.serves_released(self.pe)
+            && hub.kick.release_due()
+            && !hub.hand_off_service(self.pe)
+            && hub.kick.released()
+        {
+            self.board.call_home();
         }
     }
 }
@@ -542,6 +560,12 @@ impl<D: Devices> SharedDevices<D> {
         })
     }
 
+    /// Host work done outside the devices' lock, such as a staged disk's
+    /// step, completed something they should look at ([`Board::call_home`]).
+    pub fn call_home(&self) {
+        self.board.call_home();
+    }
+
     /// Serve the host's inputs with `f`, which can change any PE's lines.
     pub fn serve<R>(&self, f: impl FnOnce(&mut D) -> R) -> R {
         let now = self.board.now.load(Ordering::Acquire);
@@ -629,10 +653,7 @@ impl<D: Devices> SharedDevices<D> {
             for copy in copies {
                 copy.run(memory);
             }
-            let home = self.board.hub.home.load(Ordering::Acquire);
-            self.board.dma.store(0, Ordering::Release);
-            self.board.hub.lines_changed_unwoken(home);
-            self.board.hub.wake(home);
+            self.board.call_home();
         }
         result
     }

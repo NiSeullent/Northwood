@@ -143,8 +143,8 @@ impl<'a> ContainedPci<'a> {
             })
         }?;
         self.source
-            .verified_framebuffer
-            .set(source)
+            .framebuffer
+            .set(Ok(source))
             .map_err(|_| Error::Busy)
     }
 
@@ -264,14 +264,41 @@ enum Cause {
     BridgeAlias,
 }
 
+/// A plain sentence for the boot log: the function, what failed and what it
+/// means for containment.
 impl fmt::Display for ContainmentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(address) = self.address {
-            write!(f, "{address} ")?;
+            write!(f, "{address}: ")?;
         }
         match self.cause {
-            Cause::Claim(cause) => write!(f, "{cause:?} ({:?})", self.effect),
-            Cause::Topology(cause) => write!(f, "PCI topology {cause:?}"),
+            Cause::Claim(ClaimError::Mapping(error)) if self.address.is_none() => {
+                write!(
+                    f,
+                    "the PCI configuration space cannot be mapped ({error:?})"
+                )
+            }
+            Cause::Claim(ClaimError::Config(error)) => {
+                write!(f, "{error}")?;
+                if let ConfigFailure::Readback {
+                    offset: COMMAND, ..
+                } = error.reason
+                {
+                    f.write_str(
+                        "; the function keeps bus mastering or INTx on, so Stela cannot hold it \
+                         stopped",
+                    )?;
+                }
+                Ok(())
+            }
+            Cause::Claim(cause) => {
+                write!(f, "{cause}")?;
+                if let ConfigEffect::WriteMayHaveApplied { offset, .. } = self.effect {
+                    write!(f, " after Stela wrote its register {offset:#x}")?;
+                }
+                Ok(())
+            }
+            Cause::Topology(cause) => write!(f, "the PCI topology is inconsistent ({cause:?})"),
             Cause::BridgeForwarding => f.write_str("upstream bridge forwarding is unavailable"),
             Cause::BridgeAlias => f.write_str("bridge DMA requester aliases are unqualified"),
         }

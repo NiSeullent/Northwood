@@ -1,25 +1,30 @@
 //! FRECPE/FRSQRTE/FRECPX through exact integer arithmetic.
 use super::super::isa::ShiftOpcode;
+use super::encode::guest;
 use super::numerical::helper_section;
 use super::numerical::{
     ArithmeticOpcode, Condition, INPUT_MINIMUM_EXPONENT, Rounding, branch, clear_scalar,
-    emit_opcode, environment_round, exponent_range, exponent_range_below, positive_exponent_range,
-    prepare_vector_input_range, prepare_vector_input_range_below, read_numerical_vector, resolve,
-    restore_environment, test_control, vector_exponent_range, vector_positive_exponent_range,
+    emit_opcode, environment_round, exponent_range, exponent_range_below, jump,
+    positive_exponent_range, prepare_vector_input_range, prepare_vector_input_range_below,
+    read_numerical_vector, resolve, restore_environment, test_control, vector_exponent_range,
+    vector_positive_exponent_range,
 };
 use super::{Host, commit, packed, read_vector};
-use crate::x86_64::asm::{Alu, Code, Gpr, Mem, ShiftOp, Size, Unary};
+use crate::x86_64::asm::{Alu, Code, FloatLanes, Gpr, Mem, Rm, ShiftOp, Size, Unary};
 use crate::{
     GuestAddress, TargetCpu,
     aarch64::{
-        floating::{FPCR_AH, FPCR_EXCEPTION_ENABLE_MASK, FPCR_NEP, Format},
+        floating::{
+            DIVIDE_BY_ZERO, FPCR_AH, FPCR_DN, FPCR_EXCEPTION_ENABLE_MASK, FPCR_FIZ, FPCR_FZ,
+            FPCR_NEP, Format, INPUT_DENORMAL, INVALID, UNDERFLOW,
+        },
         simd::{
             arithmetic::Shape,
             estimate::{Kind, Operand},
         },
     },
 };
-use Gpr::{R8, R9, Rax, Rcx, Rdx};
+use Gpr::{R8, R9, R10, R11, Rax, Rcx, Rdx};
 use alloc::vec::Vec;
 
 const RESULT: u8 = 0;
@@ -123,7 +128,20 @@ fn dword_constant(code: &mut Code, vector: u8, value: u32) {
     super::shuffle(code, vector, vector, BROADCAST_LOW_DWORD);
 }
 
-fn source_guard(code: &mut Code, operand: &Operand, helper: &mut Vec<usize>) {
+/// Whether inputs outside the table's domain take [`special_lanes`]
+/// rather than the helper.
+fn special_supported(operand: &Operand) -> bool {
+    matches!(operand.kind, Kind::Reciprocal | Kind::ReciprocalSquareRoot)
+        && operand.format != Format::Half
+}
+
+fn source_guard(
+    code: &mut Code,
+    operand: &Operand,
+    helper: &mut Vec<usize>,
+    special: &mut Vec<usize>,
+) {
+    let to_special = special_supported(operand);
     if !operand.kind.is_unsigned() {
         // AH suppresses every estimate exception, including kept enables.
         test_control(code, FPCR_AH);
@@ -152,7 +170,12 @@ fn source_guard(code: &mut Code, operand: &Operand, helper: &mut Vec<usize>) {
         } else {
             exponent_range(code, operand.format, SOURCE, INPUT_MINIMUM_EXPONENT);
         }
-        helper.push(branch(code, Condition::AboveOrEqual));
+        let range = branch(code, Condition::AboveOrEqual);
+        if to_special {
+            special.push(range)
+        } else {
+            helper.push(range)
+        }
     } else {
         if operand.kind == Kind::Reciprocal {
             // Exclude the top two normal source exponents: their reciprocal
@@ -166,7 +189,12 @@ fn source_guard(code: &mut Code, operand: &Operand, helper: &mut Vec<usize>) {
         } else {
             vector_exponent_range(code, operand.format, operand.shape, SOURCE);
         }
-        helper.push(branch(code, Condition::NotZero));
+        let range = branch(code, Condition::NotZero);
+        if to_special {
+            special.push(range)
+        } else {
+            helper.push(range)
+        }
     }
 }
 
@@ -415,6 +443,283 @@ fn reciprocal_exponent(code: &mut Code, format: Format) {
     }
 }
 
+const LESS: u8 = 1;
+
+fn quiet_bit(format: Format) -> u64 {
+    1 << (format.fraction_bits() - 1)
+}
+
+const LESS_OR_EQUAL: u8 = 2;
+const UNORDERED: u8 = 3;
+const NOT_EQUAL: u8 = 4;
+
+/// One `format` lane's `bits` in every lane of `xmm`.
+fn lane_constant(code: &mut Code, format: Format, xmm: u8, bits: u64) {
+    if format == Format::Double {
+        code.asm().mov_imm64(Rax, bits);
+        packed(code, Host::MoveGprQword, xmm, ACCUMULATOR_GPR);
+        packed(code, Host::UnpackLowQword, xmm, xmm);
+    } else {
+        dword_constant(code, xmm, bits as u32);
+    }
+}
+
+/// Packed CMPPS/CMPPD `predicate` of `destination` against `source`. Its
+/// MXCSR status is never guest state.
+fn compare(code: &mut Code, format: Format, destination: u8, source: u8, predicate: u8) {
+    let lanes = if format == Format::Double {
+        FloatLanes::PackedDouble
+    } else {
+        FloatLanes::PackedSingle
+    };
+    code.asm()
+        .float_compare(lanes, destination, Rm::Xmm(source), predicate);
+}
+
+/// The MOVMSKPS bits of the active lanes: a Double lane's high dword.
+fn active_lanes(operand: &Operand) -> i32 {
+    match (operand.format, operand.shape) {
+        (Format::Double, Shape::Scalar) => 0b10,
+        (Format::Double, _) => 0b1010,
+        (_, Shape::Scalar) => 0b1,
+        (_, Shape::Vector64) => 0b11,
+        _ => 0b1111,
+    }
+}
+
+/// Branch taken when no active lane of the lane mask `xmm` is set.
+fn none_active(code: &mut Code, xmm: u8, active: i32) -> usize {
+    Host::DwordSignMask.register(code, ACCUMULATOR_GPR, xmm, TargetCpu::Baseline);
+    code.asm().test_imm(Size::Dword, Rax, active);
+    branch(code, Condition::Zero)
+}
+
+/// Add FPSR `flag` to R11D's fresh flags where an active lane of `xmm` is set.
+fn flag_if_active(code: &mut Code, xmm: u8, active: i32, flag: u32) {
+    let none = none_active(code, xmm, active);
+    code.asm().alu_imm32(Alu::Or, Size::Dword, R11, flag as i32);
+    let next = code.len();
+    resolve(code, none, next);
+}
+
+/// Where an active lane of `xmm` is set: take the helper unless FPCR (R10D)
+/// has one of `accepted`, and add `flag` where it has `flagged`.
+fn lanes_need_control(
+    code: &mut Code,
+    xmm: u8,
+    active: i32,
+    (accepted, flagged, flag): (u32, u32, u32),
+    helper: &mut Vec<usize>,
+) {
+    let none = none_active(code, xmm, active);
+    code.asm().test_imm(Size::Dword, R10, accepted as i32);
+    helper.push(branch(code, Condition::Zero));
+    code.asm().test_imm(Size::Dword, R10, flagged as i32);
+    let quiet = branch(code, Condition::Zero);
+    code.asm().alu_imm32(Alu::Or, Size::Dword, R11, flag as i32);
+    let next = code.len();
+    resolve(code, none, next);
+    resolve(code, quiet, next);
+}
+
+/// FPCR's (R10D) default NaN in every lane of `xmm`: negative under AH.
+fn default_nan(code: &mut Code, format: Format, xmm: u8) {
+    let sign_shift = format.bits() as u8 - 1 - FPCR_AH.trailing_zeros() as u8;
+    let quiet = format.exponent_mask() | quiet_bit(format);
+    let size = Size::of(format == Format::Double);
+    let mut asm = code.asm();
+    asm.mov(size, Rax, R10);
+    asm.alu_imm32(Alu::And, size, Rax, FPCR_AH as i32);
+    asm.shift_imm(ShiftOp::Shl, size, Rax, sign_shift);
+    asm.mov_imm64(Rcx, quiet);
+    asm.alu(Alu::Or, size, Rax, Rcx);
+    if format == Format::Double {
+        packed(code, Host::MoveGprQword, xmm, ACCUMULATOR_GPR);
+        packed(code, Host::UnpackLowQword, xmm, xmm);
+    } else {
+        code.asm().movd_to_xmm(xmm, Rax);
+        super::shuffle(code, xmm, xmm, BROADCAST_LOW_DWORD);
+    }
+}
+
+/// Each lane's NaN result in `xmm` (`quiet` holds the quiet bit in every
+/// lane): the default NaN under DN, else the input (SAVED) made quiet.
+fn nan_result(code: &mut Code, format: Format, xmm: u8, quiet: u8) {
+    packed(code, Host::MoveAligned, xmm, SAVED);
+    packed(code, Host::Or, xmm, quiet);
+    code.asm().test_imm(Size::Dword, R10, FPCR_DN as i32);
+    let kept = branch(code, Condition::Zero);
+    default_nan(code, format, xmm);
+    let next = code.len();
+    resolve(code, kept, next);
+}
+
+/// FRECPE and FRSQRTE where some active lane is outside the table's
+/// domain (zero, subnormal, infinity, NaN, FRSQRTE's negative inputs and
+/// FRECPE's inputs whose estimate is subnormal): the table path runs with
+/// those lanes replaced by one, and each takes Arm's result for its class,
+/// with the cumulative flags its class raises (none under AH). Only a
+/// subnormal input that no FZ, FIZ or AH flushes, and an FRECPE input whose
+/// subnormal estimate no FZ or AH flushes, take the helper.
+fn special_lanes(code: &mut Code, operand: &Operand, target: TargetCpu, helper: &mut Vec<usize>) {
+    let format = operand.format;
+    let sqrt = reciprocal_sqrt(operand.kind);
+    let active = active_lanes(operand);
+    let fraction_bits = format.fraction_bits();
+    let magnitude_mask = format.sign_mask() - 1;
+    let infinity = format.exponent_mask();
+    let minimum = 1u64 << fraction_bits;
+    let one = u64::from(format.exponent_bias()) << fraction_bits;
+    // FRECPE's estimate is subnormal from this magnitude on.
+    let subnormal_estimate = u64::from(2 * format.exponent_bias() - 1) << fraction_bits;
+    if operand.shape == Shape::Scalar {
+        clear_scalar(code, format, SOURCE);
+    }
+    packed(code, Host::MoveAligned, SAVED, SOURCE);
+    // In the domain: minimum <= |x| < limit, for FRSQRTE on x itself so
+    // that negative inputs leave it. NaN compares false.
+    let magnitude = if sqrt {
+        SOURCE
+    } else {
+        lane_constant(code, format, CONSTANT, magnitude_mask);
+        packed(code, Host::MoveAligned, TEMP, SOURCE);
+        packed(code, Host::And, TEMP, CONSTANT);
+        TEMP
+    };
+    lane_constant(code, format, DENOMINATOR, minimum);
+    compare(code, format, DENOMINATOR, magnitude, LESS_OR_EQUAL);
+    let limit = if sqrt { infinity } else { subnormal_estimate };
+    lane_constant(code, format, CONSTANT, limit);
+    packed(code, Host::MoveAligned, COMPACT, magnitude);
+    compare(code, format, COMPACT, CONSTANT, LESS);
+    packed(code, Host::And, DENOMINATOR, COMPACT);
+    lane_constant(code, format, CONSTANT, one);
+    packed(code, Host::And, SOURCE, DENOMINATOR);
+    packed(code, Host::AndNot, DENOMINATOR, CONSTANT);
+    packed(code, Host::Or, SOURCE, DENOMINATOR);
+    floating_estimate(code, operand, target);
+
+    // RESULT holds the table results, SAVED the inputs.
+    const MAGNITUDE: u8 = SOURCE;
+    const ZERO_CLASS: u8 = DENOMINATOR;
+    const NAN: u8 = CONSTANT;
+    const SCRATCH: u8 = TEMP;
+    const VALUE: u8 = EXPONENT;
+    const LANES: u8 = COMPACT;
+    lane_constant(code, format, SCRATCH, magnitude_mask);
+    packed(code, Host::MoveAligned, MAGNITUDE, SAVED);
+    packed(code, Host::And, MAGNITUDE, SCRATCH);
+    lane_constant(code, format, SCRATCH, minimum);
+    packed(code, Host::MoveAligned, ZERO_CLASS, MAGNITUDE);
+    compare(code, format, ZERO_CLASS, SCRATCH, LESS);
+    packed(code, Host::MoveAligned, NAN, SAVED);
+    compare(code, format, NAN, SAVED, UNORDERED);
+    {
+        let mut asm = code.asm();
+        asm.mov_load(
+            Size::Dword,
+            R10,
+            guest(core::mem::offset_of!(crate::GuestState, fpcr) as u32),
+        );
+        asm.alu(Alu::Xor, Size::Dword, R11, R11);
+    }
+    // Subnormal inputs are zeros where flushed, IDC under FZ.
+    packed(code, Host::Xor, LANES, LANES);
+    compare(code, format, LANES, MAGNITUDE, NOT_EQUAL);
+    packed(code, Host::And, LANES, ZERO_CLASS);
+    lanes_need_control(
+        code,
+        LANES,
+        active,
+        (FPCR_FZ | FPCR_FIZ | FPCR_AH, FPCR_FZ, INPUT_DENORMAL),
+        helper,
+    );
+    flag_if_active(code, ZERO_CLASS, active, DIVIDE_BY_ZERO);
+    // Signalling NaNs: NaN with the quiet bit clear.
+    lane_constant(code, format, SCRATCH, quiet_bit(format));
+    packed(code, Host::MoveAligned, LANES, SAVED);
+    packed(code, Host::And, LANES, SCRATCH);
+    packed(code, Host::Xor, VALUE, VALUE);
+    packed(code, Host::EqualDword, LANES, VALUE);
+    packed(code, Host::And, LANES, NAN);
+    flag_if_active(code, LANES, active, INVALID);
+    // VALUE: the sign alone.
+    packed(code, Host::MoveAligned, VALUE, SAVED);
+    packed(code, Host::Xor, VALUE, MAGNITUDE);
+    lane_constant(code, format, SCRATCH, infinity);
+    if sqrt {
+        // Zeros give the signed infinity, +infinity zero, other negative
+        // inputs the default NaN with IOC.
+        packed(code, Host::Or, VALUE, SCRATCH);
+        packed(code, Host::And, VALUE, ZERO_CLASS);
+        const DOMAIN: u8 = SCRATCH;
+        packed(code, Host::MoveAligned, LANES, SAVED);
+        compare(code, format, LANES, SCRATCH, LESS);
+        lane_constant(code, format, DOMAIN, minimum);
+        compare(code, format, DOMAIN, SAVED, LESS_OR_EQUAL);
+        packed(code, Host::And, DOMAIN, LANES);
+        const NEGATIVE: u8 = ZERO_CLASS;
+        packed(code, Host::Xor, LANES, LANES);
+        packed(code, Host::MoveAligned, MAGNITUDE, SAVED);
+        compare(code, format, MAGNITUDE, LANES, LESS);
+        packed(code, Host::AndNot, NEGATIVE, MAGNITUDE);
+        flag_if_active(code, NEGATIVE, active, INVALID);
+        default_nan(code, format, MAGNITUDE);
+        packed(code, Host::And, MAGNITUDE, NEGATIVE);
+        packed(code, Host::AndNot, NEGATIVE, VALUE);
+        packed(code, Host::Or, NEGATIVE, MAGNITUDE);
+        // NEGATIVE now holds the non-NaN values.
+        lane_constant(code, format, MAGNITUDE, quiet_bit(format));
+        nan_result(code, format, LANES, MAGNITUDE);
+        packed(code, Host::And, LANES, NAN);
+        packed(code, Host::AndNot, NAN, NEGATIVE);
+        packed(code, Host::Or, NAN, LANES);
+        packed(code, Host::And, RESULT, DOMAIN);
+        packed(code, Host::AndNot, DOMAIN, NAN);
+        packed(code, Host::Or, RESULT, DOMAIN);
+    } else {
+        // Zeros give the signed infinity, infinities and inputs whose
+        // estimate flushes the signed zero (UFC under FZ).
+        packed(code, Host::MoveAligned, LANES, MAGNITUDE);
+        compare(code, format, LANES, SCRATCH, LESS);
+        packed(code, Host::And, SCRATCH, ZERO_CLASS);
+        packed(code, Host::Or, VALUE, SCRATCH);
+        const SPECIAL: u8 = SCRATCH;
+        lane_constant(code, format, SPECIAL, subnormal_estimate);
+        compare(code, format, SPECIAL, MAGNITUDE, LESS_OR_EQUAL);
+        packed(code, Host::And, LANES, SPECIAL);
+        lanes_need_control(
+            code,
+            LANES,
+            active,
+            (FPCR_FZ | FPCR_AH, FPCR_FZ, UNDERFLOW),
+            helper,
+        );
+        packed(code, Host::Or, SPECIAL, ZERO_CLASS);
+        packed(code, Host::Or, SPECIAL, NAN);
+        lane_constant(code, format, MAGNITUDE, quiet_bit(format));
+        nan_result(code, format, LANES, MAGNITUDE);
+        packed(code, Host::And, LANES, NAN);
+        packed(code, Host::AndNot, NAN, VALUE);
+        packed(code, Host::Or, NAN, LANES);
+        packed(code, Host::And, NAN, SPECIAL);
+        packed(code, Host::AndNot, SPECIAL, RESULT);
+        packed(code, Host::Or, SPECIAL, NAN);
+        packed(code, Host::MoveAligned, RESULT, SPECIAL);
+    }
+    // AH keeps every estimate flag.
+    code.asm().test_imm(Size::Dword, R10, FPCR_AH as i32);
+    let alternative = branch(code, Condition::NotZero);
+    code.asm().alu(
+        Alu::Or,
+        Size::Dword,
+        guest(core::mem::offset_of!(crate::GuestState, fpsr) as u32),
+        R11,
+    );
+    let next = code.len();
+    resolve(code, alternative, next);
+}
+
 fn commit_result(code: &mut Code, operand: &Operand) {
     let result = if operand.shape == Shape::Scalar {
         read_vector(code, operand.destination, SAVED);
@@ -453,7 +758,8 @@ pub(in crate::x86_64) fn emit(
     target: TargetCpu,
 ) {
     let mut helper = Vec::new();
-    source_guard(code, operand, &mut helper);
+    let mut special = Vec::new();
+    source_guard(code, operand, &mut helper, &mut special);
     if operand.kind.is_unsigned() {
         unsigned_estimate(code, operand.kind, target);
     } else if operand.kind == Kind::ReciprocalExponent {
@@ -461,8 +767,21 @@ pub(in crate::x86_64) fn emit(
     } else {
         floating_estimate(code, operand, target);
     }
+    let mut done = Vec::new();
+    if !special.is_empty() {
+        done.push(jump(code));
+        let start = code.len();
+        for patch in special {
+            resolve(code, patch, start);
+        }
+        special_lanes(code, operand, target, &mut helper);
+    }
     if !helper.is_empty() {
         helper_section(code, &helper, pc);
+    }
+    let end = code.len();
+    for patch in done {
+        resolve(code, patch, end);
     }
     commit_result(code, operand);
 }

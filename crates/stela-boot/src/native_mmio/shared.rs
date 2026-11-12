@@ -24,7 +24,7 @@ use crate::{
 mod config_space;
 pub(crate) use config_space::{ContainedPci, ContainmentError};
 mod hpet;
-use alloc::{boxed::Box, rc::Rc, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
 use core::{
     arch::asm,
     cell::UnsafeCell,
@@ -454,7 +454,9 @@ pub(crate) struct Source {
     hpet_assignment: core::cell::RefCell<Option<Assignment<Reservation>>>,
     pci_slots: config_space::PciSlots,
     pci_clock: core::cell::OnceCell<crate::native_clock::Prepared>,
-    verified_framebuffer: core::cell::OnceCell<crate::pci_io::FramebufferSource>,
+    /// The firmware framebuffer's PCI function, checked before and after
+    /// firmware exit, or why it could not be.
+    framebuffer: core::cell::OnceCell<Result<crate::pci_io::FramebufferSource, String>>,
     ioapics: core::cell::RefCell<MountedIoapics>,
 }
 
@@ -601,13 +603,25 @@ impl Source {
             hpet_assignment: core::cell::RefCell::new(None),
             pci_slots: config_space::PciSlots::new(),
             pci_clock: core::cell::OnceCell::new(),
-            verified_framebuffer: core::cell::OnceCell::new(),
+            framebuffer: core::cell::OnceCell::new(),
             ioapics: core::cell::RefCell::new(MountedIoapics::Unclaimed),
         })
     }
 
-    pub(crate) fn verified_framebuffer(&self) -> Option<crate::pci_io::FramebufferSource> {
-        self.verified_framebuffer.get().copied()
+    /// The checked framebuffer source, or a sentence saying why there is none.
+    pub(crate) fn verified_framebuffer(&self) -> Result<crate::pci_io::FramebufferSource, String> {
+        match self.framebuffer.get() {
+            Some(result) => result.clone(),
+            None => Err(String::from(
+                "the firmware framebuffer's PCI function was never checked",
+            )),
+        }
+    }
+
+    /// Keep why the framebuffer's PCI function could not be checked. The
+    /// first outcome stays.
+    pub(crate) fn refuse_framebuffer(&self, why: String) {
+        let _ = self.framebuffer.set(Err(why));
     }
 
     pub(crate) fn authority(&self) -> &Authority {

@@ -1,32 +1,60 @@
-//! The Metal device's pipeline store: `stela/store/pipeline.bin`, a file `stela setup`
-//! preallocates beside the translation packs.
+//! The Metal device's pipeline store: `pipeline.bin`, a file `stela setup`
+//! preallocates beside the translation packs in either layout.
 //!
-//! Before boot services end, [`read`] reads the stored pipelines from the
-//! store's volume (the first with `store.cfg`). [`install`] hands them to
-//! the Metal device, which seeds its compiled pipelines' cache from them
-//! when they are its compiler build's and GPU's. When the guest restarts or
-//! powers off, [`write`] rewrites the file in place with the device's
-//! newest snapshot, over the store's partition, before the translation pack
-//! is written. Every failure leaves the boot running: its pipelines compile
-//! again.
+//! The file is a journal (`stela_formats::journal`) of the driver's pipeline
+//! cache and the compiler's NIR: an update writes only into space the newest
+//! commit does not use and then commits, so a write cut by a power loss, a
+//! panic or a forced stop leaves the previous content whole. Before boot
+//! services end, [`read`] reads the newest whole commit from the store's
+//! volume (the first with `store.cfg`). [`install`] hands its content to the
+//! Metal device, which seeds its compiled pipelines' cache from it when it is
+//! its compiler build's and GPU's.
+//!
+//! While the guest runs, [`step`] writes what the device added (new NIR and
+//! newer cache snapshots) through the store's staged partition, a piece at a
+//! time: the processor that steps only queues commands and takes results,
+//! and processors step the disk in bounded steps. When the guest restarts or
+//! powers off, [`write`] finishes that work and writes what is left. A file
+//! of an older layout reads as empty and is replaced by the first write.
+//! Every failure leaves the boot running: its pipelines compile again.
 use super::translations;
 use crate::{firmware, handoff::Region, output, paging::PAGE};
-use alloc::format;
-use stela_drivers::block::BlockDevice;
-use stela_drivers::gpu::metal::native::pipeline_store::{self, HEADER_BYTES, MAX_BYTES};
+use alloc::{format, string::String, vec, vec::Vec};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, Ordering},
+};
+use stela_drivers::block::{BlockDevice, Command};
+use stela_drivers::gpu::metal::native::pipeline_store::{self, Key, MAX_BYTES};
+use stela_formats::journal::{
+    self, Change, Commit, DATA_START, Execution, SLOT_BYTES, Target, device_ranges,
+};
 use stela_formats::payload::pieces::Extent;
 use uefi::proto::media::file::{File as _, FileInfo, FileMode};
 
-/// The handoff file holding the file's size and the stored pipelines.
+/// The handoff file holding the file's size, its newest commit and the
+/// content that commit names.
 pub const FILE: &str = "pipelines";
 /// The file's 8.3 name in the store's directory.
 const NAME: &str = "pipeline.bin";
 /// The placement record at the start of the handoff file: magic and the
-/// file's size, the store's bound; the stored bytes follow.
-const PLACEMENT_MAGIC: [u8; 8] = *b"STLGPLAC";
+/// file's size; the commit's slot ([`SLOT_BYTES`], zeros for none) and the
+/// device's store follow.
+const PLACEMENT_MAGIC: [u8; 8] = *b"STLGPLC2";
 const PLACEMENT_BYTES: usize = 16;
-/// The bytes a write sends to the device at a time.
-const TRANSFER_BYTES: usize = 1 << 20;
+/// The journal's domain, and the kinds of its blobs: the driver's pipeline
+/// cache, which a newer one replaces, and pieces of NIR entries, appended.
+const DOMAIN: [u8; 8] = *b"PIPELINE";
+const CACHE: u32 = 1;
+const NIR: u32 = 2;
+/// NIR pieces past which an update rewrites the NIR as one.
+const NIR_PIECES: usize = 64;
+/// The bytes one write command carries, and the most a step queues.
+const PIECE_BYTES: u64 = 1 << 20;
+/// How long after an update the next may start: new pipelines come in
+/// bursts, and each update of the cache rewrites it whole (tens of MB on a
+/// USB stick), so a crash loses at most this much of them.
+const QUIET_MILLIS: u64 = 30_000;
 
 /// The pipelines the store's volume holds, as the handoff file's pages:
 /// run before boot services end. `None` without a store or its file.
@@ -40,25 +68,27 @@ pub fn read() -> Option<Region> {
             ));
             return None;
         };
-        let size = file
-            .get_boxed_info::<FileInfo>()
-            .ok()?
-            .file_size()
-            .min(MAX_BYTES);
-        let mut header = [0; HEADER_BYTES];
-        let stored = if size < HEADER_BYTES as u64 {
-            0
-        } else {
-            translations::read_exact(&mut file, &mut header)?;
-            // A store this build cannot read keeps its header, so the device
-            // reports why it is ignored; a blank file holds nothing.
-            match pipeline_store::stored_bytes(&header) {
-                Ok(bytes) if bytes <= size => bytes as usize,
-                Err(pipeline_store::Rejection::Blank) => 0,
-                _ => HEADER_BYTES,
-            }
+        let size = file.get_boxed_info::<FileInfo>().ok()?.file_size();
+        let mut slots = vec![0; DATA_START as usize];
+        let found =
+            if size >= DATA_START && translations::read_exact(&mut file, &mut slots).is_some() {
+                journal::candidates(&slots, DOMAIN, size)
+                    .into_iter()
+                    .find_map(|commit| {
+                        let blobs = journal::read_entries(&commit, |offset, into| {
+                            file.set_position(offset).ok()?;
+                            translations::read_exact(&mut file, into)
+                        })?;
+                        Some((commit, blobs))
+                    })
+            } else {
+                None
+            };
+        let (slot, store) = match &found {
+            Some((commit, blobs)) => (commit.encode(), linear(commit, blobs)),
+            None => (vec![0; SLOT_BYTES as usize], Vec::new()),
         };
-        let bytes = PLACEMENT_BYTES + stored;
+        let bytes = PLACEMENT_BYTES + slot.len() + store.len();
         let pages = bytes.div_ceil(PAGE);
         let physical = firmware::pages(pages).ok()?;
         // SAFETY: firmware returned this exclusive allocation of `bytes` or
@@ -70,17 +100,19 @@ pub fn read() -> Option<Region> {
         };
         region[..8].copy_from_slice(&PLACEMENT_MAGIC);
         region[8..16].copy_from_slice(&size.to_le_bytes());
-        if stored != 0 {
-            let at = PLACEMENT_BYTES;
-            region[at..at + HEADER_BYTES].copy_from_slice(&header);
-            if translations::read_exact(&mut file, &mut region[at + HEADER_BYTES..]).is_none() {
-                // A short file seeds nothing; the device reports its length.
-                region[at + HEADER_BYTES..].fill(0);
-            }
+        region[PLACEMENT_BYTES..PLACEMENT_BYTES + slot.len()].copy_from_slice(&slot);
+        region[PLACEMENT_BYTES + slot.len()..].copy_from_slice(&store);
+        match &found {
+            Some((commit, blobs)) => output::arguments(format_args!(
+                "PIPELINES {path} file={size} stored={} generation={} blobs={}\n",
+                store.len(),
+                commit.generation,
+                blobs.len()
+            )),
+            None => output::arguments(format_args!(
+                "PIPELINES {path} file={size} stored=0 (no whole commit)\n"
+            )),
         }
-        output::arguments(format_args!(
-            "PIPELINES {path} file={size} stored={stored}\n"
-        ));
         Some(Region {
             physical: physical as u64,
             bytes: bytes as u64,
@@ -88,86 +120,387 @@ pub fn read() -> Option<Region> {
     })
 }
 
+/// The device's store layout of `commit`'s `blobs`: header, cache, NIR.
+fn linear(commit: &Commit, blobs: &[journal::Blob]) -> Vec<u8> {
+    let part = |kind| -> Vec<u8> {
+        blobs
+            .iter()
+            .filter(|(blob, _)| *blob == kind)
+            .flat_map(|(_, bytes)| bytes.iter().copied())
+            .collect()
+    };
+    let (cache, nir) = (part(CACHE), part(NIR));
+    let mut store = pipeline_store::header_with_nir(&Key(commit.key), &cache, &nir).to_vec();
+    store.extend_from_slice(&cache);
+    store.extend_from_slice(&nir);
+    if store.len() as u64 > MAX_BYTES {
+        return Vec::new();
+    }
+    store
+}
+
+/// The writer's state: the file, its newest commit, and the update being
+/// written.
+struct Writer {
+    file_bytes: u64,
+    committed: Option<Commit>,
+    /// The file's device extents, found while the drivers may be called.
+    extents: Option<Vec<Extent>>,
+    running: Option<Running>,
+    /// Host counter value before which no update starts.
+    quiet_until: u64,
+    /// A write failed: the store is not written again this boot.
+    failed: bool,
+}
+
+struct Running {
+    execution: Execution,
+    update: pipeline_store::Update,
+    /// The staged commands of the write in flight.
+    queued: Queued,
+}
+
+/// The commands the write in flight queued, by the file offset it began at.
+#[derive(Default)]
+struct Queued {
+    at: Option<u64>,
+    tags: Vec<u32>,
+}
+
+/// One holder at a time: [`step`] skips while another holds it, [`write`]
+/// waits.
+struct Held {
+    held: AtomicBool,
+    writer: UnsafeCell<Option<Writer>>,
+}
+// SAFETY: `held` admits one holder at a time to `writer`.
+unsafe impl Sync for Held {}
+static WRITER: Held = Held {
+    held: AtomicBool::new(false),
+    writer: UnsafeCell::new(None),
+};
+
+/// Runs `f` on the writer's slot holding it: at once or not at all unless
+/// `wait`.
+fn holding<R>(wait: bool, f: impl FnOnce(&mut Option<Writer>) -> R) -> Option<R> {
+    while WRITER
+        .held
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        if !wait {
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+    // SAFETY: `held` is ours until the store below.
+    let result = f(unsafe { &mut *WRITER.writer.get() });
+    WRITER.held.store(false, Ordering::Release);
+    Some(result)
+}
+
+fn try_writer<R>(f: impl FnOnce(&mut Writer) -> R) -> Option<R> {
+    holding(false, |slot| slot.as_mut().map(f)).flatten()
+}
+
+fn writer<R>(f: impl FnOnce(&mut Writer) -> R) -> Option<R> {
+    holding(true, |slot| slot.as_mut().map(f)).flatten()
+}
+
 /// Give the Metal device the stored pipelines of the handoff file
-/// `contents`, before any GPU opens.
+/// `contents`, before any GPU opens, and keep its commit for the writes.
 pub fn install(contents: &'static [u8]) {
-    if contents.len() < PLACEMENT_BYTES || contents[..8] != PLACEMENT_MAGIC {
+    let head = PLACEMENT_BYTES + SLOT_BYTES as usize;
+    if contents.len() < head || contents[..8] != PLACEMENT_MAGIC {
         return;
     }
     let size = u64::from_le_bytes(contents[8..16].try_into().expect("a size"));
+    let slot = &contents[PLACEMENT_BYTES..head];
+    let committed = (0..2).find_map(|index| Commit::decode(slot, index, DOMAIN, size));
     pipeline_store::provide(
-        &contents[PLACEMENT_BYTES..],
+        &contents[head..],
         stela_mesa::COMPILER_SHA256.as_bytes(),
-        size,
+        size.saturating_sub(DATA_START),
     );
+    let writer = Writer {
+        file_bytes: size,
+        committed,
+        extents: None,
+        running: None,
+        quiet_until: 0,
+        failed: false,
+    };
+    holding(true, |slot| *slot = Some(writer));
+}
+
+/// Find the file's device extents, once the store's partition is kept and
+/// while its drivers may still be called directly: the writes while the
+/// guest runs only queue.
+pub fn prepare() {
+    let extents = translations::with_store_file(NAME, |_, extents| extents.to_vec());
+    writer(|writer| match extents {
+        Ok(extents) => writer.extents = Some(extents),
+        Err(error) => {
+            output::arguments(format_args!("PIPELINES written only at a stop: {error}\n"));
+        }
+    });
+}
+
+/// The journal change that writes `update` after `committed`.
+fn change(update: &pipeline_store::Update, committed: Option<&Commit>) -> Change {
+    let mut change = Change::default();
+    if let Some(cache) = &update.cache {
+        change.replace.push(CACHE);
+        change.blobs.push((CACHE, cache.to_vec()));
+    }
+    if !update.nir.is_empty() {
+        let pieces = committed
+            .filter(|commit| commit.key == update.key.0)
+            .map_or(0, |commit| {
+                commit
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.kind == NIR)
+                    .count()
+            });
+        if pieces + 1 > NIR_PIECES {
+            change.replace.push(NIR);
+            change
+                .blobs
+                .push((NIR, pipeline_store::all_nir(&update.key)));
+        } else {
+            change.blobs.push((NIR, update.nir.clone()));
+        }
+    }
+    change
+}
+
+impl Writer {
+    /// The next update to write, planned, unless one runs or nothing is new.
+    fn start(&mut self) -> bool {
+        if self.running.is_some() || self.failed {
+            return self.running.is_some();
+        }
+        let Some(update) = pipeline_store::update() else {
+            return false;
+        };
+        let plan = journal::plan(
+            self.committed.as_ref(),
+            DOMAIN,
+            update.key.0,
+            self.file_bytes,
+            change(&update, self.committed.as_ref()),
+        );
+        if !plan.dropped.is_empty() {
+            output::arguments(format_args!(
+                "PIPELINES full: {} of {} pieces not kept in a file of {} bytes\n",
+                plan.dropped.len(),
+                plan.blobs.len(),
+                self.file_bytes
+            ));
+        }
+        self.running = Some(Running {
+            execution: Execution::new(plan),
+            update,
+            queued: Queued::default(),
+        });
+        true
+    }
+
+    /// The update finished: its commit is the file's newest.
+    fn finish(&mut self) {
+        if let Some(running) = self.running.take() {
+            if let Some(last) = &running.execution.plan().last {
+                self.committed = Some(last.clone());
+            }
+            pipeline_store::written(&running.update);
+        }
+    }
+
+    fn fail(&mut self, error: &str) {
+        output::arguments(format_args!("PIPELINES not written: {error}\n"));
+        self.running = None;
+        self.failed = true;
+    }
+}
+
+/// While the guest runs, from a processor that holds no device lock: start
+/// writing what the device added, or queue the next piece of the write in
+/// flight and take finished ones. Never waits for the disk.
+pub fn step() {
+    let now = super::host::fresh_counter();
+    try_writer(|writer| {
+        if writer.running.is_none() && now < writer.quiet_until {
+            return;
+        }
+        let Some(extents) = writer.extents.clone() else {
+            return;
+        };
+        if !writer.start() {
+            writer.quiet_until = now + super::host::COUNTER_HZ / 1000 * QUIET_MILLIS;
+            return;
+        }
+        let running = writer.running.as_mut().expect("started");
+        let advanced = translations::lend_staged_partition(|device| {
+            let mut target = Staged {
+                device,
+                extents: &extents,
+                queued: &mut running.queued,
+            };
+            running.execution.advance(&mut target, PIECE_BYTES)
+        });
+        match advanced {
+            None => {}
+            Some(Ok(false)) => {}
+            Some(Ok(true)) => {
+                writer.finish();
+                writer.quiet_until = now + super::host::COUNTER_HZ / 1000 * QUIET_MILLIS;
+            }
+            Some(Err(error)) => writer.fail(&error),
+        }
+    });
 }
 
 /// At a quiescent point (the guest restarts or powers off), before the
-/// translation pack is written: rewrite the file with the device's newest
-/// snapshot, when it added pipelines this boot.
+/// translation pack is written: finish the write in flight and write what
+/// is left, waiting for the disk.
 pub fn write() {
-    let Some(sealed) = pipeline_store::take() else {
-        return;
-    };
-    let bytes = HEADER_BYTES + sealed.payload.len();
     let started = output::now();
-    let written = translations::with_store_file(NAME, |device, extents| {
-        write_over(device, extents, &[&sealed.header[..], &sealed.payload[..]])
-    })
-    .and_then(|written| written);
-    match written {
-        Ok(()) => output::arguments(format_args!(
+    let written = writer(|writer| {
+        let mut bytes = 0u64;
+        loop {
+            if !writer.start() {
+                return Ok(bytes);
+            }
+            let running = writer.running.as_mut().expect("started");
+            bytes += running
+                .execution
+                .plan()
+                .blobs
+                .iter()
+                .map(|(_, blob)| blob.len() as u64)
+                .sum::<u64>();
+            let done = translations::with_store_file(NAME, |device, extents| {
+                let mut target = Direct { device, extents };
+                while !running.execution.advance(&mut target, PIECE_BYTES)? {}
+                Ok::<(), String>(())
+            })
+            .and_then(|done| done);
+            match done {
+                Ok(()) => writer.finish(),
+                Err(error) => {
+                    writer.fail(&error);
+                    return Err(());
+                }
+            }
+        }
+    });
+    if let Some(Ok(bytes)) = written
+        && bytes != 0
+    {
+        output::arguments(format_args!(
             "PIPELINES written bytes={bytes} ms={}\n",
             output::millis_since(started)
-        )),
-        Err(error) => output::arguments(format_args!("PIPELINES not written: {error}\n")),
+        ));
     }
 }
 
-/// Write `parts` in order over the file of device extents `extents`, whole
-/// blocks at a time with the last padded with zeros, then make it durable.
-/// The file is never grown: parts longer than it are refused first.
-fn write_over(
-    device: &mut dyn BlockDevice,
-    extents: &[Extent],
-    parts: &[&[u8]],
-) -> Result<(), alloc::string::String> {
-    let block = u64::from(device.identity().block_size);
-    let file: u64 = extents.iter().map(|extent| extent.bytes).sum();
-    let total: u64 = parts.iter().map(|part| part.len() as u64).sum();
-    if total > file {
-        return Err(format!("the file holds {file} bytes, fewer than {total}"));
-    }
-    if block == 0 || extents.iter().any(|extent| extent.offset % block != 0) {
-        return Err(format!("an extent is not on a {block}-byte block"));
-    }
-    let mut parts = parts.iter().copied();
-    let mut part: &[u8] = &[];
-    let mut left = total;
-    let mut buffer = alloc::vec::Vec::with_capacity(TRANSFER_BYTES);
-    for extent in extents {
-        let mut written = 0;
-        while written < extent.bytes && left > 0 {
-            let take = (extent.bytes - written)
-                .min(TRANSFER_BYTES as u64)
-                .min(left);
-            buffer.clear();
-            while buffer.len() < take as usize {
-                if part.is_empty() {
-                    part = parts.next().expect("the parts hold `total` bytes");
-                    continue;
-                }
-                let (now, later) = part.split_at(part.len().min(take as usize - buffer.len()));
-                buffer.extend_from_slice(now);
-                part = later;
+/// The staged partition while the guest runs: each write queues its
+/// commands and is made again until they finished.
+struct Staged<'a> {
+    device: &'a mut dyn BlockDevice,
+    extents: &'a [Extent],
+    queued: &'a mut Queued,
+}
+
+impl Staged<'_> {
+    /// Queue `commands` for the write at `at`, or take their results:
+    /// whether all finished.
+    fn run(
+        &mut self,
+        at: u64,
+        commands: impl FnOnce() -> Result<Vec<Command>, String>,
+    ) -> Result<bool, String> {
+        if self.queued.at != Some(at) {
+            let mut tags = Vec::new();
+            for command in commands()? {
+                tags.push(
+                    self.device
+                        .start(command)
+                        .map_err(|error| format!("{error:?}"))?,
+                );
             }
-            buffer.resize(buffer.len().next_multiple_of(block as usize), 0);
-            device
-                .write((extent.offset + written) / block, &buffer)
-                .map_err(|error| format!("{error:?}"))?;
-            written += take;
-            left -= take;
+            *self.queued = Queued { at: Some(at), tags };
+            return Ok(false);
         }
+        while let Some(&tag) = self.queued.tags.last() {
+            match self.device.finish(tag) {
+                None => return Ok(false),
+                Some(result) => {
+                    result.map_err(|error| format!("{error:?}"))?;
+                    self.queued.tags.pop();
+                }
+            }
+        }
+        *self.queued = Queued::default();
+        Ok(true)
     }
-    device.flush().map_err(|error| format!("{error:?}"))
+}
+
+impl Target for Staged<'_> {
+    type Error = String;
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<bool, String> {
+        let block = u64::from(self.device.identity().block_size);
+        let extents = self.extents;
+        self.run(offset, || {
+            let ranges =
+                device_ranges(extents, block, offset, bytes.len() as u64).ok_or_else(|| {
+                    format!(
+                        "bytes {offset}+{} are not on the file's blocks",
+                        bytes.len()
+                    )
+                })?;
+            Ok(ranges
+                .into_iter()
+                .map(|(lba, length, from)| Command::Write {
+                    lba,
+                    data: bytes[from..from + length as usize].to_vec(),
+                    fua: false,
+                })
+                .collect())
+        })
+    }
+    fn flush(&mut self) -> Result<bool, String> {
+        self.run(u64::MAX, || Ok(vec![Command::Flush]))
+    }
+}
+
+/// The partition at a stop: each write completes before it returns.
+struct Direct<'a> {
+    device: &'a mut dyn BlockDevice,
+    extents: &'a [Extent],
+}
+
+impl Target for Direct<'_> {
+    type Error = String;
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<bool, String> {
+        let block = u64::from(self.device.identity().block_size);
+        let ranges =
+            device_ranges(self.extents, block, offset, bytes.len() as u64).ok_or_else(|| {
+                format!(
+                    "bytes {offset}+{} are not on the file's blocks",
+                    bytes.len()
+                )
+            })?;
+        for (lba, length, from) in ranges {
+            self.device
+                .write(lba, &bytes[from..from + length as usize])
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        Ok(true)
+    }
+    fn flush(&mut self) -> Result<bool, String> {
+        self.device.flush().map_err(|error| format!("{error:?}"))?;
+        Ok(true)
+    }
 }

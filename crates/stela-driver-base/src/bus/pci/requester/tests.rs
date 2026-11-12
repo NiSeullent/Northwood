@@ -15,6 +15,8 @@ const ADDRESS: Address = Address {
 struct Config {
     words: [u32; 1024],
     last_read: Cell<u16>,
+    /// COMMAND bits that ignore writes, as hardwired bits do.
+    command_fixed: u16,
 }
 impl ConfigSpace for Config {
     fn read32(&self, offset: u16) -> Result<u32, crate::bus::pci::ConfigError> {
@@ -24,7 +26,13 @@ impl ConfigSpace for Config {
         })
     }
     fn write32(&mut self, offset: u16, value: u32) -> Result<(), crate::bus::pci::ConfigError> {
-        self.words[usize::from(offset / 4)] = value;
+        let index = usize::from(offset / 4);
+        let fixed = if index == usize::from(regs::COMMAND / 4) {
+            u32::from(self.command_fixed)
+        } else {
+            0
+        };
+        self.words[index] = value & !fixed | self.words[index] & fixed;
         Ok(())
     }
 
@@ -54,11 +62,14 @@ fn configure<C: ConfigSpace>(config: &mut C) {
     config
         .write16(regs::COMMAND, regs::COMMAND_INTX_DISABLE)
         .unwrap();
+    // INTA, as a function that can raise INTx.
+    config.write8(regs::INTERRUPT_PIN, 1).unwrap();
 }
 fn endpoint() -> Function<Config> {
     let mut config = Config {
         words: [0; 1024],
         last_read: Cell::new(0),
+        command_fixed: 0,
     };
     configure(&mut config);
     Function::new(ADDRESS, config).unwrap()
@@ -273,6 +284,16 @@ fn device_identity_interrupt_gating_and_header_are_observed_not_assumed() {
     assert_eq!(
         validate_stopped(&mut function),
         Err(ClaimError::UnsupportedHeader(1))
+    );
+    // Without an INTx pin, INTx Disable may stay clear; Bus Master may not.
+    let mut function = endpoint();
+    function.config().write8(regs::INTERRUPT_PIN, 0).unwrap();
+    function.config().write16(regs::COMMAND, 0).unwrap();
+    assert_eq!(validate_stopped(&mut function), Ok(()));
+    function.config().write16(regs::COMMAND, 4).unwrap();
+    assert_eq!(
+        validate_stopped(&mut function),
+        Err(ClaimError::Active { offset: 4 })
     );
     let mut function = endpoint();
     function.class = [0xff; 3];
@@ -716,4 +737,122 @@ fn containment_refuses_to_replay_function_or_pri_reset_commands() {
     ext(&mut function, 0x100, PRI, 1, 0);
     function.config().write16(0x104, 2).unwrap();
     assert!(matches!(containment_plan(function.config()), Err(error) if error == refused));
+}
+
+#[test]
+fn containment_accepts_a_hardwired_clear_command_without_an_interrupt_pin() {
+    use crate::bus::pci::ConfigEffect;
+
+    // A host bridge implements no COMMAND bit and no INTx pin.
+    let mut function = endpoint();
+    let config = function.config();
+    config.write8(regs::INTERRUPT_PIN, 0).unwrap();
+    config.write16(regs::COMMAND, 0).unwrap();
+    config.command_fixed = u16::MAX;
+    let plan = containment_plan(config).unwrap();
+    assert!(plan.permits(4, 2, u32::from(regs::COMMAND_INTX_DISABLE)));
+    assert_eq!(
+        plan.apply(config),
+        Ok(ConfigEffect::WriteMayHaveApplied {
+            offset: regs::COMMAND,
+            width: 2
+        })
+    );
+    assert_eq!(config.read16(regs::COMMAND), Ok(0));
+    assert_eq!(plan.check_disabled(|offset| config.read16(offset)), Ok(()));
+}
+
+#[test]
+fn containment_sets_intx_disable_where_writable_even_without_a_pin() {
+    let mut function = endpoint();
+    let config = function.config();
+    config.write8(regs::INTERRUPT_PIN, 0).unwrap();
+    config.write16(regs::COMMAND, 6).unwrap();
+    let plan = containment_plan(config).unwrap();
+    plan.apply(config).unwrap();
+    assert_eq!(config.read16(regs::COMMAND), Ok(0x402));
+    assert_eq!(plan.check_disabled(|offset| config.read16(offset)), Ok(()));
+}
+
+#[test]
+fn containment_stops_a_normal_endpoint_with_an_interrupt_pin() {
+    let mut function = endpoint();
+    let config = function.config();
+    config.write16(regs::COMMAND, 6).unwrap();
+    let plan = containment_plan(config).unwrap();
+    plan.apply(config).unwrap();
+    assert_eq!(config.read16(regs::COMMAND), Ok(0x402));
+    assert_eq!(plan.check_disabled(|offset| config.read16(offset)), Ok(()));
+    // A later clear of INTx Disable on a function with a pin is refused.
+    config.write16(regs::COMMAND, 2).unwrap();
+    assert!(plan.check_disabled(|offset| config.read16(offset)).is_err());
+}
+
+#[test]
+fn containment_refuses_an_interrupt_pin_that_ignores_intx_disable() {
+    use crate::bus::pci::{ConfigEffect, ConfigFailure};
+
+    let mut function = endpoint();
+    let config = function.config();
+    config.write16(regs::COMMAND, 2).unwrap();
+    config.command_fixed = regs::COMMAND_INTX_DISABLE;
+    let plan = containment_plan(config).unwrap();
+    let failure = plan.apply(config).unwrap_err();
+    assert_eq!(
+        failure.effect,
+        ConfigEffect::WriteMayHaveApplied {
+            offset: regs::COMMAND,
+            width: 2
+        }
+    );
+    assert_eq!(
+        failure.reason,
+        ConfigFailure::Readback {
+            offset: regs::COMMAND,
+            width: 2,
+            expected: 0x402,
+            observed: 2,
+        }
+    );
+}
+
+#[test]
+fn containment_refuses_bus_master_that_stays_set_without_a_pin() {
+    use crate::bus::pci::ConfigFailure;
+
+    let mut function = endpoint();
+    let config = function.config();
+    config.write8(regs::INTERRUPT_PIN, 0).unwrap();
+    config.write16(regs::COMMAND, 4).unwrap();
+    config.command_fixed = regs::COMMAND_MASTER;
+    let plan = containment_plan(config).unwrap();
+    let failure = plan.apply(config).unwrap_err();
+    assert!(matches!(
+        failure.reason,
+        ConfigFailure::Readback {
+            offset: regs::COMMAND,
+            observed: 0x404,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn containment_plan_refuses_when_the_interrupt_pin_cannot_be_read() {
+    let mut function = endpoint();
+    let config = function.config();
+    let refused = ClaimError::ReadFailed {
+        offset: regs::INTERRUPT_PIN,
+    };
+    let result = containment::Plan::read(|offset, width| {
+        if offset == regs::INTERRUPT_PIN {
+            return Err(refused);
+        }
+        Ok(match width {
+            1 => u32::from(config.read8(offset).unwrap()),
+            2 => u32::from(config.read16(offset).unwrap()),
+            _ => config.read32(offset).unwrap(),
+        })
+    });
+    assert!(matches!(result, Err(error) if error == refused));
 }

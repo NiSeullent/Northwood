@@ -8,6 +8,15 @@ mod containment;
 pub(super) use containment::PciSlots;
 pub(crate) use containment::{ContainedPci, ContainmentError};
 
+/// Log the first memory map conflict that keeps a bus's configuration
+/// space unmapped, once per boot: the census error itself names no bus.
+fn report_ecam_conflict(line: core::fmt::Arguments<'_>) {
+    static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::output::arguments(line);
+    }
+}
+
 pub(crate) struct ConfigScope {
     pending: ManuallyDrop<Box<Pending>>,
     close: Option<AdmissionClose>,
@@ -251,7 +260,15 @@ impl Source {
         for (index, window) in windows.iter().enumerate() {
             for bus in window.start_bus..=window.end_bus {
                 let (_, span) = geometry.subset(index, bus..=bus, wire.roots())?;
-                if !wire.excludes_memory(span.start(), span.end()) {
+                if let Some((start, end, kind)) = wire.memory_conflict(span.start(), span.end()) {
+                    report_ecam_conflict(format_args!(
+                        "HOST PCI configuration space of bus {:04x}:{bus:02x} at {:#x} lies in \
+                         the firmware memory map's {} at {start:#x}-{end:#x}; it must be \
+                         reserved or MMIO, so Stela does not map it\n",
+                        window.segment,
+                        span.start(),
+                        stela_boot_core::firmware_map::kind_name(kind),
+                    ));
                     return Err(Error::OutsideResource.into());
                 }
             }

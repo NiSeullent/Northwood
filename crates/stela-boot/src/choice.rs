@@ -220,6 +220,9 @@ fn storage(options: &str) -> Option<&str> {
 enum Item {
     /// Entry `n` of the startup choices.
     Choice(usize, ChoiceKind),
+    /// Entry `n`, an Install macOS that chooses its disk, on a disk other
+    /// than the one chosen before; named.
+    Another(usize, String),
     /// One of the PC firmware's own boot entries.
     Firmware(Entry),
     Diagnostics,
@@ -230,6 +233,9 @@ struct Menu<'a> {
     choices: &'a Choices,
     /// The partition Install macOS chose, when it chose one.
     disk: Option<String>,
+    /// The saved target is present and no ready Mac entry uses it.
+    /// [`Item::Another`] opens the picker while this shortcut is available.
+    present: bool,
     items: Vec<Item>,
     selected: usize,
     /// Seconds before the first entry starts, while the countdown runs.
@@ -276,6 +282,11 @@ impl<'a> Menu<'a> {
             .filter(|((_, r), _)| **r == Readiness::Ready)
             .map(|(_, options)| options.as_deref().and_then(storage))
             .collect();
+        // A disk used by a ready Mac entry stays in the picker. A disk
+        // without such an entry may still hold data, so reuse asks too.
+        let present = disk
+            .as_deref()
+            .is_some_and(|disk| !prepared.contains(&Some(disk)) && selection::chosen_present(disk));
         let mut items = Vec::new();
         for (n, entry) in choices.entries.iter().enumerate() {
             let kind = entry.kind();
@@ -298,7 +309,12 @@ impl<'a> Menu<'a> {
                     n + 1,
                     entry.name
                 )),
-                None => items.push(Item::Choice(n, kind)),
+                None => {
+                    items.push(Item::Choice(n, kind));
+                    if present && kind == ChoiceKind::Setup && unchosen(entry.options.as_bytes()) {
+                        items.push(Item::Another(n, format!("{} on another disk", entry.name)));
+                    }
+                }
             }
         }
         // A setup without its restore choice still lists its own.
@@ -347,6 +363,7 @@ impl<'a> Menu<'a> {
         Self {
             choices,
             disk,
+            present,
             countdown: match opens {
                 Opening::Countdown(seconds) => Some(seconds),
                 Opening::Glance | Opening::Wait => None,
@@ -362,6 +379,7 @@ impl<'a> Menu<'a> {
     fn name(&self, item: &'a Item) -> &'a str {
         match item {
             Item::Choice(n, _) => &self.choices.entries[*n].name,
+            Item::Another(_, name) => name,
             Item::Firmware(entry) => &entry.name,
             Item::Diagnostics => DIAGNOSTICS,
         }
@@ -473,33 +491,73 @@ fn asked() -> bool {
     pressed().is_some() || matches!(key(Some(GLANCE)), Wait::Key(_))
 }
 
-/// `menu` until one of `choices` is chosen; its options. Install macOS on a
-/// disk not chosen yet opens the disk picker first ([`installer::choose`]),
-/// and returns to the menu when it is left. A firmware entry chosen
-/// restarts the PC into it. `None` without console input to choose with.
+/// Confirm erasing the saved target. Selecting Install macOS alone grants
+/// no permission to blank it, even if the startup check cannot boot it.
+fn confirm_again(disk: &str) -> bool {
+    let Some((serial, partition)) = disk.rsplit_once(':') else {
+        return false;
+    };
+    let Some((screen, font)) = Framebuffer::from_firmware().zip(font::console()) else {
+        return false;
+    };
+    let mut canvas = Canvas::new(screen, font);
+    let (width, height) = canvas.size();
+    let middle = width / 2;
+    let mut erase = false;
+    loop {
+        canvas.fill(0, 0, width, height, ui::BACKGROUND);
+        let top = canvas.header() + 24;
+        canvas.text_centred(middle, top, "Erase and install macOS?", 1, ui::TEXT);
+        canvas.text_centred(middle, top + 30, "Disk serial", 1, ui::DIM);
+        canvas.text_centred(middle, top + 50, serial, 1, ui::TEXT);
+        canvas.text_centred(middle, top + 80, "Partition GUID", 1, ui::DIM);
+        canvas.text_centred(middle, top + 100, partition, 1, ui::TEXT);
+        canvas.text_centred(
+            middle,
+            top + 130,
+            "Erases this partition and its machine state.",
+            1,
+            ui::ORANGE,
+        );
+        let back_colour = if erase { ui::TEXT } else { ui::ORANGE };
+        let erase_colour = if erase { ui::ORANGE } else { ui::TEXT };
+        canvas.text_centred(width / 4, top + 170, "Back", 1, back_colour);
+        canvas.text_centred(
+            width - width / 4,
+            top + 170,
+            "Erase and Install",
+            1,
+            erase_colour,
+        );
+        canvas.show();
+        match key(None) {
+            Wait::Key(Press::Left) => erase = false,
+            Wait::Key(Press::Right) => erase = true,
+            Wait::Key(Press::Enter) => return erase,
+            Wait::Key(Press::Escape) | Wait::NoInput => return false,
+            _ => {}
+        }
+    }
+}
+
+/// Wait for a boot choice. Setup with no reusable saved target and the
+/// "on another disk" item open the picker. Reusing a saved target asks
+/// for confirmation before blanking it. Leaving either returns to the menu.
 fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Option<Selection> {
     loop {
         let index = menu.run()?;
-        match &menu.items[index] {
+        let (n, picker) = match &menu.items[index] {
+            Item::Another(n, _) => (*n, true),
             Item::Choice(n, ChoiceKind::Setup)
                 if unchosen(choices.entries[*n].options.as_bytes()) =>
             {
-                let Some(disk) = crate::installer::choose() else {
-                    continue;
-                };
-                let recorded = esp::destination(volume, SELECTED_DISK)
-                    .is_ok_and(|path| volume.write(path, format!("{disk}\n")).is_ok());
-                if !recorded {
-                    menu.notice = Some("The chosen disk could not be recorded on the USB.");
-                    continue;
-                }
-                output::arguments(format_args!("CHOSEN DISK {disk}\n"));
-                return Some(chosen(choices, *n, Some(&disk)));
+                (*n, !menu.present)
             }
             Item::Choice(n, _) => return Some(chosen(choices, *n, menu.disk.as_deref())),
             Item::Firmware(entry) => {
                 output::arguments(format_args!("CHOICE firmware entry ({})\n", entry.name));
                 menu.notice = Some(entries::start(entry.number));
+                continue;
             }
             Item::Diagnostics => {
                 output::arguments(format_args!("CHOICE {DIAGNOSTICS}\n"));
@@ -509,7 +567,37 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
                     entry: None,
                 });
             }
+        };
+        if !picker {
+            let disk = menu.disk.as_deref()?;
+            if !confirm_again(disk) {
+                continue;
+            }
+            if !selection::chosen_present(disk) {
+                menu.notice = Some("The disk chosen before changed or is no longer unique.");
+                menu.present = false;
+                continue;
+            }
+            match crate::installer::again(disk) {
+                Ok(()) => return Some(chosen(choices, n, Some(disk))),
+                Err(error) => {
+                    output::arguments(format_args!("INSTALLER again refused: {error}\n"));
+                    menu.notice = Some("The disk chosen before could not be prepared again.");
+                    continue;
+                }
+            }
         }
+        let Some(disk) = crate::installer::choose() else {
+            continue;
+        };
+        let recorded = esp::destination(volume, SELECTED_DISK)
+            .is_ok_and(|path| volume.write(path, format!("{disk}\n")).is_ok());
+        if !recorded {
+            menu.notice = Some("The chosen disk could not be recorded on the USB.");
+            continue;
+        }
+        output::arguments(format_args!("CHOSEN DISK {disk}\n"));
+        return Some(chosen(choices, n, Some(&disk)));
     }
 }
 

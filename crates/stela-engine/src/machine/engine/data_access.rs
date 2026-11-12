@@ -294,7 +294,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // The lock waits from here on are this access's.
             self.devices.take_lock_wait();
         }
-        self.device_lines = None;
+        // A load the devices answer without their lock (a passive register)
+        // changes no device, so the lines cached before it still hold: the
+        // home PE would otherwise advance every device and tell every PE
+        // again at its next interrupt check. Every call that can change a
+        // device moves their generation ([`Devices::generation`]), so one
+        // that did not move across the load left them as they were.
+        let kept = self.device_lines.take();
+        let generation = self.devices.generation();
         if let Some(load) = ScalarLoad::from_instruction(&instruction) {
             let (accessed, writeback) = self.scalar_address(load.address());
             if accessed != address {
@@ -306,7 +313,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
             let now = self.now();
             let raw = match self.device_read(physical, bytes, now) {
-                Ok(value) => value,
+                Ok(value) => {
+                    if generation.is_some() && self.devices.generation() == generation {
+                        self.device_lines = kept;
+                    }
+                    value
+                }
                 Err(error) => match self.device_refused(error, address, physical, bytes, None) {
                     None => 0,
                     Some(step) => return step,

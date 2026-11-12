@@ -7,7 +7,7 @@
 use crate::{
     GuestAddress, GuestState, Options, TargetCpu,
     aarch64::floating::{
-        BinaryOperation, FPCR_AH, FPCR_DN, FPCR_EXCEPTION_ENABLE_MASK, FPCR_FZ16,
+        BinaryOperation, FPCR_AH, FPCR_DN, FPCR_EXCEPTION_ENABLE_MASK, FPCR_FZ16, FPCR_NEP,
         FPCR_ROUNDING_SHIFT, Format, INEXACT, evaluate,
     },
     block::{BlockProfile, CompilationPlan},
@@ -189,6 +189,8 @@ fn half_arithmetic_lanes_match_the_reference() {
 #[derive(Clone, Copy)]
 enum Pairing {
     Elementwise,
+    /// One lane, the first of Vn and Vm (or Vm's indexed lane 0).
+    Scalar,
     Pairwise,
     Indexed,
 }
@@ -215,10 +217,12 @@ fn finite_half(random: &mut u64, partner: Option<u64>) -> u64 {
     }
 }
 
-/// The packed recipe (`half::packed`) completes every finite vector lane
-/// inline under each rounding mode, including subnormal inputs, exact
-/// cancellation and tiny or subnormal results, with Arm's results and
-/// status; FZ16, AH, overflow and NaN or infinite inputs exit or match.
+/// The packed recipe (`half::packed`) completes every finite scalar and
+/// vector lane inline under each rounding mode, including subnormal inputs,
+/// exact cancellation, inexact quotients and tiny or subnormal results, with
+/// Arm's results and status, a scalar result alone or, under FPCR.NEP, in
+/// Vn's other bits; FZ16, AH, overflow, a zero divisor and NaN or infinite
+/// inputs exit or match.
 #[test]
 fn packed_half_arithmetic_completes_every_finite_lane_inline() {
     const PACKED_FORMS: &[(u32, BinaryOperation, usize, Pairing)] = &[
@@ -256,6 +260,41 @@ fn packed_half_arithmetic_completes_every_finite_lane_inline() {
         ),
         (0x6e40_1400, BinaryOperation::Add, 8, Pairing::Pairwise),
         (0x4f00_9000, BinaryOperation::Multiply, 8, Pairing::Indexed),
+        (
+            0x6e40_3c00,
+            BinaryOperation::Divide,
+            8,
+            Pairing::Elementwise,
+        ),
+        (
+            0x2e40_3c00,
+            BinaryOperation::Divide,
+            4,
+            Pairing::Elementwise,
+        ),
+        (0x1ee0_2800, BinaryOperation::Add, 1, Pairing::Scalar),
+        (0x1ee0_3800, BinaryOperation::Subtract, 1, Pairing::Scalar),
+        (0x1ee0_0800, BinaryOperation::Multiply, 1, Pairing::Scalar),
+        (0x1ee0_1800, BinaryOperation::Divide, 1, Pairing::Scalar),
+        (
+            0x1ee0_8800,
+            BinaryOperation::NegatedMultiply,
+            1,
+            Pairing::Scalar,
+        ),
+        (
+            0x7ec0_1400,
+            BinaryOperation::AbsoluteDifference,
+            1,
+            Pairing::Scalar,
+        ),
+        (
+            0x5e40_1c00,
+            BinaryOperation::MultiplyExtended,
+            1,
+            Pairing::Scalar,
+        ),
+        (0x5f00_9000, BinaryOperation::Multiply, 1, Pairing::Scalar),
     ];
     let host = TargetCpu::detect();
     let mut random = 0x2468_ace0_1357_9bdf_u64;
@@ -282,7 +321,7 @@ fn packed_half_arithmetic_completes_every_finite_lane_inline() {
                 }
                 let operands: Vec<(u64, u64)> = (0..lanes)
                     .map(|lane| match pairing {
-                        Pairing::Elementwise => (n[lane], m[lane]),
+                        Pairing::Elementwise | Pairing::Scalar => (n[lane], m[lane]),
                         Pairing::Indexed => (n[lane], m[0]),
                         Pairing::Pairwise => {
                             let source = if lane < lanes / 2 { &n } else { &m };
@@ -291,9 +330,11 @@ fn packed_half_arithmetic_completes_every_finite_lane_inline() {
                         }
                     })
                     .collect();
+                // A scalar form's inputs keep other bits in Vn and Vm.
+                let filled = if lanes == 1 { 8 } else { lanes };
                 let limbs = |values: &[u64; 8]| {
                     let mut limbs = [0u64; 2];
-                    for (lane, value) in values.iter().enumerate().take(lanes) {
+                    for (lane, value) in values.iter().enumerate().take(filled) {
                         limbs[lane / 4] |= value << (16 * (lane % 4));
                     }
                     limbs
@@ -303,7 +344,10 @@ fn packed_half_arithmetic_completes_every_finite_lane_inline() {
                 } else {
                     alloc::vec![(case as u32 % 4) << FPCR_ROUNDING_SHIFT]
                 };
-                for fpcr in controls {
+                for mut fpcr in controls {
+                    if lanes == 1 && case % 8 == 1 {
+                        fpcr |= FPCR_NEP;
+                    }
                     let mut initial = GuestState {
                         fpcr,
                         fpsr: if case % 3 == 0 { INEXACT } else { 0 },
@@ -328,7 +372,7 @@ fn packed_half_arithmetic_completes_every_finite_lane_inline() {
                             .all(|(&(left, right), outcome)| {
                                 finite(left)
                                     && finite(right)
-                                    && outcome.as_ref().unwrap().exceptions & 0b100 == 0
+                                    && outcome.as_ref().unwrap().exceptions & 0b111 == 0
                             });
                     if exit == PC.0 {
                         assert_eq!(actual, initial, "{word:08x} {operands:x?} {fpcr:#x}");
@@ -346,6 +390,11 @@ fn packed_half_arithmetic_completes_every_finite_lane_inline() {
                         let outcome = outcome.as_ref().expect("no enabled traps");
                         expected.fpsr |= outcome.exceptions;
                         result[lane / 4] |= outcome.bits << (16 * (lane % 4));
+                    }
+                    if fpcr & FPCR_NEP != 0 {
+                        let mut kept = limbs(&n);
+                        kept[0] = kept[0] & !0xffff | result[0];
+                        result = kept;
                     }
                     expected.v[D as usize] = result;
                     assert_eq!(

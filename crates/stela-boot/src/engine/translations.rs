@@ -833,8 +833,20 @@ pub fn install(contents: &'static [u8]) -> Option<Guid> {
     (flags & WRITABLE != 0).then_some(partition)
 }
 
-/// Keep `partition`, the store's volume, for [`write`].
+/// Whether the store's partition is staged ([`super::storage::try_stage`]):
+/// its commands then queue, and processors step its I/O in bounded steps.
+static PARTITION_STAGED: AtomicBool = AtomicBool::new(false);
+
+/// Keep `partition`, the store's volume, for [`write`], staged when a slot
+/// is free.
 pub fn set_partition(partition: Box<dyn BlockDevice>) {
+    let partition = match super::storage::try_stage(partition) {
+        Ok(staged) => {
+            PARTITION_STAGED.store(true, Ordering::Release);
+            staged
+        }
+        Err(unstaged) => unstaged,
+    };
     BOOT.with(|boot| {
         if let Some(boot) = boot {
             boot.partition = Some(partition);
@@ -871,6 +883,21 @@ pub fn with_store_file<R>(
             .map_err(|error| format!("{error}"));
         boot.partition = Some(device);
         result
+    })
+}
+
+/// Lend the store's partition to `f` while the guest runs, for background
+/// writes: staged, so `f` only queues commands (`BlockDevice::start`) and
+/// takes results (`finish`), never waiting for the disk. The translation
+/// store shares it. `None` when it is absent, lent, or not staged.
+#[cfg(feature = "nvk")]
+pub fn lend_staged_partition<R>(f: impl FnOnce(&mut dyn BlockDevice) -> R) -> Option<R> {
+    if !PARTITION_STAGED.load(Ordering::Acquire) {
+        return None;
+    }
+    BOOT.with(|boot| {
+        let partition = boot.as_mut()?.partition.as_deref_mut()?;
+        Some(f(partition))
     })
 }
 

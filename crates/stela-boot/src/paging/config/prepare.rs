@@ -3,7 +3,10 @@
 //! handoff and the single native mapping registry.
 use super::{APERTURE, Error, LEAVES, PAGE};
 use alloc::vec::Vec;
-use stela_boot_core::ecam::{EcamInventory, RootWindow};
+use stela_boot_core::{
+    ecam::{EcamInventory, RootWindow},
+    firmware_map,
+};
 use stela_drivers::bus::{mmio::owned::PhysicalSpan, pci::EcamWindow};
 use stela_runtime::pc::acpi;
 use uefi::{
@@ -122,11 +125,7 @@ impl Prepared {
             .map_err(|error| Error::Firmware(error.status()))?;
         let mut exclusions = Vec::new();
         for entry in map.entries() {
-            let device = matches!(
-                entry.ty,
-                boot::MemoryType::RESERVED | boot::MemoryType::MMIO
-            ) && entry.att.bits() & (1 << 63) == 0;
-            if device || entry.page_count == 0 {
+            if firmware_map::leaves_to_devices(entry.ty.0) || entry.page_count == 0 {
                 continue;
             }
             let bytes = entry

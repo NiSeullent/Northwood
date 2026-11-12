@@ -1010,9 +1010,9 @@ fn mail_reaches_running_pes_and_kicks_only_a_sleeping_one() {
     assert!(hub.take(1).is_some_and(|mail| mail.event));
     // A PE that sleeps halts only without mail, and mail kicks it.
     let mut halts = 0;
-    hub.sleep(1, hub.lines_epoch(1), || halts += 1);
+    hub.sleep(1, hub.lines_epoch(1), true, || halts += 1);
     assert_eq!(halts, 1);
-    hub.sleep(2, hub.lines_epoch(2), || halts += 1);
+    hub.sleep(2, hub.lines_epoch(2), true, || halts += 1);
     assert_eq!(halts, 1, "PE 2 has mail");
     hub.inboxes[1].sleeping.store(true, Ordering::SeqCst);
     hub.start(1, 0x8000);
@@ -1073,7 +1073,7 @@ fn a_host_call_ends_a_run_and_wakes_a_sleeping_pe() {
     // A sleep does not start over a call, and a sleeper is woken for one.
     hub.call_host(1);
     let mut halted = false;
-    hub.sleep(1, 0, || halted = true);
+    hub.sleep(1, 0, true, || halted = true);
     assert!(!halted);
     assert!(hub.take_host_call(1));
     hub.inboxes[1].sleeping.store(true, Ordering::SeqCst);
@@ -1243,6 +1243,9 @@ impl Kick for Releases {
     fn released(&self) -> bool {
         self.0.fetch_add(1, Ordering::SeqCst);
         false
+    }
+    fn release_due(&self) -> bool {
+        true
     }
 }
 
@@ -1775,7 +1778,7 @@ fn a_signal_racing_with_a_halt_always_wakes_the_target() {
                 if target.pins(1).unwrap().fiq {
                     break;
                 }
-                hub.sleep(1, epoch, || {
+                hub.sleep(1, epoch, true, || {
                     while !kicked.swap(false, Ordering::SeqCst) {
                         if std::time::Instant::now() > deadline {
                             lost.store(true, Ordering::SeqCst);
@@ -1862,14 +1865,17 @@ fn bytes_for_the_host_wake_one_sleeping_pe_and_reach_one_machine_once() {
     worker.write(1, 0, 4, 3, 0).unwrap();
     assert_eq!(kicks.load(Ordering::Relaxed), 0);
     let mut halts = 0;
-    hub.sleep(2, hub.lines_epoch(2), || halts += 1);
+    hub.sleep(2, hub.lines_epoch(2), true, || halts += 1);
     assert_eq!(halts, 0, "the service is due");
     let mut home = home;
     assert!(home.take_host_service());
     assert!(!worker.take_host_service(), "taken once");
-    // One sleeping PE wakes for it, and a request already due wakes none.
-    hub.inboxes[1].sleeping.store(true, Ordering::SeqCst);
-    hub.inboxes[2].sleeping.store(true, Ordering::SeqCst);
+    // One PE asleep waiting for an interrupt wakes for it, and a request
+    // already due wakes none.
+    for pe in [1, 2] {
+        hub.inboxes[pe].serves.store(true, Ordering::SeqCst);
+        hub.inboxes[pe].sleeping.store(true, Ordering::SeqCst);
+    }
     worker.write(1, 0, 4, 3, 0).unwrap();
     worker.write(1, 0, 4, 3, 0).unwrap();
     assert_eq!(kicks.load(Ordering::Relaxed), 1);
@@ -2844,4 +2850,56 @@ fn native_dsb_completes_only_without_outstanding_maintenance() {
     engine(&mut machine);
     assert_eq!(machine.mirrors[CODE_PAGE].readable, 0);
     assert!(native(&mut machine));
+}
+
+/// Host work a guest exit's device call left (a storage doorbell's disk
+/// step) goes to a PE that sleeps waiting for an interrupt, and the caller
+/// goes on with its guest; a PE asleep in WFE is not woken for it, and with
+/// no PE to take it the caller does the work itself.
+#[test]
+fn released_host_work_goes_to_a_pe_that_sleeps_waiting_for_an_interrupt() {
+    #[derive(Default)]
+    struct Work {
+        kicked: Mutex<Vec<usize>>,
+        due: AtomicBool,
+        done: AtomicUsize,
+    }
+    struct Released(Arc<Work>);
+    impl Kick for Released {
+        fn kick(&self, pe: usize) {
+            self.0.kicked.lock().unwrap().push(pe);
+        }
+        fn released(&self) -> bool {
+            if self.0.due.swap(false, Ordering::SeqCst) {
+                self.0.done.fetch_add(1, Ordering::SeqCst);
+            }
+            false
+        }
+        fn release_due(&self) -> bool {
+            self.0.due.load(Ordering::SeqCst)
+        }
+    }
+    let work = Arc::new(Work::default());
+    let hub = Hub::new(3, Released(Arc::clone(&work)));
+    for pe in 0..3 {
+        hub.set_live(pe, true);
+    }
+    let home = SharedDevices::new(Pending::default(), Arc::clone(&hub));
+    let mut worker = home.worker();
+    // PE 1 is in a guest exit; PE 2 sleeps in WFE.
+    hub.inboxes[1].outside.store(true, Ordering::SeqCst);
+    hub.inboxes[2].sleeping.store(true, Ordering::SeqCst);
+    work.due.store(true, Ordering::SeqCst);
+    assert_eq!(worker.read(1, 0x40, 8, 0), Ok(0));
+    assert_eq!(work.done.load(Ordering::SeqCst), 1, "the caller did it");
+    assert!(work.kicked.lock().unwrap().is_empty());
+    assert!(!hub.service.load(Ordering::SeqCst));
+    // PE 2 now sleeps waiting for an interrupt: it is woken for the work.
+    hub.inboxes[2].serves.store(true, Ordering::SeqCst);
+    work.due.store(true, Ordering::SeqCst);
+    assert_eq!(worker.read(1, 0x40, 8, 0), Ok(0));
+    assert_eq!(work.done.load(Ordering::SeqCst), 1, "the caller went on");
+    assert!(work.due.load(Ordering::SeqCst), "left for the service");
+    assert_eq!(*work.kicked.lock().unwrap(), [2]);
+    assert!(hub.take_service());
 }

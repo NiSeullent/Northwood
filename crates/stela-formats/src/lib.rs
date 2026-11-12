@@ -10,6 +10,7 @@ pub mod code_signature;
 pub mod der;
 mod hash;
 pub mod img4;
+pub mod journal;
 pub mod local_policy;
 pub mod lzfse;
 pub mod machine_state;

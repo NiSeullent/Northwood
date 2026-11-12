@@ -795,6 +795,17 @@ impl<P: DataPolicy> MemoryThread<P> {
             .map_err(|_| MemoryStatus::Domain)
     }
 
+    /// Where the word nonzero while the local reservation is held lives
+    /// (`ThreadMonitor::held_address`).
+    pub(crate) fn reservation_word(&self) -> u64 {
+        self.reservation.held_address()
+    }
+
+    /// Whether a local reservation is held.
+    pub(crate) fn holds_reservation(&self) -> bool {
+        self.reservation.holds_reservation()
+    }
+
     pub(crate) fn prepare_clear_reservation(
         &mut self,
     ) -> Result<PreparedLocalClear<'_>, MemoryStatus> {

@@ -152,10 +152,13 @@ fn a_claim_seeds_from_a_matching_store_and_reports_any_other() {
 }
 
 #[test]
-fn the_newest_holder_keeps_snapshots_until_the_boot_takes_one() {
+fn the_newest_holder_keeps_snapshots_and_each_is_offered_until_written() {
     let gpu = gpu();
+    let key = Key::new(COMPILER, &gpu);
     let mut store = Store::new(&[], COMPILER, MAX_BYTES);
+    assert!(store.update().is_none(), "nothing holds it");
     let first = store.claim(&gpu).unwrap();
+    assert!(store.update().is_none(), "nothing was added");
     store.keep(&first, vec![1; 10]);
 
     // Another GPU has no store while the first holds it.
@@ -170,29 +173,35 @@ fn the_newest_holder_keeps_snapshots_until_the_boot_takes_one() {
     store.release(&first);
     store.keep(&second, vec![3; 10]);
 
-    let sealed = store.take().unwrap();
-    let mut bytes = sealed.header.to_vec();
-    bytes.extend_from_slice(&sealed.payload);
-    assert_eq!(
-        payload(&bytes, &Key::new(COMPILER, &gpu), MAX_BYTES),
-        Ok(&[3; 10][..])
-    );
-    // Nothing is kept or claimed after the take.
+    let update = store.update().unwrap();
+    assert_eq!(update.key, key);
+    assert_eq!(update.cache.as_deref(), Some(&vec![3; 10]));
+    // Offered again until written, and not after.
+    assert!(store.update().is_some());
+    store.written(&update);
+    assert!(store.update().is_none());
+    // A newer snapshot is offered again, the guest still running.
     store.keep(&second, vec![4; 10]);
-    assert!(store.take().is_none());
-    assert!(store.claim(&gpu).is_none());
+    store.written(&update);
+    assert_eq!(store.update().unwrap().cache.as_deref(), Some(&vec![4; 10]));
 
     // Released, the store serves another GPU.
     let mut store = Store::new(&[], COMPILER, MAX_BYTES);
     let claim = store.claim(&gpu).unwrap();
     store.release(&claim);
     assert!(store.claim(&other).is_some());
-    // A store nothing was added to has nothing to write.
-    assert!(store.take().is_none());
+}
+
+/// The layout a boot reads back: header, cache, NIR.
+fn sealed(key: &Key, cache: &[u8], nir: &[u8]) -> &'static [u8] {
+    let mut bytes = header_with_nir(key, cache, nir).to_vec();
+    bytes.extend_from_slice(cache);
+    bytes.extend_from_slice(nir);
+    Box::leak(bytes.into_boxed_slice())
 }
 
 #[test]
-fn nir_compiled_this_boot_is_stored_after_the_cache_and_read_back() {
+fn nir_compiled_this_boot_is_offered_once_and_read_back_after_the_cache() {
     let gpu = gpu();
     let key = Key::new(COMPILER, &gpu);
     let mut store = Store::new(&[], COMPILER, MAX_BYTES);
@@ -200,32 +209,44 @@ fn nir_compiled_this_boot_is_stored_after_the_cache_and_read_back() {
     store.add_nir([1; 32], b"first nir");
     store.add_nir([2; 32], b"second");
     store.keep(&claim, vec![5; 20]);
-    let sealed = store.take().unwrap();
-    let mut bytes = sealed.header.to_vec();
-    bytes.extend_from_slice(&sealed.payload);
-    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-    assert_eq!(stored_bytes(bytes), Ok(bytes.len() as u64));
-    // The cache's payload is unchanged, the NIR follows it.
-    assert_eq!(payload(bytes, &key, MAX_BYTES), Ok(&[5; 20][..]));
-    let entries: Vec<_> = NirEntries(nir_section(bytes, &key, MAX_BYTES)).collect();
+    let update = store.update().unwrap();
+    let entries: Vec<_> = NirEntries(&update.nir).collect();
     assert_eq!(
         entries,
         [([1; 32], &b"first nir"[..]), ([2; 32], &b"second"[..])]
     );
+    store.written(&update);
+    store.add_nir([4; 32], b"later");
+    let later = store.update().unwrap();
+    assert!(later.cache.is_none(), "the snapshot is written");
+    assert_eq!(
+        NirEntries(&later.nir)
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>(),
+        [[4; 32]]
+    );
 
-    // The next boot's device holds it, adds only what is new, and keeps
-    // the stored cache when it snapshots nothing.
+    let bytes = sealed(&key, &[5; 20], &update.nir);
+    assert_eq!(stored_bytes(bytes), Ok(bytes.len() as u64));
+    assert_eq!(payload(bytes, &key, MAX_BYTES), Ok(&[5; 20][..]));
+
+    // The next boot's device holds it and offers only what is new; the
+    // whole NIR is the stored entries and the added ones.
     let mut next = Store::new(bytes, COMPILER, MAX_BYTES);
     assert!(next.stored_nir().next().is_none(), "no device claimed it");
     next.claim(&gpu).unwrap();
     assert_eq!(next.stored_nir().count(), 2);
     next.add_nir([1; 32], b"first nir");
     next.add_nir([3; 32], b"third");
-    let sealed = next.take().unwrap();
-    let mut again = sealed.header.to_vec();
-    again.extend_from_slice(&sealed.payload);
-    assert_eq!(payload(&again, &key, MAX_BYTES), Ok(&[5; 20][..]));
-    let keys: Vec<_> = NirEntries(nir_section(&again, &key, MAX_BYTES))
+    let update = next.update().unwrap();
+    assert!(update.cache.is_none());
+    assert_eq!(
+        NirEntries(&update.nir)
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>(),
+        [[3; 32]]
+    );
+    let keys: Vec<_> = NirEntries(&next.all_nir(&key))
         .map(|(key, _)| key)
         .collect();
     assert_eq!(keys, [[1; 32], [2; 32], [3; 32]]);
@@ -244,4 +265,24 @@ fn damaged_nir_is_dropped_and_the_cache_kept() {
     bytes[last] ^= 1;
     assert_eq!(payload(&bytes, &key, MAX_BYTES), Ok(&b"cache"[..]));
     assert!(nir_section(&bytes, &key, MAX_BYTES).is_empty());
+}
+
+#[test]
+fn lookups_count_hits_and_compiles_apart_and_clear_when_taken() {
+    let lookups = Lookups::new();
+    lookups.note(true, 10);
+    lookups.note(false, 300);
+    lookups.note(false, 1_000);
+    lookups.note(true, 20);
+    assert_eq!(
+        lookups.take(),
+        LookupCounts {
+            hits: 2,
+            misses: 2,
+            hit_ns: 30,
+            miss_ns: 1_300,
+            miss_longest_ns: 1_000,
+        }
+    );
+    assert_eq!(lookups.take(), LookupCounts::default());
 }

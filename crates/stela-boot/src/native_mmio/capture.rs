@@ -8,6 +8,7 @@ use crate::{
     tables::Frames,
 };
 use core::sync::atomic::{AtomicBool, Ordering};
+use stela_boot_core::firmware_map;
 use stela_contracts::refuse;
 use stela_runtime::pc::acpi;
 use uefi::{
@@ -29,7 +30,6 @@ pub(super) struct Memory {
     pub start: u64,
     pub end: u64,
     pub kind: u32,
-    pub attributes: u64,
 }
 /// All fields are initialized by the loader. Kept in reserved
 /// LOADER_DATA pages, mapped by the native physmap and never offered to guests.
@@ -118,12 +118,20 @@ impl Wire {
             r.end <= first || end <= r.start || matches!(r.kind, 0 | 5 | 6 | 9 | 10 | 11 | 13)
         })
     }
+    /// Whether every map entry overlapping `first..end` leaves the range to
+    /// devices (reserved or MMIO, runtime attribute or not), so no RAM or
+    /// loader memory lies under a device mapping.
     pub(super) fn excludes_memory(&self, first: u64, end: u64) -> bool {
-        self.memory().iter().all(|r| {
-            r.end <= first
-                || end <= r.start
-                || (matches!(r.kind, 0 | 11) && r.attributes & (1 << 63) == 0)
-        })
+        self.memory_conflict(first, end).is_none()
+    }
+    /// The first map entry overlapping `first..end` that is not left to
+    /// devices, as (start, end, kind).
+    pub(super) fn memory_conflict(&self, first: u64, end: u64) -> Option<(u64, u64, u32)> {
+        firmware_map::first_conflict(
+            self.memory().iter().map(|r| (r.start, r.end, r.kind)),
+            first,
+            end,
+        )
     }
 }
 
@@ -346,7 +354,6 @@ impl Prepared {
                 start: entry.phys_start,
                 end,
                 kind: entry.ty.0,
-                attributes: entry.att.bits(),
             };
             wire.memory_count += 1;
         }

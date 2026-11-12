@@ -1664,17 +1664,29 @@ impl NativeBackend {
             return create(self, source, &mut feedback);
         };
         let cache = PipelineCache(raw(cache));
+        let hit = |feedback: &vk::PipelineCreationFeedback| {
+            feedback.flags.contains(
+                vk::PipelineCreationFeedbackFlags::VALID
+                    | vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT,
+            )
+        };
         if !grows {
             return match create(self, PipelineSource::Archived(cache), &mut feedback) {
-                Err(Error::NotArchived) => create(self, PipelineSource::Compiled, &mut feedback),
-                created => created,
+                Err(Error::NotArchived) => {
+                    let created = create(self, PipelineSource::Compiled, &mut feedback)?;
+                    pipeline_store::note_lookup(false, feedback.duration);
+                    Ok(created)
+                }
+                created => {
+                    let created = created?;
+                    pipeline_store::note_lookup(true, feedback.duration);
+                    Ok(created)
+                }
             };
         }
         let created = create(self, PipelineSource::Cached(cache), &mut feedback)?;
-        let hit = feedback.flags.contains(
-            vk::PipelineCreationFeedbackFlags::VALID
-                | vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT,
-        );
+        let hit = hit(&feedback);
+        pipeline_store::note_lookup(hit, feedback.duration);
         self.store.created(&self.device, hit);
         Ok(created)
     }

@@ -1,6 +1,6 @@
-//! Vector Half FADD, FSUB, FABD, FMUL, FMULX and FNMUL in packed AVX2 lanes,
-//! for every finite input: subnormal inputs, zeros, cancellation and tiny or
-//! subnormal results complete inline.
+//! Scalar and vector Half FADD, FSUB, FABD, FMUL, FMULX, FNMUL and FDIV in
+//! packed AVX2 lanes, for every finite input: subnormal inputs, zeros,
+//! cancellation and tiny or subnormal results complete inline.
 //!
 //! VCVTPH2PS and VCVTPS2PD widen each group of four Half lanes exactly to
 //! Double, where the sum or difference (at most 40 significant bits, the
@@ -9,6 +9,22 @@
 //! The exact Double is then rounded once to Half in integer qword lanes under
 //! FPCR's rounding mode, on the normal grid or, below 2^-14, on the
 //! subnormal grid (a variable shift), so no double rounding occurs.
+//!
+//! A quotient is not exact in Double, but its one rounding there never
+//! decides a Half result: an inexact quotient a/b of Half fields lies at
+//! least 2^-23 (relative) from every number of 12 significant bits ((a -
+//! m*b)/b with integer fields), far beyond the Double rounding error of
+//! 2^-53, so its dropped bits are never all zero nor an exact tie, it is on
+//! the same side of 2^-14 as the exact quotient, and the Half result,
+//! tininess and inexact status are the exact quotient's in every rounding
+//! mode. The quotient raises host status, so the caller's MXCSR is saved
+//! and restored around it; a zero divisor gives an infinity or NaN, which
+//! takes the helper as an overflow.
+//!
+//! A scalar form computes its one lane in the low group, whose other lanes
+//! are set to 0 and 1.0 (the left and right inputs), which complete
+//! exactly; the result is the lane alone, or, under FPCR.NEP, the lane in
+//! Vn's other bits.
 //!
 //! An exact zero sum takes its sign from the rounding mode: -0 under
 //! round-toward-minus for opposite signs. The host adds in nearest-even, so
@@ -23,7 +39,7 @@
 //! the helper, and so do NaN and infinite inputs, overflow and enabled traps.
 use super::super::super::numerical::{Condition, branch, jump, resolve, test_control};
 use super::super::super::{Host, packed};
-use crate::x86_64::asm::{Alu, Code, Cond, Gpr, Map, Pp, Rm, ShiftOp, Size, Unary, Vex};
+use crate::x86_64::asm::{Alu, Code, Cond, Gpr, Map, Mem, Pp, Rm, ShiftOp, Size, Unary, Vex};
 use crate::{
     GuestAddress, GuestState, TargetCpu,
     aarch64::{
@@ -31,11 +47,11 @@ use crate::{
             BinaryOperation, FPCR_AH, FPCR_EXCEPTION_ENABLE_MASK, FPCR_FZ16, FPCR_ROUNDING_MASK,
             FPCR_ROUNDING_SHIFT, INEXACT,
         },
-        simd::arithmetic::{Operand, Shape},
+        simd::arithmetic::{Inputs, Operand, Shape},
     },
     block::ExitKind,
 };
-use Gpr::{R8, R9, R10, Rax, Rcx};
+use Gpr::{R8, R9, R10, Rax, Rcx, Rsp};
 use alloc::vec::Vec;
 
 /// The Half inputs, as `half::prepare_inputs` leaves them, and the result.
@@ -74,6 +90,14 @@ const DOUBLE_FRACTION_BITS: u8 = 52;
 const SIGN_POSITION: u8 = 63;
 const HALF_SIGN_POSITION: u8 = 15;
 const UPPER_QWORD_BYTES: u8 = 8;
+/// R10's bits for the tiny nonzero lanes and, shifted, the overflowed ones.
+const TINY_LANES: i32 = 0xf;
+const OVERFLOW_SHIFT: u8 = 8;
+/// The low Half lane of a qword, and 1.0 in its other three lanes.
+const HALF_LANE: i32 = 0xffff;
+const ONES_ABOVE: u64 = 0x3c00_3c00_3c00_0000;
+/// The aligned stack slot holding the caller's MXCSR around a quotient.
+const MXCSR_SLOT_BYTES: i8 = 16;
 
 const fn vex(map: Map, pp: Pp, w: bool, l: bool) -> Vex {
     Vex { map, pp, w, l }
@@ -172,12 +196,9 @@ fn lanes(code: &mut Code, source: u8) {
     );
 }
 
-/// Which forms the packed recipe completes on `target`.
-pub(super) fn supports(operand: &Operand, target: TargetCpu) -> bool {
-    target.supports(TargetCpu::Avx2)
-        && target.supports(TargetCpu::F16c)
-        && matches!(operand.shape, Shape::Vector64 | Shape::Vector128)
-        && !matches!(operand.operation, BinaryOperation::Divide)
+/// Whether the packed recipe completes every form on `target`.
+pub(super) fn supports(target: TargetCpu) -> bool {
+    target.supports(TargetCpu::Avx2) && target.supports(TargetCpu::F16c)
 }
 
 /// The FPCR policies in NEAREST, POSITIVE, NEGATIVE and FLIP. Clobbers RAX
@@ -250,14 +271,9 @@ fn guard_inputs(code: &mut Code, active: u32, helper: &mut Vec<usize>) {
 /// One group of four lanes: the low (`upper` false) or high qword of LEFT
 /// and RIGHT, its Half results in the low qword of RESULT (or, for the high
 /// group, the high qword). R8D, R9D and R10D collect the lanes that are
-/// inexact, underflow, and tiny and nonzero. Overflow takes `helper`.
-fn group(
-    code: &mut Code,
-    operation: BinaryOperation,
-    upper: bool,
-    flip: bool,
-    helper: &mut Vec<usize>,
-) {
+/// inexact, underflow, and tiny and nonzero; R10D also the lanes that
+/// overflow, above [`OVERFLOW_SHIFT`]. It branches nowhere.
+fn group(code: &mut Code, operation: BinaryOperation, upper: bool, flip: bool) {
     // Widen exactly: VCVTPH2PS xmm, VCVTPS2PD ymm.
     for (input, wide) in [(LEFT, T8), (RIGHT, T9)] {
         let source = if upper {
@@ -299,6 +315,7 @@ fn group(
     let opcode = match operation {
         BinaryOperation::Add => 0x58,
         BinaryOperation::Subtract | BinaryOperation::AbsoluteDifference => 0x5c,
+        BinaryOperation::Divide => 0x5e,
         _ => 0x59,
     };
     ymm(code, Map::M0f, opcode, false, T10, T8, T9);
@@ -362,12 +379,14 @@ fn group(
     or(code, T10, T10, T4);
     add_q(code, T2, T2, T10);
     right_variable(code, T2, T2, T5);
-    // Overflow (to infinity or the largest finite) takes the helper.
+    // Overflow (to infinity or the largest finite), and an infinite or NaN
+    // quotient, takes the helper.
     broadcast(code, T9, LARGEST_FINITE);
     greater_q(code, T4, T2, T9);
     lanes(code, T4);
-    code.asm().test(Size::Dword, Rax, Rax);
-    helper.push(branch(code, Condition::NotZero));
+    let mut asm = code.asm();
+    asm.shift_imm(ShiftOp::Shl, Size::Dword, Rax, OVERFLOW_SHIFT);
+    asm.alu(Alu::Or, Size::Dword, R10, Rax);
     // The sign, transformed as FNMUL and FABD transform the rounded result.
     match operation {
         BinaryOperation::AbsoluteDifference => {}
@@ -418,6 +437,19 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress) {
     helper.push(branch(code, Condition::NotZero));
     super::prepare_inputs(code, operand);
     let wide = operand.shape == Shape::Vector128;
+    let scalar = operand.shape == Shape::Scalar;
+    if scalar {
+        // Lane 0 alone; 0 and 1.0 in the others.
+        let mut asm = code.asm();
+        asm.movd_from_xmm(Rax, LEFT);
+        asm.alu_imm32(Alu::And, Size::Dword, Rax, HALF_LANE);
+        asm.movq_to_xmm(LEFT, Rax);
+        asm.movd_from_xmm(Rax, RIGHT);
+        asm.alu_imm32(Alu::And, Size::Dword, Rax, HALF_LANE);
+        asm.mov_imm64(Rcx, ONES_ABOVE);
+        asm.alu(Alu::Or, Size::Qword, Rax, Rcx);
+        asm.movq_to_xmm(RIGHT, Rax);
+    }
     guard_inputs(code, if wide { 0xffff } else { 0xff }, &mut helper);
     let flip = matches!(
         operand.operation,
@@ -428,13 +460,27 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress) {
     asm.alu(Alu::Xor, Size::Dword, R8, R8);
     asm.alu(Alu::Xor, Size::Dword, R9, R9);
     asm.alu(Alu::Xor, Size::Dword, R10, R10);
-    group(code, operand.operation, false, flip, &mut helper);
+    let divide = operand.operation == BinaryOperation::Divide;
+    if divide {
+        let mut asm = code.asm();
+        asm.alu_imm8(Alu::Sub, Size::Qword, Rsp, MXCSR_SLOT_BYTES);
+        asm.stmxcsr(Mem::base(Rsp, 0));
+    }
+    group(code, operand.operation, false, flip);
     if wide {
-        group(code, operand.operation, true, flip, &mut helper);
+        group(code, operand.operation, true, flip);
+    }
+    if divide {
+        let mut asm = code.asm();
+        asm.ldmxcsr(Mem::base(Rsp, 0));
+        asm.alu_imm8(Alu::Add, Size::Qword, Rsp, MXCSR_SLOT_BYTES);
     }
     code.asm().vzeroupper();
+    code.asm()
+        .test_imm(Size::Dword, R10, TINY_LANES << OVERFLOW_SHIFT);
+    helper.push(branch(code, Condition::NotZero));
     // A tiny nonzero lane under FZ16 or AH takes the helper.
-    code.asm().test(Size::Dword, R10, R10);
+    code.asm().test_imm(Size::Dword, R10, TINY_LANES);
     let none = branch(code, Condition::Zero);
     test_control(code, FPCR_FZ16 | FPCR_AH);
     helper.push(branch(code, Condition::NotZero));
@@ -467,7 +513,21 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress) {
         super::super::super::numerical::state(core::mem::offset_of!(GuestState, fpsr)),
         Rax,
     );
-    if wide {
+    if scalar {
+        let mut asm = code.asm();
+        asm.movd_from_xmm(Rax, RESULT);
+        asm.alu_imm32(Alu::And, Size::Dword, Rax, HALF_LANE);
+        asm.movq_to_xmm(LEFT, Rax);
+        // FPCR.NEP keeps Vn's other bits (`half::merge_scalar`).
+        let left = match operand.inputs {
+            Inputs::Elementwise { left, .. } | Inputs::Indexed { left, .. } => Some(left),
+            Inputs::Pairwise { .. } | Inputs::PairwiseScalar { .. } => None,
+        };
+        if let Some(left) = left {
+            super::super::super::read_vector(code, left, super::super::super::half::ORIGINAL_LEFT);
+            super::super::super::half::merge_scalar(code);
+        }
+    } else if wide {
         packed(code, Host::MoveAligned, LEFT, RESULT);
     } else {
         Host::MoveQword.register(code, LEFT, RESULT, TargetCpu::Baseline);

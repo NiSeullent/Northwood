@@ -95,6 +95,22 @@ pub(super) struct Mirrors {
     /// open while this PE has no maintenance outstanding, whatever its
     /// state or derived state ([`Machine::open_barrier`]).
     pub(super) barrier: register_read::Cell,
+    /// What native SEVL and WFE complete on
+    /// (`x86_64::register_read::send_event_thunk`, `event_wait_thunk`): open
+    /// on the PE's event register as native code is entered
+    /// ([`Machine::enter_events`]). Neither depends on any System register
+    /// or the PE's state: SEVL never traps, and a WFE that finds the event
+    /// register set clears it and completes before any trap check (Arm
+    /// `Hint_WFE`); one that finds it clear exits for the engine to wait.
+    pub(super) events: register_read::Cell,
+    /// What native CLREX completes on
+    /// (`x86_64::register_read::clear_exclusive_thunk`): open as native
+    /// code is entered while the engine holds no monitor of its own and
+    /// traces none ([`Machine::enter_events`]), its `value` the PE's
+    /// reservation word (`Cpu::reservation_word`), which a held canonical
+    /// reservation makes nonzero. CLREX never traps, so nothing else
+    /// decides it.
+    pub(super) exclusive: register_read::Cell,
     /// The records native GENTER and GEXIT complete from
     /// (`x86_64::transition`), indexed by `state`, which they move.
     pub(super) transitions: transition::Table,
@@ -107,9 +123,9 @@ pub(super) struct Mirrors {
     /// ([`Machine::take_thread_switches`]).
     pub(super) switches: register_read::SwitchLog,
     /// Nonzero while the engine holds an exclusive monitor of its own
-    /// (`Cpu::monitor`) or the PE's monitor and event register live in its
-    /// canonical memory, set as native code is entered: native ERET then
-    /// leaves clearing and signalling them to the engine.
+    /// (`Cpu::monitor`), set as native code is entered: native ERET then
+    /// leaves clearing it to the engine. A canonical reservation has its
+    /// own word, which the exclusive service keeps (`Record::reservation`).
     pub(super) monitor: u64,
     /// The performance monitor's cycle counter as native code is entered
     /// ([`Machine::enter_cycles`]), from which a cycle counter read computes
@@ -137,6 +153,13 @@ pub(super) const INTERRUPT_STATUS: Place =
 /// Where native code finds [`Mirrors::barrier`].
 pub(super) const BARRIER: Place = Place::new(Anchor::Mirrors, offset_of!(Mirrors, barrier));
 
+/// Where native code finds [`Mirrors::events`].
+pub(super) const EVENTS: Place = Place::new(Anchor::Mirrors, offset_of!(Mirrors, events));
+
+/// Where native code finds [`Mirrors::exclusive`].
+pub(super) const CLEAR_EXCLUSIVE: Place =
+    Place::new(Anchor::Mirrors, offset_of!(Mirrors, exclusive));
+
 /// MRS ISR_EL1 to Xt, Rt in bits 4:0.
 pub(super) const READ_INTERRUPT_STATUS: u32 = 0xd538_c100;
 
@@ -159,18 +182,12 @@ pub(super) const CODE_PAGE: usize = STACK_SELECT + 1;
 /// completed plainly in the state on a host that keeps PAN in RFLAGS.AC.
 pub(super) const PAN_WRITES: usize = CODE_PAGE + 1;
 
-/// The cells of SEVL and WFE (`x86_64::register_read::send_event_thunk`,
-/// `event_wait_thunk`), open on the event register once one completed
-/// plainly in the state; WFE completes natively only when an event is set.
-pub(super) const SEND_EVENT: usize = PAN_WRITES + 1;
-pub(super) const EVENT_WAIT: usize = SEND_EVENT + 1;
-
 /// The cell of MSR TTBR0_EL1 (`x86_64::register_read::unchanged_write_thunk`),
 /// open on the storage a plain write reached: a write of the value the
 /// register holds completes natively and changes nothing, any other exits.
 /// A kernel rewrites the same table base at most switches into a thread of
 /// the address space it already runs.
-pub(super) const TABLE_BASE_KEPT: usize = EVENT_WAIT + 1;
+pub(super) const TABLE_BASE_KEPT: usize = PAN_WRITES + 1;
 
 /// TTBR0_EL1 (TTBR0_EL2 at EL2 with E2H).
 pub(super) const TABLE_BASE: Encoding = Encoding::new(3, 0, 2, 0, 0);
@@ -367,6 +384,8 @@ impl Default for Mirrors {
             fields: [0; 3],
             interrupt_status: register_read::Cell::default(),
             barrier: register_read::Cell::default(),
+            events: register_read::Cell::default(),
+            exclusive: register_read::Cell::default(),
             transitions: transition::Table::default(),
             lines_until: 0,
             switches: register_read::SwitchLog::default(),
@@ -767,6 +786,19 @@ pub(super) fn data_barrier(pc: u64, word: u32) -> bool {
         Some(SystemOperation::Synchronization(
             Synchronization::DataCompletion { nxs: false, .. }
         ))
+    )
+}
+
+/// Whether `word` at `pc` is CLREX.
+pub(super) fn clear_exclusive(pc: u64, word: u32) -> bool {
+    matches!(
+        block::decode_system_mode_instruction(GuestAddress(pc), word)
+            .ok()
+            .flatten()
+            .map(|instruction| instruction.operation),
+        Some(SystemOperation::Exclusive(Ok(
+            stela_compiler::aarch64::exclusive::Operand::Clear
+        )))
     )
 }
 

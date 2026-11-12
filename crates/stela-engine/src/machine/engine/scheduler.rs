@@ -315,13 +315,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.chain.begin(index, budget);
         self.cpu.state.daif = u32::from(self.cpu.pstate.daif);
         self.mirrors.selected = u64::from(self.cpu.pstate.sp);
-        self.mirrors.monitor =
-            u64::from(self.cpu.monitor.is_some() || self.cpu.has_canonical_memory());
+        self.mirrors.monitor = u64::from(self.cpu.monitor.is_some());
         self.mirrors.transition(self.mirror_state());
         self.mirrors.enter(self.cpu.pstate);
         self.cpu.state.pan = u64::from(self.cpu.pstate.pan);
         self.enter_amx_cell();
         self.enter_cycles();
+        self.enter_events();
         self.cpu.state.anchors = self.anchors();
         self.cpu.state.lower_limit = self.lower_limit();
         let entered = self.timing_start();
@@ -447,7 +447,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 if let Some(count) = self.statistics.exit_kinds.get_mut(kind as usize) {
                     *count += 1;
                 }
-                if let Some(miss) = self.lookup_miss(last, next_pc, kind, remaining > budget) {
+                let probed = self.lookup_miss(last, next_pc, kind, remaining > budget);
+                if let Some(miss) = probed {
                     self.statistics.lookup_misses[miss] += 1;
                 }
                 let mut slot = kind as usize;
@@ -462,7 +463,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     // (`step_timing::numerical_key`).
                     self.timed_word = Some(self.timed_system_word(last, next_pc));
                 }
+                let spent = remaining > budget;
                 let exited = self.exit(last, next_pc, kind);
+                if exited.is_ok()
+                    && let Some(miss) = self.branch_miss(last, next_pc, kind, spent, probed)
+                {
+                    let counts = &mut self.statistics.branch_misses[kind as usize];
+                    counts[miss as usize] += 1;
+                    counts[BranchMiss::COUNT] += u64::from(transitioned);
+                }
                 if exited.is_ok() {
                     let btype = self.cpu.pstate.btype;
                     match ExitKind::try_from(kind) {
@@ -497,6 +506,54 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 handled
             }
         }
+    }
+
+    /// Why the run that ended at block `index`'s branch-kind exit of `kind`
+    /// to `next_pc` took no transfer there, after the exit completed:
+    /// `spent` when the budget ran out, `probed` what [`Self::lookup_miss`]
+    /// found before the exit, in the contexts the run's probe used, which
+    /// spares probing again but for the entry's BTYPE. `None` for other
+    /// kinds and single runs.
+    pub(super) fn branch_miss(
+        &self,
+        index: usize,
+        next_pc: u64,
+        kind: u64,
+        spent: bool,
+        probed: Option<usize>,
+    ) -> Option<BranchMiss> {
+        if kind as usize >= super::reports::BRANCH_KINDS
+            || self.variants[self.code.blocks[index].variant.0 as usize].single
+        {
+            return None;
+        }
+        if spent {
+            return Some(BranchMiss::Spent);
+        }
+        if self.chain.interrupt_moved() {
+            return Some(BranchMiss::Interrupt);
+        }
+        match probed {
+            Some(0) => return Some(BranchMiss::Unlinked),
+            Some(1) => return Some(BranchMiss::Itlb),
+            Some(2) => return Some(BranchMiss::Table),
+            _ => {}
+        }
+        let Some(key) = self.current_key(next_pc) else {
+            return Some(BranchMiss::Itlb);
+        };
+        let table = &self.code.table;
+        let entry = table.find(table.slot(next_pc, key), next_pc, key);
+        Some(if entry.pc != next_pc || entry.key != key {
+            BranchMiss::Table
+        } else if probed.is_none() {
+            // A direct exit in its page links at its target's fetch.
+            BranchMiss::Unlinked
+        } else if entry.targets & (1 << self.cpu.pstate.btype) == 0 {
+            BranchMiss::Btype
+        } else {
+            BranchMiss::Found
+        })
     }
 
     /// Why block `index`'s exit of `kind` to `next_pc` took no lookup

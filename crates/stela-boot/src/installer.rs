@@ -497,19 +497,72 @@ impl Picker {
                 disk.write(write.lba, &write.bytes)?;
             }
         }
+        disk.blank(first, blocks)?;
+        Ok(target)
+    }
+}
+
+impl Disk {
+    /// Zero the first MiB and the machine state's tail of the partition of
+    /// `blocks` from `first`, so the restore and the NOR start blank, and
+    /// make it durable.
+    fn blank(&mut self, first: u64, blocks: u64) -> Result<()> {
+        let block = self.geometry.block_bytes;
         let bytes = blocks * block;
         let split =
             machine_state::split(bytes).map_err(|_| refuse!("the partition is too small"))?;
-        disk.zero(first, MIB)?;
-        disk.zero(
+        self.zero(first, MIB)?;
+        self.zero(
             first + split.namespace_bytes / block,
             bytes - split.namespace_bytes,
         )?;
-        disk.io
+        self.io
             .flush_blocks()
-            .map_err(|_| refuse!("the disk did not finish writing"))?;
-        Ok(target)
+            .map_err(|_| refuse!("the disk did not finish writing"))
     }
+}
+
+/// Install macOS again on the Stela partition chosen before (`SERIAL:GUID`),
+/// as choosing it again in the picker does: its table unchanged, its first
+/// MiB and machine state blank.
+pub fn again(chosen: &str) -> Result<()> {
+    let target: Target = chosen.parse()?;
+    let mut disks = disks();
+    let mut matching_disks = disks
+        .iter_mut()
+        .filter(|disk| disk.serial.as_deref() == Some(target.serial.as_str()));
+    let disk = matching_disks
+        .next()
+        .ok_or(refuse!("the disk chosen before is not there"))?;
+    if matching_disks.next().is_some() {
+        return Err(refuse!("several disks have the serial chosen before"));
+    }
+    let mut matching_partitions = disk
+        .table
+        .as_ref()
+        .into_iter()
+        .flat_map(|table| &table.partitions)
+        .filter(|partition| partition.unique_guid == target.partition);
+    let partition = matching_partitions
+        .next()
+        .ok_or(refuse!("the partition chosen before is not there"))?;
+    if matching_partitions.next().is_some() {
+        return Err(refuse!("several partitions have the GUID chosen before"));
+    }
+    if partition.role() != Some(Role::AppleRegion) {
+        return Err(refuse!(
+            "the partition chosen before is no longer a Stela partition"
+        ));
+    }
+    if let Some(refusal) = disk.refusal {
+        return Err(refuse!("{refusal}", refusal));
+    }
+    let first = partition.first_lba;
+    let blocks = partition.blocks();
+    output::arguments(format_args!(
+        "INSTALLER again on the partition chosen before first_lba={first} blocks={blocks}\n"
+    ));
+    disk.blank(first, blocks)
 }
 
 /// Open `handle`'s block I/O, without taking it from its driver.
@@ -609,8 +662,12 @@ fn disks() -> Vec<Disk> {
             Ok(Found::Blank | Found::Interrupted) => {}
             Err(_) => disk.foreign = true,
         }
-        // Stela finds the disk again by its serial number.
+        // Stela's own drivers must reach the disk, and find it again by its
+        // serial number.
+        let controller = crate::pci_io::disk_controller(handle)
+            .and_then(|function| stela_drivers::probe::disk_refusal(&function));
         disk.refusal = match &disk.serial {
+            _ if controller.is_some() => controller,
             None => Some("No serial number"),
             Some(serial) if serial.contains(char::is_whitespace) => {
                 Some("Serial number has spaces")

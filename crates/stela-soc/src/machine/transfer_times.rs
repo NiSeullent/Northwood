@@ -164,4 +164,27 @@ mod tests {
         let times = devices.take_transfer_times();
         assert!(times.iter().all(|time| time.calls == 1), "{times:?}");
     }
+
+    /// An AIC unmask, the write that follows each acknowledged interrupt,
+    /// is as quiet as a console byte: the masters run every few writes.
+    #[test]
+    fn an_aic_unmask_runs_the_masters_only_every_few_writes() {
+        const AIC: u64 = 0x2_3b0c_0000;
+        const MASK_CLR: u64 = 0x6600;
+        let mut devices = AppleDevices::new();
+        devices
+            .add_aic(AIC, 1152, stela_soc_data::aic::AicLayout::aic2(0x8000, 16))
+            .unwrap();
+        let mut ram = Locked(Ram::new(0x8_0000_0000, 0x1000));
+        devices.time_transfers(Some(clock));
+        let writes = super::super::QUIET_WRITES as u64 + 4;
+        for now in 1..=writes {
+            devices.write(0, AIC + MASK_CLR, 4, 1, now).unwrap();
+            devices.settle_write(0, now, &mut ram).transfer.unwrap();
+        }
+        let times = devices.take_transfer_times();
+        assert_eq!(times[0].calls, writes, "{times:?}");
+        assert_eq!(times[8].calls, writes, "{times:?}");
+        assert!(times[1..8].iter().all(|time| time.calls == 1), "{times:?}");
+    }
 }

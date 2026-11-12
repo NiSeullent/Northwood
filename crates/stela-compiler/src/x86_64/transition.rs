@@ -116,6 +116,9 @@ pub struct Record {
     pub untag: [u64; 2],
     /// ERET: the event register byte the return sets.
     pub event: u64,
+    /// ERET: a word nonzero while the PE holds a local reservation outside
+    /// the frame (its canonical memory's), which only the engine clears.
+    pub reservation: u64,
     /// SVC and ERET between levels whose PAC key enables differ: nonzero,
     /// and the PAC service's tag words ([`Places::pointer_tags`]) must be
     /// `pointer_from` (an open service of the level left) and become
@@ -768,7 +771,8 @@ pub fn supervisor_call_thunk(pc: GuestAddress, syndrome: u32, places: &Places) -
 /// than the operands (NZCV, A, I, F, DIT, UAO, SSBS) the record's, so
 /// neither an illegal return nor PACM, single-step or another EL, and no
 /// waiting interrupt unmasked; and the engine holds no exclusive monitor of
-/// its own (`Places::monitor`). PSTATE's operands come from SPSR, the PC
+/// its own (`Places::monitor`) nor the PE a reservation outside the frame
+/// (`Record::reservation`). PSTATE's operands come from SPSR, the PC
 /// from ELR with its tag removed where the record says, the SP moves, the
 /// frame's local monitor clears and the event register is set.
 pub fn exception_return_thunk(pc: GuestAddress, places: &Places) -> Thunk {
@@ -781,6 +785,9 @@ pub fn exception_return_thunk(pc: GuestAddress, places: &Places) -> Thunk {
     locate(&mut asm, places, EXCEPTION_RETURN, &mut misses);
     check_epoch(&mut asm, &mut misses);
     asm.place(Rcx, places.monitor);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
+    misses.push(asm.jcc(Cond::Ne));
+    asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, reservation)));
     asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
     misses.push(asm.jcc(Cond::Ne));
     check_host(&mut asm, &mut misses);

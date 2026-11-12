@@ -77,8 +77,94 @@ impl ConfigError {
         }
     }
 }
+/// A configuration register's name for the boot log.
+pub struct Register(pub u16);
+impl core::fmt::Display for Register {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self.0 {
+            0x00 => "vendor and device ID",
+            0x04 => "COMMAND",
+            0x06 => "STATUS",
+            0x08 => "class and revision",
+            0x0c => "header type",
+            0x18 => "bus numbers",
+            _ => return write!(f, "register {:#x}", self.0),
+        };
+        write!(f, "{name} register ({:#04x})", self.0)
+    }
+}
+
+/// A plain sentence: what was accessed, what was expected and read, and
+/// whether a write may have taken effect.
 impl core::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "PCI configuration {:?} ({:?})", self.reason, self.effect)
+        match self.reason {
+            ConfigFailure::Readback {
+                offset,
+                width,
+                expected,
+                observed,
+            } => {
+                let digits = width * 2;
+                write!(
+                    f,
+                    "the {} reads {observed:#0w$x} where {expected:#0w$x} was expected",
+                    Register(offset),
+                    w = digits + 2,
+                )?;
+            }
+            ConfigFailure::Access { offset, width } => write!(
+                f,
+                "a {width}-byte access at {offset:#x} is misaligned or outside configuration space"
+            )?,
+            ConfigFailure::Mapping(error) => {
+                write!(f, "the configuration space could not be mapped ({error:?})")?
+            }
+            ConfigFailure::UnqualifiedControl => {
+                f.write_str("a control is in a state Stela does not change")?
+            }
+            reason => write!(f, "the configuration access failed ({reason:?})")?,
+        }
+        match self.effect {
+            ConfigEffect::None => Ok(()),
+            ConfigEffect::WriteMayHaveApplied { offset, .. } => {
+                write!(f, " after Stela wrote the {}", Register(offset))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+
+    #[test]
+    fn a_readback_failure_reads_as_a_sentence() {
+        let error = ConfigError::write_may_have_applied(
+            4,
+            2,
+            ConfigFailure::Readback {
+                offset: 4,
+                width: 2,
+                expected: 0x400,
+                observed: 0,
+            },
+        );
+        assert_eq!(
+            format!("{error}"),
+            "the COMMAND register (0x04) reads 0x0000 where 0x0400 was expected after \
+             Stela wrote the COMMAND register (0x04)"
+        );
+        let error = ConfigError::before_effect(ConfigFailure::Readback {
+            offset: 0x52,
+            width: 2,
+            expected: 0x80,
+            observed: 0x81,
+        });
+        assert_eq!(
+            format!("{error}"),
+            "the register 0x52 reads 0x0081 where 0x0080 was expected"
+        );
     }
 }

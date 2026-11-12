@@ -60,6 +60,16 @@ impl core::fmt::Debug for SharedMemory {
     }
 }
 impl SharedMemory {
+    /// Where the word nonzero while the local reservation is held lives.
+    pub(crate) fn reservation_word(&self) -> u64 {
+        self.memory.reservation_word()
+    }
+
+    /// Whether a local reservation is held.
+    pub(crate) fn holds_reservation(&self) -> bool {
+        self.memory.holds_reservation()
+    }
+
     pub(crate) fn prepare_clear_reservation(
         &mut self,
     ) -> Result<crate::memory::domain::PreparedLocalClear<'_>, MemoryStatus> {
@@ -417,6 +427,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             cpu.event = false;
             cpu.canonical_memory = Some(memory);
         }
+        // Records name the event byte and reservation word they found.
+        self.mirrors.transitions.forget();
         Ok(())
     }
 }

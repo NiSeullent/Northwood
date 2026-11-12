@@ -60,7 +60,9 @@ pub mod miss {
     pub const CHECK: usize = 5;
     pub const INTERRUPT: usize = 6;
     pub const OTHER: usize = 7;
-    pub const REASONS: usize = 8;
+    /// ERET: the engine's monitor or a canonical reservation was held.
+    pub const MONITOR: usize = 8;
+    pub const REASONS: usize = 9;
 }
 
 /// [`dynamic_branch`] of a block ending with a native transition: its
@@ -135,6 +137,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             miss::DEADLINE
         } else if returning && self.chain.interrupt_moved() {
             miss::EPOCH
+        } else if kind == EXCEPTION_RETURN && self.cpu.holds_exclusive() {
+            miss::MONITOR
         } else if self.transition_operands_differ(&record, kind) {
             miss::CHECK
         } else if returning && self.transition_unmasks(kind) {
@@ -159,7 +163,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Whether the operands `record` fixes differ from the PE's, as the
     /// thunk checks them: GENTER's and SVC's PAN; GEXIT's ASPSR guarded bit
     /// and SPSR's fixed bits; ERET's SPSR fixed bits, or a monitor the
-    /// engine holds (`Places::monitor`).
+    /// engine holds or a canonical reservation (`Cpu::holds_exclusive`).
     fn transition_operands_differ(&self, record: &Record, kind: usize) -> bool {
         if matches!(kind, GUARDED_ENTER | SUPERVISOR_CALL) {
             return u64::from(self.cpu.pstate.pan) != record.check;
@@ -167,8 +171,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let Some((spsr, aspsr)) = self.returned_state(kind) else {
             return true;
         };
-        let monitor = kind == EXCEPTION_RETURN
-            && (self.cpu.monitor.is_some() || self.cpu.has_canonical_memory());
+        let monitor = kind == EXCEPTION_RETURN && self.cpu.holds_exclusive();
         let guarded = kind == GUARDED_EXIT && aspsr & 1 != record.aspsr_value;
         monitor || guarded || spsr & record.check_mask != record.check
     }
@@ -217,11 +220,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// (HCR_EL2.E2H and TGE: one translation regime, PAC keys and controls,
     /// and no fine-grained trap of either) or within EL2, unguarded, with
     /// the watchpoints the same on both sides and no single-step in
-    /// progress. ERET also needs the local monitor kept in the frame alone:
-    /// a PE with canonical memory (the home PE of a parallel board) clears
-    /// its reservation through the shared registry (`Cpu::exception_return`),
-    /// which native code cannot reach. An SVC leaves the monitor alone
-    /// (`Cpu::take`), so it makes records there too.
+    /// progress. A PE with canonical memory (the home PE of a parallel
+    /// board) makes ERET records too: its thunk completes only while no
+    /// reservation is held (`Record::reservation`), when the clear through
+    /// the shared registry (`Cpu::exception_return`) changes nothing, and
+    /// exits to the engine otherwise. An SVC leaves the monitor alone
+    /// (`Cpu::take`).
     pub(super) fn note_transition(&mut self, kind: usize, start: Start, spsr: u64, aspsr: u64) {
         self.statistics.engine_transitions[kind] += 1;
         let (from, to) = (start.pstate, self.cpu.pstate);
@@ -237,7 +241,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     && self.cpu.in_host()
                     && start.watch == self.watch
                     && !self.cpu.step_advance
-                    && (kind == SUPERVISOR_CALL || !self.cpu.has_canonical_memory())
                     && if kind == SUPERVISOR_CALL {
                         to.el == 2
                     } else {
@@ -453,6 +456,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             fields_set,
             untag,
             event: self.cpu.event_storage(),
+            reservation: self.cpu.reservation_word(),
             close,
             scratch: 0,
             pointer_swap: u64::from(note.pointer.is_some()),
@@ -631,13 +635,13 @@ pub(super) mod tests {
         const PAGE: usize = 4096;
         machine.cpu.state.daif = u32::from(machine.cpu.pstate.daif);
         machine.mirrors.selected = u64::from(machine.cpu.pstate.sp);
-        machine.mirrors.monitor =
-            u64::from(machine.cpu.monitor.is_some() || machine.cpu.has_canonical_memory());
+        machine.mirrors.monitor = u64::from(machine.cpu.monitor.is_some());
         let state = machine.mirror_state();
         machine.mirrors.transition(state);
         machine.mirrors.enter(machine.cpu.pstate);
         machine.cpu.state.pan = u64::from(machine.cpu.pstate.pan);
         machine.enter_cycles();
+        machine.enter_events();
         machine.cpu.state.anchors = machine.anchors();
         machine.cpu.state.lower_limit = machine.lower_limit();
         let code = stela_compiler::x86_64::pinned::entered(code);

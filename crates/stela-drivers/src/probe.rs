@@ -256,6 +256,23 @@ pub fn claims_identity(function: &crate::bus::pci::Identity) -> bool {
     registry::pre_exit_claim(function)
 }
 
+/// Why the disks behind storage controller `function` are out of reach of
+/// Stela's drivers, for the disk chooser to refuse them before boot
+/// services end rather than the boot failing after; `None` when a driver
+/// here takes the controller, or it is no storage controller.
+pub fn disk_refusal(function: &crate::bus::pci::Identity) -> Option<&'static str> {
+    if function.class[0] != 0x01
+        || claims_identity(function)
+        || native::Kind::of_identity(function).is_some()
+    {
+        return None;
+    }
+    Some(match function.class[1] {
+        0x04 => "Its controller is in RAID mode: set SATA to AHCI in firmware setup",
+        _ => "Stela has no driver for its controller",
+    })
+}
+
 /// What [`probe_with_provider`] will do with `function`, for a boot log
 /// line written before boot services end: the default candidate, or why
 /// none applies. Later admission also checks the boot's driver policy.
@@ -2149,6 +2166,58 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// The chooser refuses a disk whose controller no driver here takes,
+    /// naming RAID mode, and offers every disk a driver reaches.
+    #[test]
+    fn disks_behind_undriven_storage_controllers_are_refused_before_the_choice() {
+        let identity = |vendor, device, class| crate::bus::pci::Identity {
+            address: Address {
+                segment: 0,
+                bus: 0,
+                device: 0x17,
+                function: 0,
+            },
+            vendor,
+            device,
+            class,
+        };
+        // A RAID-mode controller outside the AHCI table, and an IDE one.
+        assert_eq!(
+            disk_refusal(&identity(0x8086, 0x1234, [0x01, 0x04, 0x00])),
+            Some("Its controller is in RAID mode: set SATA to AHCI in firmware setup")
+        );
+        assert_eq!(
+            disk_refusal(&identity(0x1b4b, 0x9230, [0x01, 0x04, 0x00])),
+            Some("Its controller is in RAID mode: set SATA to AHCI in firmware setup")
+        );
+        assert_eq!(
+            disk_refusal(&identity(0x8086, 0x7ae2, [0x01, 0x01, 0x8a])),
+            Some("Stela has no driver for its controller")
+        );
+        // AHCI, Intel RAID-mode SATA the AHCI table lists, NVMe, VMD.
+        assert_eq!(
+            disk_refusal(&identity(0x8086, 0x7ae2, [0x01, 0x06, 0x01])),
+            None
+        );
+        assert_eq!(
+            disk_refusal(&identity(0x8086, 0x2822, [0x01, 0x04, 0x00])),
+            None
+        );
+        assert_eq!(
+            disk_refusal(&identity(0x144d, 0xa808, [0x01, 0x08, 0x02])),
+            None
+        );
+        assert_eq!(
+            disk_refusal(&identity(0x8086, 0x467f, [0x01, 0x04, 0x00])),
+            None
+        );
+        // xHCI: USB disks are refused by their own checks, not here.
+        assert_eq!(
+            disk_refusal(&identity(0x8086, 0x7ae0, [0x0c, 0x03, 0x30])),
+            None
+        );
     }
 
     #[test]

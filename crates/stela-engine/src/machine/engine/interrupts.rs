@@ -438,11 +438,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     // it waits for runs next instead of after the slice.
                     self.slice_end = self.statistics.blocks;
                     // A WFE that finds an event set completes before any
-                    // trap check, as native code completes it then.
-                    if register.is_none() {
-                        let value = self.cpu.event_storage();
-                        self.mirrors[EVENT_WAIT] = register_read::Cell { readable: 1, value };
-                    }
+                    // trap check, as native code completes it then
+                    // ([`Mirrors::events`]).
                     return self.next();
                 }
                 Some(now)

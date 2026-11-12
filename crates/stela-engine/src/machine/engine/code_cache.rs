@@ -410,8 +410,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 continue;
             };
             let scoped = asid.filter(|_| half == 0);
-            let spaces = &self.spaces[half];
+            let every = &self.spaces;
+            let spaces = &every[half];
             let (ghosts, statistics) = (&mut self.itlb_ghosts, &mut self.statistics);
+            let dropped = &mut self.dropped_refills;
             let forget = |entry: &chain::LookupEntry| {
                 let source = match scoped {
                     None => Some(ItlbSource::DropEvery),
@@ -427,6 +429,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 statistics.itlb_drops[1] += 1;
                 statistics.itlb_sources[source as usize] += 1;
                 super::compilation::note_itlb_ghost(ghosts, entry, ItlbMiss::Forgotten);
+                if spaces.live(entry.key).is_some() {
+                    Self::keep_dropped(
+                        dropped,
+                        |number| every.iter().any(|spaces| spaces.live(number).is_some()),
+                        entry.key,
+                        entry.pc,
+                    );
+                }
                 true
             };
             if self.itlb.forget_range_where(first..=last, forget) {

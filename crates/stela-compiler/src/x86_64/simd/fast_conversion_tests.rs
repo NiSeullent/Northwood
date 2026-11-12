@@ -436,6 +436,7 @@ fn environment_free_half_narrowing_matches_the_reference() {
         singles[(seed % singles.len() as u64) as usize]
     };
     let mut inline_rne = 0;
+    let mut inline_tiny = 0;
     for target in targets {
         // FCVT Hd, Sn; FCVTN Vd.4H, Vn.4S; FCVTN2 Vd.8H, Vn.4S.
         for (word, lanes, upper) in [
@@ -484,6 +485,19 @@ fn environment_free_half_narrowing_matches_the_reference() {
                     let magnitude = bits & 0x7fff_ffff;
                     magnitude == 0 || (0x3880_0000..=0x477f_efff).contains(&magnitude)
                 });
+                // A vector narrowing of normal or zero lanes that overflow in
+                // no rounding mode completes inline with F16C, tiny lanes
+                // included, while FPCR.AH leaves tininess to the helper.
+                let narrowable = lanes == 4
+                    && target.supports(TargetCpu::F16c)
+                    && inputs.iter().all(|&bits| {
+                        let magnitude = bits & 0x7fff_ffff;
+                        magnitude == 0 || (0x0080_0000..=0x477f_e000).contains(&magnitude)
+                    });
+                let tiny = inputs.iter().any(|&bits| {
+                    let magnitude = bits & 0x7fff_ffff;
+                    magnitude != 0 && magnitude < 0x3880_0000
+                });
                 let mut controls = controls();
                 controls.push(FPCR_AHP);
                 for fpcr in controls {
@@ -504,6 +518,12 @@ fn environment_free_half_narrowing_matches_the_reference() {
                         let exit = run(&code, &mut actual);
                         if exit == PC.0 {
                             assert_eq!(actual, initial);
+                            assert!(
+                                !(narrowable
+                                    && fpcr & (FPCR_EXCEPTION_ENABLE_MASK | FPCR_AHP | FPCR_AH)
+                                        == 0),
+                                "vector narrowing exited: {word:08x} {inputs:x?} {fpcr:#x} {target:?}"
+                            );
                             assert!(
                                 !(field
                                     && fpcr
@@ -547,10 +567,14 @@ fn environment_free_half_narrowing_matches_the_reference() {
                             "{word:08x} {inputs:x?} {fpcr:#x} {target:?}"
                         );
                         inline_rne += usize::from(fpcr & (3 << FPCR_ROUNDING_SHIFT) == 0);
+                        inline_tiny += usize::from(lanes == 4 && tiny);
                     }
                 }
             }
         }
     }
     assert!(inline_rne > 10_000, "{inline_rne}");
+    if TargetCpu::detect().supports(TargetCpu::F16c) {
+        assert!(inline_tiny > 1_000, "{inline_tiny}");
+    }
 }

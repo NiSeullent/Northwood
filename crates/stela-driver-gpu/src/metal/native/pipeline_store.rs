@@ -3,9 +3,11 @@
 //! The boot reads the store's file before the device opens and hands its
 //! bytes here ([`provide`]). The first backend to open claims it and, when
 //! the key matches, seeds the pipeline cache its compiled pipelines read and
-//! fill; its snapshots of that cache replace the kept bytes, and at a
-//! quiescent point the boot takes the newest ([`take`]) and writes it over
-//! the file.
+//! fill; its snapshots of that cache replace the kept bytes. The boot writes
+//! what was added ([`update`]) back to the file while the guest runs and as
+//! it stops, each piece once ([`written`]), in a journal a cut write cannot
+//! damage (`stela_formats::journal`), and hands the next boot's device the
+//! store it reads from that journal in the layout below.
 //!
 //! A store is a header, the driver's `vkGetPipelineCacheData` bytes, then
 //! the AIR compiler's NIR by the digest of what each compilation read
@@ -26,7 +28,7 @@ use alloc::{sync::Arc, vec::Vec};
 use ash::vk;
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use stela_crypto::{Sha256, digest::Digest};
 
@@ -299,14 +301,8 @@ pub struct Claim {
     pub refused: Option<Rejection>,
 }
 
-/// A store to write: its header and payload.
-#[derive(Debug)]
-pub struct Sealed {
-    pub header: [u8; HEADER_BYTES],
-    pub payload: Arc<Vec<u8>>,
-}
-
-/// The boot's store: what it read, and the newest snapshot.
+/// The boot's store: what it read, the newest snapshot, and what of both
+/// the boot wrote back since ([`Store::update`]).
 #[derive(Debug)]
 pub struct Store {
     compiler: Vec<u8>,
@@ -315,7 +311,11 @@ pub struct Store {
     owner: Option<(u64, Key)>,
     claims: u64,
     kept: Option<(Key, Arc<Vec<u8>>)>,
-    taken: bool,
+    /// Snapshots kept so far, and the newest of them written.
+    kept_version: u64,
+    written_version: u64,
+    /// Keys of the NIR added this boot that is written.
+    written_nir: alloc::collections::BTreeSet<[u8; 32]>,
     /// The key the stored bytes matched at a claim, and their NIR.
     matched: Option<Key>,
     /// The keys of the matched NIR, verified once at the claim, so that
@@ -338,7 +338,9 @@ impl Store {
             owner: None,
             claims: 0,
             kept: None,
-            taken: false,
+            kept_version: 0,
+            written_version: 0,
+            written_nir: alloc::collections::BTreeSet::new(),
             matched: None,
             stored_keys: alloc::collections::BTreeSet::new(),
             nir: alloc::collections::BTreeMap::new(),
@@ -357,8 +359,7 @@ impl Store {
     /// Keeps `blob`, NIR of `key` compiled this boot, for the next.
     pub fn add_nir(&mut self, key: [u8; 32], blob: &[u8]) {
         let bytes = blob.len() as u64 + 36;
-        if self.taken
-            || self.matched.is_none() && self.owner.is_none()
+        if self.matched.is_none() && self.owner.is_none()
             || self.nir_bytes + bytes > MAX_NIR_BYTES
             || self.stored_keys.contains(&key)
         {
@@ -376,10 +377,10 @@ impl Store {
 
     /// The store for a backend of `gpu`. A newer backend of the same key
     /// replaces the holder, as a reopened device does; another GPU's while
-    /// one holds it, or any after [`Self::take`], has none.
+    /// one holds it, has none.
     pub fn claim(&mut self, gpu: &Identity) -> Option<Claim> {
         let key = Key::new(&self.compiler, gpu);
-        if self.taken || self.owner.is_some_and(|(_, owner)| owner != key) {
+        if self.owner.is_some_and(|(_, owner)| owner != key) {
             return None;
         }
         self.claims += 1;
@@ -410,6 +411,7 @@ impl Store {
     pub fn keep(&mut self, claim: &Claim, payload: Vec<u8>) {
         if self.holds(claim) {
             self.kept = Some((claim.key, Arc::new(payload)));
+            self.kept_version += 1;
         }
     }
 
@@ -421,54 +423,152 @@ impl Store {
     }
 
     fn holds(&self, claim: &Claim) -> bool {
-        !self.taken
-            && self
-                .owner
-                .is_some_and(|(generation, _)| generation == claim.generation)
+        self.owner
+            .is_some_and(|(generation, _)| generation == claim.generation)
     }
 
-    /// The newest snapshot to write, sealed, with the stored NIR and what
-    /// this boot added, within the bound; the store takes none after.
-    pub fn take(&mut self) -> Option<Sealed> {
-        let owner = self.owner.map(|(_, key)| key);
-        self.taken = true;
-        self.owner = None;
-        let added = core::mem::take(&mut self.nir);
-        let (key, cache) = match self.kept.take() {
-            Some((key, payload)) => (key, payload),
-            None if added.is_empty() => return None,
-            // New NIR alone: the stored cache goes on beside it.
-            None => {
-                let key = self.matched.or(owner)?;
-                let cache = payload(self.stored, &key, self.bound).unwrap_or(&[]);
-                (key, Arc::new(cache.to_vec()))
+    /// What was added since the last [`Self::written`]: the newest snapshot
+    /// when newer than the one written, and the NIR not written, for the key
+    /// the store is held for. `None` when nothing is new.
+    pub fn update(&self) -> Option<Update> {
+        let key = self
+            .kept
+            .as_ref()
+            .map(|(key, _)| *key)
+            .or(self.owner.map(|(_, key)| key))
+            .or(self.matched)?;
+        let cache = match &self.kept {
+            Some((kept, payload)) if *kept == key && self.kept_version > self.written_version => {
+                Some(payload.clone())
             }
+            _ => None,
         };
-        let room = self
-            .bound
-            .saturating_sub(HEADER_BYTES as u64 + cache.len() as u64)
-            .min(MAX_NIR_BYTES);
         let mut nir = Vec::new();
-        let stored = match self.matched {
-            Some(matched) if matched == key => nir_section(self.stored, &key, self.bound),
-            _ => &[],
-        };
-        for (entry, blob) in
-            NirEntries(stored).chain(added.iter().map(|(key, blob)| (*key, &blob[..])))
-        {
-            if (nir.len() + 36 + blob.len()) as u64 > room {
-                break;
+        let mut nir_keys = Vec::new();
+        for (entry, blob) in &self.nir {
+            if !self.written_nir.contains(entry) {
+                push_entry(&mut nir, entry, blob);
+                nir_keys.push(*entry);
             }
-            push_entry(&mut nir, &entry, blob);
         }
-        let header = header_with_nir(&key, &cache, &nir);
-        let mut payload = Arc::unwrap_or_clone(cache);
-        payload.extend_from_slice(&nir);
-        Some(Sealed {
-            header,
-            payload: Arc::new(payload),
+        (cache.is_some() || !nir.is_empty()).then_some(Update {
+            key,
+            cache,
+            nir,
+            cache_version: self.kept_version,
+            nir_keys,
         })
     }
+
+    /// `update` is durable: what it holds is not offered again.
+    pub fn written(&mut self, update: &Update) {
+        if update.cache.is_some() {
+            self.written_version = self.written_version.max(update.cache_version);
+        }
+        self.written_nir.extend(update.nir_keys.iter().copied());
+    }
+
+    /// Every NIR entry the store holds for `key`, stored and added, as one
+    /// section: what a store rewritten whole keeps.
+    pub fn all_nir(&self, key: &Key) -> Vec<u8> {
+        let stored = match self.matched {
+            Some(matched) if matched == *key => nir_section(self.stored, key, self.bound),
+            _ => &[],
+        };
+        let mut nir = stored.to_vec();
+        for (entry, blob) in &self.nir {
+            push_entry(&mut nir, entry, blob);
+        }
+        nir
+    }
+}
+
+/// What a store added since it was last written ([`Store::update`]).
+#[derive(Debug)]
+pub struct Update {
+    pub key: Key,
+    /// The newest cache snapshot, which replaces the written one.
+    pub cache: Option<Arc<Vec<u8>>>,
+    /// NIR entries ([`NirEntries`]) added to the written ones.
+    pub nir: Vec<u8>,
+    cache_version: u64,
+    nir_keys: Vec<[u8; 32]>,
+}
+
+/// Pipelines created through the store's cache since the last
+/// [`Lookups::take`]: those the cache held and those compiled, with the
+/// driver's creation time of each kind and the longest compile.
+pub struct Lookups {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    hit_ns: AtomicU64,
+    miss_ns: AtomicU64,
+    miss_longest_ns: AtomicU64,
+}
+
+/// What [`Lookups::take`] answers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LookupCounts {
+    pub hits: u64,
+    pub misses: u64,
+    pub hit_ns: u64,
+    pub miss_ns: u64,
+    pub miss_longest_ns: u64,
+}
+
+impl Lookups {
+    pub const fn new() -> Self {
+        Self {
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            hit_ns: AtomicU64::new(0),
+            miss_ns: AtomicU64::new(0),
+            miss_longest_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// A creation of `ns` nanoseconds, `hit` when the cache held it.
+    pub fn note(&self, hit: bool, ns: u64) {
+        if hit {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.hit_ns.fetch_add(ns, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            self.miss_ns.fetch_add(ns, Ordering::Relaxed);
+            self.miss_longest_ns.fetch_max(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// The counts since the last call, cleared.
+    pub fn take(&self) -> LookupCounts {
+        let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
+        LookupCounts {
+            hits: take(&self.hits),
+            misses: take(&self.misses),
+            hit_ns: take(&self.hit_ns),
+            miss_ns: take(&self.miss_ns),
+            miss_longest_ns: take(&self.miss_longest_ns),
+        }
+    }
+}
+
+impl Default for Lookups {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static LOOKUPS: Lookups = Lookups::new();
+
+/// The boot's pipeline creations through the store's cache since the last
+/// call: what the platform reports (`GPU STORE`).
+pub fn take_lookups() -> LookupCounts {
+    LOOKUPS.take()
+}
+
+/// Counts a creation through the store's cache.
+pub(super) fn note_lookup(hit: bool, ns: u64) {
+    LOOKUPS.note(hit, ns);
 }
 
 /// The boot's store, behind a lock no interrupt handler takes.
@@ -507,10 +607,28 @@ pub fn provide(stored: &'static [u8], compiler: &[u8], bound: u64) {
     with_store(|slot| *slot = Some(store));
 }
 
-/// At a quiescent point: the newest snapshot to write, if any pipeline was
-/// added since the store was read. Later snapshots are not kept.
-pub fn take() -> Option<Sealed> {
-    with_store(|slot| slot.as_mut()?.take())
+/// What the boot's store added since it was last written, for the boot to
+/// write while the guest runs and as it stops ([`Store::update`]).
+pub fn update() -> Option<Update> {
+    with_store(|slot| slot.as_ref()?.update())
+}
+
+/// `update` is durable on the file.
+pub fn written(update: &Update) {
+    with_store(|slot| {
+        if let Some(store) = slot {
+            store.written(update);
+        }
+    });
+}
+
+/// Every NIR entry the boot's store holds for `key` ([`Store::all_nir`]).
+pub fn all_nir(key: &Key) -> Vec<u8> {
+    with_store(|slot| {
+        slot.as_ref()
+            .map(|store| store.all_nir(key))
+            .unwrap_or_default()
+    })
 }
 
 /// The NIR the store holds for the device that claimed it, by key.

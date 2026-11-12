@@ -401,13 +401,18 @@ pub struct FunctionObservation {
 impl FunctionObservation {
     /// Copied firmware fields, to be revalidated under a real native owner.
     pub fn identity(&self) -> stela_drivers::bus::pci::Identity {
-        let word = |offset| u16::from_le_bytes([self.header[offset], self.header[offset + 1]]);
-        stela_drivers::bus::pci::Identity {
-            address: self.address,
-            vendor: word(0),
-            device: word(2),
-            class: [self.header[11], self.header[10], self.header[9]],
-        }
+        header_identity(self.address, &self.header)
+    }
+}
+
+/// The identity a function's configuration `header` gives.
+fn header_identity(address: Address, header: &[u8; 64]) -> stela_drivers::bus::pci::Identity {
+    let word = |offset: usize| u16::from_le_bytes([header[offset], header[offset + 1]]);
+    stela_drivers::bus::pci::Identity {
+        address,
+        vendor: word(0),
+        device: word(2),
+        class: [header[11], header[10], header[9]],
     }
 }
 
@@ -867,6 +872,17 @@ pub(crate) fn disk_location(handle: Handle) -> Option<alloc::string::String> {
         .map(|text| text.to_string())
         .unwrap_or_default();
     Some(alloc::format!("{address} {}", plain_nodes(&below)))
+}
+
+/// The identity of the PCI controller the disk behind `handle` hangs from,
+/// as its configuration header gives it.
+pub(crate) fn disk_controller(handle: Handle) -> Option<stela_drivers::bus::pci::Identity> {
+    let path = get_protocol::<DevicePath>(handle).ok()?;
+    let mut remaining = &*path;
+    let controller = boot::locate_device_path::<PciIo>(&mut remaining).ok()?;
+    let mut io = get_protocol::<PciIo>(controller).ok()?;
+    let address = io.address().ok()?;
+    Some(header_identity(address, &io.read_header().ok()?))
 }
 
 /// The device path nodes of `text` before the partition, without any

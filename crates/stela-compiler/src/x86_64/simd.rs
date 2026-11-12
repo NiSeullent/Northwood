@@ -18,6 +18,12 @@ mod complex;
 mod conversion_costs;
 pub(in crate::x86_64) mod encode;
 mod estimate;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux")
+))]
+mod estimate_tests;
 pub(in crate::x86_64) mod exponent_scale;
 mod extrema_scale;
 #[cfg(all(

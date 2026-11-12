@@ -425,6 +425,105 @@ pub fn wait_for_named(
     }
 }
 
+/// The most partitions [`disk_account`] names on one disk; the rest are
+/// counted.
+const ACCOUNT_PARTITIONS: usize = 6;
+
+/// One line per disk of `devices` for the account of a failed search, so a
+/// photo of the screen tells what Stela's drivers saw: the bus, model,
+/// size and block size, the serial's last four characters ([`tail`]), and
+/// the partitions its GPT holds, each by its GUID's last four characters,
+/// size and type, or why it has none. A disk whose serial is `chosen`'s is
+/// marked.
+pub fn disk_account(devices: &mut [Box<dyn BlockDevice>], chosen: Option<&Target>) -> Vec<String> {
+    devices
+        .iter_mut()
+        .map(|device| {
+            let identity = device.identity().clone();
+            let bytes = identity
+                .blocks
+                .saturating_mul(u64::from(identity.block_size));
+            let mut line = alloc::format!(
+                "{} {:?} {} {}-byte blocks serial {}",
+                bus(identity.transport),
+                identity.model.trim(),
+                size(bytes),
+                identity.block_size,
+                tail(&identity.serial)
+            );
+            if chosen.is_some_and(|target| target.serial.trim() == identity.serial.trim()) {
+                line.push_str(" (the chosen disk)");
+            }
+            match gpt::read(&mut **device) {
+                Ok(table) => {
+                    let count = table.partitions.len();
+                    line.push_str(&alloc::format!(
+                        ": GPT {count} partition{}",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                    for (index, partition) in table.partitions.iter().enumerate() {
+                        if index == ACCOUNT_PARTITIONS {
+                            line.push_str(&alloc::format!(", +{}", count - index));
+                            break;
+                        }
+                        let guid = tail(&alloc::format!("{}", partition.unique_guid));
+                        let kind = partition.role().map_or("other", |role| role.name());
+                        line.push_str(&alloc::format!(
+                            "{}{guid} {} {kind}",
+                            if index == 0 { ": " } else { ", " },
+                            size(
+                                partition
+                                    .blocks()
+                                    .saturating_mul(u64::from(identity.block_size))
+                            )
+                        ));
+                    }
+                }
+                Err(error) => line.push_str(&alloc::format!(": {error}")),
+            }
+            line
+        })
+        .collect()
+}
+
+/// The bus a disk is on, as the firmware-side chooser names it.
+fn bus(transport: stela_drivers::block::Transport) -> &'static str {
+    use stela_drivers::block::Transport;
+    match transport {
+        Transport::VirtioBlk => "virtio",
+        Transport::Nvme => "NVMe",
+        Transport::Ahci => "SATA",
+        Transport::Usb => "USB",
+        Transport::Ram => "RAM",
+        Transport::Firmware => "firmware",
+        Transport::SdMmc => "SD/MMC",
+    }
+}
+
+/// `bytes` in decimal GB as disks are sold, or MB below a GB.
+fn size(bytes: u64) -> String {
+    match bytes {
+        bytes if bytes >= 1_000_000_000 => alloc::format!("{} GB", bytes / 1_000_000_000),
+        bytes => alloc::format!("{} MB", bytes / 1_000_000),
+    }
+}
+
+/// The last four characters of an identifier (a serial number, a GUID),
+/// after any padding, or `none`: enough to tell two apart on one PC, too
+/// little to identify the hardware.
+fn tail(identifier: &str) -> String {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        return String::from("none");
+    }
+    let start = identifier
+        .char_indices()
+        .rev()
+        .nth(3)
+        .map_or(0, |(index, _)| index);
+    alloc::format!("..{}", &identifier[start..])
+}
+
 /// The byte at `offset` of the storage check's pattern.
 pub fn pattern(offset: u64) -> u8 {
     let mixed = offset.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ offset >> 7;
@@ -934,6 +1033,53 @@ mod tests {
             open(&mut devices, &target(&format!("disk-a:{TARGET}"))),
             Err(StorageError::Table(GptError::Invalid(_)))
         ));
+    }
+
+    /// The account names each disk without its whole serial, and the
+    /// partitions each GPT holds, so a missing partition shows on screen
+    /// next to the ones that are there.
+    #[test]
+    fn the_disk_account_names_each_disk_and_its_partitions_without_serials() {
+        let mut devices = disks();
+        let mut sata = table::formatted(
+            "  SN-0001-A7Z9  ",
+            &[table::partition(
+                stela_formats::payload::gpt::Role::AppleRegion.type_guid(),
+                "3BB00000-0000-0000-0000-000000000009",
+                40,
+                199,
+            )],
+        );
+        sata.identity.transport = stela_drivers::block::Transport::Ahci;
+        sata.identity.model = String::from("SATA SSD  ");
+        devices.push(Box::new(sata));
+        let mut damaged = table::formatted("XY", &[]);
+        let mut block = [0; 512];
+        for lba in [1, 255] {
+            damaged.read(lba, &mut block).unwrap();
+            block[16] ^= 0xff;
+            damaged.write(lba, &block).unwrap();
+        }
+        devices.push(Box::new(damaged));
+        let chosen = target("SN-0001-A7Z9:3BB00000-0000-0000-0000-000000000009");
+        let lines = disk_account(&mut devices, Some(&chosen));
+        assert_eq!(
+            lines,
+            [
+                "virtio \"RAM\" 0 MB 512-byte blocks serial ..sk-a: GPT 2 partitions: \
+                 ..0001 0 MB EFI System, ..0002 0 MB other",
+                "virtio \"RAM\" 0 MB 512-byte blocks serial ..sk-b: GPT 2 partitions: \
+                 ..0001 0 MB EFI System, ..0002 0 MB other",
+                "virtio \"RAM\" 0 MB 512-byte blocks serial ..lank: no GPT",
+                "SATA \"SATA SSD\" 0 MB 512-byte blocks serial ..A7Z9 (the chosen disk): \
+                 GPT 1 partition: ..0009 0 MB Stela Apple region",
+                "virtio \"RAM\" 0 MB 512-byte blocks serial ..XY: invalid GPT: \
+                 GPT header CRC mismatch",
+            ]
+        );
+        assert!(lines.iter().all(|line| !line.contains("SN-0001")));
+        assert_eq!(tail(""), "none");
+        assert_eq!(size(256_060_514_304), "256 GB");
     }
 
     #[test]

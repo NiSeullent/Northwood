@@ -46,10 +46,10 @@ use {
     stela_formats::payload::PayloadError, stela_formats::payload::ReadAt,
     stela_formats::payload::gpt, stela_formats::payload::gpt::Disk,
     stela_formats::payload::gpt::Role, stela_formats::preboot,
-    stela_formats::preboot::PrebootError, stela_runtime::pc::machine_state,
-    stela_runtime::pc::storage::Target, stela_soc_data::nor::CAPACITY, stela_soc_data::nor::Image,
-    stela_soc_data::nor::SECTOR_SIZE, stela_soc_data::nor::nvram::Variables,
-    stela_soc_data::nor::nvram::empty_bank,
+    stela_formats::preboot::PrebootError, stela_runtime::pc::failure_record,
+    stela_runtime::pc::machine_state, stela_runtime::pc::storage::Target,
+    stela_soc_data::nor::CAPACITY, stela_soc_data::nor::Image, stela_soc_data::nor::SECTOR_SIZE,
+    stela_soc_data::nor::nvram::Variables, stela_soc_data::nor::nvram::empty_bank,
 };
 
 /// One GPT partition, through its whole disk's block I/O.
@@ -260,6 +260,69 @@ fn find(target: &Target) -> Result<Partition> {
         Search::EspPartition => refuse!("the partition is an EFI system partition"),
         Search::Found => refuse!("the partition was found"),
     })
+}
+
+/// Copy into the log, once, the record a previous start left in the machine
+/// state of the partition `options` name for it (`--storage` and `--nor`
+/// alike) when the USB's own log was out of reach of Stela's drivers
+/// (`failure_record`), then clear it.
+pub fn carry_failure_record(options: &[u8]) {
+    let Ok(text) = core::str::from_utf8(options) else {
+        return;
+    };
+    let storage = option(text, "--storage");
+    let Some(target) = storage
+        .filter(|_| option(text, "--nor") == storage)
+        .and_then(|name| name.parse::<Target>().ok())
+    else {
+        return;
+    };
+    let Ok(Ok(mut partition)) = search(&target) else {
+        return;
+    };
+    if partition.confine(Part::State).is_err() {
+        return;
+    }
+    let mut region = vec![0u8; failure_record::BYTES as usize];
+    if partition
+        .read_at(failure_record::OFFSET, &mut region)
+        .is_err()
+    {
+        return;
+    }
+    let Some(record) = failure_record::decode(&region) else {
+        return;
+    };
+    output::arguments(format_args!(
+        "PREVIOUS BOOT failed where the USB's log was out of reach; the chosen disk kept:\n"
+    ));
+    for line in record.lines() {
+        output::arguments(format_args!("PREVIOUS BOOT {line}\n"));
+    }
+    // A zero header clears the record.
+    let block = partition.block_bytes;
+    let mut zeros = Aligned::new(block as usize);
+    let cleared = partition
+        .io
+        .write_blocks(
+            partition.media,
+            partition.first_lba + failure_record::OFFSET / block,
+            zeros.bytes(),
+        )
+        .and_then(|()| partition.io.flush_blocks());
+    if cleared.is_err() {
+        output::arguments(format_args!(
+            "PREVIOUS BOOT record not cleared: the chosen disk refused the write\n"
+        ));
+    }
+}
+
+/// Whether the partition Install macOS chose before (`SERIAL:GUID`) is on
+/// this PC: exactly one disk with its serial, and exactly one partition
+/// with its GUID that is no EFI system partition.
+pub fn chosen_present(disk: &str) -> bool {
+    disk.parse::<Target>()
+        .is_ok_and(|target| matches!(search(&target), Ok(Ok(_))))
 }
 
 /// Why the partition `target` names is no longer there to boot, when it is

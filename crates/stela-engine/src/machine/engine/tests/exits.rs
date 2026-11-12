@@ -180,6 +180,64 @@ fn exit_transition_costs() {
         let ns = time(&mut machine, 1, part);
         std::println!("EXITS part={name} ns={ns}");
     }
+    // A direct exit's whole round trip through the run loop.
+    let mut machine = branches();
+    let ns = time(&mut machine, 2, direct_round);
+    std::println!("EXITS direct round_trip ns_per_exit={ns}");
+    // Its parts: the schedule, the fetch, and the run with its exit.
+    let ns = time(&mut machine, 1, |machine| machine.schedule().unwrap());
+    std::println!("EXITS direct part=schedule ns={ns}");
+    let ns = time(&mut machine, 1, |machine| {
+        let _ = machine.fetch_block(BASE, false).unwrap();
+    });
+    std::println!("EXITS direct part=fetch ns={ns}");
+    let Ok(Fetched::Block(index)) = machine.fetch_block(BASE, false) else {
+        panic!("a block");
+    };
+    let ns = time(&mut machine, 1, |machine| {
+        machine.host.exits.push(NativeExit::Exit {
+            next_pc: BASE + 8,
+            kind: ExitKind::Direct as u64,
+        });
+        let budget = machine.chain_budget();
+        machine.execute(index, budget).unwrap();
+    });
+    std::println!("EXITS direct part=execute ns={ns}");
+}
+
+/// `b .+8`, a word no run reaches, and `b .-8`: two blocks whose direct
+/// exits lead to each other.
+fn branches() -> Machine<FakeHost, NoDevices> {
+    const FORWARD: u32 = 0x1400_0002;
+    const BACK: u32 = 0x17ff_fffe;
+    machine(&[FORWARD, 0, BACK])
+}
+
+/// Each block's run ending at its direct exit to the other, through the
+/// whole loop step: the schedule, the fetch, the entry, the native return,
+/// the exit and its link.
+fn direct_round(machine: &mut Machine<FakeHost, NoDevices>) {
+    for next_pc in [BASE + 8, BASE] {
+        machine.host.exits.push(NativeExit::Exit {
+            next_pc,
+            kind: ExitKind::Direct as u64,
+        });
+        machine.schedule().unwrap();
+        machine.step().unwrap();
+        assert_eq!(machine.cpu.pc, next_pc);
+    }
+}
+
+/// The round trip keeps the PC moving between the two blocks and leaves no
+/// scripted exit behind.
+#[test]
+fn direct_rounds_alternate_between_the_blocks() {
+    let mut machine = branches();
+    for _ in 0..8 {
+        direct_round(&mut machine);
+    }
+    assert!(machine.host.exits.is_empty());
+    assert_eq!(machine.statistics.exit_kinds[ExitKind::Direct as usize], 16);
 }
 
 /// The parts of one transition, at EL1 after an SVC.

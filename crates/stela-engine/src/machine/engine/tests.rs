@@ -778,6 +778,57 @@ fn refused_device_registers_read_zero_and_drop_writes() {
     assert_eq!(machine.take_unmodeled().len(), 2);
 }
 
+/// A device load the devices answer without their lock leaves their
+/// generation where it was, and the lines cached before it still hold: the
+/// next interrupt check asks the devices nothing. A load that took the lock
+/// moved the generation, and the next check asks again.
+#[test]
+fn a_lock_free_device_load_keeps_the_cached_lines() {
+    const PASSIVE: u64 = 0x2_3b3c_0a00;
+    const LOCKED: u64 = 0x2_3b3c_0a08;
+    #[derive(Default)]
+    struct Generations {
+        generation: u64,
+        queries: usize,
+    }
+    impl Devices for Generations {
+        fn read(&mut self, _: usize, physical: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+            if physical != PASSIVE {
+                self.generation += 1;
+            }
+            Ok(7)
+        }
+        fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn lines(&mut self, _: usize, _: u64) -> Lines {
+            self.queries += 1;
+            Lines::default()
+        }
+        fn generation(&self) -> Option<u64> {
+            Some(self.generation)
+        }
+    }
+    // ldr x2, [x1]
+    let load = 0xf940_0022;
+    let mut machine = board(&[], Generations::default(), Vec::new());
+    let pe = machine.current;
+    let now = machine.now();
+    machine.device_lines_of(pe, now);
+    assert_eq!(machine.devices.queries, 1);
+    for (address, queries) in [(PASSIVE, 1), (LOCKED, 2), (PASSIVE, 2)] {
+        machine.cpu.pc = BASE;
+        machine.write_register(Register::X(1), address);
+        machine
+            .device_access(load, address, address, false)
+            .unwrap();
+        assert_eq!(machine.read_register(Register::X(2)), 7);
+        let now = machine.now();
+        machine.device_lines_of(pe, now);
+        assert_eq!(machine.devices.queries, queries, "{address:#x}");
+    }
+}
+
 #[test]
 fn survey_substitutes_registers_but_never_dma_service_effects() {
     let mut machine = machine(&[0]);
@@ -3200,6 +3251,10 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
     assert_eq!(machine.statistics.exit_kinds, kinds);
     // Neither exit had a thunk yet.
     assert_eq!(machine.statistics.lookup_misses, [2, 0, 0, 0, 0]);
+    let mut branch_misses = [[0; BRANCH_REASONS]; BRANCH_KINDS];
+    branch_misses[ExitKind::Direct as usize][BranchMiss::Unlinked as usize] = 1;
+    branch_misses[ExitKind::Return as usize][BranchMiss::Unlinked as usize] = 1;
+    assert_eq!(machine.statistics.branch_misses, branch_misses);
     let (first, second) = (&machine.code.blocks[0], &machine.code.blocks[1]);
     let records = [0, 1].map(|slot| machine.code.blocks.record(slot));
     assert!((0..first.successors.len()).all(|position| records[0].linked(position)));
@@ -3317,6 +3372,8 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
     // The cell's probe finds no translation of `far`'s page in the new
     // context; the fetch translates it anew and finds the table's entry.
     assert_eq!(machine.statistics.lookup_misses, [2, 1, 0, 0, 0]);
+    branch_misses[ExitKind::Direct as usize][BranchMiss::Itlb as usize] = 1;
+    assert_eq!(machine.statistics.branch_misses, branch_misses);
     let translated = machine.statistics.fetches[1];
     assert!(matches!(
         machine.fetch_block(far, false),
@@ -3632,6 +3689,8 @@ fn itlb_fills_name_why_the_page_was_missing() {
     assert_eq!(misses(&machine), expected);
     machine.forget_lookups(Reach::Containing(BASE), None);
     assert_eq!(machine.statistics.itlb_drops[..2], [0, 1]);
+    // The page translates at its fetch, not ahead (`refill_dropped`).
+    machine.dropped_refills.clear();
     fetch(&mut machine);
     expected[ItlbMiss::Forgotten as usize] += 1;
     assert_eq!(misses(&machine), expected);
@@ -3661,6 +3720,60 @@ fn itlb_fills_name_why_the_page_was_missing() {
     machine.translate_page(pages[0], key);
     expected[ItlbMiss::Evicted as usize] += 1;
     assert_eq!(misses(&machine), expected);
+}
+
+/// The pages a TLBI by VA drops of a live context walk again at the next
+/// fetch in it, through the translation then current, so no fetch misses on
+/// them: also after a translation change between the two (a new fetch
+/// epoch, the same context). A TLBI ALL renews the context: the new one
+/// takes none of its predecessor's dropped pages and its fetch misses.
+#[test]
+fn pages_a_tlbi_by_va_dropped_walk_again_at_the_next_fetch_in_their_context() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const RET: u32 = 0xd65f_03c0;
+    let mut machine = machine(&[RET]);
+    let fetch = |machine: &mut Machine<FakeHost, NoDevices>| {
+        assert!(matches!(
+            machine.fetch_block(BASE, false),
+            Ok(Fetched::Block(_))
+        ));
+    };
+    let misses = |machine: &Machine<FakeHost, NoDevices>| machine.statistics.itlb_misses;
+    let refilled = |machine: &Machine<FakeHost, NoDevices>| {
+        machine.statistics.itlb_sources[ItlbSource::Refilled as usize]
+    };
+    let page = BASE & !(FETCH_PAGE - 1);
+    fetch(&mut machine);
+    let context = machine.chain.contexts()[chain::half(BASE)];
+    let (expected, mut refills) = (misses(&machine), refilled(&machine));
+    for epoch in [false, true] {
+        machine.forget_lookups(Reach::Containing(BASE), None);
+        assert!(machine.current_key(BASE).is_none());
+        assert_eq!(machine.dropped_refills.get(&context), Some(&vec![page]));
+        if epoch {
+            let generation = machine.translation_generation;
+            machine.permissions_changed();
+            assert_ne!(machine.translation_generation, generation);
+        }
+        fetch(&mut machine);
+        assert_eq!(machine.chain.contexts()[chain::half(BASE)], context);
+        assert_eq!(misses(&machine), expected);
+        refills += 1;
+        assert_eq!(refilled(&machine), refills);
+        assert!(machine.dropped_refills.is_empty());
+        assert!(machine.current_key(BASE).is_some());
+    }
+    machine.forget_lookups(Reach::Containing(BASE), None);
+    machine.tlb_maintained(Reach::All, Everywhere::All, None);
+    // The page translates at its fetch, not ahead (`refill_pages`).
+    machine.pending_refills.clear();
+    fetch(&mut machine);
+    assert_ne!(machine.chain.contexts()[chain::half(BASE)], context);
+    let mut expected = expected;
+    expected[ItlbMiss::Context as usize] += 1;
+    assert_eq!(misses(&machine), expected);
+    assert_eq!(refilled(&machine), refills);
+    assert_eq!(machine.dropped_refills.get(&context), Some(&vec![page]));
 }
 
 /// The live entries of the block table.
@@ -4243,6 +4356,8 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
     // its block's entry accepts what BTI c is compatible with.
     let unguarded = target_key(&machine, far);
     machine.forget_lookups(mmu::tlbi::Reach::Containing(far), None);
+    // The remap is the fetch cache's alone: no refill walks the tables.
+    machine.dropped_refills.clear();
     let slot = (far / FETCH_PAGE) as usize % FETCH_CACHE;
     machine.fetch[slot].as_mut().unwrap().guarded = true;
     let Ok(Fetched::Block(guarded)) = machine.fetch_block(far, false) else {
@@ -4842,6 +4957,8 @@ fn a_compiled_pac_landing_uses_the_current_sctlr_for_lookup_entries() {
     assert!(machine.fetch_block(pc, false).is_ok());
     // The page mapped guarded, which a TLBI makes known.
     machine.forget_lookups(mmu::tlbi::Reach::Containing(pc), None);
+    // The remap is the fetch cache's alone: no refill walks the tables.
+    machine.dropped_refills.clear();
     let slot = (pc / FETCH_PAGE) as usize % FETCH_CACHE;
     machine.fetch[slot].as_mut().unwrap().guarded = true;
     let Ok(Fetched::Block(index)) = machine.fetch_block(pc, false) else {
@@ -7317,10 +7434,11 @@ fn implementation_defined_values_complete_natively_after_the_engine_does() {
     assert_eq!(installed[installed.len() - 1], [0; chain::THUNK_BYTES]);
 }
 
-/// SEVL and a WFE that finds an event complete natively on the event
-/// register once the engine completed one; a WFE that waits opens nothing.
+/// SEVL and a WFE that finds an event set complete natively on the event
+/// register in any state and across derived state changes; a WFE that finds
+/// it clear exits for the engine to wait.
 #[test]
-fn event_instructions_complete_natively_after_the_engine_does() {
+fn event_instructions_complete_natively_on_the_event_register() {
     const ADD: u32 = 0x9100_0400; // add x0, x0, #1
     const SEVL: u32 = 0xd503_20bf;
     const WFE: u32 = 0xd503_205f;
@@ -7334,30 +7452,82 @@ fn event_instructions_complete_natively_after_the_engine_does() {
     machine.derived_changed();
     machine.host.exits = vec![fall(base + 8), fall(base + 16)];
     machine.step().unwrap();
-    let send = register_read::send_event_thunk(GuestAddress(base + 4), cell_place(SEND_EVENT));
+    let send = register_read::send_event_thunk(GuestAddress(base + 4), EVENTS);
     assert_eq!(machine.host.installed.last(), Some(&send.code));
     machine.step().unwrap();
-    let wait = register_read::event_wait_thunk(GuestAddress(base + 12), cell_place(EVENT_WAIT));
+    let wait = register_read::event_wait_thunk(GuestAddress(base + 12), EVENTS);
     // Then the thunk of the link the exit into its block took at its fetch.
     let installed = &machine.host.installed;
     assert_eq!(installed[installed.len() - 2], wait.code);
     assert_eq!(installed[installed.len() - 1], [0; chain::THUNK_BYTES]);
-    let event = register_read::Cell {
-        readable: 1,
-        value: machine.cpu.event_storage(),
+    let run = |machine: &mut Machine<FakeHost, NoDevices>, code: &[u8]| {
+        super::transitions::tests::run_native(machine, code)
     };
-    machine.cpu.pc = base + 4;
-    machine.system_instruction(SEVL).unwrap();
-    assert_eq!(machine.mirrors[SEND_EVENT], event);
+    let fallthrough = ExitKind::Fallthrough as u64;
+    // SEVL sets the register, WFE takes it.
+    machine.cpu.consume_event();
+    assert_eq!(run(&mut machine, &send.code), (base + 8, fallthrough));
     assert!(machine.cpu.event_is_set());
-    machine.cpu.pc = base + 12;
-    machine.system_instruction(WFE).unwrap();
-    assert_eq!(machine.mirrors[EVENT_WAIT], event);
+    assert_eq!(run(&mut machine, &wait.code), (base + 16, fallthrough));
     assert!(!machine.cpu.event_is_set());
+    // A clear register: the engine waits.
+    let system = ExitKind::System as u64;
+    assert_eq!(run(&mut machine, &wait.code), (base + 12, system));
+    // Derived state and the PE's state decide nothing.
     machine.derived_changed();
-    machine.cpu.pc = base + 12;
-    machine.system_instruction(WFE).unwrap();
-    assert_eq!(machine.mirrors[EVENT_WAIT].readable, 0);
+    machine.cpu.pstate.el = 0;
+    machine.cpu.signal_event();
+    assert_eq!(run(&mut machine, &wait.code), (base + 16, fallthrough));
+    assert!(!machine.cpu.event_is_set());
+    assert_eq!(
+        machine.mirrors.events,
+        register_read::Cell {
+            readable: 1,
+            value: machine.cpu.event_storage(),
+        }
+    );
+}
+
+/// CLREX completes natively on the frame's monitor while the engine holds
+/// none of its own, in any state; with an engine monitor it exits for the
+/// engine to clear it.
+#[test]
+fn clrex_completes_natively_while_the_monitor_lives_in_the_frame() {
+    use crate::machine::cpu::{RESERVATION_GRANULE, Reservation};
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const CLREX: u32 = 0xd503_3f5f;
+    let mut machine = machine(&[ADD, CLREX, ADD]);
+    let base = machine.cpu.pc;
+    machine.cpu.pstate = Pstate::reset(1);
+    machine.derived_changed();
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: base + 8,
+        kind: ExitKind::Fallthrough as u64,
+    }];
+    machine.step().unwrap();
+    let thunk = register_read::clear_exclusive_thunk(GuestAddress(base + 4), CLEAR_EXCLUSIVE);
+    assert!(machine.host.installed.contains(&thunk.code));
+    let run = |machine: &mut Machine<FakeHost, NoDevices>| {
+        super::transitions::tests::run_native(machine, &thunk.code)
+    };
+    machine.cpu.state.exclusive_bytes = 8;
+    assert_eq!(run(&mut machine), (base + 8, ExitKind::Fallthrough as u64));
+    assert_eq!(machine.cpu.state.exclusive_bytes, 0);
+    // Derived state and the PE's state decide nothing.
+    machine.derived_changed();
+    machine.cpu.pstate.el = 0;
+    machine.cpu.state.exclusive_bytes = 4;
+    assert_eq!(run(&mut machine), (base + 8, ExitKind::Fallthrough as u64));
+    assert_eq!(machine.cpu.state.exclusive_bytes, 0);
+    // The engine's own monitor: the engine clears it.
+    machine.cpu.monitor = Some(Reservation {
+        granule: 0x1000,
+        bytes: [0; RESERVATION_GRANULE as usize],
+    });
+    machine.cpu.state.exclusive_bytes = 8;
+    assert_eq!(run(&mut machine), (base + 4, ExitKind::System as u64));
+    assert_eq!(machine.cpu.state.exclusive_bytes, 8);
+    assert!(machine.cpu.monitor.is_some());
 }
 
 /// MSR and MRS of PSTATE.DIT complete natively on the word PSTATE takes

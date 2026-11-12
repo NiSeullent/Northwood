@@ -927,6 +927,10 @@ pub struct Machine<H: Host, D: Devices> {
     pending_refills: BTreeMap<(usize, contexts::Key), Vec<u64>>,
     /// The pages the contexts just made walk again before the fetch goes on.
     refills: Vec<u64>,
+    /// The pages TLBIs by VA dropped of each live context, by its number:
+    /// the next fetch in the context walks them again
+    /// ([`Self::refill_dropped`]).
+    dropped_refills: BTreeMap<u64, Vec<u64>>,
     /// Identification registers the CPU profile has no value for.
     profile_missing: Vec<SystemRegister>,
     /// Accessors by encoding.
@@ -1376,6 +1380,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             fill_next: 0,
             pending_refills: BTreeMap::new(),
             refills: Vec::new(),
+            dropped_refills: BTreeMap::new(),
             applying_mail: false,
             profile_missing: Vec::new(),
             lookup: super::system::Lookup::new(),

@@ -179,3 +179,29 @@ fn device_quirks_adjust_transfer_configuration() {
     assert_eq!(result, Err(AGAIN));
     assert_eq!(fixture.disk.speed_limit, 0b1);
 }
+
+/// ATA strings hold two characters per word, high byte first, padded with
+/// spaces on either side or ended by a NUL. The serial the disk is found by
+/// is read as the firmware-side chooser reads it (`ascii`): unswapped and
+/// trimmed, so both name one disk alike.
+#[test]
+fn identify_serials_are_unswapped_and_trimmed_of_padding() {
+    let serial = |raw: &[u8]| {
+        let mut page = identify_page("", 1024);
+        let words = IDENTIFY_SERIAL;
+        let mut bytes = raw.to_vec();
+        bytes.resize(2 * words.len(), b' ');
+        for pair in bytes.chunks_mut(2) {
+            pair.swap(0, 1);
+        }
+        page[2 * words.start..2 * words.end].copy_from_slice(&bytes);
+        identify(&page).unwrap().serial
+    };
+    // Twenty characters, right-justified as many disks report them.
+    assert_eq!(serial(b"           WD-ABC123"), "WD-ABC123");
+    assert_eq!(serial(b"00000000000042"), "00000000000042");
+    // An odd length splits the last word between a character and padding.
+    assert_eq!(serial(b"  ABC12"), "ABC12");
+    assert_eq!(serial(b"XYZ27\0garbage"), "XYZ27");
+    assert_eq!(serial(b""), "");
+}

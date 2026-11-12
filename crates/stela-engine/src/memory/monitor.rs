@@ -10,7 +10,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::{cell::RefCell, marker::PhantomData};
 
 const MIN_ERG_BYTES: u64 = 16;
@@ -239,8 +239,36 @@ pub struct MonitorDomain<B, M, A> {
 pub struct ThreadMonitor<B, M, A> {
     domain: Arc<MonitorDomain<B, M, A>>,
     reservation: Option<Reservation<B, M, A>>,
+    /// Nonzero while `reservation` holds one, at a fixed address the PE's
+    /// native ERET reads ([`Self::held_address`]): with none held the
+    /// return's clear changes nothing here.
+    held: alloc::boxed::Box<AtomicU64>,
     global: Option<GlobalMark<B, M, A>>,
     event: Option<Arc<EventCell<B>>>,
+}
+
+impl<B, M, A> ThreadMonitor<B, M, A> {
+    /// Where the word nonzero while a local reservation is held lives, for
+    /// the PE's own native code.
+    pub(crate) fn held_address(&self) -> u64 {
+        &*self.held as *const AtomicU64 as u64
+    }
+
+    /// Whether a local reservation is held.
+    pub(crate) fn holds_reservation(&self) -> bool {
+        self.reservation.is_some()
+    }
+
+    fn take_reservation(&mut self) -> Option<Reservation<B, M, A>> {
+        self.held.store(0, Ordering::Relaxed);
+        self.reservation.take()
+    }
+
+    fn put_reservation(&mut self, reservation: Option<Reservation<B, M, A>>) {
+        self.held
+            .store(u64::from(reservation.is_some()), Ordering::Relaxed);
+        self.reservation = reservation;
+    }
 }
 
 /// A kept exclusive borrow of the real local monitor. Dropping this
@@ -251,7 +279,7 @@ pub(crate) struct PreparedClear<'a, B, M, A> {
 }
 impl<B, M, A> PreparedClear<'_, B, M, A> {
     pub(crate) fn commit(self) {
-        self.domain.retire(self.thread.reservation.take());
+        self.domain.retire(self.thread.take_reservation());
     }
 }
 
@@ -353,6 +381,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         ThreadMonitor {
             domain: Arc::clone(self),
             reservation: None,
+            held: alloc::boxed::Box::new(AtomicU64::new(0)),
             global: None,
             event: None,
         }
@@ -590,7 +619,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
     pub fn clear(&self, thread: &mut ThreadMonitor<B, M, A>) -> Result<(), MonitorError> {
         let _failure = FailureBoundary(&self.failed);
         self.owner(thread)?;
-        self.retire(thread.reservation.take());
+        self.retire(thread.take_reservation());
         Ok(())
     }
 
@@ -617,7 +646,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
             return Err(MonitorError::EventsUnbound.into());
         }
         // Local replacement never itself opens the independent global mark.
-        self.retire(thread.reservation.take());
+        self.retire(thread.take_reservation());
         let mut old_global = GlobalRetirement {
             domain: self,
             saved: None,
@@ -670,7 +699,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
             self.check_execution()?;
             value
         };
-        thread.reservation = pending.saved.take();
+        thread.put_reservation(pending.saved.take());
         drop(old_global); // Old stripe reacquisition occurs after new gate release.
         Ok(value)
     }
@@ -689,7 +718,7 @@ impl<B, M, A> MonitorDomain<B, M, A> {
         let key = self.key(access)?;
         let saved = LocalRetirement {
             domain: self,
-            saved: thread.reservation.take(),
+            saved: thread.take_reservation(),
         };
         let result = {
             let mut entries = self.lock(self.stripe(key))?;

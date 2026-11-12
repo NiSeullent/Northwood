@@ -133,10 +133,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
             },
             SystemOperation::SendEvent { local } => {
                 self.send_event(local);
-                if local {
-                    let value = self.cpu.event_storage();
-                    self.mirrors[SEND_EVENT] = register_read::Cell { readable: 1, value };
-                }
                 self.next()
             }
             SystemOperation::Wait {
@@ -443,6 +439,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         }
         step
+    }
+
+    /// Open [`Mirrors::events`] on the PE's event register as native code is
+    /// entered: its storage, the PE's own or its canonical memory's.
+    pub(super) fn enter_events(&mut self) {
+        self.mirrors.events = register_read::Cell {
+            readable: 1,
+            value: self.cpu.event_storage(),
+        };
+        self.mirrors.exclusive = register_read::Cell {
+            readable: u64::from(self.cpu.monitor.is_none() && !self.monitor_tracing),
+            value: self.cpu.reservation_word(),
+        };
     }
 
     /// Fill [`Mirrors::cycles`] and [`Mirrors::instructions`] as native code

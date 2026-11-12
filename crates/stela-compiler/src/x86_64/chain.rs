@@ -129,10 +129,10 @@ pub const MAX_LOOKUP_ENTRIES: usize = 1 << 22;
 const ITLB_SET_BITS: u32 = 15;
 /// Entries in an ITLB by default, two in each set: pages of every context
 /// it keeps. A PE's is sized from host memory, between the two bounds
-/// below ([`LookupTable::itlb_with`]).
+/// below ([`LookupTable::itlb_with`]): the largest takes 2 MiB.
 pub const ITLB_ENTRIES: usize = 1 << 14;
 pub const MIN_ITLB_ENTRIES: usize = 1 << 12;
-pub const MAX_ITLB_ENTRIES: usize = 1 << 14;
+pub const MAX_ITLB_ENTRIES: usize = 1 << 16;
 
 /// Arena bytes per block table entry: a block with its exits and thunks
 /// takes about 300 bytes, so a table of this many entries holds a little
@@ -2926,7 +2926,9 @@ mod tests {
         assert_eq!(lookup_entries(100 * MIB), LOOKUP_ENTRIES);
         assert_eq!(lookup_entries(512 * MIB), 1 << 21);
         assert_eq!(lookup_entries(64 * 1024 * MIB), MAX_LOOKUP_ENTRIES);
-        assert_eq!(itlb_entries(512 * MIB), MAX_ITLB_ENTRIES);
+        assert_eq!(itlb_entries(128 * MIB), 1 << 15);
+        assert_eq!(itlb_entries(256 * MIB), MAX_ITLB_ENTRIES);
+        assert_eq!(itlb_entries(720 * MIB), MAX_ITLB_ENTRIES);
         assert_eq!(lookup_entries(0), MIN_LOOKUP_ENTRIES);
         assert_eq!(itlb_entries(0), MIN_ITLB_ENTRIES);
     }
@@ -4042,5 +4044,76 @@ mod tests {
         }
         assert_ne!(table.find(slot(&stale), stale.pc, stale.key), stale);
         assert!(table.evicted().iter().sum::<u64>() > 0);
+    }
+
+    /// The largest ITLB, 64 Ki entries in 2 MiB, keeps every invalidation
+    /// rule of the default one: a TLBI by VA drops its pages in every
+    /// context and grows their half's drop epoch, a renewed context of an
+    /// old one's salt takes its slots but none of its entries and goes
+    /// with its salt, and forgetting everything empties it and grows both
+    /// epochs. Pages the default ITLB keeps in one set take two.
+    #[test]
+    fn the_largest_itlb_keeps_its_invalidation_rules() {
+        const LOWER: u64 = 0x0000_7f12_3456_0000;
+        const UPPER: u64 = 0xffff_fe00_0123_4000;
+        let mut itlb = LookupTable::itlb_with(MAX_ITLB_ENTRIES);
+        assert_eq!(itlb.entries(), 1 << 16);
+        assert_eq!(itlb.mask(), (1 << 15) - 1);
+        assert_eq!(itlb.table_bytes(), 2 << 20);
+        // Page number bit 14: one set of the default ITLB, two here.
+        let apart = UPPER ^ 1 << (PAGE_SHIFT + 14);
+        let small = LookupTable::itlb();
+        assert_eq!(small.page_slot(UPPER, 1) / 2, small.page_slot(apart, 1) / 2);
+        assert_ne!(itlb.page_slot(UPPER, 1) / 2, itlb.page_slot(apart, 1) / 2);
+        let put = |itlb: &mut LookupTable, page: u64, context: u64| {
+            itlb.insert(
+                itlb.page_slot(page, context),
+                LookupEntry::page(page, context, 1),
+            );
+        };
+        let held = |itlb: &LookupTable, page: u64, context: u64| {
+            let entry = itlb.find(itlb.page_slot(page, context), page, context);
+            entry.pc == page && entry.key == context
+        };
+        let epoch =
+            |itlb: &LookupTable, page: u64| itlb.sets.header()[half(page)].load(Ordering::Relaxed);
+        let pages = [LOWER, LOWER + 0x1000, UPPER, apart];
+        for context in 1..=8 {
+            for page in pages {
+                put(&mut itlb, page, context);
+            }
+        }
+        assert!(
+            pages
+                .iter()
+                .all(|&page| (1..=8).all(|c| held(&itlb, page, c)))
+        );
+        // A TLBI by VA of one page, every ASID: that page in every context.
+        let (upper, lower) = (epoch(&itlb, UPPER), epoch(&itlb, LOWER));
+        assert!(itlb.forget_range(UPPER..=UPPER + 0xfff, u64::MAX));
+        assert!((1..=8).all(|c| !held(&itlb, UPPER, c)));
+        assert!((1..=8).all(|c| held(&itlb, apart, c) && held(&itlb, LOWER, c)));
+        assert!(epoch(&itlb, UPPER) > upper);
+        assert_eq!(epoch(&itlb, LOWER), lower);
+        // Context 1 renewed as the number of its salt: its slots, none of
+        // its entries.
+        let renewed = 1 + LOOKUP_SALTS as u64;
+        assert_eq!(itlb.salt(renewed), itlb.salt(1));
+        assert_eq!(itlb.page_slot(LOWER, renewed), itlb.page_slot(LOWER, 1));
+        assert!(!held(&itlb, LOWER, renewed));
+        put(&mut itlb, LOWER, renewed);
+        assert!(held(&itlb, LOWER, renewed) && held(&itlb, LOWER, 1));
+        // Forgetting salt 1's pages takes both numbers and no other salt.
+        let lower = epoch(&itlb, LOWER);
+        assert!(itlb.forget_range(LOWER..=LOWER + 0x1fff, 1 << 1));
+        assert!(!held(&itlb, LOWER, renewed) && !held(&itlb, LOWER, 1));
+        assert!(!held(&itlb, LOWER + 0x1000, 1));
+        assert!((2..=8).all(|c| held(&itlb, LOWER, c) && held(&itlb, LOWER + 0x1000, c)));
+        assert!(epoch(&itlb, LOWER) > lower);
+        // Everything: empty, both halves' epochs grown.
+        let (upper, lower) = (epoch(&itlb, UPPER), epoch(&itlb, LOWER));
+        itlb.clear();
+        assert!(itlb.is_empty());
+        assert!(epoch(&itlb, UPPER) > upper && epoch(&itlb, LOWER) > lower);
     }
 }

@@ -269,7 +269,7 @@ pub struct AppleDevices {
     last_write: Vec<Option<(u64, u8)>>,
     writer: Option<(u64, u8)>,
     /// Devices that start no DMA and reach no master's registers (the
-    /// console UART): a write to one runs the masters' steps only when
+    /// console UART, the AIC): a write to one runs the masters' steps only when
     /// their DMA is due or every [`QUIET_WRITES`] writes
     /// ([`Self::quiet_write`]).
     quiet: Vec<DeviceId>,

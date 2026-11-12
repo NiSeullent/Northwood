@@ -74,6 +74,10 @@ impl Kick for Doorbells {
     fn released(&self) -> bool {
         super::storage::released()
     }
+
+    fn release_due(&self) -> bool {
+        super::storage::release_due()
+    }
 }
 
 /// What every PE's machine shares with the home machine's settings.
@@ -293,10 +297,12 @@ impl Pe {
                 // gives the screen the frames the DCP model presented and a
                 // staged guest disk its host I/O.
                 stop if machine.yielded_for_interrupt(&stop) => {
-                    super::run::host_work(&mut machine, |_| {
+                    super::run::host_work(&mut machine, |machine| {
                         super::service::serve(false, false);
                         super::display::flush(super::display::Turn::Idle);
-                        super::storage::serve_staged(true);
+                        if super::storage::serve_staged(true) {
+                            machine.devices.call_home();
+                        }
                         // A GPU compilation a guest call deferred.
                         #[cfg(feature = "nvk")]
                         super::gpu::gate::run_job(false);

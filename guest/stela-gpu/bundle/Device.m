@@ -98,6 +98,9 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 	NSMutableArray *_settling;
 	NSMutableArray *_indirect;
 	uint64_t _seen;
+	/* Whether the kext holds this device's notification; only `_completions`
+	 * raises it, and the kext's delivery ends it. */
+	_Atomic(bool) _armed;
 	bool _lost;
 	/* A moment both clocks read: the GPU's in ticks, the CPU's in seconds. */
 	uint64_t _anchorTick;
@@ -186,7 +189,7 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 	_completions = dispatch_queue_create("com.stela.StelaGPU.completions", NULL);
 	_notifications = IONotificationPortCreate(kIOMainPortDefault);
 	IONotificationPortSetDispatchQueue(_notifications, _completions);
-	[self arm];
+	/* Armed once something waits: nothing does yet. */
 	return self;
 }
 
@@ -236,10 +239,19 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 	return 'STLA';
 }
 
-/* Waking on completions. */
+/*
+ * Waking on completions. The kext wakes every armed device at each completion
+ * interrupt, whichever process's work completed, so a device stays armed only
+ * while something of its own waits for one: command buffers in flight,
+ * releases waiting for the GPU, refused buffers' signals to publish, or event
+ * waiters asleep. Otherwise each process using Metal would wake and ask the
+ * service at every other process's completion.
+ */
 
+/* On `_completions`. */
 - (void)arm
 {
+	atomic_store(&_armed, true);
 	uint64_t reference[kOSAsyncRef64Count] = {
 		[kIOAsyncCalloutFuncIndex] = (uint64_t)completed,
 		[kIOAsyncCalloutRefconIndex] = (uint64_t)(__bridge void *)self,
@@ -247,6 +259,49 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 	mach_port_t port = IONotificationPortGetMachPort(_notifications);
 	IOConnectCallAsyncScalarMethod(_gate.connect, kStelaGPUNotifyCompletion, port, reference,
 				       kOSAsyncRef64Count, &_seen, 1, NULL, NULL);
+}
+
+/* Whether anything of this device waits for a completion notification. */
+- (bool)awaitsCompletion
+{
+	os_unfair_lock_lock(&_lock);
+	bool waiting = _inFlight.count != 0 || _settling.count != 0;
+	os_unfair_lock_unlock(&_lock);
+	os_unfair_lock_lock(&_deferLock);
+	waiting = waiting || _deferred.count != 0;
+	os_unfair_lock_unlock(&_deferLock);
+	os_unfair_lock_lock(&_wakeLock);
+	waiting = waiting || _sleepers != 0;
+	os_unfair_lock_unlock(&_wakeLock);
+	return waiting;
+}
+
+/*
+ * On `_completions`, after a delivery ended the kext's notification: arms the
+ * next while anything waits. It reads as disarmed before the look, so whoever
+ * starts waiting after the look finds it disarmed and asks (`armIfNeeded`).
+ */
+- (void)rearm
+{
+	atomic_store(&_armed, false);
+	atomic_thread_fence(memory_order_seq_cst);
+	if ([self awaitsCompletion]) {
+		[self arm];
+	}
+}
+
+/* From any thread, once something waits: arms the notification unless armed. */
+- (void)armIfNeeded
+{
+	atomic_thread_fence(memory_order_seq_cst);
+	if (atomic_load(&_armed)) {
+		return;
+	}
+	dispatch_async(_completions, ^{
+		if (!atomic_load(&self->_armed)) {
+			[self arm];
+		}
+	});
 }
 
 - (void)completionsReached:(uint64_t)count
@@ -306,7 +361,7 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 	[self publishSettling:settling lost:lost];
 	[self releaseDeferredReaching:lost ? UINT64_MAX : reached.value];
 	[self wakeWaiters];
-	[self arm];
+	[self rearm];
 }
 
 /* Under `_lock`: whether the command buffers in flight are of more than one
@@ -354,6 +409,7 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 	}
 	_sleepers++;
 	os_unfair_lock_unlock(&_wakeLock);
+	[self armIfNeeded];
 	if (dispatch_semaphore_wait(_wake, dispatch_time(DISPATCH_TIME_NOW, (int64_t)milliseconds * 1000000)) == 0) {
 		return;
 	}
@@ -388,6 +444,8 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 	os_unfair_lock_unlock(&_deferLock);
 	if (now) {
 		[self released:entry];
+	} else {
+		[self armIfNeeded];
 	}
 }
 
@@ -510,6 +568,7 @@ static void completed(void *reference, int result, void *count)
 	os_unfair_lock_lock(&_lock);
 	[_settling addObject:@[ event, @(value) ]];
 	os_unfair_lock_unlock(&_lock);
+	[self armIfNeeded];
 }
 
 /* Publishes what refused command buffers signal, dropping each value the
