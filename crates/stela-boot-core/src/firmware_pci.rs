@@ -6,6 +6,7 @@
 //! observation is checked Start+Length; raw maximum is held separately.
 use crate::ecam::RootWindow;
 use core::ops::Range;
+pub mod cnvi;
 pub mod glk;
 pub mod lpss;
 pub const QWORD_BYTES: usize = 46;

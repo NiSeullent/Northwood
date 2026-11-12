@@ -32,7 +32,7 @@ use stela_runtime::pc::{
 /// these resources to the diagnostic choice. The PCI census reads only
 /// firmware-published configuration and does not attach devices.
 pub(super) fn firmware(machine: &mut Machine, resources: &Resources) -> Vec<(u16, u16)> {
-    let census = crate::pci_io::capture();
+    let census = crate::pci_io::capture_host_check();
     let mut identities = Vec::new();
     let mut required = BTreeSet::new();
     let mut profile_selected = BTreeSet::new();
@@ -156,6 +156,7 @@ pub(super) fn firmware(machine: &mut Machine, resources: &Resources) -> Vec<(u16
             false
         }
     };
+    cnvi_dmar(&cnvi_addresses);
     let manifest = if resources.present {
         let region = resources.manifest;
         if region.physical == 0 || region.bytes == 0 || region.bytes > MAX_MANIFEST_BYTES as u64 {
@@ -216,6 +217,60 @@ pub(super) fn firmware(machine: &mut Machine, resources: &Resources) -> Vec<(u16
         ),
     );
     identities
+}
+
+fn cnvi_dmar(addresses: &BTreeSet<pci::Address>) {
+    if addresses.is_empty() {
+        return;
+    }
+    let Some(rsdp) = crate::storage::rsdp() else {
+        output::arguments(format_args!("HOST WIFI CNVI DMAR rsdp=unavailable\n"));
+        return;
+    };
+    // SAFETY: the firmware's RSDP and its tables are mapped before EBS.
+    let table = match unsafe { stela_runtime::pc::acpi::find(rsdp, b"DMAR") } {
+        Ok(table) => table,
+        Err(error) => {
+            output::arguments(format_args!("HOST WIFI CNVI DMAR table={error:?}\n"));
+            return;
+        }
+    };
+    let table = match stela_boot_core::dmar::parse(table) {
+        Ok(table) => table,
+        Err(error) => {
+            output::arguments(format_args!("HOST WIFI CNVI DMAR parse={error:?}\n"));
+            return;
+        }
+    };
+    for address in addresses {
+        let direct = |scope: &stela_boot_core::remapping::Scope| {
+            !scope.bridge
+                && scope.bus == address.bus
+                && scope.path.as_slice() == [(address.device, address.function)]
+        };
+        let units = || {
+            table
+                .units
+                .iter()
+                .filter(|unit| unit.segment == address.segment)
+        };
+        let direct_units: Vec<_> = units()
+            .filter(|unit| unit.scopes.iter().any(direct))
+            .map(|unit| unit.base)
+            .collect();
+        let include_all: Vec<_> = units()
+            .filter(|unit| unit.include_all)
+            .map(|unit| unit.base)
+            .collect();
+        let direct_reserved = table
+            .reserved
+            .iter()
+            .filter(|range| range.segment == address.segment && range.scopes.iter().any(direct))
+            .count();
+        output::arguments(format_args!(
+            "HOST WIFI CNVI DMAR pci={address} direct_units={direct_units:x?} include_all_units={include_all:x?} direct_reserved={direct_reserved} scope=firmware-listing\n"
+        ));
+    }
 }
 
 fn cnvi_firmware(

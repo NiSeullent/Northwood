@@ -2506,6 +2506,8 @@ fn start_platform(
         }
     }
     if let Some(pci) = &contained_pci {
+        #[cfg(feature = "diagnostics")]
+        remappers.report_cnvi_root(pci);
         remappers.forward_pci_bridges(pci);
     }
     let prepared_sci = match (&contained_pci, &handoff.power) {

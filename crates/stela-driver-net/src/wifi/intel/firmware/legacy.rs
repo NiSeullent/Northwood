@@ -18,6 +18,7 @@ pub mod adapter;
 pub mod alive;
 pub mod aux;
 pub mod hcmd;
+pub mod identity;
 pub mod nvm;
 pub mod paging;
 pub mod phy;

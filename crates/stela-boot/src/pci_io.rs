@@ -572,6 +572,17 @@ pub enum CaptureFailure {
     Allocation,
 }
 pub fn capture() -> Result<Census, CaptureFailure> {
+    capture_with_cnvi(false)
+}
+
+#[cfg(feature = "diagnostics")]
+pub fn capture_host_check() -> Result<Census, CaptureFailure> {
+    capture_with_cnvi(true)
+}
+
+fn capture_with_cnvi(
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))] observe_cnvi_csr: bool,
+) -> Result<Census, CaptureFailure> {
     use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams};
     let handles = boot::find_handles::<PciIo>()
         .map_err(|error| CaptureFailure::Enumeration(error.status()))?;
@@ -638,6 +649,9 @@ pub fn capture() -> Result<Census, CaptureFailure> {
             observe_nvme(handle, &mut protocol, address, &header, &bars[0]);
             observe_lpss_i2c(handle, address, &header, &bars[0]);
             observe_glk(&mut protocol, address, &header, &bars[0]);
+            if observe_cnvi_csr {
+                observe_cnvi(&mut protocol, address, &header, &bars[0]);
+            }
         }
         result.functions.push(FunctionObservation {
             address,
@@ -646,6 +660,82 @@ pub fn capture() -> Result<Census, CaptureFailure> {
         });
     }
     Ok(result)
+}
+
+#[cfg(feature = "diagnostics")]
+fn observe_cnvi(
+    protocol: &mut PciIo,
+    address: Address,
+    header: &[u8; 64],
+    regions: &Result<Vec<BarRegion>, Error>,
+) {
+    use stela_boot_core::firmware_pci::cnvi;
+    use stela_drivers::{bus::pci::regs, net::wifi::intel::firmware::legacy::identity};
+
+    if !cnvi::matches(header) {
+        return;
+    }
+    let command = u16::from_le_bytes([header[4], header[5]]);
+    let memory_decode = command & regs::COMMAND_MEMORY != 0;
+    let bus_master = command & regs::COMMAND_MASTER != 0;
+    let power = cnvi::power_state(header, |offset| {
+        let mut word = 0u16;
+        // SAFETY: the original scoped PCI_IO, one aligned UINT16 output.
+        status(unsafe {
+            (protocol.config_read)(protocol, 1, u32::from(offset), 1, (&raw mut word).cast())
+        })
+        .ok()
+        .map(|()| u16::from_le(word))
+    });
+    let Some(bar) = regions
+        .as_ref()
+        .ok()
+        .and_then(|regions| cnvi::bar0(header, regions))
+    else {
+        crate::output::arguments(format_args!(
+            "HOST WIFI CNVI PCI pci={address} power={power:?} memory_decode={memory_decode} bus_master={bus_master} bar0=unverified\n"
+        ));
+        return;
+    };
+    crate::output::arguments(format_args!(
+        "HOST WIFI CNVI PCI pci={address} power={power:?} memory_decode={memory_decode} bus_master={bus_master} bar0_bus={:#x} bar0_host={:#x} bar0_bytes={} source=uefi-pci-io\n",
+        bar.pci.start,
+        bar.host.start,
+        bar.host.end - bar.host.start
+    ));
+    if power != Ok(0) || !memory_decode {
+        return;
+    }
+
+    let mut read = |offset: u32| {
+        let mut word = 0u32;
+        // SAFETY: the same handle's BAR0 is readable and covers these
+        // aligned identity CSRs. No reset, wake, port or PRPH write is issued.
+        status(unsafe {
+            (protocol.mem_read)(protocol, 2, 0, u64::from(offset), 1, (&raw mut word).cast())
+        })
+        .map(|()| u32::from_le(word))
+    };
+    let snapshot = (|| {
+        Ok::<_, Error>(identity::Snapshot {
+            hw_revision: read(identity::HW_REVISION)?,
+            rf_id: read(identity::RF_ID)?,
+            gp_control: read(identity::GP_CONTROL)?,
+        })
+    })();
+    match snapshot {
+        Ok(snapshot) => crate::output::arguments(format_args!(
+            "HOST WIFI CNVI CSR pci={address} hw_rev={:#010x} rf_id={:#010x} gp={:#010x} identity={:?} awake={:?}\n",
+            snapshot.hw_revision,
+            snapshot.rf_id,
+            snapshot.gp_control,
+            snapshot.qualify_31dc(),
+            snapshot.qualify_awake(),
+        )),
+        Err(error) => crate::output::arguments(format_args!(
+            "HOST WIFI CNVI CSR pci={address} read=failed {error}\n"
+        )),
+    }
 }
 
 #[cfg(feature = "diagnostics")]

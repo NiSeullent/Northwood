@@ -78,6 +78,14 @@ struct BlockedFabric {
     units: Vec<(usize, InitialBlock<MmioRegisters>)>,
 }
 
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+enum CnviFirmwareRoute {
+    Unit { descriptor: usize, base: u64 },
+    NoUnit,
+    Unresolved,
+}
+
 impl BlockedFabric {
     /// Observe every original unit in the same direct-delivery epoch. The
     /// caller may hold the pins across a later IRQ handoff.
@@ -130,6 +138,8 @@ pub(super) struct Remappers {
     roles: core::cell::RefCell<roles::Inventory>,
     topology: core::cell::RefCell<Vec<(u16, Vec<Present>)>>,
     dmar: Option<dmar::Remapping>,
+    #[cfg(feature = "diagnostics")]
+    cnvi_firmware_routes: Vec<(Address, CnviFirmwareRoute)>,
     /// The firmware describes no remapping hardware: every requester's DMA
     /// and interrupt messages reach memory and the APICs untranslated.
     unremapped: bool,
@@ -164,6 +174,65 @@ fn requester(address: Address) -> u16 {
 }
 
 impl Remappers {
+    /// Report original-route planning and retained receipt metadata. Checking
+    /// or consuming a specific blocked requester is left to its owner.
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn report_cnvi_root(&self, pci: &native_mmio::ContainedPci<'_>) {
+        let Ok(addresses) = pci.cnvi_addresses() else {
+            output::arguments(format_args!("HOST WIFI CNVI ROOT census=unavailable\n"));
+            return;
+        };
+        for address in addresses {
+            let rid = requester(address);
+            let role = self.function_role(address);
+            let route = self
+                .cnvi_firmware_routes
+                .iter()
+                .find_map(|&(at, route)| (at == address).then_some(route));
+            match route {
+                Some(CnviFirmwareRoute::Unit { descriptor, base }) => {
+                    let Some(taken) = self
+                        .taken
+                        .iter()
+                        .find(|taken| taken.descriptor == descriptor)
+                    else {
+                        output::arguments(format_args!(
+                            "HOST WIFI CNVI ROOT pci={address} rid={rid:#06x} role={role:?} unit={base:#x} takeover=not-taken claim=not-attempted\n"
+                        ));
+                        continue;
+                    };
+                    let initial = match taken.initial {
+                        InitialContexts::Window => "window",
+                        InitialContexts::Blocked => "blocked",
+                    };
+                    let fabric = self.initial_fabric.as_ref().is_some_and(|fabric| {
+                        core::ptr::eq(fabric.source, pci.source())
+                            && fabric
+                                .units
+                                .iter()
+                                .any(|(index, _)| *index == taken.descriptor)
+                    });
+                    output::arguments(format_args!(
+                        "HOST WIFI CNVI ROOT pci={address} rid={rid:#06x} role={role:?} unit={base:#x} takeover=taken initial={initial} allows={} blocked_fabric={fabric} initial_lines={} claim=not-attempted\n",
+                        taken.unit.allows(rid),
+                        self.initial_lines.is_some(),
+                    ));
+                }
+                route => {
+                    let route = match route {
+                        Some(CnviFirmwareRoute::NoUnit) => "no-unit",
+                        Some(CnviFirmwareRoute::Unresolved) => "unresolved",
+                        None => "not-observed",
+                        _ => unreachable!(),
+                    };
+                    output::arguments(format_args!(
+                        "HOST WIFI CNVI ROOT pci={address} rid={rid:#06x} role={role:?} route={route} claim=not-attempted\n"
+                    ));
+                }
+            }
+        }
+    }
+
     /// Whether a complete blocked fabric qualified. The policy chooses one
     /// only when no device needs the drivers' pool, so legacy probe has
     /// nothing to write; it keeps the original PCI view for reading.
@@ -207,6 +276,8 @@ impl Remappers {
             roles: core::cell::RefCell::new(roles::Inventory::empty()),
             topology: core::cell::RefCell::new(Vec::new()),
             dmar: None,
+            #[cfg(feature = "diagnostics")]
+            cnvi_firmware_routes: Vec::new(),
             unremapped: false,
         }
     }
@@ -395,6 +466,24 @@ impl Remappers {
             }
         };
         let mut cohorts = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        for address in pci.cnvi_addresses().unwrap_or_default() {
+            let route = inventories
+                .iter()
+                .find(|(segment, _)| *segment == address.segment)
+                .map(|(_, present)| {
+                    remapping::route(&parsed, address.segment, present, requester(address))
+                });
+            let route = match route {
+                Some(Ok(Some(descriptor))) => CnviFirmwareRoute::Unit {
+                    descriptor,
+                    base: parsed.units[descriptor].base,
+                },
+                Some(Ok(None)) => CnviFirmwareRoute::NoUnit,
+                _ => CnviFirmwareRoute::Unresolved,
+            };
+            remappers.cnvi_firmware_routes.push((address, route));
+        }
         remappers.dmar = Some(parsed.clone());
         if cohorts.try_reserve_exact(parsed.units.len()).is_err()
             || remappers

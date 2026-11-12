@@ -64,6 +64,28 @@ impl<'a> ContainedPci<'a> {
         Ok(ids)
     }
 
+    /// Exact 31dc addresses from the parked original PCI census.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn cnvi_addresses(&self) -> Result<Vec<Address>, Error> {
+        let cohort = self
+            .source
+            .pci_slots
+            .0
+            .try_borrow()
+            .map_err(|_| Error::Busy)?;
+        let Cohort::Parked(fabric) = &*cohort else {
+            return Err(Error::Unavailable);
+        };
+        let mut addresses = Vec::new();
+        for slot in &fabric.slots {
+            if slot.header.identity == 0x31dc_8086 && slot.header.class_revision >> 8 == 0x028000 {
+                addresses.try_reserve(1).map_err(|_| Error::Exhausted)?;
+                addresses.push(slot.address);
+            }
+        }
+        Ok(addresses)
+    }
+
     /// Original populated bridge routes in upstream-first order.
     pub(crate) fn bridges(&self) -> Result<Vec<Address>, Error> {
         let cohort = self
