@@ -263,7 +263,10 @@ pub fn claims_identity(function: &crate::bus::pci::Identity) -> bool {
 pub fn disk_refusal(function: &crate::bus::pci::Identity) -> Option<&'static str> {
     if function.class[0] != 0x01
         || claims_identity(function)
-        || native::Kind::of_identity(function).is_some()
+        || matches!(
+            registry::select_pci(function, &registry::DriverPolicy::default()).driver(),
+            Some(registry::Driver::Native(_))
+        )
     {
         return None;
     }
