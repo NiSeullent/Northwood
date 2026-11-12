@@ -74,6 +74,7 @@ use stela_runtime::pc::{
 };
 use uefi::boot;
 
+mod i8042;
 mod inventory;
 mod summary;
 
@@ -337,6 +338,7 @@ fn prepare(
         ),
     );
     let pci_ids = inventory::firmware(&mut machine, resources);
+    i8042::observe_firmware();
     // SAFETY: main passed the loader's validated immutable resources,
     // and the standalone diagnostic retains their identity mapping.
     let catalog = unsafe { host_firmware::identity_catalog(resources) }

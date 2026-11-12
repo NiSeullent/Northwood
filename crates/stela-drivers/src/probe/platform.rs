@@ -42,19 +42,51 @@ const FADT_BOOT_ARCH: usize = 109;
 /// IAPC_BOOT_ARCH bit: the motherboard has an 8042 or equivalent.
 const FADT_8042: u16 = 1 << 1;
 
-/// Whether the FADT lets the i8042 ports be probed directly when the
-/// namespace lists no i8042 device, as Linux `acpi_parse_fadt` decides: a
-/// FADT before revision 2 has no boot flags, and from revision 2 on the 8042
-/// flag must be set. No FADT says nothing against it.
-pub(crate) fn fadt_expects_i8042(fadt: Option<&[u8]>) -> bool {
-    let Some(fadt) = fadt else {
-        return true;
-    };
-    match fadt.get(8) {
-        Some(revision) if *revision >= 2 => fadt
-            .get(FADT_BOOT_ARCH..FADT_BOOT_ARCH + 2)
-            .is_some_and(|flags| u16::from_le_bytes([flags[0], flags[1]]) & FADT_8042 != 0),
-        _ => true,
+/// The firmware's i8042 declaration. This carries no port ownership or
+/// evidence that an i8042 answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum I8042Fadt {
+    Absent,
+    LegacyRevision(u8),
+    Truncated { revision: Option<u8> },
+    FlagClear { revision: u8 },
+    FlagSet { revision: u8 },
+}
+
+impl I8042Fadt {
+    /// Inspect the fields of a FADT identified by the caller.
+    pub fn observe(fadt: Option<&[u8]>) -> Self {
+        let Some(fadt) = fadt else {
+            return Self::Absent;
+        };
+        let Some(&revision) = fadt.get(8) else {
+            return Self::Truncated { revision: None };
+        };
+        if revision < 2 {
+            return Self::LegacyRevision(revision);
+        }
+        let Some(flags) = fadt.get(FADT_BOOT_ARCH..FADT_BOOT_ARCH + 2) else {
+            return Self::Truncated {
+                revision: Some(revision),
+            };
+        };
+        if u16::from_le_bytes([flags[0], flags[1]]) & FADT_8042 == 0 {
+            Self::FlagClear { revision }
+        } else {
+            Self::FlagSet { revision }
+        }
+    }
+
+    /// Preserve the direct-probe fallback when there is no modern FADT
+    /// declaration and the namespace lists no i8042 device.
+    fn permits_direct_probe(self) -> bool {
+        matches!(
+            self,
+            Self::Absent
+                | Self::LegacyRevision(_)
+                | Self::Truncated { revision: None }
+                | Self::FlagSet { .. }
+        )
     }
 }
 
@@ -148,12 +180,13 @@ pub(super) fn attach_i8042(
         }
         direct = keyboards.is_empty()
             && mice.is_empty()
-            && fadt_expects_i8042(
+            && I8042Fadt::observe(
                 session
                     .table(b"FACP")
                     .map_err(|error| PlatformError::Acpi(error.into()))?
                     .as_deref(),
-            );
+            )
+            .permits_direct_probe();
         let Some(config) = i8042(direct || !keyboards.is_empty(), !mice.is_empty(), &io)? else {
             return Ok(None);
         };
@@ -263,13 +296,36 @@ mod tests {
 
     #[test]
     fn the_fadt_8042_flag_allows_a_direct_probe() {
-        assert!(fadt_expects_i8042(Some(&fadt(6, FADT_8042 | 1))));
-        assert!(!fadt_expects_i8042(Some(&fadt(6, 1))));
-        // Before revision 2 the boot flags are reserved, and Linux probes.
-        assert!(fadt_expects_i8042(Some(&fadt(1, 0))));
-        assert!(fadt_expects_i8042(None));
-        // A table too short to hold the flags says no 8042.
-        assert!(!fadt_expects_i8042(Some(&fadt(6, FADT_8042)[..100])));
+        let set = fadt(6, FADT_8042 | 1);
+        let clear = fadt(6, 1);
+        let legacy = fadt(1, 0);
+        for (table, observation, permits_direct_probe) in [
+            (
+                Some(set.as_slice()),
+                I8042Fadt::FlagSet { revision: 6 },
+                true,
+            ),
+            (
+                Some(clear.as_slice()),
+                I8042Fadt::FlagClear { revision: 6 },
+                false,
+            ),
+            (Some(legacy.as_slice()), I8042Fadt::LegacyRevision(1), true),
+            (None, I8042Fadt::Absent, true),
+            (
+                Some(&set[..8]),
+                I8042Fadt::Truncated { revision: None },
+                true,
+            ),
+            (
+                Some(&set[..FADT_BOOT_ARCH + 1]),
+                I8042Fadt::Truncated { revision: Some(6) },
+                false,
+            ),
+        ] {
+            assert_eq!(I8042Fadt::observe(table), observation);
+            assert_eq!(observation.permits_direct_probe(), permits_direct_probe);
+        }
     }
 
     #[test]

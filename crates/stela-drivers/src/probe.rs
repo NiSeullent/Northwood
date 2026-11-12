@@ -34,6 +34,8 @@ mod legacy;
 pub mod native;
 #[cfg(any(test, feature = "native-acpi"))]
 mod platform;
+#[cfg(feature = "native-acpi")]
+pub use platform::I8042Fadt;
 pub mod registry;
 pub mod services;
 #[cfg(feature = "native-acpi")]
