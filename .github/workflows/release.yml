@@ -103,7 +103,9 @@ jobs:
 
   app:
     needs: version
-    runs-on: macos-26
+    # Swift cross-builds the arm64 guest app. Use the Intel hosted pool
+    # because the Arm pool failed to assign a runner for the release.
+    runs-on: macos-26-intel
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -271,7 +273,7 @@ jobs:
           - os: windows-2025
             platform: windows-x86_64
             targets: x86_64-pc-windows-msvc
-          - os: macos-26
+          - os: macos-26-intel
             platform: macos-universal
             targets: aarch64-apple-darwin x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
