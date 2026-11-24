@@ -738,7 +738,10 @@ fn describe_usb(device: &Usb) -> Vec<String> {
         candidates.push("USB Ethernet (ID candidate)".into());
     }
     for vendor_interface in [false, true] {
-        if let Some(setup) = bluetooth::Setup::of(device.vendor, device.product, vendor_interface) {
+        if let Some(setup) = bluetooth::Setup::of(device.vendor, device.product, vendor_interface)
+            // A vendor ID alone could belong to an Apple keyboard or hub.
+            && setup != bluetooth::Setup::BroadcomApple
+        {
             let label = format!("{} Bluetooth (ID candidate)", setup.name());
             if !candidates.contains(&label) {
                 candidates.push(label);

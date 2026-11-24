@@ -13,6 +13,7 @@ pub enum InitializationReport {
     Atheros(ath3k::runtime::OwnedReport),
     Qualcomm(qca::OwnedReport),
     Broadcom(broadcom::OwnedReport),
+    BroadcomApple(broadcom::AppleReport),
     Intel(intel::OwnedReport),
     Realtek(realtek::OwnedReport),
     MediaTek(mediatek::OwnedReport),
@@ -95,12 +96,13 @@ pub enum Setup {
     Atheros,
     Qualcomm,
     Broadcom,
+    BroadcomApple,
     Realtek,
     MediaTek,
     Intel,
 }
 impl Setup {
-    /// The setup for a controller with these IDs, whose interface 0 is of
+    /// The setup for a controller with these IDs, whose HCI interface is of
     /// vendor class FF/01/01 (`vendor_interface`) rather than E0/01/01;
     /// `None` for one no setup here takes.
     pub fn of(vendor: u16, product: u16, vendor_interface: bool) -> Option<Self> {
@@ -118,6 +120,9 @@ impl Setup {
         }
         if broadcom::listed(vendor, product, vendor_interface) {
             return Some(Self::Broadcom);
+        }
+        if vendor_interface && vendor == broadcom::APPLE_VENDOR {
+            return Some(Self::BroadcomApple);
         }
         // The others take only the standard HCI interface.
         if vendor_interface {
@@ -152,6 +157,7 @@ impl Setup {
             Self::Atheros => "Qualcomm Atheros AR3011/AR3012",
             Self::Qualcomm => "Qualcomm",
             Self::Broadcom => "Broadcom",
+            Self::BroadcomApple => "Apple Broadcom",
             Self::Realtek => "Realtek",
             Self::MediaTek => "MediaTek",
             Self::Intel => "Intel",
@@ -212,6 +218,11 @@ impl<B: Io> Hci<B> {
                 .map(InitializationReport::Broadcom)
                 .map_err(InitializationError::Broadcom);
         }
+        if self.binding.apple_rom {
+            return broadcom::initialize_apple(self)
+                .map(InitializationReport::BroadcomApple)
+                .map_err(InitializationError::Broadcom);
+        }
         if realtek::is_candidate(self.binding.device()) {
             return realtek::initialize(self, provider)
                 .map(InitializationReport::Realtek)
@@ -252,6 +263,8 @@ mod tests {
             (0x0cf3, 0x3000, false, Some(Setup::Atheros)),
             (0x0a5c, 0x21e8, true, Some(Setup::Broadcom)),
             (0x19ff, 0x0239, false, Some(Setup::Broadcom)),
+            (0x05ac, 0x8290, true, Some(Setup::BroadcomApple)),
+            (0x05ac, 0x8290, false, None),
             // A Broadcom module maker's ID on the standard interface, and a
             // MediaTek ID on a vendor-class one.
             (0x0a5c, 0x21e8, false, None),

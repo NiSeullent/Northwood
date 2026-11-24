@@ -2258,7 +2258,11 @@ fn status_and_boot_log_read_northwood_setup_with_legacy_fallback() {
     f.host.erase_as = Some("NORTHWOOD");
     let mut create = command(&f, Path::new("disk5"));
     create.confirmed = true;
-    setup(&environment(&f.host), create).unwrap();
+    let report = setup(&environment(&f.host), create).unwrap();
+    assert!(
+        report.contains("Install macOS 27 via Northwood"),
+        "{report}"
+    );
     let layout = Layout::Northwood;
     let legacy = Layout::Legacy;
     let volume = stela_volume(&f);
@@ -2268,6 +2272,20 @@ fn status_and_boot_log_read_northwood_setup_with_legacy_fallback() {
     assert_eq!(fs::read(&loader).unwrap(), image);
     assert!(modern_record.is_file());
     assert!(config.is_file());
+    let choices =
+        Choices::parse(&fs::read_to_string(f.esp.join(layout.esp_path(layout::CHOICES))).unwrap())
+            .unwrap();
+    let install = &choices.entries[1];
+    assert_eq!(install.name, "Install macOS 27 via Northwood");
+    assert_eq!(
+        install.kind(),
+        stela_loader::mount_interface::ChoiceKind::Setup
+    );
+    let parsed = ::northwood_config::parse(&fs::read(&config).unwrap()).unwrap();
+    let install = &parsed.config.boot.entries[1];
+    assert_eq!(install.name, "Install macOS 27 via Northwood");
+    let restore = ::northwood_config::render::options_line(&install.config, true).unwrap();
+    assert!(System::parse(&restore).unwrap().install.is_some());
     for directory in [
         layout::DATA_BOOT,
         layout::DATA_INSTALL,

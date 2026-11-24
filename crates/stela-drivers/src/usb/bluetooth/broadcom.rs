@@ -4,6 +4,7 @@
 //! Controller identification, exact Provider resources and acknowledged
 //! HCD commands are required. Success is historical protocol evidence, not
 //! vendor authentication, Bluetooth service readiness or physical validation.
+//! Also supports the Apple USB ROM setup from the pinned Linux btbcm.
 //! USB media and the distinct BCM4377 PCIe transport remain separate backends.
 pub mod diagnostics;
 mod identity;
@@ -13,6 +14,7 @@ mod patch;
 use super::{FirmwareReceipt, Hci, Io, Packet};
 use alloc::{boxed::Box, vec::Vec};
 pub(crate) use identity::listed;
+pub(crate) use identity::{APPLE_VENDOR, is_apple_interface};
 pub use identity::{Identity, LocalVersion, UsbIdentity, is_vendor_interface};
 pub use patch::{Hcd, Record};
 
@@ -53,6 +55,23 @@ pub struct OwnedReport {
     /// Source-required policy: controller duplicate filtering is strict.
     pub strict_duplicate_filter: bool,
 }
+
+/// Observations from the Apple ROM setup. Rejected optional commands have no
+/// observation. No host firmware was downloaded by this setup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppleReport {
+    pub usb: UsbIdentity,
+    pub interface: u8,
+    pub verbose: Option<[u8; 7]>,
+    pub product: Option<[u8; 5]>,
+    pub features: Option<[u8; 9]>,
+    pub local_name: Option<Vec<u8>>,
+    pub command_credits: u8,
+    pub asynchronous: Vec<Packet>,
+    pub strict_duplicate_filter: bool,
+}
+
+pub(super) use initialize::run_apple as initialize_apple;
 
 #[derive(Debug)]
 pub enum Error {

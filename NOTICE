@@ -1189,6 +1189,9 @@ crates/stela-drivers/src/usb/bluetooth/: Broadcom/Cypress USB PatchRAM
   initialization
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-or-later
     drivers/bluetooth/btbcm.c
+crates/stela-drivers/src/usb/bluetooth/: Apple Broadcom USB HCI ROM setup
+    Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0-or-later
+    drivers/bluetooth/btusb.c, drivers/bluetooth/btbcm.c
 crates/stela-drivers/src/usb/bluetooth/: Qualcomm Rome / WCN USB DFU
   initialization
     Linux a804c5742bff224d4cb4d25dd383554d598be32b; GPL-2.0-or-later

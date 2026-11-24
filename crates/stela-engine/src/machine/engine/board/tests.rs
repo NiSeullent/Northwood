@@ -4,7 +4,7 @@
 use super::*;
 use std::{
     sync::{
-        Arc,
+        Arc, Barrier,
         atomic::{AtomicBool, AtomicU32, AtomicUsize},
     },
     thread,
@@ -52,6 +52,7 @@ fn grace_keeps_buffers_until_readers_left() {
     const READERS: usize = 4;
     const BUFFERS: usize = 4;
     const WORDS: usize = 8;
+    const READ_BATCH: u64 = 16;
     let grace = Arc::new(Grace::new(READERS + 2));
     let buffers: Arc<Vec<[AtomicU64; WORDS]>> = Arc::new(
         (0..BUFFERS)
@@ -60,7 +61,7 @@ fn grace_keeps_buffers_until_readers_left() {
     );
     let current = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicBool::new(false));
-    let started = Instant::now();
+    let ready = Arc::new(Barrier::new(READERS + 1));
     let readers: Vec<_> = (0..READERS)
         .map(|pe| {
             let (grace, buffers, current, done) = (
@@ -69,11 +70,12 @@ fn grace_keeps_buffers_until_readers_left() {
                 current.clone(),
                 done.clone(),
             );
+            let ready = Arc::clone(&ready);
             thread::spawn(move || {
                 let mut reads = 0u64;
                 while !done.load(Ordering::Relaxed) {
                     grace.enter(pe);
-                    for _ in 0..16 {
+                    for _ in 0..READ_BATCH {
                         let held = &buffers[current.load(Ordering::Acquire)];
                         let value = held[0].load(Ordering::Relaxed);
                         assert_ne!(value, u64::MAX, "a reader saw a poisoned buffer");
@@ -93,16 +95,26 @@ fn grace_keeps_buffers_until_readers_left() {
                         grace.pass(pe);
                     }
                     grace.leave(pe);
+                    if reads == READ_BATCH {
+                        ready.wait();
+                    }
                 }
                 reads
             })
         })
         .collect();
+    // Let each reader perform a batch before the writer can finish.
+    ready.wait();
+    let deadline = Instant::now() + Duration::from_secs(120);
     // The last PE is parked throughout: it never holds anything up.
     let writer = READERS;
     grace.enter(writer);
     let mut value = 1;
     for _ in 0..20_000 {
+        assert!(
+            Instant::now() < deadline,
+            "the writer exceeded its time budget"
+        );
         let old = current.load(Ordering::Relaxed);
         let new = (old + 1) % BUFFERS;
         value += 1;
@@ -111,8 +123,10 @@ fn grace_keeps_buffers_until_readers_left() {
         }
         current.store(new, Ordering::Release);
         let snapshot = grace.snapshot();
+        let mut wait_expired = give_up(Instant::now());
         assert!(
-            grace.wait(writer, &snapshot, give_up(started)),
+            grace.wait(writer, &snapshot, || Instant::now() >= deadline
+                || wait_expired()),
             "a grace period never passed"
         );
         for word in &buffers[old] {

@@ -549,6 +549,103 @@ fn vendor_descriptor_admission_matches_source_and_requires_real_interface() {
 }
 
 #[test]
+fn apple_vendor_hci_uses_the_rom_setup_on_interface_zero_or_two() {
+    for number in [0, 2] {
+        let mut device = device(APPLE_VENDOR, 0x8290, 0xff);
+        device.configuration[11] = number;
+        let interfaces = crate::usb::descriptor::interfaces(&device.configuration);
+        let binding = Binding::new(&device, &interfaces[0]).unwrap();
+        assert!(!is_candidate(&device));
+        let (mut hci, trace) = model(0x220e);
+        hci.binding = binding;
+        hci.io.steps = [
+            (0x0c03, &[0][..]),
+            (0xfc79, &[0, 7, 0, 0, 0, 1, 0]),
+            (0xfc5a, &[0, 0xac, 0x05, 0x90, 0x82]),
+            (0xfc6e, &[1]),
+            (0x0c14, &[0; 249]),
+        ]
+        .into_iter()
+        .map(|(opcode, reply)| Step {
+            command: wire(opcode, &[]),
+            responses: vec![(cc(opcode, reply, 1), Some(1))],
+        })
+        .collect();
+        let empty = Catalog::from_handoff(vec![]).unwrap();
+        let InitializationReport::BroadcomApple(report) = hci
+            .initialize_with_provider(&empty, PlatformInputs::default())
+            .unwrap()
+        else {
+            panic!("expected Apple ROM initialization");
+        };
+        assert_eq!(report.interface, number);
+        assert_eq!(report.usb.product, 0x8290);
+        assert_eq!(report.verbose.unwrap()[1], 7);
+        assert_eq!(report.product.unwrap(), [0, 0xac, 0x05, 0x90, 0x82]);
+        assert!(report.features.is_none());
+        assert_eq!(report.local_name.as_deref(), Some(&[0; 249][..]));
+        assert!(report.strict_duplicate_filter);
+        assert!(hci.io.steps.is_empty());
+        assert_eq!(trace.borrow().commands.len(), 5);
+        assert_eq!(trace.borrow().closed, 0);
+    }
+}
+
+#[test]
+fn apple_vendor_hci_refuses_wrong_interfaces_and_conflicting_controllers() {
+    for (vendor, number, alternate) in [(APPLE_VENDOR, 1, 0), (APPLE_VENDOR, 2, 1), (0x1234, 2, 0)]
+    {
+        let mut device = device(vendor, 0x8290, 0xff);
+        device.configuration[11] = number;
+        device.configuration[12] = alternate;
+        let interfaces = crate::usb::descriptor::interfaces(&device.configuration);
+        assert!(Binding::new(&device, &interfaces[0]).is_err());
+    }
+    let mut device = device(APPLE_VENDOR, 0x8290, 0xff);
+    let mut second = device.configuration[9..].to_vec();
+    second[2] = 2;
+    device.configuration.extend(second);
+    device.configuration[4] = 2;
+    let length = device.configuration.len() as u16;
+    device.configuration[2..4].copy_from_slice(&length.to_le_bytes());
+    let interfaces = crate::usb::descriptor::interfaces(&device.configuration);
+    assert_eq!(interfaces.len(), 2);
+    for interface in &interfaces {
+        assert_eq!(
+            Binding::new(&device, interface).unwrap_err(),
+            "Apple Bluetooth HCI has competing EP0 interfaces"
+        );
+    }
+}
+
+#[test]
+fn apple_rom_reset_rejection_retires_the_attachment() {
+    let device = device(APPLE_VENDOR, 0x8290, 0xff);
+    let interface = &crate::usb::descriptor::interfaces(&device.configuration)[0];
+    let (mut hci, trace) = model(0x220e);
+    hci.binding = Binding::new(&device, interface).unwrap();
+    hci.io.steps[0].responses[0] = (cc(0x0c03, &[0x0c], 1), Some(1));
+    let empty = Catalog::from_handoff(vec![]).unwrap();
+    let error = hci
+        .initialize_with_provider(&empty, PlatformInputs::default())
+        .unwrap_err();
+    let InitializationError::Broadcom(error) = error else {
+        panic!("expected an Apple ROM controller error");
+    };
+    assert!(matches!(
+        attempt(error).0,
+        Error::Controller {
+            opcode: 0x0c03,
+            status: 0x0c,
+            ..
+        }
+    ));
+    assert_eq!(trace.borrow().commands.len(), 1);
+    assert_eq!(trace.borrow().closed, 1);
+    assert_eq!(hci.state(), State::Closed);
+}
+
+#[test]
 fn short_identity_and_finalize_responses_fail_with_partial_observations() {
     for index in [1, 2, 3, 4, 5, 10, 11, 12, 13] {
         let (mut hci, trace) = model(0x220e);

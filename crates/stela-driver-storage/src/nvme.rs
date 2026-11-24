@@ -39,6 +39,12 @@ use owned::{Buffer, RegisterIo};
 
 pub const CLASS: [u8; 3] = [0x01, 0x08, 0x02];
 
+/// Apple T2 internal storage PCI identity. The class alone does not establish
+/// compatibility with the standard submission and Identify protocol.
+pub const fn is_apple_t2(vendor: u16, device: u16) -> bool {
+    matches!((vendor, device), (0x106b, 0x2005))
+}
+
 const CAPABILITIES: usize = 0x00;
 const VERSION: usize = 0x08;
 const INTERRUPT_MASK_SET: usize = 0x0c;
@@ -831,6 +837,14 @@ pub fn attach(
     dma: &mut dyn DmaAllocator,
     minimum: &(impl crate::bus::pci::power::Timer + ?Sized),
 ) -> Result<Attached, BlockError> {
+    // Linux's PCI NVMe profile for 106b:2005 needs 128-byte submission
+    // entries, shared tags, stable command IDs and restricted Identify CNS.
+    // Refuse it before powering the function or resetting firmware queues.
+    if is_apple_t2(function.vendor, function.device) {
+        return Err(BlockError::Unsupported(
+            "Apple T2 NVMe requires controller-specific queues and Identify commands",
+        ));
+    }
     minimum.check().map_err(BlockError::PciPower)?;
     validate_clock(handoff.clock)?;
     function.power_up(minimum)?;

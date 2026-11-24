@@ -272,18 +272,22 @@ fn usb_bluetooth_in(devices: &Path) -> Result<Vec<UsbBluetooth>> {
         else {
             continue;
         };
-        let vendor_interface = match (
+        let (vendor_interface, apple_interface_two) = match (
             field(&interface, "bInterfaceNumber").as_deref(),
             field(&interface, "bInterfaceClass").as_deref(),
             field(&interface, "bInterfaceSubClass").as_deref(),
             field(&interface, "bInterfaceProtocol").as_deref(),
         ) {
-            (Some("00"), Some("e0"), Some("01"), Some("01")) => false,
-            (Some("00"), Some("ff"), Some("01"), Some("01")) => true,
+            (Some("00"), Some("e0"), Some("01"), Some("01")) => (false, false),
+            (Some("00"), Some("ff"), Some("01"), Some("01")) => (true, false),
+            (Some("02"), Some("ff"), Some("01"), Some("01")) => (true, true),
             _ => continue,
         };
         let device = devices.join(device);
         if let (Some(vendor), Some(product)) = (id(&device, "idVendor"), id(&device, "idProduct")) {
+            if apple_interface_two && vendor != 0x05ac {
+                continue;
+            }
             let controller = UsbBluetooth {
                 vendor,
                 product,
@@ -637,7 +641,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sysfs_lists_usb_bluetooth_controllers_by_interface_zero() {
+    fn sysfs_lists_usb_bluetooth_on_interface_zero_or_apple_interface_two() {
         let root = tempfile::tempdir().unwrap();
         let write = |dir: &str, fields: &[(&str, &str)]| {
             let dir = root.path().join(dir);
@@ -669,6 +673,18 @@ mod tests {
                 ("bInterfaceProtocol", "01"),
             ],
         );
+        for (device, vendor) in [("1-5", "05ac"), ("1-6", "0a5c")] {
+            write(device, &[("idVendor", vendor), ("idProduct", "8290")]);
+            write(
+                &format!("{device}:1.2"),
+                &[
+                    ("bInterfaceNumber", "02"),
+                    ("bInterfaceClass", "ff"),
+                    ("bInterfaceSubClass", "01"),
+                    ("bInterfaceProtocol", "01"),
+                ],
+            );
+        }
         // A keyboard, and a hub without interfaces of its own.
         write("1-10", &[("idVendor", "046d"), ("idProduct", "c539")]);
         write(
@@ -684,6 +700,11 @@ mod tests {
         assert_eq!(
             usb_bluetooth_in(root.path()).unwrap(),
             [
+                UsbBluetooth {
+                    vendor: 0x05ac,
+                    product: 0x8290,
+                    vendor_interface: true,
+                },
                 UsbBluetooth {
                     vendor: 0x0a5c,
                     product: 0x21e8,

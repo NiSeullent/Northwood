@@ -188,18 +188,23 @@ impl Canvas {
     /// The logo and name, together centred at the top; the first unit row
     /// under them.
     pub fn header(&mut self) -> usize {
+        self.named_header(NAME)
+    }
+
+    /// Draw the common header with a page-specific title.
+    pub fn named_header(&mut self, title: &str) -> usize {
         let (width, _) = self.size();
         let gap = 12;
-        let name = self.text_width(NAME, 2);
+        let name = self.text_width(title, 2);
         let left = width.saturating_sub(LOGO + gap + name) / 2;
         let top = 28;
         self.logo(left, top, LOGO);
         // Centre the name's ink, not its glyph cells, on the logo.
-        let (first, last) = self.ink_rows(NAME);
+        let (first, last) = self.ink_rows(title);
         self.text(
             left + LOGO + gap,
             (top + LOGO / 2).saturating_sub(first + last + 1),
-            NAME,
+            title,
             2,
             TEXT,
         );

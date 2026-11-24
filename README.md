@@ -9,7 +9,8 @@ for NVIDIA GPUs and a model of Apple silicon hardware.
 
 > [!WARNING]
 Northwood is still in development. Check the [hardware notes](hardware/) for
-device-specific support and verification status.
+device-specific support and verification status, including the
+[Intel MacBook Pro inventory](hardware/macbook-pro-intel.md).
 
 ## Translator
 

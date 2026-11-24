@@ -414,6 +414,9 @@ fn graphics(machine: &mut Machine, devices: &Devices, display: bool) {
             adapter.device,
             adapter.unavailable_reason(),
         );
+        if let Some(family) = adapter.family() {
+            detail.push_str(&format!(", PCI family={family}"));
+        }
         if let Some(memory) = adapter.glk_memory {
             let observation = match memory {
                 Ok(memory) => format!(

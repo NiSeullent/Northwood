@@ -609,6 +609,11 @@ fn find_target(install: &Install, payload_path: &str) -> Result<Target> {
             "the target disk holds the payload, or has no device path"
         ));
     }
+    if crate::pci_io::is_apple_t2_disk(*handle) {
+        return Err(refuse!(
+            "Apple T2 storage is unavailable as a payload staging target"
+        ));
+    }
     let io = boot::open_protocol_exclusive::<BlockIO>(*handle)
         .map_err(|_| refuse!("cannot open the target disk exclusively"))?;
     let media = io.media();

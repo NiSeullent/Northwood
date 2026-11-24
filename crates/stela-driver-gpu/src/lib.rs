@@ -82,6 +82,25 @@ pub struct Adapter {
 }
 
 impl Adapter {
+    /// PCI family identification for GPUs relevant to Intel Mac bring-up.
+    /// IDs follow Linux's amdgpu, radeon and drm/intel PCI tables. Shared
+    /// device IDs identify a chip family without identifying the OEM board.
+    pub fn family(&self) -> Option<&'static str> {
+        Some(match (self.vendor, self.device) {
+            (Vendor::Amd, 0x6741 | 0x6760) => "TeraScale 2",
+            (Vendor::Amd, 0x6821) => "GCN Southern Islands",
+            (Vendor::Amd, 0x67df | 0x67eb | 0x67ef) => "GCN Polaris",
+            (Vendor::Amd, 0x7340 | 0x7341 | 0x7360) => "RDNA 1",
+            (Vendor::Intel, 0x0a2e | 0x0d26) => "Intel Haswell",
+            (Vendor::Intel, 0x1622 | 0x1626 | 0x162b) => "Intel Broadwell",
+            (Vendor::Intel, 0x191b | 0x1926) => "Intel Skylake",
+            (Vendor::Intel, 0x5926) => "Intel Kaby Lake",
+            (Vendor::Intel, 0x3e92 | 0x3e9b | 0x3ea5) => "Intel Coffee Lake",
+            (Vendor::Intel, 0x8a52 | 0x8a53) => "Intel Ice Lake",
+            _ => return None,
+        })
+    }
+
     /// Inventory only: does not size BARs, enable bus mastering, reset the
     /// device, change the firmware's scanout or allocate GPU memory.
     pub fn discover<C: ConfigSpace>(function: &Function<C>) -> Option<Self> {
@@ -178,5 +197,30 @@ mod tests {
             }
             assert!(Adapter::discover(&function(vendor, [4, 3, 0])).is_none());
         }
+    }
+
+    #[test]
+    fn pci_family_identification_requires_matching_vendor_and_device() {
+        let mut adapter = Adapter::discover(&function(AMD_VENDOR, [DISPLAY_CLASS, 0, 0])).unwrap();
+        for (device, family) in [
+            (0x6741, "TeraScale 2"),
+            (0x6821, "GCN Southern Islands"),
+            (0x67ef, "GCN Polaris"),
+            (0x7340, "RDNA 1"),
+            (0x7360, "RDNA 1"),
+        ] {
+            adapter.device = device;
+            assert_eq!(adapter.family(), Some(family));
+        }
+        assert_eq!(
+            adapter.unavailable_reason(),
+            "AMDGPU is not ported to Stela"
+        );
+        adapter.vendor = Vendor::Intel;
+        assert_eq!(adapter.family(), None);
+        adapter.device = 0x3e9b;
+        assert_eq!(adapter.family(), Some("Intel Coffee Lake"));
+        adapter.device = 0xffff;
+        assert_eq!(adapter.family(), None);
     }
 }

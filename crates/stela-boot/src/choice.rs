@@ -3,7 +3,7 @@
 //! ([`ui`]), the entries that can start now, then the PC firmware's own
 //! boot entries (`firmware::entries`), with one highlighted. A macOS entry
 //! is left out until a macOS is installed or while Install macOS has not
-//! prepared its SSD, and Install macOS once it has (`selection::ready`). Up and Down move the
+//! prepared its SSD, and Install macOS once it has (`selection::ready`). Arrow keys move the
 //! highlight, Enter starts the highlighted entry, and an entry's key (`1`-`9`,
 //! then `a`-`z`) starts it at once; a firmware entry restarts the PC into it.
 //! Diagnostics builds add a hardware report after the existing choices.
@@ -204,8 +204,6 @@ pub fn unchosen(options: &[u8]) -> bool {
         .is_ok_and(|text| text.split_ascii_whitespace().any(|w| w == CHOSEN_DISK))
 }
 
-/// The heading over the firmware's entries.
-const PC: &str = "This PC";
 const DIAGNOSTICS: &str = "Diagnostics";
 
 /// The SSD (`--storage`) a startup choice's options name.
@@ -222,6 +220,65 @@ enum Item {
     /// One of the PC firmware's own boot entries.
     Firmware(Entry),
     Diagnostics,
+}
+
+impl Item {
+    /// Labels and colours for the entry's drive icon.
+    fn appearance(&self) -> (&'static str, u32) {
+        match self {
+            Self::Choice(_, ChoiceKind::Mac) => ("Startup disk", ui::BLUE),
+            Self::Choice(_, ChoiceKind::Setup) => ("Installer", ui::ORANGE),
+            Self::Choice(_, ChoiceKind::Update) => ("Update", ui::BLUE),
+            Self::Choice(_, ChoiceKind::Other) => ("Boot option", ui::DIM),
+            Self::Firmware(_) => ("Firmware", ui::DIM),
+            Self::Diagnostics => ("Hardware report", ui::DIM),
+        }
+    }
+
+    fn draw_icon(&self, canvas: &mut Canvas, middle: usize, top: usize, accent: u32) {
+        let left = middle.saturating_sub(26);
+        canvas.panel(left, top, 52, 34, 7, ui::LINE);
+        canvas.panel(left + 3, top + 3, 46, 22, 5, ui::RAISED);
+        canvas.fill(left + 7, top + 25, 38, 1, ui::DIM);
+        canvas.panel(left + 39, top + 28, 5, 3, 2, accent);
+        if matches!(
+            self,
+            Self::Choice(_, ChoiceKind::Setup | ChoiceKind::Update)
+        ) {
+            canvas.fill(left + 25, top + 6, 2, 13, accent);
+            canvas.fill(left + 21, top + 14, 10, 2, accent);
+            canvas.fill(left + 23, top + 16, 6, 2, accent);
+        }
+    }
+}
+
+fn caption(canvas: &mut Canvas, middle: usize, y: usize, text: &str, width: usize, colour: u32) {
+    let capacity = width / canvas.text_width(" ", 1);
+    if text.len() <= capacity {
+        canvas.text_centred(middle, y, text, 1, colour);
+    } else if capacity > 3 {
+        let last = text.floor_char_boundary(capacity - 3);
+        canvas.text_centred(middle, y, &format!("{}...", &text[..last]), 1, colour);
+    }
+}
+
+fn card_name(canvas: &mut Canvas, middle: usize, y: usize, name: &str, width: usize) {
+    let capacity = width / canvas.text_width(" ", 1);
+    if name.len() > capacity
+        && let Some(space) = name[..name.floor_char_boundary(capacity)].rfind(' ')
+    {
+        caption(canvas, middle, y, &name[..space], width, ui::TEXT);
+        caption(
+            canvas,
+            middle,
+            y + 17,
+            name[space + 1..].trim_start(),
+            width,
+            ui::TEXT,
+        );
+    } else {
+        caption(canvas, middle, y + 8, name, width, ui::TEXT);
+    }
 }
 
 /// The menu.
@@ -362,43 +419,95 @@ impl<'a> Menu<'a> {
         }
     }
 
-    /// The entries under the header, the highlighted one raised with an
-    /// orange mark, then the countdown or a notice.
+    /// The visible startup volumes, the selected name, and startup controls.
     fn draw(&self, canvas: &mut Canvas) {
-        const ROW: usize = 36;
+        const CARD_WIDTH: usize = 172;
+        const CARD_HEIGHT: usize = 126;
+        const GAP: usize = 12;
         let (width, height) = canvas.size();
         canvas.fill(0, 0, width, height, ui::BACKGROUND);
-        let top = canvas.header() + 24;
-        let column = width.saturating_sub(32).min(440);
-        let left = (width - column) / 2;
-        let fits = (height.saturating_sub(top + 120) / ROW).max(1);
+        let header = canvas.named_header("Northwood");
+        let available = width.saturating_sub(48);
+        let fits = ((available + GAP) / (CARD_WIDTH + GAP))
+            .clamp(1, 6)
+            .min(self.items.len());
+        let card = available.min(CARD_WIDTH);
+        let strip = fits * card + (fits - 1) * GAP;
+        let left = width.saturating_sub(strip) / 2;
+        let top = ((height.saturating_sub(CARD_HEIGHT)) / 2).max(header + 12);
         let first = stela_boot_core::screen::window(self.selected, self.items.len(), fits);
-        let mut y = top;
-        let mut firmware = false;
-        for index in (first..self.items.len()).take(fits) {
+        for index in first..first + fits {
             let item = &self.items[index];
-            if !firmware && matches!(item, Item::Firmware(_) | Item::Diagnostics) {
-                firmware = true;
-                y += 16;
-                canvas.text(left + 16, y, PC, 1, ui::DIM);
-                y += 28;
-            }
+            let x = left + (index - first) * (card + GAP);
+            let middle = x + card / 2;
             if index == self.selected {
-                canvas.panel(left, y, column, ROW - 4, 8, ui::RAISED);
-                canvas.panel(left + 6, y + 9, 3, ROW - 22, 1, ui::ORANGE);
+                canvas.panel(x, top, card, CARD_HEIGHT, 12, ui::ORANGE);
+                canvas.panel(
+                    x + 2,
+                    top + 2,
+                    card.saturating_sub(4),
+                    CARD_HEIGHT - 4,
+                    10,
+                    ui::RAISED,
+                );
+            } else {
+                canvas.panel(x, top, card, CARD_HEIGHT, 12, ui::CARD);
             }
-            canvas.text(left + 20, y + 8, self.name(item), 1, ui::TEXT);
-            y += ROW;
-        }
-        let (status, colour) = match (self.notice, self.countdown) {
-            (Some(notice), _) => (String::from(notice), ui::ORANGE),
-            (None, Some(seconds)) => (
-                format!("{} in {seconds}", self.name(&self.items[0])),
+            let (kind, accent) = item.appearance();
+            item.draw_icon(canvas, middle, top + 20, accent);
+            card_name(
+                canvas,
+                middle,
+                top + 62,
+                self.name(item),
+                card.saturating_sub(16),
+            );
+            caption(
+                canvas,
+                middle,
+                top + 101,
+                kind,
+                card.saturating_sub(16),
                 ui::DIM,
-            ),
-            (None, None) => return,
+            );
+            if let Some(key) = Choices::key(index) {
+                let mut utf8 = [0; 4];
+                canvas.text(x + 10, top + 7, key.encode_utf8(&mut utf8), 1, ui::DIM);
+            }
+        }
+        if first > 0 {
+            canvas.text(left.saturating_sub(18), top + 48, "<", 1, ui::DIM);
+        }
+        if first + fits < self.items.len() {
+            canvas.text(left + strip + 10, top + 48, ">", 1, ui::DIM);
+        }
+        let label = self.name(&self.items[self.selected]);
+        caption(
+            canvas,
+            width / 2,
+            top + CARD_HEIGHT + 18,
+            label,
+            available,
+            ui::TEXT,
+        );
+
+        let countdown;
+        let (status, colour) = if let Some(notice) = self.notice {
+            (notice, ui::ORANGE)
+        } else if let Some(seconds) = self.countdown {
+            countdown = format!("Starting in {seconds}s");
+            (countdown.as_str(), ui::DIM)
+        } else {
+            ("Left / Right to choose    Enter to start", ui::DIM)
         };
-        canvas.text_centred(width / 2, height - 56, &status, 1, colour);
+        caption(
+            canvas,
+            width / 2,
+            height.saturating_sub(40),
+            status,
+            available,
+            colour,
+        );
     }
 
     /// The chosen item; `None` without console input.
@@ -416,11 +525,18 @@ impl<'a> Menu<'a> {
             }
             let items = self.items.len();
             match wait {
-                Wait::Key(Press::Up) => self.selected = (self.selected + items - 1) % items,
-                Wait::Key(Press::Down) => self.selected = (self.selected + 1) % items,
+                Wait::Key(Press::Left | Press::Up) => {
+                    self.selected = (self.selected + items - 1) % items;
+                }
+                Wait::Key(Press::Right | Press::Down) => {
+                    self.selected = (self.selected + 1) % items
+                }
+                Wait::Key(Press::Home) => self.selected = 0,
+                Wait::Key(Press::End) => self.selected = items - 1,
                 Wait::Key(Press::Enter) => return Some(self.selected),
                 Wait::Key(Press::Character(key)) => {
-                    let chosen = (0..items).find(|&n| Choices::key(n) == Some(key));
+                    let chosen =
+                        (0..items).find(|&n| Choices::key(n) == Some(key.to_ascii_lowercase()));
                     if chosen.is_some() {
                         return chosen;
                     }

@@ -40,7 +40,9 @@ else
     exit 1
 fi
 [[ "$revision" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "STELA_SOURCE_REVISION must be letters, digits, dots and dashes" >&2; exit 1; }
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
+short_version="${version%%+*}"
+short_version="${short_version%%-*}"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $short_version" "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :StelaSourceRevision $revision" "$app/Contents/Info.plist"
 
 iconset="$stage/Stela.iconset"

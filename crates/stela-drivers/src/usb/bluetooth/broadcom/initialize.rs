@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2015 Intel Corporation
 //! btbcm USB reset/identification, HCD replay and finalize over real HCI events.
-use super::{Attempt, Error, Hcd, Identity, LocalVersion, OwnedReport, Result, UsbIdentity};
+use super::{
+    AppleReport, Attempt, Error, Hcd, Identity, LocalVersion, OwnedReport, Result, UsbIdentity,
+};
 use crate::{
     firmware::{ErrorKind as ResourceKind, Provider, Requirement},
     usb::bluetooth::{
@@ -36,6 +38,25 @@ pub(super) fn run<B: Io>(
     if !super::is_candidate(hci.binding.device()) {
         return Err(Error::Unsupported("USB PatchRAM identity/interface"));
     }
+    initialize(hci, |engine| engine.run(provider, address))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+)]
+pub(in crate::usb::bluetooth) fn run_apple<B: Io>(hci: &mut Hci<B>) -> Result<AppleReport> {
+    initialize(hci, |engine| engine.apple())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+)]
+fn initialize<B: Io, R>(
+    hci: &mut Hci<B>,
+    setup: impl FnOnce(&mut Engine<'_, B>) -> Result<R>,
+) -> Result<R> {
     hci.open()?;
     let start = hci.io.now_us();
     let mut engine = Engine {
@@ -44,7 +65,7 @@ pub(super) fn run<B: Io>(
         credits: 1,
         attempt: Attempt::default(),
     };
-    match engine.run(provider, address) {
+    match setup(&mut engine) {
         Ok(report) => Ok(report),
         Err(cause) => {
             let cause = Error::Attempt {
@@ -244,6 +265,31 @@ impl<B: Io> Engine<'_, B> {
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
+    fn apple(&mut self) -> Result<AppleReport> {
+        self.reset()?;
+        // Linux btbcm_setup_apple uses these reads for diagnostics. A real
+        // controller rejection is optional, but transport/protocol faults
+        // still take the normal retirement path.
+        self.attempt.verbose = optional(self.exact(READ_VERBOSE))?;
+        self.attempt.product = optional(self.exact(READ_USB_PRODUCT))?;
+        self.attempt.features = optional(self.exact(READ_FEATURES))?;
+        self.attempt.local_name = optional(self.name())?;
+        Ok(AppleReport {
+            usb: UsbIdentity::read(self.hci.binding.device()),
+            interface: self.hci.binding.interface(),
+            verbose: self.attempt.verbose,
+            product: self.attempt.product,
+            features: self.attempt.features,
+            local_name: self.attempt.local_name.take(),
+            command_credits: self.credits,
+            asynchronous: core::mem::take(&mut self.attempt.asynchronous),
+            strict_duplicate_filter: true,
+        })
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
     fn run(
         &mut self,
         provider: &dyn Provider,
@@ -343,6 +389,17 @@ impl<B: Io> Engine<'_, B> {
             after_features,
             after_local_name,
         })
+    }
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+)]
+fn optional<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Err(Error::Controller { .. }) => Ok(None),
+        other => other.map(Some),
     }
 }
 

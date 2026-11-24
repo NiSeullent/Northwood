@@ -377,6 +377,25 @@ fn wireless_class_bluetooth_still_uses_the_hci_plan() {
 }
 
 #[test]
+fn apple_composite_hid_and_vendor_bluetooth_get_distinct_plans() {
+    let configuration = vec![
+        9, 2, 55, 0, 2, 7, 0, 0x80, 50, 9, 4, 0, 0, 1, 3, 1, 1, 0, 7, 5, 0x83, 3, 16, 0, 1, 9, 4,
+        2, 0, 3, 0xff, 1, 1, 0, 7, 5, 0x81, 3, 16, 0, 1, 7, 5, 0x82, 2, 64, 0, 0, 7, 5, 0x02, 2,
+        64, 0, 0,
+    ];
+    let mut dev = device(vec![configuration]);
+    dev.descriptor[8..12].copy_from_slice(&[0xac, 0x05, 0x90, 0x82]);
+    select(&mut dev).unwrap();
+    let all = interfaces(&dev.configuration);
+    assert!(matches!(plan(&dev, &all[0], &all), Ok(Plan::Hid(_, _))));
+    let Ok(Plan::Bluetooth(binding)) = plan(&dev, &all[1], &all) else {
+        panic!("expected Apple composite Bluetooth plan");
+    };
+    assert_eq!(binding.interface(), 2);
+    assert_eq!(binding.endpoints().len(), 3);
+}
+
+#[test]
 fn equal_cdc_coverage_prefers_ncm_then_ecm_then_rndis() {
     use crate::usb::cdc::tests::rndis_configuration;
 
