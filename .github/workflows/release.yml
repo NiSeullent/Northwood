@@ -20,7 +20,7 @@ permissions:
 
 concurrency:
   group: build-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/tags/v') }}
 
 defaults:
   run:
@@ -46,8 +46,8 @@ env:
   INSTALL: |-
     Install:
 
-    1. Unpack the archive for your system.
-    2. Run sudo ./northwood setup on Linux or macOS. On Windows, run northwood.exe setup or open stela.exe for the setup wizard.
+    1. On macOS, install Northwood.pkg and run sudo /usr/local/bin/northwood setup. On Windows, run .\Northwood.exe setup from PowerShell.
+    2. When using the Linux or macOS archive, unpack it and run sudo ./northwood setup. The Windows archive also contains stela.exe, which opens the setup wizard.
     3. Choose the USB stick, the macOS version and the Mac model, then confirm. Setup erases the USB stick.
     4. Boot the PC from the USB stick.
 
@@ -85,8 +85,12 @@ jobs:
             echo "::error::Cargo.toml has no [workspace.package] version"
             exit 1
           fi
-          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" == v* && "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version (expected v$version)"
+          tag="v$version"
+          if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-beta\.([1-9][0-9]*)$ ]]; then
+            tag="v${BASH_REMATCH[1]}b${BASH_REMATCH[2]}"
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" == v* && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version (expected $tag)"
             exit 1
           fi
           for path in LICENSE NOTICE LICENSES LICENSING.md CREDITS.md; do
@@ -99,7 +103,9 @@ jobs:
 
   app:
     needs: version
-    runs-on: macos-26
+    # Swift cross-builds the arm64 guest app. Use the Intel hosted pool
+    # because the Arm pool failed to assign a runner for the release.
+    runs-on: macos-26-intel
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -267,7 +273,7 @@ jobs:
           - os: windows-2025
             platform: windows-x86_64
             targets: x86_64-pc-windows-msvc
-          - os: macos-26
+          - os: macos-26-intel
             platform: macos-universal
             targets: aarch64-apple-darwin x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -364,10 +370,43 @@ jobs:
           fi
           ls -l "$ARCHIVE".*
 
+      - name: Package the standalone Windows USB utility
+        if: runner.os == 'Windows'
+        run: |
+          cp "$ARCHIVE/northwood.exe" Northwood.exe
+          cmp "$ARCHIVE/northwood.exe" Northwood.exe
+
+      - name: Package the macOS USB utility
+        if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          stage="$(mktemp -d)"
+          trap 'rm -rf "$stage"' EXIT
+          mkdir -p "$stage/root/usr/local/bin" "$stage/root/usr/local/share/northwood"
+          install -m 755 "$ARCHIVE/northwood" "$stage/root/usr/local/bin/northwood"
+          cp -R "$ARCHIVE"/{INSTALL.txt,LICENSE,NOTICE,LICENSES,LICENSING.md,CREDITS.md} \
+            "$stage/root/usr/local/share/northwood/"
+          package_version="${VERSION%%+*}"
+          package_identifier=org.northwood.usb-installer
+          if [[ "$package_version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-beta\.([0-9]+)$ ]]; then
+            package_identifier+=.beta
+            package_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+          fi
+          package_version="${package_version%%-*}"
+          pkgbuild --root "$stage/root" --identifier "$package_identifier" \
+            --version "$package_version" --install-location / Northwood.pkg
+          pkgutil --expand-full Northwood.pkg "$stage/expanded"
+          cmp "$ARCHIVE/northwood" "$stage/expanded/Payload/usr/local/bin/northwood"
+          test -s "$stage/expanded/Payload/usr/local/share/northwood/LICENSE"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARCHIVE }}
-          path: ${{ env.ARCHIVE }}.*
+          path: |
+            ${{ env.ARCHIVE }}.*
+            Northwood.exe
+            Northwood.pkg
           if-no-files-found: error
           compression-level: 0
 
@@ -399,7 +438,7 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           tag="v$VERSION"
-          for asset in northwood.efi "northwood-$tag-linux-x86_64.tar.gz" "northwood-$tag-windows-x86_64.zip" \
+          for asset in northwood.efi Northwood.exe Northwood.pkg "northwood-$tag-linux-x86_64.tar.gz" "northwood-$tag-windows-x86_64.zip" \
             "northwood-$tag-macos-universal.tar.gz" "northwood-$tag-source.tar.zst"; do
             [[ -s "dist/$asset" ]] || { echo "::error::missing $asset"; exit 1; }
           done
@@ -411,11 +450,17 @@ jobs:
               echo "Diagnostic prerelease. The IdeaPad 1 15IGL7 has booted Diagnostics from a physical USB."
               echo "Internal Intel CNVi Wi-Fi association, complete macOS installation and installed boot are still under development."
               echo
+            elif [[ "${VERSION%%+*}" == *-beta.* ]]; then
+              echo "Experimental prerelease. Intel MacBook Pro model detection and Apple Broadcom USB Bluetooth initialization are included."
+              echo "Physical MacBook Pro USB installation and installed boot are unverified. T2 internal SSD installation, Touch Bar, Apple Wi-Fi, AirDrop and Radeon or Intel GPU acceleration remain under development."
+              echo
             fi
             printf '%s\n\n' "$ABOUT"
             echo "Downloads:"
             echo
             echo "- Linux x86-64 (glibc 2.35 or newer): northwood-$tag-linux-x86_64.tar.gz"
+            echo "- Windows x86-64 USB utility: Northwood.exe. Its accompanying license and notices are in northwood-$tag-windows-x86_64.zip."
+            echo "- macOS USB utility, Apple silicon and Intel: Northwood.pkg"
             echo "- Windows x86-64: northwood-$tag-windows-x86_64.zip"
             echo "- macOS, Apple silicon and Intel: northwood-$tag-macos-universal.tar.gz"
             echo "- Source, with every submodule at its pin and Stela's patches: northwood-$tag-source.tar.zst"
@@ -440,6 +485,7 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           if [[ "$GITHUB_REF_NAME" == diag-* ]]; then
             if gh release view "$GITHUB_REF_NAME" --json isPrerelease --jq '.isPrerelease' > release-state.txt; then
@@ -453,7 +499,11 @@ jobs:
               --title "Northwood $GITHUB_REF_NAME" --notes-file notes.txt
             exit
           fi
+          args=(--verify-tag)
+          if [[ "${VERSION%%+*}" == *-* ]]; then
+            args+=(--prerelease --latest=false)
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag \
+            "${args[@]}" \
             --title "Northwood $GITHUB_REF_NAME" \
             --notes-file notes.txt

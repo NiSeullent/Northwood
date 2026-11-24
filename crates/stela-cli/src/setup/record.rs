@@ -318,7 +318,7 @@ impl Record {
     /// (Stela) choice.
     pub(super) fn restore_choice(&self, kind: Kind, install: &machines::Install) -> String {
         if self.installs.len() == 1 {
-            return restore_choice_name(kind).into();
+            return restore_choice_name(kind, self.layout).into();
         }
         let several = match kind {
             Kind::Update => "Update macOS",

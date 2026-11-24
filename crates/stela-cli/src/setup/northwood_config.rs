@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Project setup's typed boot options into the shared Northwood schema.
 
+use super::{INSTALL_CHOICE, NORTHWOOD_INSTALL_CHOICE};
 use ::northwood_config::{
     self as config, NwConfig,
     plist::{self, Dictionary, Value},
@@ -245,11 +246,29 @@ fn merge_entries(previous: &[Value], next: Vec<Value>, mut current: Vec<Value>) 
         if named_entry(&entries, name).is_some() {
             continue;
         }
-        let old = named_entry(previous, name);
+        // Carry overrides forward when setup renames its generated installer entry.
+        let previous_name = if name == NORTHWOOD_INSTALL_CHOICE
+            && named_entry(previous, name).is_none()
+            && named_entry(previous, INSTALL_CHOICE).is_some()
+            && named_entry(&current, name).is_none()
+        {
+            INSTALL_CHOICE
+        } else {
+            name
+        };
+        let old = named_entry(previous, previous_name);
         let existing = current
             .iter()
-            .position(|item| entry_name(item) == Some(name))
-            .map(|index| current.remove(index));
+            .position(|item| entry_name(item) == Some(previous_name))
+            .map(|index| {
+                let mut existing = current.remove(index);
+                if previous_name != name
+                    && let Value::Dictionary(existing) = &mut existing
+                {
+                    existing.insert("Name".into(), string(name));
+                }
+                existing
+            });
         current.retain(|item| entry_name(item) != Some(name));
         if let Some(entry) = merge_value(old, Some(entry), existing, Scope::Other) {
             entries.push(entry);
@@ -664,5 +683,31 @@ mod tests {
         ]);
         let expected = entries(vec![added, expected_a, authored_c, custom]);
         assert_eq!(merge_generated(&previous, next, current), expected);
+    }
+
+    #[test]
+    fn renamed_installer_keeps_authored_overrides_in_one_entry() {
+        let entry = |name, bundle, verify_on_read| {
+            dict([
+                ("Name", string(name)),
+                (
+                    "Overrides",
+                    dict([(
+                        "Boot",
+                        dict([
+                            ("Bundle", string(bundle)),
+                            ("VerifyOnRead", flag(verify_on_read)),
+                        ]),
+                    )]),
+                ),
+            ])
+        };
+        let previous = [entry(INSTALL_CHOICE, "old", false)];
+        let next = vec![entry(NORTHWOOD_INSTALL_CHOICE, "new", false)];
+        let current = vec![entry(INSTALL_CHOICE, "old", true)];
+        assert_eq!(
+            merge_entries(&previous, next, current),
+            vec![entry(NORTHWOOD_INSTALL_CHOICE, "new", true)],
+        );
     }
 }

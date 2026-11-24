@@ -52,6 +52,7 @@ const REGISTER_COUNT: u8 = ZERO_REGISTER_INDEX + 1;
 
 #[derive(Debug)]
 struct CodeRegion {
+    base: u64,
     source: Box<[u8]>,
     end: u64,
     generation: u64,
@@ -60,8 +61,7 @@ struct CodeRegion {
 #[derive(Debug)]
 struct LoadedBlock {
     profile: BlockProfile,
-    region_base: u64,
-    generation: u64,
+    region: Rc<CodeRegion>,
     source_bytes: usize,
     prepared: crate::artifact::LoadedArtifact,
     mapping: platform::Mapping,
@@ -76,7 +76,10 @@ pub struct BlockRuntime {
     target: stela_compiler::TargetCpu,
     preparation: ArtifactPreparation,
     next_generation: u64,
-    regions: BTreeMap<u64, CodeRegion>,
+    // Both source mutation methods evict every block referencing the old
+    // snapshot. An exact-PC hit can use the retained source without a second
+    // lookup in the ordered region map.
+    regions: BTreeMap<u64, Rc<CodeRegion>>,
     loaded: BTreeMap<u64, LoadedBlock>,
     _serialized: PhantomData<Rc<()>>,
 }
@@ -165,14 +168,15 @@ impl BlockRuntime {
             .next_generation
             .checked_add(1)
             .ok_or(refuse!("code generation exhausted"))?;
-        self.loaded.retain(|_, block| block.region_base != base.0);
+        self.loaded.retain(|_, block| block.region.base != base.0);
         self.regions.insert(
             base.0,
-            CodeRegion {
+            Rc::new(CodeRegion {
+                base: base.0,
                 source: source.into_boxed_slice(),
                 end,
                 generation,
-            },
+            }),
         );
         self.next_generation = generation;
         Ok(generation)
@@ -181,12 +185,12 @@ impl BlockRuntime {
     pub fn unregister_code(&mut self, base: GuestAddress) -> bool {
         let removed = self.regions.remove(&base.0).is_some();
         if removed {
-            self.loaded.retain(|_, block| block.region_base != base.0);
+            self.loaded.retain(|_, block| block.region.base != base.0);
         }
         removed
     }
 
-    fn region(&self, pc: GuestAddress) -> Option<(u64, &CodeRegion)> {
+    fn region(&self, pc: GuestAddress) -> Option<(u64, &Rc<CodeRegion>)> {
         self.regions
             .range(..=pc.0)
             .next_back()
@@ -200,11 +204,15 @@ impl BlockRuntime {
             Err(error) => return Ok(Some(error.into())),
         };
         let prepared = block.prepared;
+        let region = self
+            .regions
+            .get(&block.region_base.0)
+            .filter(|region| region.generation == block.generation)
+            .ok_or_else(|| refuse!("prepared block source changed", pc = pc.0))?;
         let loaded = LoadedBlock::from_artifact(
             self.target,
             block.artifact_profile,
-            block.region_base.0,
-            block.generation,
+            Rc::clone(region),
             block.analysis.source_bytes,
             crate::artifact::LoadedArtifact {
                 manifest: prepared.manifest,
@@ -422,7 +430,12 @@ impl BlockRuntime {
                 outcome.reason = StopReason::UnalignedTarget;
                 break;
             }
-            let Some((base, region)) = self.region(pc) else {
+            let cached = self.loaded.get(&pc.0);
+            let source = match cached {
+                Some(block) => Some((block.region.base, &block.region)),
+                None => self.region(pc),
+            };
+            let Some((base, region)) = source else {
                 outcome.reason = StopReason::UnmappedTarget;
                 break;
             };
@@ -466,9 +479,9 @@ impl BlockRuntime {
             } else {
                 None
             };
-            let (block, current) = if let Some(block) = self.loaded.get(&pc.0) {
+            let block = if let Some(block) = cached {
                 outcome.memory_cache_hits += 1;
-                (block, region)
+                block
             } else {
                 // Strict AOT misses retain their source refusal ordering
                 // without constructing a plan. Other misses use the parse
@@ -495,20 +508,15 @@ impl BlockRuntime {
                     };
                     break;
                 }
-                let block = self
-                    .loaded
+                self.loaded
                     .get(&pc.0)
-                    .ok_or_else(|| refuse!("loaded block disappeared", pc = pc.0))?;
-                let (_, current) = self
-                    .region(pc)
-                    .ok_or_else(|| refuse!("loaded block unmapped", pc = pc.0))?;
-                (block, current)
+                    .ok_or_else(|| refuse!("loaded block disappeared", pc = pc.0))?
             };
-            require!(
-                block.region_base == base
-                    && block.generation == current.generation
-                    && block.source_bytes > 0,
-                "refusing stale block execution"
+            let current = &block.region;
+            debug_assert!(
+                self.regions
+                    .get(&current.base)
+                    .is_some_and(|registered| Rc::ptr_eq(registered, current))
             );
             let mut completed_blocks = 1;
             let native_exit = if block.profile.has(Features::RESIDENT_LOOPS) {
@@ -527,8 +535,8 @@ impl BlockRuntime {
                     .ok_or(refuse!("invalid resident-block budget accounting"))?;
                 returned
             } else {
-                // SAFETY: the generation check above shows this mapping and source are current, and
-                // the caller's direct-RAM contract covers the call.
+                // SAFETY: source replacement and unregistration evict cached
+                // mappings. The caller's direct-RAM contract covers the call.
                 unsafe { block.mapping.call_block(&mut state.registers)? }
             };
             let BlockExit { next_pc, kind } = native_exit;
@@ -556,7 +564,7 @@ impl BlockRuntime {
                     pc,
                     GuestAddress(next_pc),
                     block.source_bytes,
-                    block.region_base,
+                    current.base,
                     &current.source,
                 )?)
             } else {
@@ -571,7 +579,7 @@ impl BlockRuntime {
                     pc,
                     GuestAddress(next_pc),
                     block.source_bytes,
-                    block.region_base,
+                    current.base,
                     &current.source,
                 )?)
             } else {
@@ -586,7 +594,7 @@ impl BlockRuntime {
                     pc,
                     GuestAddress(next_pc),
                     block.source_bytes,
-                    block.region_base,
+                    current.base,
                     &current.source,
                 )?)
             } else {
@@ -601,7 +609,7 @@ impl BlockRuntime {
                     pc,
                     GuestAddress(next_pc),
                     block.source_bytes,
-                    block.region_base,
+                    current.base,
                     &current.source,
                 )?)
             } else {
@@ -616,7 +624,7 @@ impl BlockRuntime {
                     pc,
                     GuestAddress(next_pc),
                     block.source_bytes,
-                    block.region_base,
+                    current.base,
                     &current.source,
                 )?)
             } else {
@@ -631,7 +639,7 @@ impl BlockRuntime {
                     pc,
                     GuestAddress(next_pc),
                     block.source_bytes,
-                    block.region_base,
+                    current.base,
                     &current.source,
                 )?;
                 Some(system::execution::Boundary::new(
@@ -647,7 +655,7 @@ impl BlockRuntime {
                     pc,
                     GuestAddress(next_pc),
                     block.source_bytes,
-                    block.region_base,
+                    current.base,
                     &current.source,
                 )?)
             } else {

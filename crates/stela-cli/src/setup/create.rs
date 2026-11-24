@@ -1,8 +1,7 @@
 //! Creating a setup: the plan of what it writes, its description, and
 //! writing it.
 use super::{
-    CHOOSER_SECONDS, Environment, INSTALL_CHOICE, InstallImage, LOADER_PATH, MARGIN, Request,
-    assets,
+    CHOOSER_SECONDS, Environment, InstallImage, LOADER_PATH, MARGIN, Request, assets,
     bundle::{self, Kind},
     ecid::Ecid,
     firmware, format,
@@ -893,6 +892,7 @@ pub(super) fn describe(plan: &Plan) -> Result<String> {
         writeln!(text, "  GPU firmware   {}", plan.gpu_chips.join(", "))?;
     }
     let install = &record.installs[0];
+    let install_choice = record.restore_choice(Kind::Restore, install);
     writeln!(
         text,
         "  ECID           {}",
@@ -956,7 +956,7 @@ pub(super) fn describe(plan: &Plan) -> Result<String> {
     )?;
     writeln!(
         text,
-        "  choices.cfg    {}: \"{}\", \"{INSTALL_CHOICE}\" ({CHOOSER_SECONDS} s menu)",
+        "  choices.cfg    {}: \"{}\", \"{install_choice}\" ({CHOOSER_SECONDS} s menu)",
         record
             .esp
             .join(record.layout.esp_path(layout::CHOICES))
@@ -977,7 +977,7 @@ pub(super) fn describe(plan: &Plan) -> Result<String> {
     match disk.is_chosen() {
         true => writeln!(
             text,
-            "  Mac's SSD      a PC disk chosen at {INSTALL_CHOICE}"
+            "  Mac's SSD      a PC disk chosen at {install_choice}"
         )?,
         false => writeln!(
             text,
@@ -1184,6 +1184,9 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         return Ok(report);
     }
     let disk = plan.installed.disk.clone();
+    let install_choice = plan
+        .record
+        .restore_choice(Kind::Restore, &plan.record.installs[0]);
     let volumes = [plan.record.esp.clone(), plan.record.volume.clone()];
     apply(environment, plan)?;
     // Before "Done": a USB taken out right after holds everything.
@@ -1196,18 +1199,18 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
     }
     let start = match disk {
         disk if disk.is_chosen() => format!(
-            "choose \"{INSTALL_CHOICE}\" in Stela's startup choices, pick the PC disk and the \
+            "choose \"{install_choice}\" in the startup picker, pick the PC disk and the \
              space macOS gets, and the install restores macOS onto it; Stela then starts the \
              installed macOS from that disk"
         ),
         disk if disk.external_disks => format!(
-            "its internal SSD ({}) is blank, so Stela offers \"{INSTALL_CHOICE}\", which \
+            "its internal SSD ({}) is blank, so Stela offers \"{install_choice}\", which \
              restores macOS onto it; Stela then starts that macOS from the USB, and macOS \
              sees the PC's other disks as external drives",
             disk.apple_region
         ),
         disk => format!(
-            "choose \"{INSTALL_CHOICE}\" in Stela's startup choices to install macOS onto \
+            "choose \"{install_choice}\" in the startup picker to install macOS onto \
              {target}, then boot from the USB again, which starts the installed macOS",
             target = disk.apple_region
         ),

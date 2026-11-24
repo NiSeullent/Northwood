@@ -4,6 +4,72 @@ use super::*;
 use crate::bus::{dma::RegionAllocator, mmio::Mmio};
 use alloc::boxed::Box;
 
+#[test]
+fn apple_t2_controller_is_refused_before_configuration_or_dma() {
+    use crate::bus::pci::{Address, EcamWindow, power};
+
+    struct NoEffects;
+    // SAFETY: these methods are never used to simulate a physical wait.
+    unsafe impl power::Timer for NoEffects {
+        fn check(&self) -> Result<(), power::Error> {
+            panic!("T2 attachment must not start hardware timing");
+        }
+        fn wait_us(&self, _: u64) -> Result<(), power::Error> {
+            panic!("T2 attachment must not wait on hardware");
+        }
+    }
+    impl DmaAllocator for NoEffects {
+        fn allocate(
+            &mut self,
+            _: usize,
+            _: usize,
+        ) -> Result<crate::bus::dma::DmaBuffer, BlockError> {
+            panic!("T2 attachment must not allocate DMA");
+        }
+    }
+
+    let mut config = Box::new([0u32; 1024]);
+    config[0] = 0x2005_106b;
+    config[1] = 0x0000_0006;
+    config[2] = u32::from_be_bytes([CLASS[0], CLASS[1], CLASS[2], 0]);
+    let expected = config.clone();
+    let window = EcamWindow {
+        base: config.as_mut_ptr() as u64,
+        segment: 0,
+        start_bus: 0,
+        end_bus: 0,
+    };
+    let address = Address {
+        segment: 0,
+        bus: 0,
+        device: 0,
+        function: 0,
+    };
+    // SAFETY: only the fixture can access the array during the modeled attachment.
+    let mut function = Function::new(address, unsafe { window.config(0, 0, 0) }).unwrap();
+    let handoff = Handoff {
+        ecam: vec![],
+        mapped: vec![],
+        dma: 0..0,
+        clock: Clock {
+            ticks_per_microsecond: 0,
+        },
+        firmware: None,
+        completion: None,
+    };
+    let result = attach(&mut function, &handoff, &mut NoEffects, &NoEffects);
+    assert!(matches!(
+        result,
+        Err(BlockError::Unsupported(
+            "Apple T2 NVMe requires controller-specific queues and Identify commands"
+        ))
+    ));
+    drop(function);
+    assert_eq!(config, expected);
+    assert!(!is_apple_t2(0x106b, 0x2003));
+    assert!(!is_apple_t2(0x8086, 0x2005));
+}
+
 struct Fixture {
     disk: Namespace,
     // The real driver uses volatile MMIO/DMA accesses to these owned,

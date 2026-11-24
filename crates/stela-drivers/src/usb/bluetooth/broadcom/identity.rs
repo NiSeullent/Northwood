@@ -28,14 +28,29 @@ impl UsbIdentity {
     }
 }
 
-/// Exact Linux btusb BCM_PATCHRAM vendor/interface entries. This is candidate
-/// admission only; HCI version/manufacturer still binds firmware.
+/// Linux btusb vendor-interface admission for the separate Broadcom PatchRAM
+/// and Apple ROM setups. PatchRAM still checks controller identity.
 pub fn is_vendor_interface(device: &Device, interface: &Interface) -> bool {
+    is_patchram_interface(device, interface) || is_apple_interface(device, interface)
+}
+
+fn is_patchram_interface(device: &Device, interface: &Interface) -> bool {
     let usb = UsbIdentity::read(device);
     interface.number == 0
         && interface.alternate == 0
         && (interface.class, interface.subclass, interface.protocol) == (0xff, 1, 1)
         && listed(usb.vendor, usb.product, true)
+}
+
+pub(crate) const APPLE_VENDOR: u16 = 0x05ac;
+
+/// Linux btusb's BTUSB_BCM_APPLE | BTUSB_IFNUM_2 entry. Apple uses
+/// interface 2 when a composite controller exposes other functions first.
+pub(crate) fn is_apple_interface(device: &Device, interface: &Interface) -> bool {
+    UsbIdentity::read(device).vendor == APPLE_VENDOR
+        && matches!(interface.number, 0 | 2)
+        && interface.alternate == 0
+        && (interface.class, interface.subclass, interface.protocol) == (0xff, 1, 1)
 }
 
 /// Whether a controller with these IDs is a btusb BCM_PATCHRAM entry when
@@ -63,7 +78,7 @@ pub(super) fn is_candidate(device: &Device) -> bool {
     crate::usb::descriptor::interfaces(&device.configuration)
         .iter()
         .any(|i| {
-            is_vendor_interface(device, i)
+            is_patchram_interface(device, i)
                 || (i.number == 0
                     && i.alternate == 0
                     && (i.class, i.subclass, i.protocol) == (0xe0, 1, 1)

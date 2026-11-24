@@ -115,7 +115,7 @@ fn record_board(capture: &Capture) {
         Observation::Value(value) => Some(value),
         _ => None,
     };
-    use stela_boot_core::host_identity::{smbios_string, smbios_text};
+    use stela_boot_core::host_identity::{intel_macbook_pro, smbios_string, smbios_text};
     for (key, value) in [
         ("SystemVendor", observed(system.system_vendor)),
         ("SystemModel", observed(system.product_name)),
@@ -126,5 +126,16 @@ fn record_board(capture: &Capture) {
         if let Some(value) = value.and_then(smbios_text) {
             crate::host_inventory::text(key, alloc::string::String::from_utf8_lossy(value));
         }
+    }
+    if let Some(model) = observed(system.system_vendor)
+        .zip(observed(system.product_name))
+        .and_then(|(vendor, product)| intel_macbook_pro(vendor, product))
+    {
+        let bridge = model.expected_bridge.label();
+        crate::host_inventory::text("AppleExpectedBridge", bridge);
+        crate::output::arguments(format_args!(
+            "HOST APPLE model={} expected_bridge={bridge}\n",
+            model.model
+        ));
     }
 }

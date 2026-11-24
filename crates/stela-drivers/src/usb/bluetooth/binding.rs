@@ -18,13 +18,14 @@ const INTERRUPT: u8 = 3;
 pub struct Binding {
     pub(super) device: Device,
     pub(super) interface: u8,
+    pub(super) apple_rom: bool,
     pub(super) events: Endpoint,
     pub(super) input: Endpoint,
     pub(super) output: Endpoint,
 }
 
 impl Binding {
-    /// Select legacy HCI on interface 0's alternate zero, as Linux
+    /// Select legacy HCI on alternate zero, as Linux
     /// `btusb_probe` does: the first interrupt IN, bulk IN and bulk OUT
     /// endpoints carry events, inbound and outbound ACL; other endpoints are
     /// left alone. The SCO interface stays at alternate zero.
@@ -39,7 +40,8 @@ impl Binding {
         {
             return Err("not a legacy Bluetooth HCI interface");
         }
-        if interface.number != HCI_INTERFACE {
+        let apple_rom = super::broadcom::is_apple_interface(device, interface);
+        if interface.number != HCI_INTERFACE && !apple_rom {
             // btusb claims interface 1 (SCO) and btmtk interface 2 (ISO) for
             // the HCI on interface 0; this link carries commands, events and
             // ACL only, so those stay at alternate zero.
@@ -57,8 +59,24 @@ impl Binding {
             });
         }
         // Do not accept caller-invented interface data detached from the device.
-        if !super::super::descriptor::interfaces(&device.configuration).contains(interface) {
+        let interfaces = super::super::descriptor::interfaces(&device.configuration);
+        if !interfaces.contains(interface) {
             return Err("Bluetooth interface is not in configuration");
+        }
+        if apple_rom
+            && interfaces.iter().any(|other| {
+                other.number != interface.number
+                    && (super::broadcom::is_apple_interface(device, other)
+                        || (
+                            other.number,
+                            other.alternate,
+                            other.class,
+                            other.subclass,
+                            other.protocol,
+                        ) == (HCI_INTERFACE, 0, CLASS, SUBCLASS, PROTOCOL))
+            })
+        {
+            return Err("Apple Bluetooth HCI has competing EP0 interfaces");
         }
         let first = |kind: u8, input: bool| {
             interface
@@ -75,6 +93,7 @@ impl Binding {
             (Some(events), Some(input), Some(output)) => Ok(Self {
                 device: device.clone(),
                 interface: interface.number,
+                apple_rom,
                 events,
                 input,
                 output,

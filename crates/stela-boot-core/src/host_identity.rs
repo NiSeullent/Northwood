@@ -64,6 +64,62 @@ pub fn smbios_text(value: &[u8]) -> Option<&[u8]> {
     Some(&value[start..end])
 }
 
+/// The coprocessor fitted to an Intel MacBook Pro model at the factory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppleBridge {
+    None,
+    T1,
+    T2,
+}
+
+impl AppleBridge {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::T1 => "T1",
+            Self::T2 => "T2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntelMacBookPro<'a> {
+    pub model: &'a str,
+    pub expected_bridge: AppleBridge,
+}
+
+/// Classify the known Intel MacBook Pro 11 through 16 SMBIOS models. This
+/// describes the factory configuration. Driver admission still needs live
+/// device identification, since the SMBIOS strings can be spoofed.
+pub fn intel_macbook_pro<'a>(
+    system_vendor: &[u8],
+    product: &'a [u8],
+) -> Option<IntelMacBookPro<'a>> {
+    if !smbios_text(system_vendor)?.eq_ignore_ascii_case(b"Apple Inc.") {
+        return None;
+    }
+
+    let model = core::str::from_utf8(smbios_text(product)?).ok()?;
+    let expected_bridge = match model {
+        "MacBookPro11,1" | "MacBookPro11,2" | "MacBookPro11,3" | "MacBookPro11,4"
+        | "MacBookPro11,5" | "MacBookPro12,1" | "MacBookPro13,1" | "MacBookPro14,1" => {
+            AppleBridge::None
+        }
+        "MacBookPro13,2" | "MacBookPro13,3" | "MacBookPro14,2" | "MacBookPro14,3" => {
+            AppleBridge::T1
+        }
+        "MacBookPro15,1" | "MacBookPro15,2" | "MacBookPro15,3" | "MacBookPro15,4"
+        | "MacBookPro16,1" | "MacBookPro16,2" | "MacBookPro16,3" | "MacBookPro16,4" => {
+            AppleBridge::T2
+        }
+        _ => return None,
+    };
+    Some(IntelMacBookPro {
+        model,
+        expected_bridge,
+    })
+}
+
 /// The string at byte `offset` of the first SMBIOS structure of type `kind`
 /// in `table` (DSP0134 §6.1.3), or `None` when there is none or the table
 /// ends early. Callers name only model and version fields: type 0's BIOS
@@ -184,5 +240,53 @@ mod tests {
         assert_eq!(smbios_text(b"  ASUS  \0\0"), Some(&b"ASUS"[..]));
         assert_eq!(smbios_text(b" \0"), None);
         assert_eq!(smbios_text(b""), None);
+    }
+
+    #[test]
+    fn macbook_pro_inventory_identifies_the_expected_bridge() {
+        use AppleBridge::{None as NoBridge, T1, T2};
+        for (generation, variants) in [
+            (11, &[NoBridge; 5][..]),
+            (12, &[NoBridge]),
+            (13, &[NoBridge, T1, T1]),
+            (14, &[NoBridge, T1, T1]),
+            (15, &[T2; 4]),
+            (16, &[T2; 4]),
+        ] {
+            for (index, &expected_bridge) in variants.iter().enumerate() {
+                let model = format!("MacBookPro{generation},{}", index + 1);
+                assert_eq!(
+                    intel_macbook_pro(b"Apple Inc.", model.as_bytes()),
+                    Some(IntelMacBookPro {
+                        model: &model,
+                        expected_bridge,
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn macbook_pro_inventory_requires_known_product_and_apple_vendor() {
+        assert_eq!(
+            intel_macbook_pro(b" Apple Inc. \0", b" MacBookPro16,1 \0"),
+            Some(IntelMacBookPro {
+                model: "MacBookPro16,1",
+                expected_bridge: AppleBridge::T2,
+            })
+        );
+        assert_eq!(intel_macbook_pro(b"QEMU", b"MacBookPro16,1"), None);
+        for product in [
+            &b"MacBookPro10,1"[..],
+            b"MacBookPro12,2",
+            b"MacBookPro16,5",
+            b"MacBookPro17,1",
+            b"MacBookPro16,01",
+            b"MacBookPro16,1\0extra",
+            b"MacBookPro16,\xff",
+            b"",
+        ] {
+            assert_eq!(intel_macbook_pro(b"Apple Inc.", product), None);
+        }
     }
 }

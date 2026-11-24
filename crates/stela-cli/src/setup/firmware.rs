@@ -245,6 +245,10 @@ fn describe_bluetooth(controllers: &[super::host::UsbBluetooth], repair: &str) -
             controller.vendor_interface,
         );
         notes.push(match setup {
+            Some(Setup::BroadcomApple) => format!(
+                "this computer's Apple Broadcom Bluetooth controller ({ids}) uses its onboard firmware. \
+                 A Northwood boot checks the live controller"
+            ),
             // Recipes pin images for these setups' drivers only
             // (`recipes::MEDIATEK_BLUETOOTH`, `recipes::INTEL_RSA`).
             Some(setup @ (Setup::MediaTek | Setup::Intel)) => format!(

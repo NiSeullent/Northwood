@@ -434,14 +434,14 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
             record.build,
             kind.label(),
             ecid.map_or_else(|| "the setup".into(), |e| format!("ECID {e}")),
-            super::restore_choice_name(kind)
+            super::restore_choice_name(kind, record.layout)
         ));
     }
     if record.installs_media() && record.active_medium().is_none() {
         report.problem(format!(
-            "the active build {} has no install medium, so its Install macOS choice is \
-             missing: {image}",
-            record.build
+            "the active build {} has no install medium, so its {} choice is missing: {image}",
+            record.build,
+            super::restore_choice_name(bundle::Kind::Restore, record.layout)
         ));
     }
     for medium in &record.media {

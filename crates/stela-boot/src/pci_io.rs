@@ -13,7 +13,7 @@ use uefi::{
     boot::{self, OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol},
     proto::{
         ProtocolPointer,
-        device_path::{DevicePath, DeviceSubType, DeviceType},
+        device_path::{DevicePath, DeviceSubType, DeviceType, messaging::NvmeNamespace},
         unsafe_protocol,
     },
 };
@@ -106,6 +106,31 @@ fn get_protocol<P: ProtocolPointer + ?Sized>(handle: Handle) -> uefi::Result<Sco
             OpenProtocolAttributes::GetProtocol,
         )
     }
+}
+
+/// Look for the Apple T2 storage function on a whole-disk firmware handle.
+/// Match a direct PCI handle or its single NVMe namespace path node.
+pub(crate) fn is_apple_t2_disk(handle: Handle) -> bool {
+    let pci = get_protocol::<PciIo>(handle).ok().or_else(|| {
+        let path = get_protocol::<DevicePath>(handle).ok()?;
+        if path.instance_iter().count() != 1 {
+            return None;
+        }
+        let mut remaining = &*path;
+        let controller = boot::locate_device_path::<PciIo>(&mut remaining).ok()?;
+        let mut nodes = remaining.node_iter();
+        <&NvmeNamespace>::try_from(nodes.next()?).ok()?;
+        if nodes.next().is_some() {
+            return None;
+        }
+        get_protocol(controller).ok()
+    });
+    pci.and_then(|mut pci| pci.read_header().ok())
+        .is_some_and(|header| {
+            let vendor = u16::from_le_bytes([header[0], header[1]]);
+            let device = u16::from_le_bytes([header[2], header[3]]);
+            stela_drivers::storage::nvme::is_apple_t2(vendor, device)
+        })
 }
 
 fn gop_pci(handle: Handle) -> Option<ScopedProtocol<PciIo>> {
@@ -424,7 +449,10 @@ fn observe_nvme(
     use stela_drivers::{bus::pci::regs, storage::nvme};
     use uefi::proto::nvme::pass_thru::NvmePassThru;
 
-    if [header[11], header[10], header[9]] != nvme::CLASS {
+    let vendor = u16::from_le_bytes([header[0], header[1]]);
+    let device = u16::from_le_bytes([header[2], header[3]]);
+    let apple_t2 = nvme::is_apple_t2(vendor, device);
+    if !apple_t2 && [header[11], header[10], header[9]] != nvme::CLASS {
         return;
     }
     let protocol_test = boot::test_protocol::<NvmePassThru>(OpenProtocolParams {
@@ -437,6 +465,12 @@ fn observe_nvme(
         Ok(false) => "absent",
         Err(_) => "unavailable",
     };
+    if apple_t2 {
+        crate::output::arguments(format_args!(
+            "FW APPLE T2 NVME pci={address} pass-thru={pass_thru} native=unsupported\n"
+        ));
+        return;
+    }
     let command = u16::from_le_bytes([header[4], header[5]]);
     let mse = command & regs::COMMAND_MEMORY != 0;
     let bme = command & regs::COMMAND_MASTER != 0;
@@ -635,6 +669,13 @@ pub fn capture() -> Result<Census, CaptureFailure> {
         }
         #[cfg(feature = "diagnostics")]
         {
+            // apple-bce's PCI table identifies the T2's Buffer Copy Engine.
+            // Report enumeration only. No BAR or DMA operation is needed.
+            if header[..4] == [0x6b, 0x10, 0x01, 0x18] {
+                crate::output::arguments(format_args!(
+                    "FW APPLE T2 BCE pci={address} native=unsupported\n"
+                ));
+            }
             observe_nvme(handle, &mut protocol, address, &header, &bars[0]);
             observe_lpss_i2c(handle, address, &header, &bars[0]);
             observe_glk(&mut protocol, address, &header, &bars[0]);

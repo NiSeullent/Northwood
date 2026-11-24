@@ -148,6 +148,7 @@ const CHOICES_PATH: &str = "EFI/stela/choices.cfg";
 const CHOOSER_SECONDS: u32 = 5;
 /// The startup choice that installs macOS onto a setup's one install.
 const INSTALL_CHOICE: &str = "Install macOS";
+const NORTHWOOD_INSTALL_CHOICE: &str = "Install macOS 27 via Northwood";
 /// The startup choice that updates a setup's one install in place.
 const UPDATE_CHOICE: &str = "Update macOS";
 /// `stela setup {words} --usb {usb}` in backticks, as a user types it: every
@@ -266,9 +267,10 @@ fn split_report(result: Result<String>) -> (String, Result<()>) {
 
 /// The startup choice that restores with a bundle of `kind` on a setup
 /// with one install.
-fn restore_choice_name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Update => UPDATE_CHOICE,
+fn restore_choice_name(kind: Kind, layout: Layout) -> &'static str {
+    match (kind, layout) {
+        (Kind::Update, _) => UPDATE_CHOICE,
+        (Kind::Restore, Layout::Northwood) => NORTHWOOD_INSTALL_CHOICE,
         _ => INSTALL_CHOICE,
     }
 }
@@ -745,7 +747,7 @@ impl Request {
             cliclack::note(
                 "Next steps",
                 format!(
-                    "Boot the target PC from this USB and choose Install macOS.\nThe install \
+                    "Boot the target PC from this USB and choose the macOS installation entry.\nThe install \
                      needs the internet for Apple's signing server.{gpu}{profile}"
                 ),
             )?;

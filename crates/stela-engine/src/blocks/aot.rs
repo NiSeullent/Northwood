@@ -38,8 +38,7 @@ impl LoadedBlock {
     pub(super) fn from_artifact(
         target: stela_compiler::TargetCpu,
         profile: BlockProfile,
-        region_base: u64,
-        generation: u64,
+        region: Rc<CodeRegion>,
         source_bytes: usize,
         prepared: LoadedArtifact,
         native: &[u8],
@@ -47,12 +46,12 @@ impl LoadedBlock {
         if !crate::platform::cpu::admitted(target) {
             return Err(crate::Error::HostLacks(target));
         }
+        require!(source_bytes > 0, "compiled block has no source");
         let mapping = platform::Mapping::new(native)?;
         serialize_instruction_execution()?;
         Ok(Self {
             profile,
-            region_base,
-            generation,
+            region,
             source_bytes,
             prepared,
             mapping,
@@ -133,7 +132,6 @@ impl BlockRuntime {
         require!(region.end - pc.0 >= 4, "truncated preparation instruction");
         let offset = (pc.0 - base) as usize;
         let available = ((region.source.len() - offset) / 4).min(MAX_BLOCK_INSTRUCTIONS) * 4;
-        let generation = region.generation;
         let window = &region.source[offset..offset + available];
         let analysis = analyze_with_profile(window, pc, self.profile)?;
         let plan = CompilationPlan::new(
@@ -180,8 +178,7 @@ impl BlockRuntime {
         let block = LoadedBlock::from_artifact(
             self.target,
             profile,
-            base,
-            generation,
+            Rc::clone(region),
             source_bytes,
             prepared,
             native,

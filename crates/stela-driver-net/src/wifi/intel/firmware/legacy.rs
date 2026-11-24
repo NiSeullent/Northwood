@@ -16,6 +16,7 @@ use stela_crypto::{Sha256, digest::Digest};
 
 pub mod adapter;
 pub mod alive;
+#[path = "legacy/auxiliary.rs"]
 pub mod aux;
 pub mod hcmd;
 pub mod nvm;

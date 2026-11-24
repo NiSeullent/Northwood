@@ -1,5 +1,6 @@
 use super::super::LocalRegisters;
 use super::*;
+use crate::machine::Stop;
 use core::sync::atomic::AtomicUsize;
 
 struct Kicks(Arc<AtomicUsize>);
