@@ -1,4 +1,4 @@
-//! Every guest PE on its own host core (the default). The boot processor's
+//! Every guest PE on its own host logical CPU (the default). The boot processor's
 //! machine keeps the boot PE and serves resets and DMA; each other PE runs
 //! a machine of its own on the AP its worker binding names, from the first
 //! time a device starts it. Whichever PE waits for an interrupt serves the
@@ -117,7 +117,7 @@ pub(crate) fn spawn<H: Host>(
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
     }
     output::arguments(format_args!(
-        "PARALLEL {} PEs, each on its own host core\n",
+        "PARALLEL {} PEs, each on its own host logical CPU\n",
         bindings.len()
     ));
     // Every PE's guest time passes while the serial port takes a long

@@ -311,6 +311,18 @@ unsafe impl NativeServices for Services<'_> {
     }
 
     fn map_bar(&self, address: Address, bar: Bar) -> Result<Mapping, ServiceError> {
+        if let Bar::Memory {
+            address: base,
+            size,
+            prefetchable: false,
+            ..
+        } = bar
+            && size < PAGE
+        {
+            // SAFETY: the caller's native attachment owns this function.
+            return unsafe { self.mmio.map_subpage_bar(address.segment, base, size) }
+                .map_err(ServiceError::Mapping);
+        }
         let resource = self.bar_resource(address, bar)?;
         let bytes = usize::try_from(resource.physical_span().bytes())
             .map_err(|_| ServiceError::Refused("BAR too large"))?;

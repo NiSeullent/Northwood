@@ -7,8 +7,8 @@ use stela_boot_core::{record::Capture, topology as native};
 use stela_contracts::refuse;
 use stela_soc_data::board::assigned::{AssignedCore, RetainedRoster};
 
-/// A kept roster of started executors. Captured AP inventory alone
-/// cannot construct this view: each selected AP must have acknowledged its
+/// The guest's prefix of the started executors. Host-only workers stay out
+/// of the Apple topology plan. Each retained AP must have acknowledged its
 /// private installed Host and CPUID identity through Executors::start.
 pub(crate) struct AssignedRoster<'a> {
     _bsp: BspRoster<'a>,
@@ -20,20 +20,31 @@ impl<'a> AssignedRoster<'a> {
         capture: &'a Capture,
         executors: &'a crate::native_smp::executor::Executors,
         _owner: &super::host::HostOwner,
+        guest_workers: usize,
     ) -> Result<Self> {
+        if !(1..=executors.started()).contains(&guest_workers) {
+            return Err(refuse!(
+                "guest worker count exceeds the started host roster"
+            ));
+        }
         let bsp = BspRoster::current(capture, 0)?;
-        let mut cores = bsp.cores().to_vec();
-        for worker in 1..=executors.processors().len() {
-            let processor = executors
-                .processors()
-                .iter()
-                .find(|processor| processor.slot() == worker)
-                .ok_or(refuse!("assigned started worker roster has a slot gap"))?;
+        let mut cores = Vec::with_capacity(guest_workers);
+        cores.extend_from_slice(bsp.cores());
+        // The validated slot order selects distinct physical cores before SMT
+        // siblings. Source class placement runs within this guest prefix.
+        for (index, processor) in executors.processors()[..guest_workers - 1]
+            .iter()
+            .enumerate()
+        {
+            let worker = index + 1;
+            if processor.slot() != worker {
+                return Err(refuse!("assigned started worker roster has a slot gap"));
+            }
             let index = *capture
                 .selected
                 .get(worker)
                 .filter(|_| worker < capture.core_count as usize)
-                .ok_or(refuse!("assigned worker exceeds captured physical cores"))?
+                .ok_or(refuse!("assigned worker exceeds captured host threads"))?
                 as usize;
             let source = *capture
                 .processors

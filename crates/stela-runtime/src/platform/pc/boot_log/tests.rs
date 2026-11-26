@@ -311,7 +311,7 @@ fn a_blank_or_invalid_header_starts_a_fresh_log_and_the_reader_refuses_it() {
         bytes
     };
     let mut wrong_version = good.clone();
-    wrong_version[8] = 2;
+    wrong_version[8] = 3;
     let digest = Sha256::digest(&wrong_version[..FIELDS]);
     wrong_version[FIELDS..RECORD].copy_from_slice(&digest);
     let mut other_ring = good.clone();
@@ -322,7 +322,7 @@ fn a_blank_or_invalid_header_starts_a_fresh_log_and_the_reader_refuses_it() {
         (damage(0), HeaderError::NotALog),
         (damage(16), HeaderError::Checksum),
         (damage(FIELDS + 3), HeaderError::Checksum),
-        (wrong_version, HeaderError::Version(2)),
+        (wrong_version, HeaderError::Version(3)),
         (
             other_ring,
             HeaderError::RingSize {
@@ -347,6 +347,17 @@ fn a_blank_or_invalid_header_starts_a_fresh_log_and_the_reader_refuses_it() {
             bytes: HEADER_BYTES
         })
     );
+}
+
+#[test]
+fn reads_version_one_at_the_start_of_a_larger_usb_log() {
+    let mut disk = Recorder::new(LOG_BYTES, 512);
+    let mut writer = Writer::open(&mut disk).unwrap();
+    writer.append(b"boot recorded in the first four MiB\n");
+    writer.flush(&mut disk).unwrap();
+    let original = disk.log().unwrap();
+    disk.disk.bytes.resize(LOG_BYTES as usize * 2, 0);
+    assert_eq!(disk.log().unwrap(), original);
 }
 
 #[test]

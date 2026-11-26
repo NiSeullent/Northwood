@@ -44,7 +44,13 @@ and Apple7 GPU families.
 - Network access to prepare the restore image and Apple's signing answers.
   A network installer also downloads macOS during installation.
 
-Stela currently models the Mac mini (M2) and runs macOS 27.
+Northwood models the Mac mini (M2) and runs macOS 27 with up to eight guest
+CPUs. Parallel boots can start up to 64 firmware-enabled host
+threads across CPU sockets, as memory allows. Guest CPUs get separate
+physical cores before using SMT siblings. With a writable translation cache,
+the remaining host threads verify cache entries as work arrives. Set
+`Guest.Cores` in `nwconfig.plist` to cap the host thread count. The default `0`
+selects it automatically.
 
 ## Install
 
@@ -112,6 +118,24 @@ cargo xtask dist
 The build writes `target/release/northwood`, `target/release/stela` and a
 matching `northwood.efi`. The first build fetches and compiles Linux, Mesa
 and LLVM sources.
+
+## Boot diagnostics
+
+Read a saved Northwood or Stambha `boot.log` and summarize each boot's
+recorded timings.
+
+```sh
+./northwood boot-log boot.log
+./northwood boot-log --perf boot.log
+```
+
+With a diagnostics EFI, run the QEMU matrix to check host worker execution
+and translation proof on single- and dual-socket 32-core, 64-thread layouts.
+The report contains timings for the authored test workload in QEMU.
+
+```sh
+cargo xtask boot native-matrix --image /path/to/diagnostics.efi --output native-check --require-translation-proof
+```
 
 ## Legal
 

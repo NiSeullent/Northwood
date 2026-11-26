@@ -590,26 +590,35 @@ fn with_sinks<R>(wait: bool, f: impl FnOnce(&mut Vec<Sink>) -> R) -> Option<R> {
 static FIRMWARE_CONSOLE: AtomicBool = AtomicBool::new(true);
 /// `--host-check` shows its report itself, so every line reaches the screen.
 static RAW_SCREEN: AtomicBool = AtomicBool::new(false);
-/// The time-stamp counter's rate, once known, which stamps each line the
-/// logs keep with the seconds since the PC started.
+/// The time-stamp counter's rate, once known, and this EFI application's
+/// entry sample. An engine relocated into its own image receives the same epoch.
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+static BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// The record's next byte starts a line.
 static LINE_START: AtomicBool = AtomicBool::new(true);
 
-/// Stamp the logs' lines from now on with the time from the counter running
-/// at `tsc_hz`.
-pub fn set_clock(tsc_hz: u64) {
-    TSC_HZ.store(tsc_hz, Ordering::Relaxed);
+/// Stamp the logs' lines from now on with the time since EFI entry.
+pub fn set_clock(tsc_hz: u64, boot_epoch: u64) {
+    BOOT_EPOCH.store(boot_epoch, Ordering::Relaxed);
+    TSC_HZ.store(tsc_hz, Ordering::Release);
 }
 
-/// `[  12.345] `: the seconds since the PC started, as the kernel's own
-/// lines show them; nothing before the counter's rate is known.
+pub(crate) fn boot_epoch() -> u64 {
+    BOOT_EPOCH.load(Ordering::Relaxed)
+}
+
+pub(crate) fn boot_elapsed_millis() -> u64 {
+    let hz = TSC_HZ.load(Ordering::Acquire);
+    stela_boot_core::tsc::boot_elapsed_millis(boot_epoch(), rdtsc(), hz)
+}
+
+/// `[  12.345] `: the seconds since EFI entry; nothing before calibration.
 fn stamp(record: &mut Pending<[u8; PENDING_BYTES]>) {
-    let hz = TSC_HZ.load(Ordering::Relaxed);
+    let hz = TSC_HZ.load(Ordering::Acquire);
     if hz == 0 {
         return;
     }
-    let millis = rdtsc() / (hz / 1000).max(1);
+    let millis = stela_boot_core::tsc::boot_elapsed_millis(boot_epoch(), rdtsc(), hz);
     let mut text = Text::<24>::default();
     let _ = write!(text, "[{:5}.{:03}] ", millis / 1000, millis % 1000);
     record.push(text.as_bytes());
@@ -933,7 +942,7 @@ pub fn millis_since(start: u64) -> u64 {
 pub fn boot_stage(name: &str) {
     arguments(format_args!(
         "BOOT STAGE name={name} elapsed_ms={}\n",
-        millis_since(0),
+        boot_elapsed_millis(),
     ));
 }
 

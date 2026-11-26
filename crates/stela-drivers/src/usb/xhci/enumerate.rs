@@ -276,7 +276,8 @@ impl Controller {
         }
         // Address Device sends SET_ADDRESS with BSR=0. The xHC does not
         // time the device's recovery interval (xHCI 1.2b 4.6.5); USB 2.0
-        // 9.2.6.3 permits it to ignore Setup packets for another 2 ms.
+        // 9.2.6.3 permits it to ignore Setup packets for 2 ms. Allow the
+        // 10 ms used by Linux's port initialization.
         during(
             "USB address recovery",
             self.minimum_wait(ADDRESS_RECOVERY_US),
@@ -350,6 +351,7 @@ impl Controller {
                 enumerate_us: 0,
             };
             if connected {
+                let first_failure = failures.len();
                 let location = location(self, port);
                 crate::working(&location);
                 let clock = self.clock;
@@ -371,6 +373,14 @@ impl Controller {
                     })
                 };
                 self.connect(location, None, reset, dma, &mut devices, failures);
+                if let Some((at, _)) = failures.get_mut(first_failure)
+                    && at.ends_with("enable/reset port")
+                {
+                    let status = self.registers.read32(self.port_offset(port));
+                    let link = status >> PLS_SHIFT & PLS_FIELD;
+                    use core::fmt::Write;
+                    let _ = write!(at, " portsc={status:#010x} link={link}");
+                }
                 probe.reset_us = reset_us;
                 probe.enumerate_us = clock
                     .now_us()
@@ -495,9 +505,9 @@ impl Controller {
         let portsc = self.registers.read32(at);
         self.write_port(port, portsc & PORT_CHANGES);
         let link = portsc >> PLS_SHIFT & PLS_FIELD;
-        if self.port_major[usize::from(port - 1)] == 3
-            && matches!(link, LINK_INACTIVE | LINK_COMPLIANCE)
-        {
+        let usb2 = self.port_major[usize::from(port - 1)] != 3;
+        let warm = !usb2 && matches!(link, LINK_INACTIVE | LINK_COMPLIANCE);
+        if warm {
             // Linux `hub_port_reset` warm-resets a SuperSpeed link stuck in
             // SS.Inactive or Compliance Mode.
             self.write_port(port, WPR);
@@ -508,31 +518,45 @@ impl Controller {
             }
             self.write_port(port, WRC | PRC);
             self.minimum_wait(RESET_RECOVERY_US)?;
-        } else if self.port_major[usize::from(port - 1)] != 3 {
-            self.write_port(port, PR);
-            let clock = self.clock;
-            if !wait(&mut *self.registers, clock, PORT_RESET_US, |r| {
-                r.read32(at) & PRC != 0
-            }) {
-                return Err(BlockError::Timeout);
+        } else if usb2 {
+            // Linux hub_port_reset retries a connected port that completed
+            // reset without enabling it. Do not restart an in-flight reset.
+            for _ in 0..5 {
+                self.write_port(port, PR);
+                if !wait(&mut *self.registers, clock, PORT_RESET_US, |r| {
+                    let status = r.read32(at);
+                    status & CCS == 0 || status & (PR | PRC) == PRC
+                }) {
+                    return Err(BlockError::Timeout);
+                }
+                let status = self.registers.read32(at);
+                if status & CCS == 0 {
+                    return Ok(None);
+                }
+                self.write_port(port, PRC);
+                self.minimum_wait(RESET_RECOVERY_US)?;
+                self.drain();
+                self.ready()?;
+                if self.registers.read32(at) & (CCS | PED) != CCS {
+                    break;
+                }
             }
-            self.write_port(port, PRC);
-            self.minimum_wait(RESET_RECOVERY_US)?;
         } else {
-            let clock = self.clock;
             if !wait(&mut *self.registers, clock, PORT_RESET_US, |r| {
-                r.read32(at) & PED != 0
+                let status = r.read32(at);
+                status & CCS == 0 || status & PED != 0
             }) {
                 return Err(BlockError::Timeout);
             }
         }
         let portsc = self.registers.read32(at);
+        if portsc & CCS == 0 {
+            return Ok(None);
+        }
         if portsc & PED == 0 {
             return Err(BlockError::Unsupported("root port did not enable"));
         }
-        if self.port_major[usize::from(port - 1)] != 3
-            || matches!(link, LINK_INACTIVE | LINK_COMPLIANCE)
-        {
+        if usb2 || warm {
             self.current_port_reset(None, port)?;
         }
         Ok(Some((portsc >> PORT_SPEED_SHIFT & PORT_SPEED_FIELD) as u8))

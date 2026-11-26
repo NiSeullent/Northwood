@@ -1439,13 +1439,21 @@ impl<'a> Store<'a> {
         true
     }
 
+    /// Whether this shard can fill a background proof batch. Do not wake a
+    /// worker for a short tail that the stop's proof will already handle.
+    pub fn proof_ready(&self, blocks: usize) -> bool {
+        self.pending_blocks >= blocks.max(1)
+            && !self.proven_full
+            && self.proven_bytes < self.proven_bound
+    }
+
     /// Pending pages holding at least `blocks` blocks (all, when fewer
     /// wait), oldest key first, to prove outside the store's lock; `None`
     /// when none wait or the proven bound is full: reached, or short of an
     /// entry a fold left out. A batch then would be proven only to be
     /// dropped, and its pages with it.
     pub fn take_batch(&mut self, blocks: usize) -> Option<ProofBatch> {
-        if self.pending.is_empty() || self.proven_full || self.proven_bytes >= self.proven_bound {
+        if !self.proof_ready(1) {
             return None;
         }
         let mut pages = Vec::new();
@@ -1468,13 +1476,21 @@ impl<'a> Store<'a> {
         self.counters.unprovable += batch.unprovable;
         for (key, entries) in batch.records {
             for entry in entries {
-                let bytes = entry.retained_bytes();
-                if self.proven_bytes + bytes > self.proven_bound {
+                // The guest can offer this entry again while a worker owns
+                // the detached proof batch. Its replacement only takes the
+                // difference in retained bytes.
+                let previous = self
+                    .proven
+                    .get(&key)
+                    .and_then(|record| record.find(entry.offset, &entry.context))
+                    .map_or(0, |known| known.retained_bytes());
+                let bytes = self.proven_bytes - previous + entry.retained_bytes();
+                if bytes > self.proven_bound {
                     self.counters.unkept += 1;
                     self.proven_full = true;
                     continue;
                 }
-                self.proven_bytes += bytes;
+                self.proven_bytes = bytes;
                 self.proven
                     .entry(key)
                     .or_insert_with(|| Record::new(self.translator, key))
@@ -2536,6 +2552,8 @@ mod tests {
         store.offer(offer(0x1_0000_4008, first));
         store.offer(offer(0x1_0000_4010, first));
         store.offer(offer(0x1_0000_8010, second));
+        assert!(store.proof_ready(3));
+        assert!(!store.proof_ready(4));
         let batch = store.take_batch(1).unwrap();
         assert_eq!(batch.blocks(), 2);
         assert_eq!(store.pending(), 1);
@@ -2568,6 +2586,25 @@ mod tests {
         let batch = full.take_batch(1).unwrap();
         full.fold(batch.prove());
         assert_eq!((full.counters.proven, full.counters.unkept), (1, 1));
+    }
+
+    #[test]
+    fn an_offer_repeated_while_its_batch_is_off_core_does_not_charge_twice() {
+        let key = Digest::of(b"repeated proof");
+        let mut store = Store::new(translator_id(), None).0;
+        let block = offer(0x1_0000_4008, key);
+        store.keep_pending(&block);
+        let first = store.take_batch(1).unwrap();
+        store.keep_pending(&block);
+        let repeated = store.take_batch(1).unwrap();
+        store.fold(first.prove());
+        let bytes = store.proven_bytes;
+        assert!(bytes > 0);
+        store.proven_bound = bytes;
+        store.fold(repeated.prove());
+        assert_eq!(store.proven_bytes, bytes);
+        assert_eq!(store.proven[&key].entries.len(), 1);
+        assert_eq!(store.counters.unkept, 0);
     }
 
     /// Once a fold left an entry out for the proven bound, a batch proven

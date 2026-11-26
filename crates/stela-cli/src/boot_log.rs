@@ -27,9 +27,7 @@ pub(crate) mod diagnostics;
 mod perf;
 
 fn boot_number(line: &str) -> Option<u64> {
-    line.strip_prefix("=== STELA BOOT ")
-        .and_then(|line| line.strip_suffix(" ==="))
-        .and_then(|number| number.parse().ok())
+    boot_log::marker(line.as_bytes())
         .or_else(|| volume_log_sequence(line.as_bytes()).filter(|&sequence| sequence != 0))
 }
 
@@ -138,7 +136,7 @@ impl BootLog {
                 if several {
                     writeln!(output, "=== {place} ===")?;
                 }
-                output.write_all(&log.stream)?;
+                write_log(output, &log)?;
             }
         }
         Ok(())
@@ -198,11 +196,20 @@ impl BootLog {
     fn find(&self) -> Result<Vec<(String, Log)>> {
         let mut file = File::open(&self.file)
             .with_context(|| format!("cannot open {}", self.file.display()))?;
-        let mut magic = [0; boot_log::MAGIC.len()];
-        if file.read_exact(&mut magic).is_ok() && &magic == boot_log::MAGIC {
-            let bytes = region(&mut file, 0).with_context(|| {
-                format!("cannot read standalone boot log {}", self.file.display())
-            })?;
+        let mut page = Vec::with_capacity(boot_log::HEADER_BYTES as usize);
+        (&mut file)
+            .take(boot_log::HEADER_BYTES)
+            .read_to_end(&mut page)?;
+        if boot_log::has_magic(&page) {
+            let bytes = (|| {
+                file.seek(SeekFrom::Start(0))?;
+                let mut bytes = Vec::new();
+                (&mut file)
+                    .take(boot_log::MAX_FILE_BYTES)
+                    .read_to_end(&mut bytes)?;
+                Ok::<_, io::Error>(bytes)
+            })()
+            .with_context(|| format!("cannot read standalone boot log {}", self.file.display()))?;
             let log = boot_log::read(&bytes)
                 .with_context(|| format!("invalid standalone boot log {}", self.file.display()))?;
             return Ok(vec![(self.file.display().to_string(), log)]);
@@ -292,6 +299,49 @@ impl BootLog {
         };
         read(&mut file, offset).with_context(|| format!("{}", self.file.display()))
     }
+}
+
+fn write_log(output: &mut impl Write, log: &Log) -> io::Result<()> {
+    let oldest = log.overwritten();
+    let mut kept = false;
+    for (index, start) in log.starts.iter().enumerate() {
+        if start.start >= oldest || start.first.is_empty() {
+            continue;
+        }
+        kept = true;
+        writeln!(
+            output,
+            "[boot log: saved first lines of boot {}]",
+            start.boot
+        )?;
+        output.write_all(&start.first)?;
+        if !start.first.ends_with(b"\n") {
+            writeln!(output)?;
+        }
+        if !start.last.is_empty()
+            && log
+                .starts
+                .get(index + 1)
+                .is_some_and(|next| next.start <= oldest)
+        {
+            writeln!(
+                output,
+                "[boot log: saved last lines of boot {}]",
+                start.boot
+            )?;
+            output.write_all(&start.last)?;
+            if !start.last.ends_with(b"\n") {
+                writeln!(output)?;
+            }
+        }
+    }
+    if kept {
+        writeln!(
+            output,
+            "[boot log: retained ring follows after overwritten lines]"
+        )?;
+    }
+    output.write_all(&log.stream)
 }
 
 /// The boot log of the machine state that starts at byte `state` of `file`.
@@ -591,6 +641,42 @@ pub(crate) mod tests {
             error.contains("no machine state in its last bytes"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn boot_log_reads_a_larger_stambha_region_and_numbered_boot_notes() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot.log");
+        let lines = b"=== STELA BOOT 1 === version=0.6.1\nSTELA UEFI MOUNT version=0.6.1\n\
+                      HOST MEMORY free=12000M heap=1000M guest=11000M profile=resident\n\
+                      === STELA BOOT 2 === version=0.6.1\nSTELA UEFI MOUNT version=0.6.1\n\
+                      HOST MEMORY free=13000M heap=1000M guest=12000M profile=resident\n";
+        let mut bytes = vec![0; (2 * boot_log::LOG_BYTES) as usize];
+        let head = boot_log::HEADER_BYTES as usize;
+        let ring = (bytes.len() - head) as u64;
+        bytes[..8].copy_from_slice(boot_log::MAGIC);
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        bytes[16..24].copy_from_slice(&(lines.len() as u64).to_le_bytes());
+        bytes[24..32].copy_from_slice(&2u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&ring.to_le_bytes());
+        let digest = Sha256::digest(&bytes[..56]);
+        bytes[56..88].copy_from_slice(&digest);
+        bytes[head..head + lines.len()].copy_from_slice(lines);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut cmd = command(&path, None, None);
+        let mut raw = Vec::new();
+        cmd.write(&mut raw).unwrap();
+        assert_eq!(raw, lines);
+
+        cmd.perf = true;
+        let mut report = Vec::new();
+        cmd.write(&mut report).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.contains("1 | 1 | resident | 12000/11000"));
+        assert!(report.contains("2 | 2 | resident | 13000/12000"));
     }
 
     #[test]

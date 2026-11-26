@@ -45,6 +45,7 @@ mod host_firmware;
 mod lan;
 mod machine;
 mod memory_matrix;
+mod native_matrix;
 mod network;
 mod network_check;
 mod preboot;
@@ -141,6 +142,8 @@ pub enum Command {
     Run(Box<Run>),
     /// Verify memory admission and the built-in kernel across QEMU RAM sizes.
     MemoryMatrix(memory_matrix::Arguments),
+    /// Validate active native workers and measure the synthetic guest scheduler.
+    NativeMatrix(native_matrix::Arguments),
 }
 
 #[derive(Args)]
@@ -523,6 +526,7 @@ pub fn run(command: Command) -> Result<ExitCode> {
         }
         Command::Run(arguments) => launch(*arguments, true),
         Command::MemoryMatrix(arguments) => memory_matrix::run(arguments),
+        Command::NativeMatrix(arguments) => native_matrix::run(arguments),
     }
 }
 

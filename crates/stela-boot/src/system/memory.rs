@@ -120,20 +120,23 @@ pub(super) fn prepare_sipi(cores: usize, has_aps: bool) -> (usize, u64) {
 
 /// Reserve the engine's working memory and each physical worker's resources.
 pub(super) fn reserve(
-    (cores, sipi): (usize, u64),
+    assignment: stela_boot_core::options::NativeAssignment,
+    sipi: u64,
     ram: &[(usize, usize)],
     staged: u64,
     released: u64,
     before_reclaim: u64,
 ) -> Result<EngineMemory> {
     use stela_boot_core::host_memory::{self, Profile, gigabytes};
+    let (cores, runners) = (assignment.cores, assignment.runners);
+    let sizes_for = |free| host_memory::sizes(free, cores, runners);
     let map = memory_map(None)?.ledger;
     let mut low_dma = Region::default();
-    if let Ok(baseline) = host_memory::sizes(map.usable, cores, cores) {
+    if let Ok(baseline) = sizes_for(map.usable) {
         low_dma = crate::native_memory::reserve_low_dma(|bytes| {
             // The reservation may split a 2 MiB-aligned usable range.
             let free = map.usable.saturating_sub(bytes + 2 * LARGE);
-            host_memory::sizes(free, cores, cores).is_ok_and(|sizes| {
+            sizes_for(free).is_ok_and(|sizes| {
                 sizes.profile == baseline.profile && sizes.cores == baseline.cores
             }) && (before_reclaim > map.usable || free >= before_reclaim)
         });
@@ -146,7 +149,7 @@ pub(super) fn reserve(
     map.report("budget");
     let free = map.usable;
     output::arguments(format_args!(
-        "HOST MEMORY free={}M before_reclaim={}M cores={cores} staged={staged:#x} loader_released={released:#x} \
+        "HOST MEMORY free={}M before_reclaim={}M cores={cores} runners={runners} staged={staged:#x} loader_released={released:#x} \
          align_loss={:#x}\n",
         free >> 20,
         before_reclaim >> 20,
@@ -182,10 +185,10 @@ pub(super) fn reserve(
         }
         .refusal());
     }
-    let mut sizes = host_memory::sizes(free, cores, cores)?;
+    let mut sizes = sizes_for(free)?;
     // Keep the established engine budget when it already admitted this boot.
     // The released pages then increase the guest's backing directly.
-    if let Ok(mut established) = host_memory::sizes(before_reclaim, cores, cores)
+    if let Ok(mut established) = sizes_for(before_reclaim)
         && established.profile != Profile::Paged
         && before_reclaim <= free
     {
@@ -195,7 +198,7 @@ pub(super) fn reserve(
     let heap = match allocate(sizes.heap) {
         Ok(heap) => heap,
         Err(_) => {
-            let fallback = host_memory::fragmented_sizes(free, cores, cores)?;
+            let fallback = host_memory::fragmented_sizes(free, cores, runners)?;
             output::arguments(format_args!(
                 "HOST MEMORY heap_contiguous_unavailable={}M fallback={}M\n",
                 sizes.heap >> 20,
@@ -241,12 +244,13 @@ pub(super) fn reserve(
             sizes.cores,
         )),
     }
-    let cores = sizes.cores;
-    // Each claimed core owns a full native part. Check both ends before allocation.
-    for slot in [0, cores - 1] {
+    let assignment = assignment.limit(sizes.cores);
+    let (cores, runners) = (assignment.cores, assignment.runners);
+    // Check both the guest runner and spare native worker pools before allocation.
+    for slot in [runners - 1, cores - 1] {
         let part = crate::native_smp::resources::partition(
             cores,
-            cores,
+            runners,
             slot,
             sizes.code.bytes,
             sizes.pool,
@@ -282,6 +286,7 @@ pub(super) fn reserve(
     })?;
     let native_resources = NativeResources {
         cores: cores as u32,
+        runners: runners as u32,
         code_parts: sizes.code.parts,
         stacks,
         invocations,

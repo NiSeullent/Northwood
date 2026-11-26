@@ -255,18 +255,28 @@ fn ready<H: Host>(machine: &Machine<H, TestDevices>, entry: u64) -> bool {
         _ => false,
     })
 }
-fn states<H: Host>(machine: &Machine<H, TestDevices>) -> Result<Vec<GuestState>> {
-    machine
+fn states<H: Host>(machine: &Machine<H, TestDevices>) -> Result<(Vec<GuestState>, u64)> {
+    let mut retired = 0u64;
+    let states = machine
         .peer_states()
         .iter()
-        .map(|state| match state {
-            PeerState::Running => Ok(machine.cpu.state.clone()),
-            PeerState::Parked { cpu, wfi: None } => Ok(cpu.state.clone()),
-            _ => Err(refuse!(
-                "native kernel PE not at an active instruction boundary"
-            )),
+        .map(|state| {
+            let cpu = match state {
+                PeerState::Running => &machine.cpu,
+                PeerState::Parked { cpu, wfi: None } => cpu,
+                _ => {
+                    return Err(refuse!(
+                        "native kernel PE not at an active instruction boundary"
+                    ));
+                }
+            };
+            retired = retired.checked_add(cpu.retired).ok_or(refuse!(
+                "native scheduler retired instruction total overflow"
+            ))?;
+            Ok(cpu.state.clone())
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((states, retired))
 }
 /// # Safety
 /// Real selected BSP/AP ownership/reservations/descriptors remain pinned. No
@@ -351,6 +361,15 @@ pub(crate) unsafe fn check(
                 .collect::<Vec<_>>(),
         })
     }?;
+    // In an oversubscribed hypervisor, one round needs a separate host
+    // timeslice for every vCPU. Preserve the bare-metal deadline and the
+    // round limit while scaling only the virtualized fixture's time budget.
+    let deadline_seconds = if crate::output::hypervisor_exit_port() {
+        10 * (cores as u64).div_ceil(8)
+    } else {
+        10
+    };
+    let deadline_ticks = handoff.tsc_hz.saturating_mul(deadline_seconds);
     let started = crate::apic::rdtsc();
     while !ready(&machine, entry) {
         // SAFETY: source-started Cpu loans and owner-local AP Hosts;
@@ -361,11 +380,14 @@ pub(crate) unsafe fn check(
                 "native scheduler checked cold control/CPU-start path stopped"
             ));
         }
-        if crate::apic::rdtsc().wrapping_sub(started) >= handoff.tsc_hz * 10 {
+        if crate::apic::rdtsc().wrapping_sub(started) >= deadline_ticks {
+            crate::output::arguments(format_args!(
+                "NATIVE SCHEDULER exhausted cold-start time budget seconds={deadline_seconds} workers={cores}\n"
+            ));
             return Err(refuse!("native scheduler checked cold startup deadline"));
         }
     }
-    let before = states(&machine)?;
+    let (before, retired_before) = states(&machine)?;
     let source::KernelProgram {
         code: program,
         done,
@@ -395,6 +417,7 @@ pub(crate) unsafe fn check(
         .map_err(|_| refuse!("native scheduler source alias publication refused"))?;
     let mut rounds = 0;
     let mut max_pending = 0;
+    let scheduler_started = crate::apic::rdtsc();
     loop {
         // SAFETY: the real fixed BSP/AP owners, canonical RAM and source bytes
         // stay pinned. The diagnostic admits no external DMA/debug/AMX writer;
@@ -434,10 +457,17 @@ pub(crate) unsafe fn check(
         }) {
             break;
         }
-        if rounds >= 256 || crate::apic::rdtsc().wrapping_sub(started) >= handoff.tsc_hz * 10 {
+        if rounds >= 256 {
+            return Err(refuse!("native scheduler source program/IRQ round limit"));
+        }
+        if crate::apic::rdtsc().wrapping_sub(started) >= deadline_ticks {
+            crate::output::arguments(format_args!(
+                "NATIVE SCHEDULER exhausted time budget seconds={deadline_seconds} workers={cores} completed_rounds={rounds}\n"
+            ));
             return Err(refuse!("native scheduler source program/IRQ deadline"));
         }
     }
+    let scheduler_ticks = crate::apic::rdtsc().wrapping_sub(scheduler_started);
     if max_pending < 2
         || machine.devices.canonical_writes != cores * 2
         || machine.devices.cpu_commits != cores * 4
@@ -446,7 +476,13 @@ pub(crate) unsafe fn check(
             "native scheduler did not consume whole actual pending cohort/CPU leases"
         ));
     }
-    let after = states(&machine)?;
+    let (after, retired_after) = states(&machine)?;
+    let scheduled_instructions = retired_after
+        .checked_sub(retired_before)
+        .filter(|&count| count != 0)
+        .ok_or(refuse!(
+            "native scheduler did not retire fixture instructions"
+        ))?;
     for (old, actual) in before.iter().zip(&after) {
         let mut expected = old.clone();
         // Both READY writes leave the fixture's IRQ asserted. The timer FIQ
@@ -531,11 +567,12 @@ pub(crate) unsafe fn check(
         ));
     }
     crate::output::arguments(format_args!(
-        "CHECK native-shared-kernel PASS physical_cores={cores} boot_PE={boot_processor} BSP_worker=0 actual_frames={cores} lse_updates={} full_GPR_SIMD_FP_state=preserved canonical_RAM=shared cold_M0_to_M1=checked CPU_starts={} consumed_device_writes={} CPU_controller_commits={} max_pending={max_pending} legacy_warmup=none scheduler_rounds={rounds} source_ERET_STXP=failed source_WFE=completed source_timer_FIQ=delivered source_permission_abort=precise actual_Host_effects=receipted; original macOS SMP unqualified\n",
+        "CHECK native-shared-kernel PASS physical_cores={cores} boot_PE={boot_processor} BSP_worker=0 actual_frames={cores} lse_updates={} full_GPR_SIMD_FP_state=preserved canonical_RAM=shared cold_M0_to_M1=checked CPU_starts={} consumed_device_writes={} CPU_controller_commits={} max_pending={max_pending} legacy_warmup=none scheduler_rounds={rounds} scheduler_ticks={scheduler_ticks} tsc_hz={} scheduled_instructions={scheduled_instructions} source_ERET_STXP=failed source_WFE=completed source_timer_FIQ=delivered source_permission_abort=precise actual_Host_effects=receipted; original macOS SMP unqualified\n",
         cores * source::INCREMENTS,
         cores - 1,
         machine.devices.canonical_writes,
-        machine.devices.cpu_commits
+        machine.devices.cpu_commits,
+        handoff.tsc_hz
     ));
     Ok(())
 }

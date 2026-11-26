@@ -112,6 +112,8 @@ pub struct Handoff {
     pub(crate) bundle_layout: BundleLayout,
     /// GPT identity of the image's boot ESP, independent of other DATA users.
     pub(crate) boot_esp: Option<pc::swap::volume::BootEsp>,
+    /// BSP TSC at EFI entry, used only for elapsed boot diagnostics.
+    pub(crate) boot_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

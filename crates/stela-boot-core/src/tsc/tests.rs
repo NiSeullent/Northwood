@@ -1,5 +1,16 @@
 use super::*;
 use crate::topology::{Cpuid, Msr, Snapshot};
+
+#[test]
+fn boot_elapsed_millis_uses_the_current_entry_epoch() {
+    let hz = 2_294_686_699;
+    let warm_entry = hz * 5700;
+    let sample = warm_entry + hz / 4 + 1;
+    assert_eq!(boot_elapsed_millis(warm_entry, sample, hz), 250);
+    assert_eq!(boot_elapsed_millis(warm_entry, warm_entry - 1, hz), 0);
+    assert_eq!(boot_elapsed_millis(warm_entry, sample, 0), 0);
+}
+
 fn fixture() -> Snapshot {
     let records = [
         Cpuid {

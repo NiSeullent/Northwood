@@ -3,6 +3,36 @@ use crate::bus::dma::TestRegion;
 use crate::usb::xhci::model::*;
 
 #[test]
+fn usb2_root_reset_retries_a_connected_disabled_port_and_stops_at_five() {
+    for disabled_resets in [1, 5] {
+        let mut dma = TestRegion::new(256 * 1024 * 8);
+        let nodes = alloc::collections::BTreeMap::from([(0, hub::model::Node::leaf(HIGH_SPEED))]);
+        let (mut controller, model) = hub::tests::controller(&mut dma, 32, nodes);
+        {
+            let mut model = model.borrow_mut();
+            model.root_status = Some(PP | CCS);
+            model.root_disabled_resets = disabled_resets;
+        }
+        let mut failures = Vec::new();
+        let devices = controller.enumerate(&mut dma, &mut failures);
+        if disabled_resets == 1 {
+            assert_eq!(model.borrow().root_resets, 2);
+            assert_eq!(devices.len(), 1);
+            assert!(failures.is_empty());
+        } else {
+            assert_eq!(model.borrow().root_resets, 5);
+            assert!(devices.is_empty());
+            assert_eq!(failures.len(), 1);
+            assert!(failures[0].0.ends_with("portsc=0x00000e01 link=0"));
+            assert_eq!(
+                failures[0].1,
+                BlockError::Unsupported("root port did not enable")
+            );
+        }
+    }
+}
+
+#[test]
 fn multi_tt_hubs_use_the_status_endpoint_of_alternate_setting_one() {
     // Interface 0 alternate 0 (single TT) and 1 (multi TT), each with
     // an interrupt IN status endpoint of its own.

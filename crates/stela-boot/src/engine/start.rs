@@ -168,6 +168,7 @@ fn start(handoff: u64) -> Started {
     if handoff.magic != MAGIC {
         output::fatal("engine handoff has the wrong magic");
     }
+    crate::status::set_clock(handoff.tsc_hz, handoff.boot_epoch);
     layout::set(handoff.placement);
     // Use the physmap directly: its CPU and physical bases have the
     // same alignment phase. A separately placed heap alias cannot in general
@@ -207,7 +208,6 @@ fn start(handoff: u64) -> Started {
     // physmap; metadata and Arc are created in this active engine allocator.
     let host_firmware = unsafe { crate::host_firmware::after_ebs(&handoff.host_firmware) }
         .unwrap_or_else(|error| output::fatal(error));
-    crate::status::set_clock(handoff.tsc_hz);
     stela_drivers::on_wait(crate::status::tick);
     stela_drivers::on_work(crate::status::progress);
     crate::status::take_screen(
@@ -297,7 +297,12 @@ fn open_host(
     let translation_store = handoff.files[..handoff.file_count]
         .iter()
         .find(|file| file.name() == translations::FILE)
-        .and_then(|file| translations::install(bundle::contents(file)))
+        .and_then(|file| {
+            translations::install(
+                bundle::contents(file),
+                handoff.native_resources.cores as usize,
+            )
+        })
         .filter(|_| handoff.storage.present);
     // The Metal device's stored pipelines, before any GPU opens.
     #[cfg(feature = "nvk")]
@@ -692,10 +697,9 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
                 output::fatal("owned native AP bootstrap refused");
             }
             crate::status::warn(&alloc::format!(
-                "{} of {} cores started; macOS runs on {}",
+                "{} of {} host threads started",
                 executors.started(),
                 handoff.native_resources.cores,
-                executors.started(),
             ));
         }
         None => crate::status::done(""),
@@ -790,8 +794,8 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         host.built.as_deref(),
         storage.nvram.take(),
     );
-    // The APs start before the board is modeled, so that the guest gets one
-    // PE for each core that started.
+    // Start the APs before modeling the guest, so a failed AP startup can
+    // reduce the number of assignable Apple PEs.
     let Processors { executors, sender } = start_processors(boot, &mut host);
     let Modeled {
         mut board,
@@ -816,8 +820,10 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     if loaded_tree.is_some() {
         crate::status::done("");
     }
+    let started = executors.started();
     output::arguments(format_args!(
-        "NATIVE ACTIVE workers={active_workers} parked=0 source_PEs={}\n",
+        "NATIVE ACTIVE workers={active_workers} host_started={started} host_spare={} source_PEs={}\n",
+        started - active_workers,
         full_profile.processors.len().max(1),
     ));
     if loaded_tree.is_some() {
@@ -827,6 +833,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         native_processors.expect("validated native roster"),
         &executors,
         &host.owner,
+        active_workers,
     )
     .unwrap_or_else(|error| output::fatal(&error));
     let OpenedHost {
@@ -1119,7 +1126,7 @@ fn model_board(
         Some(board) => board_profile(board, target, speculation),
         None => test_profile(target, speculation),
     };
-    let active_workers = started;
+    let active_workers = started.min(boot.handoff.native_resources.runners as usize);
     let source_pes = full_profile.processors.len().max(1);
     let available = boot
         .native_processors
@@ -1293,6 +1300,20 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
             &settings,
         )
         .unwrap_or_else(|error| output::fatal(error));
+        let proof_workers = translations::start_proof_workers(
+            &executors,
+            &worker_bindings,
+            &sender,
+            handoff.tsc_hz,
+        );
+        output::arguments(format_args!(
+            "NATIVE WORK guest_pes={} proof_workers={proof_workers} parked={} logical={}\n",
+            worker_bindings.len(),
+            executors
+                .started()
+                .saturating_sub(worker_bindings.len() + proof_workers),
+            executors.started()
+        ));
     }
     // The run's driver calls keep the engine's TLB entries; the serialized
     // workers' validations require PCIDE clear.
@@ -1682,7 +1703,7 @@ fn boot_progress(loaded_source: Option<&bundle::source::Intake>) -> progress::Bo
     })
 }
 
-/// Assign the source board's projected PEs to the entire started roster.
+/// Assign the source board's projected PEs to its retained host workers.
 fn assign<'s>(
     boot: Boot<'_>,
     roster: &'s topology::AssignedRoster<'_>,
@@ -1832,6 +1853,7 @@ fn check_processors(
             )
         }
         .unwrap_or_else(|error| output::fatal(error));
+        translations::check_proof_workers(executors, sender, handoff.tsc_hz);
         output::terminate(0x10);
     }
     output::arguments(format_args!(
@@ -1929,7 +1951,7 @@ fn assigned_board(
         output::fatal("assigned boot identity differs from the original source handoff");
     }
     output::arguments(format_args!(
-        "NATIVE ASSIGNMENT original_boot={} assigned_boot={} physical_cores={} PEs={} boot_path={} removed={}\n",
+        "NATIVE ASSIGNMENT original_boot={} assigned_boot={} host_reserved={} PEs={} boot_path={} removed={}\n",
         boot_processor,
         boot.cpu,
         handoff.native_resources.cores,
@@ -2225,9 +2247,10 @@ fn install_host(handoff: &'static Handoff, options: &Options, ram: &[RamRange]) 
     #[cfg(not(feature = "diagnostics"))]
     let _ = options;
     let cores = handoff.native_resources.cores as usize;
+    let runners = handoff.native_resources.runners as usize;
     let partition = crate::native_smp::resources::partition(
         cores,
-        cores,
+        runners,
         0,
         handoff.code.bytes,
         handoff.pool.bytes,

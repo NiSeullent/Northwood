@@ -448,11 +448,58 @@ pub fn bar_physical(
         .and_then(|window| address.checked_add(window.translation))
 }
 
+/// Translate a small BAR and the one complete CPU page that contains it.
+/// Both the BAR and the entire page must lie inside the same bridge window.
+pub fn subpage_bar(
+    windows: impl IntoIterator<Item = BusWindow>,
+    segment: u32,
+    address: u64,
+    bytes: u64,
+) -> Option<(u64, usize)> {
+    if !(1..PAGE).contains(&bytes) {
+        return None;
+    }
+    for window in windows {
+        let Some(physical) = bar_physical([window], segment, address, bytes) else {
+            continue;
+        };
+        let offset = physical % PAGE;
+        if offset + bytes > PAGE {
+            return None;
+        }
+        let bus_page = address.checked_sub(offset)?;
+        let physical_page = bar_physical([window], segment, bus_page, PAGE)?;
+        return Some((physical_page, offset as usize));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const PAT_DEFAULT: u64 = 0x0007_0406_0007_0406;
+
+    #[test]
+    fn subpage_bar_requires_one_complete_translated_window_page() {
+        let window = BusWindow {
+            segment: 2,
+            minimum: 0x1000,
+            maximum: 0x2fff,
+            translation: 0xfc00_0000,
+        };
+        assert_eq!(
+            subpage_bar([window], 2, 0x1c00, 0x400),
+            Some((0xfc00_1000, 0xc00))
+        );
+        assert_eq!(subpage_bar([window], 2, 0x1c00, 0x800), None);
+        assert_eq!(subpage_bar([window], 0, 0x1c00, 0x400), None);
+        let partial = BusWindow {
+            minimum: 0x1c00,
+            ..window
+        };
+        assert_eq!(subpage_bar([partial], 2, 0x1c00, 0x400), None);
+    }
 
     fn controls() -> Controls {
         Controls {
