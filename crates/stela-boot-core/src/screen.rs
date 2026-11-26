@@ -2,6 +2,8 @@
 use alloc::{format, string::String};
 use core::sync::atomic::{AtomicU8, Ordering};
 
+pub mod picker;
+
 const IDLE: u8 = 0;
 const ACTIVE: u8 = 1;
 const RETIRED: u8 = 2;

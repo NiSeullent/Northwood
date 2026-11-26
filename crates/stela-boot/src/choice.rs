@@ -26,10 +26,11 @@ use crate::{
     output,
     selection::{self, Readiness},
     status,
-    ui::{self, Canvas},
+    ui::Canvas,
 };
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
+use stela_boot_core::screen::picker::{Layout, Target};
 use stela_contracts::refuse;
 use stela_loader::mount_interface::{
     CHOSEN_DISK, ChoiceKind, Choices, Opening,
@@ -37,10 +38,14 @@ use stela_loader::mount_interface::{
     opening, with_disk,
 };
 use uefi::{
+    Event,
     boot::{self, EventType, TimerTrigger, Tpl},
     fs::FileSystem,
     proto::console::text::{Key, ScanCode},
 };
+
+mod appearance;
+mod pointer;
 
 const TICK: Duration = Duration::from_secs(1);
 /// How long a key may still come to open the menu when the first entry
@@ -74,41 +79,64 @@ pub(crate) enum Wait {
 
 /// The next key, waiting up to `timeout` (forever with `None`).
 pub(crate) fn key(timeout: Option<Duration>) -> Wait {
-    let Ok(keys) = uefi::system::with_stdin(|input| input.wait_for_key_event()) else {
+    let Some(keys) = keyboard_event() else {
         return Wait::NoInput;
     };
-    let timer = match timeout {
-        Some(duration) => {
-            // SAFETY: a plain timer event without a notification function.
-            let Ok(timer) =
-                (unsafe { boot::create_event(EventType::TIMER, Tpl::APPLICATION, None, None) })
-            else {
-                return Wait::NoInput;
-            };
-            if boot::set_timer(&timer, TimerTrigger::Relative(duration)).is_err() {
-                let _ = boot::close_event(timer);
-                return Wait::NoInput;
-            }
-            Some(timer)
-        }
-        None => None,
-    };
-    let mut events = Vec::from([keys]);
-    // SAFETY: the copy is only waited on and closed once, below.
-    events.extend(timer.as_ref().map(|t| unsafe { t.unsafe_clone() }));
-    let signaled = boot::wait_for_event(&events).ok();
-    if let Some(timer) = timer {
-        let _ = boot::close_event(timer);
-    }
-    match signaled {
+    match await_event(Vec::from([keys]), timeout) {
         Some(0) => pressed().map_or(Wait::Nothing, Wait::Key),
         Some(_) => Wait::Timeout,
         None => Wait::NoInput,
     }
 }
 
+fn keyboard_event() -> Option<Event> {
+    if !keyboard_available() {
+        return None;
+    }
+    uefi::system::with_stdin(|input| input.wait_for_key_event()).ok()
+}
+
+fn keyboard_available() -> bool {
+    uefi::table::system_table_raw().is_some_and(|system| {
+        // SAFETY: the system table is live for the duration of the picker.
+        !unsafe { system.as_ref() }.stdin.is_null()
+    })
+}
+
+fn await_event(mut events: Vec<Event>, timeout: Option<Duration>) -> Option<usize> {
+    if events.is_empty() {
+        return None;
+    }
+    let timer = match timeout {
+        Some(duration) => {
+            // SAFETY: a plain timer event without a notification function.
+            let Ok(timer) =
+                (unsafe { boot::create_event(EventType::TIMER, Tpl::APPLICATION, None, None) })
+            else {
+                return None;
+            };
+            if boot::set_timer(&timer, TimerTrigger::Relative(duration)).is_err() {
+                let _ = boot::close_event(timer);
+                return None;
+            }
+            Some(timer)
+        }
+        None => None,
+    };
+    // SAFETY: the copy is only waited on and closed once, below.
+    events.extend(timer.as_ref().map(|t| unsafe { t.unsafe_clone() }));
+    let signaled = boot::wait_for_event(&events).ok();
+    if let Some(timer) = timer {
+        let _ = boot::close_event(timer);
+    }
+    signaled
+}
+
 /// A key already waiting, without waiting.
 fn pressed() -> Option<Press> {
+    if !keyboard_available() {
+        return None;
+    }
     Some(
         match uefi::system::with_stdin(|input| input.read_key()).ok()?? {
             Key::Printable(character) => match char::from(character) {
@@ -220,65 +248,6 @@ enum Item {
     /// One of the PC firmware's own boot entries.
     Firmware(Entry),
     Diagnostics,
-}
-
-impl Item {
-    /// Labels and colours for the entry's drive icon.
-    fn appearance(&self) -> (&'static str, u32) {
-        match self {
-            Self::Choice(_, ChoiceKind::Mac) => ("Startup disk", ui::BLUE),
-            Self::Choice(_, ChoiceKind::Setup) => ("Installer", ui::ORANGE),
-            Self::Choice(_, ChoiceKind::Update) => ("Update", ui::BLUE),
-            Self::Choice(_, ChoiceKind::Other) => ("Boot option", ui::DIM),
-            Self::Firmware(_) => ("Firmware", ui::DIM),
-            Self::Diagnostics => ("Hardware report", ui::DIM),
-        }
-    }
-
-    fn draw_icon(&self, canvas: &mut Canvas, middle: usize, top: usize, accent: u32) {
-        let left = middle.saturating_sub(26);
-        canvas.panel(left, top, 52, 34, 7, ui::LINE);
-        canvas.panel(left + 3, top + 3, 46, 22, 5, ui::RAISED);
-        canvas.fill(left + 7, top + 25, 38, 1, ui::DIM);
-        canvas.panel(left + 39, top + 28, 5, 3, 2, accent);
-        if matches!(
-            self,
-            Self::Choice(_, ChoiceKind::Setup | ChoiceKind::Update)
-        ) {
-            canvas.fill(left + 25, top + 6, 2, 13, accent);
-            canvas.fill(left + 21, top + 14, 10, 2, accent);
-            canvas.fill(left + 23, top + 16, 6, 2, accent);
-        }
-    }
-}
-
-fn caption(canvas: &mut Canvas, middle: usize, y: usize, text: &str, width: usize, colour: u32) {
-    let capacity = width / canvas.text_width(" ", 1);
-    if text.len() <= capacity {
-        canvas.text_centred(middle, y, text, 1, colour);
-    } else if capacity > 3 {
-        let last = text.floor_char_boundary(capacity - 3);
-        canvas.text_centred(middle, y, &format!("{}...", &text[..last]), 1, colour);
-    }
-}
-
-fn card_name(canvas: &mut Canvas, middle: usize, y: usize, name: &str, width: usize) {
-    let capacity = width / canvas.text_width(" ", 1);
-    if name.len() > capacity
-        && let Some(space) = name[..name.floor_char_boundary(capacity)].rfind(' ')
-    {
-        caption(canvas, middle, y, &name[..space], width, ui::TEXT);
-        caption(
-            canvas,
-            middle,
-            y + 17,
-            name[space + 1..].trim_start(),
-            width,
-            ui::TEXT,
-        );
-    } else {
-        caption(canvas, middle, y + 8, name, width, ui::TEXT);
-    }
 }
 
 /// The menu.
@@ -419,134 +388,145 @@ impl<'a> Menu<'a> {
         }
     }
 
-    /// The visible startup volumes, the selected name, and startup controls.
-    fn draw(&self, canvas: &mut Canvas) {
-        const CARD_WIDTH: usize = 172;
-        const CARD_HEIGHT: usize = 126;
-        const GAP: usize = 12;
-        let (width, height) = canvas.size();
-        canvas.fill(0, 0, width, height, ui::BACKGROUND);
-        let header = canvas.named_header("Northwood");
-        let available = width.saturating_sub(48);
-        let fits = ((available + GAP) / (CARD_WIDTH + GAP))
-            .clamp(1, 6)
-            .min(self.items.len());
-        let card = available.min(CARD_WIDTH);
-        let strip = fits * card + (fits - 1) * GAP;
-        let left = width.saturating_sub(strip) / 2;
-        let top = ((height.saturating_sub(CARD_HEIGHT)) / 2).max(header + 12);
-        let first = stela_boot_core::screen::window(self.selected, self.items.len(), fits);
-        for index in first..first + fits {
-            let item = &self.items[index];
-            let x = left + (index - first) * (card + GAP);
-            let middle = x + card / 2;
-            if index == self.selected {
-                canvas.panel(x, top, card, CARD_HEIGHT, 12, ui::ORANGE);
-                canvas.panel(
-                    x + 2,
-                    top + 2,
-                    card.saturating_sub(4),
-                    CARD_HEIGHT - 4,
-                    10,
-                    ui::RAISED,
-                );
-            } else {
-                canvas.panel(x, top, card, CARD_HEIGHT, 12, ui::CARD);
+    fn select_key(&mut self, key: Press) -> Option<usize> {
+        self.countdown = None;
+        self.notice = None;
+        let items = self.items.len();
+        match key {
+            Press::Left | Press::Up => self.selected = (self.selected + items - 1) % items,
+            Press::Right | Press::Down => self.selected = (self.selected + 1) % items,
+            Press::Home => self.selected = 0,
+            Press::End => self.selected = items - 1,
+            Press::Enter => return Some(self.selected),
+            Press::Character(key) => {
+                return (0..items).find(|&n| Choices::key(n) == Some(key.to_ascii_lowercase()));
             }
-            let (kind, accent) = item.appearance();
-            item.draw_icon(canvas, middle, top + 20, accent);
-            card_name(
-                canvas,
-                middle,
-                top + 62,
-                self.name(item),
-                card.saturating_sub(16),
-            );
-            caption(
-                canvas,
-                middle,
-                top + 101,
-                kind,
-                card.saturating_sub(16),
-                ui::DIM,
-            );
-            if let Some(key) = Choices::key(index) {
-                let mut utf8 = [0; 4];
-                canvas.text(x + 10, top + 7, key.encode_utf8(&mut utf8), 1, ui::DIM);
-            }
+            _ => {}
         }
-        if first > 0 {
-            canvas.text(left.saturating_sub(18), top + 48, "<", 1, ui::DIM);
-        }
-        if first + fits < self.items.len() {
-            canvas.text(left + strip + 10, top + 48, ">", 1, ui::DIM);
-        }
-        let label = self.name(&self.items[self.selected]);
-        caption(
-            canvas,
-            width / 2,
-            top + CARD_HEIGHT + 18,
-            label,
-            available,
-            ui::TEXT,
-        );
+        None
+    }
 
-        let countdown;
-        let (status, colour) = if let Some(notice) = self.notice {
-            (notice, ui::ORANGE)
-        } else if let Some(seconds) = self.countdown {
-            countdown = format!("Starting in {seconds}s");
-            (countdown.as_str(), ui::DIM)
+    fn tick(&mut self) -> Option<usize> {
+        let seconds = self.countdown?;
+        if seconds <= 1 {
+            Some(0)
         } else {
-            ("Left / Right to choose    Enter to start", ui::DIM)
-        };
-        caption(
-            canvas,
-            width / 2,
-            height.saturating_sub(40),
-            status,
-            available,
-            colour,
-        );
+            self.countdown = Some(seconds - 1);
+            None
+        }
     }
 
     /// The chosen item; `None` without console input.
     fn run(&mut self) -> Option<usize> {
         console::release();
-        let (screen, font) = Framebuffer::from_firmware().zip(font::console())?;
+        if self.items.is_empty() {
+            return None;
+        }
+        let Some((screen, font)) = Framebuffer::from_firmware().zip(font::console()) else {
+            return self.run_text();
+        };
         let mut canvas = Canvas::new(screen, font);
+        let Some(mut layout) = Layout::new(canvas.size(), self.items.len(), self.selected) else {
+            return self.run_text();
+        };
+        let (width, height) = screen.resolution();
+        output::arguments(format_args!(
+            "PICKER graphics {width}x{height} entries={}\n",
+            self.items.len()
+        ));
+        let mut input = pointer::InputDevices::open(canvas.size());
+        let mut dirty = true;
+        let mut cursor = None;
         loop {
-            self.draw(&mut canvas);
-            canvas.show();
-            let wait = key(self.countdown.map(|_| TICK));
-            if let Wait::Key(_) = wait {
-                self.countdown = None;
-                self.notice = None;
+            if dirty {
+                layout = Layout::new(canvas.size(), self.items.len(), self.selected)?;
+                self.draw(&mut canvas, layout);
+                canvas.show();
+                if let Some(position) = cursor {
+                    canvas.cursor(position, true);
+                }
+                dirty = false;
             }
-            let items = self.items.len();
-            match wait {
-                Wait::Key(Press::Left | Press::Up) => {
-                    self.selected = (self.selected + items - 1) % items;
+            match input.wait(self.countdown.map(|_| TICK)) {
+                pointer::Input::Key(key) => {
+                    if let Some(chosen) = self.select_key(key) {
+                        return Some(chosen);
+                    }
+                    dirty = true;
                 }
-                Wait::Key(Press::Right | Press::Down) => {
-                    self.selected = (self.selected + 1) % items
-                }
-                Wait::Key(Press::Home) => self.selected = 0,
-                Wait::Key(Press::End) => self.selected = items - 1,
-                Wait::Key(Press::Enter) => return Some(self.selected),
-                Wait::Key(Press::Character(key)) => {
-                    let chosen =
-                        (0..items).find(|&n| Choices::key(n) == Some(key.to_ascii_lowercase()));
-                    if chosen.is_some() {
-                        return chosen;
+                pointer::Input::Pointer { position, clicked } => {
+                    dirty = self.countdown.take().is_some();
+                    if clicked {
+                        dirty |= self.notice.take().is_some();
+                        match layout.hit(position) {
+                            Some(Target::Start) => return Some(self.selected),
+                            Some(Target::Select(index)) => {
+                                self.selected = index;
+                                dirty = true;
+                            }
+                            None => {}
+                        }
+                    }
+                    let previous = cursor.replace(position);
+                    if !dirty && previous != Some(position) {
+                        if let Some(previous) = previous {
+                            canvas.cursor(previous, false);
+                        }
+                        canvas.cursor(position, true);
                     }
                 }
-                Wait::Key(_) | Wait::Nothing => {}
-                Wait::Timeout => match self.countdown {
-                    Some(1) => return Some(0),
-                    Some(seconds) => self.countdown = Some(seconds - 1),
-                    None => {}
-                },
+                pointer::Input::Timeout => {
+                    if let Some(chosen) = self.tick() {
+                        return Some(chosen);
+                    }
+                    dirty = true;
+                }
+                pointer::Input::Idle => {}
+                pointer::Input::Unavailable => return None,
+            }
+        }
+    }
+
+    fn run_text(&mut self) -> Option<usize> {
+        use core::fmt::Write;
+        let system = uefi::table::system_table_raw()?;
+        // SAFETY: the system table is live while this pre-boot menu runs.
+        let system = unsafe { system.as_ref() };
+        if system.stdout.is_null() || system.stdin.is_null() {
+            return None;
+        }
+        loop {
+            uefi::system::with_stdout(|output| {
+                let _ = output.clear();
+                let _ = writeln!(output, "{} startup options\n", crate::ui::NAME);
+                let visible = self.items.len().min(8);
+                let first =
+                    stela_boot_core::screen::window(self.selected, self.items.len(), visible);
+                for index in first..first + visible {
+                    let focus = if index == self.selected { '>' } else { ' ' };
+                    let key = Choices::key(index).unwrap_or(' ');
+                    let name: String = self.name(&self.items[index]).chars().take(56).collect();
+                    let _ = writeln!(output, "{focus} {key}  {name}");
+                }
+                let _ = writeln!(output, "\nArrow keys to select    Enter to start");
+                if let Some(notice) = self.notice {
+                    let _ = writeln!(output, "{notice}");
+                } else if let Some(seconds) = self.countdown {
+                    let _ = writeln!(output, "Starting in {seconds}s");
+                }
+            });
+            match key(self.countdown.map(|_| TICK)) {
+                Wait::Key(key) => {
+                    if let Some(chosen) = self.select_key(key) {
+                        return Some(chosen);
+                    }
+                }
+                Wait::Timeout => {
+                    if let Some(chosen) = self.tick() {
+                        return Some(chosen);
+                    }
+                }
+                Wait::Nothing => {}
                 Wait::NoInput => return None,
             }
         }

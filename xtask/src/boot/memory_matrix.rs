@@ -13,8 +13,7 @@ use std::{
     process::ExitCode,
 };
 
-const LOW_MEMORY_MIB: u32 = 2048;
-const STANDARD_MEMORY_MIB: u32 = 8192;
+const MINIMUM_MEMORY_MIB: u32 = 8192;
 const REFUSAL_EXIT: u8 = (0x11 << 1) | 1;
 
 #[derive(Args)]
@@ -39,7 +38,7 @@ struct QemuExit {
 #[derive(Debug, Serialize)]
 struct Verification {
     outcome: &'static str,
-    usable_mib: u32,
+    usable_mib: Option<u32>,
     profile: Option<&'static str>,
     qemu_returncode: u8,
 }
@@ -61,7 +60,13 @@ pub(super) fn run(arguments: Arguments) -> Result<ExitCode> {
     let image_binding = binding(&image)?;
     let mut rows = Vec::new();
     let mut failures = 0;
-    for memory_mib in [LOW_MEMORY_MIB, 2560, 3072, 4096, STANDARD_MEMORY_MIB] {
+    for memory_mib in [
+        4096,
+        7168,
+        MINIMUM_MEMORY_MIB - 1,
+        MINIMUM_MEMORY_MIB,
+        12288,
+    ] {
         for host_cores in [2, 4] {
             let directory = format!("{memory_mib}m-{host_cores}c");
             let output = arguments.output.join(&directory);
@@ -74,14 +79,16 @@ pub(super) fn run(arguments: Arguments) -> Result<ExitCode> {
             });
             match result {
                 Ok(verification) => {
-                    println!(
-                        "{memory_mib} MiB, {host_cores} vCPUs: {} ({} MiB usable{})",
-                        verification.outcome,
-                        verification.usable_mib,
-                        verification
-                            .profile
-                            .map_or("".to_owned(), |p| format!(", {p}")),
+                    print!(
+                        "{memory_mib} MiB, {host_cores} vCPUs: {}",
+                        verification.outcome
                     );
+                    if let (Some(usable), Some(profile)) =
+                        (verification.usable_mib, verification.profile)
+                    {
+                        print!(" ({usable} MiB usable, {profile})");
+                    }
+                    println!();
                     row["verification"] = json!(verification);
                 }
                 Err(error) => {
@@ -146,6 +153,32 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 fn verify(memory_mib: u32, host_cores: u8, exit: QemuExit, serial: &str) -> Result<Verification> {
     ensure!(!exit.timed_out, "QEMU timed out");
+    let qemu_returncode = exit.qemu_returncode;
+    let fatal = serial.lines().find(|line| line.starts_with("STELA FATAL "));
+    let sufficient = memory_mib >= MINIMUM_MEMORY_MIB;
+    let admission = if sufficient { "PASS" } else { "FAIL" };
+    let prefix = format!("CHECK installed-memory {admission} ");
+    ensure!(
+        serial.lines().any(|line| {
+            line.starts_with(&prefix) && field(line, "minimum") == Some("0x200000000")
+        }),
+        "{memory_mib} MiB installed, expected the RAM check to report {admission}; exit={qemu_returncode}, fatal={fatal:?}",
+    );
+    if !sufficient {
+        ensure!(
+            fatal.is_some()
+                && qemu_returncode == REFUSAL_EXIT
+                && serial.contains("STELA STOPPED code=0x11;")
+                && !serial.contains(KERNEL_BANNER),
+            "{memory_mib} MiB installed, expected an early RAM refusal; exit={qemu_returncode}, fatal={fatal:?}",
+        );
+        return Ok(Verification {
+            outcome: "refused as expected",
+            usable_mib: None,
+            profile: None,
+            qemu_returncode,
+        });
+    }
     let memory = serial
         .lines()
         .filter_map(|line| line.strip_prefix("HOST MEMORY "));
@@ -162,46 +195,9 @@ fn verify(memory_mib: u32, host_cores: u8, exit: QemuExit, serial: &str) -> Resu
         "reported {usable_mib} MiB usable in a {memory_mib} MiB VM"
     );
     let profile = memory.filter_map(|line| field(line, "profile")).last();
-    let fatal = serial.lines().find(|line| line.starts_with("STELA FATAL "));
-    let qemu_returncode = exit.qemu_returncode;
-    if usable_mib < LOW_MEMORY_MIB {
-        ensure!(
-            memory_mib == LOW_MEMORY_MIB,
-            "only {usable_mib} MiB of RAM usable"
-        );
-        let refusal = format!(
-            "STELA FATAL this PC has {}.{} GB of RAM free; Stela needs at least 2 GB free to start the guest",
-            usable_mib / 1024,
-            usable_mib % 1024 * 10 / 1024,
-        );
-        ensure!(
-            fatal == Some(refusal.as_str())
-                && qemu_returncode == REFUSAL_EXIT
-                && profile.is_none()
-                && serial.contains("STELA STOPPED code=0x11;")
-                && !serial.contains(KERNEL_BANNER),
-            "{usable_mib} MiB usable, expected a pre-guest RAM refusal; exit={qemu_returncode}, fatal={fatal:?}",
-        );
-        return Ok(Verification {
-            outcome: "refused as expected",
-            usable_mib,
-            profile: None,
-            qemu_returncode,
-        });
-    }
-    let profile = match profile {
-        Some("standard") => "standard",
-        Some("compact") => "compact",
-        Some("paged") => "paged",
-        _ => anyhow::bail!("no recognized memory profile at {usable_mib} MiB; fatal={fatal:?}"),
-    };
     ensure!(
-        memory_mib != STANDARD_MEMORY_MIB || profile == "standard",
-        "8 GiB VM selected {profile}, expected standard"
-    );
-    ensure!(
-        usable_mib > 3072 || profile == "paged",
-        "{usable_mib} MiB usable selected {profile}, expected paged"
+        profile == Some("standard"),
+        "{usable_mib} MiB usable selected {profile:?}, expected standard; fatal={fatal:?}",
     );
     ensure!(
         qemu_returncode == IDLE_EXIT && fatal.is_none() && !serial.contains("STELA PANIC "),
@@ -219,8 +215,8 @@ fn verify(memory_mib: u32, host_cores: u8, exit: QemuExit, serial: &str) -> Resu
     verify_kernel(serial).map_err(anyhow::Error::msg)?;
     Ok(Verification {
         outcome: "fixture passed",
-        usable_mib,
-        profile: Some(profile),
+        usable_mib: Some(usable_mib),
+        profile: Some("standard"),
         qemu_returncode,
     })
 }
@@ -243,51 +239,44 @@ mod tests {
     }
 
     #[test]
-    fn refusal_requires_the_measured_floor_and_the_specific_fatal() {
+    fn refusal_requires_the_installed_memory_marker_and_fatal_exit() {
         let log = concat!(
-            "HOST MEMORY free=1920M before_reclaim=1800M cores=1\n",
-            "STELA FATAL this PC has 1.8 GB of RAM free; Stela needs at least 2 GB free to start the guest\n",
+            "CHECK installed-memory FAIL installed=0x1fff00000 minimum=0x200000000\n",
+            "STELA FATAL at least 8 GiB of installed RAM is required\n",
             "STELA STOPPED code=0x11; power off to continue\n",
         );
-        assert!(verify_two_cores(2048, exit(REFUSAL_EXIT), log).is_ok());
-        assert!(verify_two_cores(2048, exit(FAILED_EXIT), log).is_err());
-        assert!(verify_two_cores(2560, exit(REFUSAL_EXIT), log).is_err());
-        assert!(
-            verify_two_cores(2048, exit(REFUSAL_EXIT), &log.replace("1920M", "2048M")).is_err()
-        );
+        assert!(verify_two_cores(8191, exit(REFUSAL_EXIT), log).is_ok());
+        assert!(verify_two_cores(8191, exit(FAILED_EXIT), log).is_err());
+        assert!(verify_two_cores(8192, exit(REFUSAL_EXIT), log).is_err());
         assert!(
             verify_two_cores(
-                2048,
+                8191,
                 exit(REFUSAL_EXIT),
-                &log.replace("RAM free", "disk free")
+                &log.replace("0x200000000", "0x80000000")
             )
             .is_err()
+        );
+        assert!(
+            verify_two_cores(8191, exit(REFUSAL_EXIT), &format!("{log}{KERNEL_BANNER}\n")).is_err()
         );
     }
 
     #[test]
     fn admission_needs_the_full_kernel_and_the_standard_control() {
         let mut log = format!(
-            "HOST MEMORY free=2048M cores=1\nHOST MEMORY free=2048M profile=paged\n\
+            "CHECK installed-memory PASS installed=0x200000000 minimum=0x200000000\n\
+             HOST MEMORY free=8060M cores=1\nHOST MEMORY free=8060M profile=standard\n\
              NATIVE INVENTORY firmware_processors=2 physical_cores=2 requested=1\n\
              {KERNEL_BANNER}\nSTOP idle\n"
         );
-        assert!(verify_two_cores(2048, exit(IDLE_EXIT), &log).is_err());
+        assert!(verify_two_cores(8192, exit(IDLE_EXIT), &log).is_err());
         for (index, expected) in KERNEL_RESULTS {
             writeln!(log, "X{index}: {:#x}", expected.unwrap_or(1)).unwrap();
         }
-        assert!(verify_two_cores(2048, exit(IDLE_EXIT), &log).is_ok());
-        assert!(verify(2048, 4, exit(IDLE_EXIT), &log).is_err());
-        assert!(verify_two_cores(2048, exit(IDLE_EXIT), &log.replace("paged", "compact")).is_err());
-        let standard = log.replace("2048M", "8060M");
-        assert!(verify_two_cores(8192, exit(IDLE_EXIT), &standard).is_err());
+        assert!(verify_two_cores(8192, exit(IDLE_EXIT), &log).is_ok());
+        assert!(verify(8192, 4, exit(IDLE_EXIT), &log).is_err());
         assert!(
-            verify_two_cores(
-                8192,
-                exit(IDLE_EXIT),
-                &standard.replace("paged", "standard")
-            )
-            .is_ok()
+            verify_two_cores(8192, exit(IDLE_EXIT), &log.replace("standard", "compact")).is_err()
         );
     }
 }

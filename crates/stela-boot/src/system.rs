@@ -135,8 +135,8 @@ fn memory_map(stage: Option<&str>) -> Result<memory_map::Map> {
     Ok(memory_map::summarize(&map, stage))
 }
 
-pub(crate) fn report_initial_map(map: &impl MemoryMap) {
-    memory_map::summarize(map, Some("entry"));
+pub(crate) fn report_initial_map(map: &impl MemoryMap) -> u64 {
+    memory_map::summarize(map, Some("entry")).ledger.installed
 }
 
 /// Host-check measures the live map before loading any guest bundle. The
@@ -148,7 +148,7 @@ pub(crate) fn diagnostic_memory() -> Result<(Option<stela_boot_core::host_memory
     let map = memory_map(Some("diagnostic"))?.ledger;
     let profile = host_memory::sizes(map.usable, 1, 1);
     let detail = format!(
-        "usable={} MiB, minimum={} MiB, one-worker estimate={}",
+        "usable={} MiB, minimum usable={} MiB, one-worker estimate={}",
         map.usable >> 20,
         host_memory::MIN_PHYSICAL >> 20,
         profile
@@ -937,9 +937,9 @@ fn load(
     // and no native driver has started.
     unsafe { usb_legacy.take(tsc_hz) };
     crate::status::progress("Checking firmware DMA remapping");
+    let dmar_flags = remapping.dmar_flags();
     // SAFETY: the firmware's identity map is still loaded, the APs idle in
     // firmware code, and no Stela driver or memory reuse has started.
-    let dmar_flags = remapping.dmar_flags();
     let inactive_firmware_units =
         unsafe { crate::native_dma::release_firmware_units(remapping, tsc_hz) };
     let native_mmio_capture = match native_mmio {

@@ -560,26 +560,25 @@ mod half {
     }
 
     /// One lane of `left` * `right` + `addend`, each sign changed first as the
-    /// form says and the exact sum rounded once. Infinity times zero is
-    /// invalid even with a NaN addend; otherwise the result of NaN operands is
-    /// the first NaN of `left`, `right` and `addend`, quiet with its sign
-    /// unchanged.
+    /// form says and the exact sum rounded once. NaN operands propagate the
+    /// first NaN of `left`, `right` and `addend`, quiet with its sign unchanged.
+    /// An infinity times zero signals invalid in the absence of NaNs, as in
+    /// the Intel SDM's FMA numeric behavior table.
     pub(super) fn fused(
         [left, addend, right]: [u16; 3],
         [negate_product, negate_addend]: [bool; 2],
         rounding: u32,
     ) -> (u16, u32) {
-        let invalid = (INDEFINITE, INVALID);
-        let (x, y) = (value(left), value(right));
-        if !nan(left) && !nan(right) && (x == 0.0 && y.is_infinite() || x.is_infinite() && y == 0.0)
-        {
-            return invalid;
-        }
         if let Some(&first) = [left, right, addend].iter().find(|&&bits| nan(bits)) {
             let status = [left, right, addend]
                 .iter()
                 .any(|&bits| nan(bits) && bits & QUIET == 0);
             return (first | QUIET, if status { INVALID } else { 0 });
+        }
+        let invalid = (INDEFINITE, INVALID);
+        let (x, y) = (value(left), value(right));
+        if x == 0.0 && y.is_infinite() || x.is_infinite() && y == 0.0 {
+            return invalid;
         }
         let sign = |negative: bool| if negative { SIGN } else { 0 };
         let product_sign = (left ^ right) & SIGN ^ sign(negate_product);
@@ -1705,6 +1704,13 @@ mod tests {
         assert_eq!(from_double(1e300, 3), (0x7bff, OVERFLOW | INEXACT));
         // Infinity times zero is invalid, as is infinities of opposite sign.
         assert_eq!(fused([0, 0, 0x7c00], [false, false], 0), (0xfe00, INVALID));
+        // A NaN addend takes precedence and retains its payload. Only a
+        // signaling NaN makes this case invalid.
+        assert_eq!(fused([0, 0x7ff6, 0x7c00], [false, false], 0), (0x7ff6, 0));
+        assert_eq!(
+            fused([0x7c00, 0x7df6, 0], [false, false], 0),
+            (0x7ff6, INVALID)
+        );
         assert_eq!(
             fused([0x7c00, 0x7c00, 0x3c00], [false, true], 0),
             (0xfe00, INVALID)

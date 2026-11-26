@@ -38,7 +38,7 @@ env:
 
     Requirements:
 
-    - An x86-64-v2 CPU (about 2011 or newer), UEFI with Secure Boot off, 4 GB of RAM (8 GB or more recommended; under about 7 GB free, macOS gets 2 GB and runs slower).
+    - An x86-64-v2 CPU (about 2011 or newer), UEFI with Secure Boot off, and 8 GiB of installed RAM or more.
     - An NVIDIA GTX 16 or RTX 20 series GPU or newer.
     - A USB stick of 8 GB or more for a network installer, or 32 GB or more for a full installer.
     - An empty GPT partition of at least 60 GB.
@@ -461,8 +461,9 @@ jobs:
                 echo "- Boot now handles the firmware watchdog, legacy xHCI ownership and ExitBootServices retries."
                 echo "- Intel host startup honors the DMAR x2APIC opt-out, recovers duplicate firmware CPU coordinates and keeps secondary CPUs available to firmware."
                 echo "- USB setup supports an offline kit with previously prepared restore inputs. See the [USB setup instructions](https://github.com/NiSeullent/Northwood/blob/v1.0.0b2/README.md#install)."
-                echo "- Includes input, storage, Ethernet, Wi-Fi DMA and display fixes, focused JIT optimizations and the Nw mark."
-                echo "- Firmware and synthetic guest boot are tested in QEMU at 1 core, at 32 cores with 64 threads, and with 4 GiB of RAM. Physical Xeon and full macOS installation still require hardware verification."
+                echo "- Includes input, storage, Ethernet, Wi-Fi DMA and display fixes, focused JIT optimizations, and an Nw startup picker with keyboard and firmware pointer support."
+                echo "- Metal acceleration uses the supported Nouveau/NVK path. See the [legacy GPU notes](https://github.com/NiSeullent/Northwood/blob/v1.0.0b2/hardware/legacy-gpus.md) for AMD GCN 2, NVIDIA Kepler, and Intel Ivy Bridge."
+                echo "- Firmware and synthetic guest boot are tested in QEMU with single- and dual-socket CPU layouts, including 32 cores and 64 threads. The loader refuses hosts below 8 GiB of installed RAM. Physical Xeon and full macOS installation still require hardware verification."
                 echo
                 echo "[Stela and Stambha issue triage](https://github.com/NiSeullent/Northwood/blob/v1.0.0b2/hardware/stela-fork-triage.md)"
               fi

@@ -330,6 +330,24 @@ fn xeon_smt_is_recovered_from_sparse_apic_ids_when_firmware_locations_collide() 
     assert!(order[32..].contains(&30));
     assert_eq!(source[32].apic_id, 0x100);
     assert_eq!(source[32].location.package, 2);
+    assert_eq!(order[..32].iter().filter(|&&index| index < 32).count(), 16);
+    assert!(packages_match_apic_ids(&source, 7));
+    let retired: Vec<_> = enabled_unselected(&source, &[order[0] as u32])
+        .unwrap()
+        .collect();
+    assert_eq!(retired.len(), 63);
+    assert_eq!(retired.iter().filter(|&&index| index >= 32).count(), 32);
+
+    // Some firmware numbers cores globally but labels both packages as zero,
+    // so its full coordinates pass uniqueness checks despite merging sockets.
+    for processor in &mut source[32..] {
+        processor.location.package = 0;
+        processor.location.core += 16;
+    }
+    assert_eq!(select(&source).unwrap().len(), 64);
+    assert!(!packages_match_apic_ids(&source, 7));
+    place_by_apic_id(&mut source, 1, 7).unwrap();
+    assert_eq!(select(&source), Ok(order));
 
     source[63].apic_id = source[62].apic_id;
     place_by_apic_id(&mut source, 1, 7).unwrap();

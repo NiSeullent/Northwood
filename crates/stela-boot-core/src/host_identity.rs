@@ -10,7 +10,7 @@ pub struct Identity<'a> {
     pub cpu: &'a str,
     /// CPUID leaf 1's EAX: family, model and stepping.
     pub signature: u32,
-    /// Every byte the firmware's memory map describes as RAM.
+    /// RAM reported by the firmware, including installed memory when known.
     pub ram_bytes: u64,
     pub firmware_vendor: &'a str,
     pub firmware_revision: u32,

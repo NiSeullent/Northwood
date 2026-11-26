@@ -533,7 +533,7 @@ fn observe_lpss_i2c(
     let (master, host) = match boot::protocols_per_handle(handle) {
         Ok(guids) => {
             let presence = |protocol: &uefi::Guid| {
-                if guids.iter().any(|&guid| guid == protocol) {
+                if guids.contains(&protocol) {
                     "present"
                 } else {
                     "absent"

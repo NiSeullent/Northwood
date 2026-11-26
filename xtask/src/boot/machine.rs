@@ -111,12 +111,7 @@ pub(super) fn command(arguments: &Run, options: MachineOptions<'_>) -> Process {
             &cpu,
             "-smp",
         ])
-        .arg(format!(
-            "cpus={},sockets=1,cores={},threads={}",
-            u32::from(arguments.host_cores) * u32::from(arguments.host_threads),
-            arguments.host_cores,
-            arguments.host_threads
-        ))
+        .arg(smp(arguments))
         .args(
             arguments
                 .icount
@@ -152,6 +147,14 @@ pub(super) fn command(arguments: &Run, options: MachineOptions<'_>) -> Process {
         None => &mut command,
     };
     command
+}
+
+pub(super) fn smp(arguments: &Run) -> String {
+    let sockets = u32::from(arguments.host_sockets);
+    let cores = u32::from(arguments.host_cores);
+    let threads = u32::from(arguments.host_threads);
+    let cpus = sockets * cores * threads;
+    format!("cpus={cpus},sockets={sockets},cores={cores},threads={threads}")
 }
 
 /// How the mount stops QEMU: the debug-exit port, or QMP for an audio check.

@@ -1,7 +1,5 @@
-//! Stela's look on the firmware framebuffer, shared by the startup menu,
-//! the disk picker and the boot console: dark gray pages under the logo and
-//! name, centred at the top, with orange for what is chosen and blue for
-//! what is new or done.
+//! Northwood's firmware palette and drawing primitives, shared by the
+//! startup picker, disk picker and boot console.
 //!
 //! Pages are laid out in units of [`scale`] screen pixels, so they keep
 //! their proportions on any display, and drawn in memory before they are
@@ -9,20 +7,20 @@
 use crate::console::{Framebuffer, font::Font};
 use alloc::{vec, vec::Vec};
 
-pub const BACKGROUND: u32 = 0x18191c;
-pub const CARD: u32 = 0x222428;
-pub const RAISED: u32 = 0x2c2e34;
-pub const LINE: u32 = 0x3a3c43;
-pub const TEXT: u32 = 0xe6e7ea;
-pub const DIM: u32 = 0x8b8e96;
-pub const ORANGE: u32 = 0xf0883a;
-pub const BLUE: u32 = 0x3f86e8;
-pub const RED: u32 = 0xe4574d;
+pub const BACKGROUND: u32 = 0x10131a;
+pub const CARD: u32 = 0x1b202b;
+pub const RAISED: u32 = 0x252e40;
+pub const LINE: u32 = 0x3c485e;
+pub const TEXT: u32 = 0xf0f4fa;
+pub const DIM: u32 = 0xaebacc;
+pub const ORANGE: u32 = 0xf4ad70;
+pub const BLUE: u32 = 0x9cbcff;
+pub const RED: u32 = 0xf77f76;
 
 /// Page units the header takes at the top.
 pub const HEADER: usize = 88;
 const LOGO: usize = 32;
-const NAME: &str = "Stela";
+pub(crate) const NAME: &str = "Northwood";
 pub use stela_boot_core::screen::scale;
 
 /// A page drawn in memory and shown at once.
@@ -33,7 +31,7 @@ pub struct Canvas {
     height: usize,
     scale: usize,
     /// Pixels with blue in the low byte, row by row.
-    pixels: Vec<u32>,
+    pixels: Vec<[u8; 4]>,
 }
 
 impl Canvas {
@@ -58,7 +56,7 @@ impl Canvas {
             width,
             height,
             scale: scale(rows),
-            pixels: vec![BACKGROUND; width * height],
+            pixels: vec![BACKGROUND.to_le_bytes(); width * height],
         }
     }
 
@@ -71,7 +69,8 @@ impl Canvas {
         let right = (x + width).min(self.width);
         for row in y..(y + height).min(self.height) {
             if x < right {
-                self.pixels[row * self.width + x..row * self.width + right].fill(colour);
+                self.pixels[row * self.width + x..row * self.width + right]
+                    .fill(colour.to_le_bytes());
             }
         }
     }
@@ -113,14 +112,19 @@ impl Canvas {
     }
 
     pub fn text_width(&self, text: &str, size: usize) -> usize {
-        text.len() * self.font.width * size
+        text.chars().count() * self.font.width * size
     }
 
     /// `text` from (`x`, `y`) at `size` times the font.
     pub fn text(&mut self, x: usize, y: usize, text: &str, size: usize, colour: u32) {
         let s = self.scale * size;
         let (glyph_width, glyph_height) = (self.font.width, self.font.height);
-        for (index, character) in text.bytes().enumerate() {
+        for (index, character) in text.chars().enumerate() {
+            let character = if character.is_ascii_graphic() || character == ' ' {
+                character as u8
+            } else {
+                b'?'
+            };
             let left = (x + index * glyph_width * size) * self.scale;
             for gy in 0..glyph_height {
                 for gx in 0..glyph_width {
@@ -144,33 +148,11 @@ impl Canvas {
         self.text(middle.saturating_sub(width / 2), y, text, size, colour);
     }
 
-    /// The logo, `size` units square from (`x`, `y`), smoothed by sampling
-    /// each pixel four by four.
-    fn logo(&mut self, x: usize, y: usize, size: usize) {
-        const SAMPLES: usize = 4;
-        let side = size * self.scale;
-        let (x, y) = (x * self.scale, y * self.scale);
-        for py in 0..side {
-            for px in 0..side {
-                let mut sum = [0u32; 3];
-                for sy in 0..SAMPLES {
-                    for sx in 0..SAMPLES {
-                        let u = (px * SAMPLES + sx) as f32 / (side * SAMPLES) as f32;
-                        let v = (py * SAMPLES + sy) as f32 / (side * SAMPLES) as f32;
-                        let colour =
-                            stela_boot_core::screen::logo_pixel(u, v).unwrap_or(BACKGROUND);
-                        for (channel, total) in sum.iter_mut().enumerate() {
-                            *total += (colour >> (16 - 8 * channel)) & 0xff;
-                        }
-                    }
-                }
-                let n = (SAMPLES * SAMPLES) as u32;
-                let colour = sum
-                    .iter()
-                    .fold(0, |pixel, total| (pixel << 8) | ((total + n / 2) / n));
-                self.device_fill(x + px, y + py, 1, 1, colour);
-            }
-        }
+    /// Northwood's monogram from firmware-safe drawing primitives.
+    fn logo(&mut self, x: usize, y: usize) {
+        self.panel(x, y, LOGO, LOGO, 8, BLUE);
+        self.panel(x + 1, y + 1, LOGO - 2, LOGO - 2, 7, RAISED);
+        self.text_centred(x + LOGO / 2, y + 8, "Nw", 1, TEXT);
     }
 
     /// The first and last glyph rows any character of `text` sets.
@@ -198,7 +180,7 @@ impl Canvas {
         let name = self.text_width(title, 2);
         let left = width.saturating_sub(LOGO + gap + name) / 2;
         let top = 28;
-        self.logo(left, top, LOGO);
+        self.logo(left, top);
         // Centre the name's ink, not its glyph cells, on the logo.
         let (first, last) = self.ink_rows(title);
         self.text(
@@ -212,17 +194,54 @@ impl Canvas {
     }
 
     pub fn show(&self) {
-        let mut row = vec![0u8; self.width * 4];
-        for y in 0..self.height {
-            for (out, pixel) in row
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(&self.pixels[y * self.width..(y + 1) * self.width])
-            {
-                *out = pixel.to_le_bytes();
+        for (y, row) in self.pixels.chunks_exact(self.width).enumerate() {
+            self.screen.show_row(y, row.as_flattened());
+        }
+    }
+
+    /// Draw or erase the cursor by blitting only its affected rectangle.
+    /// The page buffer remains the original artwork underneath the cursor.
+    pub(crate) fn cursor(&self, (x, y): (usize, usize), visible: bool) {
+        const WIDTH: usize = 11;
+        const CURSOR: [&[u8; WIDTH]; 15] = [
+            b"#          ",
+            b"##         ",
+            b"#o#        ",
+            b"#oo#       ",
+            b"#ooo#      ",
+            b"#oooo#     ",
+            b"#ooooo#    ",
+            b"#oooooo#   ",
+            b"#ooooooo#  ",
+            b"#oooo##### ",
+            b"#oo#o#     ",
+            b"#o##oo#    ",
+            b"##  #o#    ",
+            b"#    #o#   ",
+            b"      ##   ",
+        ];
+        let scale = self.scale;
+        let (x, y) = (x * scale, y * scale);
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let columns = (WIDTH * scale).min(self.width - x);
+        let rows = (CURSOR.len() * scale).min(self.height - y);
+        let mut pixels = [[0u8; 4]; WIDTH * 4];
+        for line in 0..rows {
+            let offset = (y + line) * self.width + x;
+            let row = &mut pixels[..columns];
+            row.copy_from_slice(&self.pixels[offset..offset + columns]);
+            if visible {
+                for (column, pixel) in row.iter_mut().enumerate() {
+                    match CURSOR[line / scale][column / scale] {
+                        b'#' => *pixel = 0x070911u32.to_le_bytes(),
+                        b'o' => *pixel = TEXT.to_le_bytes(),
+                        _ => {}
+                    }
+                }
             }
-            self.screen.show_row(y, &row);
+            self.screen.show_span(x, y + line, row.as_flattened());
         }
     }
 }

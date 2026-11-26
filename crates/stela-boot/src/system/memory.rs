@@ -231,7 +231,7 @@ pub(super) fn reserve(
         Profile::Standard => {}
         Profile::Compact => crate::status::info(&format!(
             "this PC has {} GB of RAM free, less than a full boot takes: macOS gets {} GB and \
-             Stela keeps small caches, so everything runs slower; 8 GB of RAM is recommended",
+             Northwood keeps smaller caches and macOS may run slower",
             gigabytes(free),
             gigabytes(sizes.guest)
         )),

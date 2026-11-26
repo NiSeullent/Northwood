@@ -72,10 +72,10 @@ pub(crate) static ALLOCATOR: heap::Heap = heap::Heap::new().reporting_failures(|
 /// The live firmware keeps its boot-service pages. Budget the first heap from
 /// the conventional pages still available after the pristine image copy.
 /// Before the heap exists, so its refusals are an [`EarlyText`].
-fn initial_heap_bytes() -> Result<usize, EarlyText> {
+fn initial_memory() -> Result<(usize, u64), EarlyText> {
     let map = uefi::boot::memory_map(MemoryType::LOADER_DATA)
         .map_err(|_| EarlyText::from("firmware memory map unavailable for the boot heap"))?;
-    system::report_initial_map(&map);
+    let mapped_ram = system::report_initial_map(&map);
     let free = map
         .entries()
         .filter(|entry| entry.ty == MemoryType::CONVENTIONAL)
@@ -87,7 +87,7 @@ fn initial_heap_bytes() -> Result<usize, EarlyText> {
         })
         .ok_or_else(|| EarlyText::from("firmware memory map overflows the boot heap budget"))?;
     stela_boot_core::memory_budget::bootstrap_heap(free)
-        .map(|bytes| bytes as usize)
+        .map(|bytes| (bytes as usize, mapped_ram))
         .map_err(|error| {
             let mut text = EarlyText::default();
             let _ = core::fmt::Write::write_fmt(&mut text, format_args!("{error}"));
@@ -96,8 +96,8 @@ fn initial_heap_bytes() -> Result<usize, EarlyText> {
 }
 
 /// The boot log's identity line (`stela_boot_core::host_identity`): this
-/// build, the CPU, the RAM the firmware describes and the firmware.
-fn host_identity() -> alloc::string::String {
+/// build, the CPU, installed RAM and the firmware.
+fn host_identity(ram_bytes: u64) -> alloc::string::String {
     use core::arch::x86_64::__cpuid;
     use stela_boot_core::host_identity::{Identity, brand, line};
     let signature = __cpuid(1).eax;
@@ -114,23 +114,6 @@ fn host_identity() -> alloc::string::String {
         }
     }
     let cpu = brand(words);
-    let ram_bytes = uefi::boot::memory_map(MemoryType::LOADER_DATA)
-        .map(|map| {
-            map.entries()
-                .filter(|entry| {
-                    !matches!(
-                        entry.ty,
-                        MemoryType::RESERVED
-                            | MemoryType::MMIO
-                            | MemoryType::MMIO_PORT_SPACE
-                            | MemoryType::UNUSABLE
-                            | MemoryType::PAL_CODE
-                    )
-                })
-                .map(|entry| entry.page_count * paging::PAGE as u64)
-                .sum()
-        })
-        .unwrap_or(0);
     let vendor = alloc::string::String::from(uefi::system::firmware_vendor());
     let (family, model, stepping) = stela_boot_core::host_identity::signature_parts(signature);
     let leaf0 = __cpuid(0);
@@ -238,8 +221,8 @@ fn main() -> Status {
             error.status()
         )),
     }
-    let heap_bytes =
-        initial_heap_bytes().unwrap_or_else(|error| output::early_fatal(error.as_str()));
+    let (heap_bytes, mapped_ram) =
+        initial_memory().unwrap_or_else(|error| output::early_fatal(error.as_str()));
     let heap = uefi::boot::allocate_pages(
         AllocateType::AnyPages,
         MemoryType::LOADER_DATA,
@@ -256,7 +239,21 @@ fn main() -> Status {
     status::set_clock(firmware::tsc_hz());
     firmware::start_ticker();
     let log = log_file::open();
-    output::arguments(format_args!("{}", host_identity()));
+    let (smbios, installed_ram) = host_firmware::capture_identity();
+    let ram = installed_ram.map_or(mapped_ram, |installed| installed.max(mapped_ram));
+    output::arguments(format_args!("{}", host_identity(ram)));
+    let minimum = stela_boot_core::host_memory::MIN_INSTALLED;
+    let admission = if ram < minimum { "FAIL" } else { "PASS" };
+    output::arguments(format_args!(
+        "CHECK installed-memory {admission} installed={ram:#x} minimum={minimum:#x} \
+         mapped={mapped_ram:#x} smbios={installed_ram:?}\n"
+    ));
+    if ram < minimum {
+        output::fatal(format_args!(
+            "Northwood needs at least 8 GiB of installed RAM. The firmware reports {} MiB.",
+            ram >> 20
+        ));
+    }
     if output::hypervisor_exit_port() {
         output::arguments(format_args!(
             "HOST hypervisor present: stop codes also go to its exit port\n"
@@ -269,7 +266,7 @@ fn main() -> Status {
     status::begin("Reading Stela's settings");
     let (mut volume, mut firmware_root) = firmware::volume().unwrap_or_else(|e| output::fatal(e));
     let host_firmware =
-        host_firmware::read(&mut firmware_root).unwrap_or_else(|e| output::fatal(e));
+        host_firmware::read(&mut firmware_root, smbios).unwrap_or_else(|e| output::fatal(e));
     drop(firmware_root);
     let options = firmware::options(&mut volume).unwrap_or_else(|e| output::fatal(e));
     let options = choice::resolve(&mut volume, options);

@@ -626,6 +626,18 @@ pub enum Refusal {
     InvalidAssignment,
 }
 
+/// Firmware package numbers are arbitrary. Compare their grouping with the
+/// package bits in the APIC IDs, without requiring the labels to match.
+pub fn packages_match_apic_ids(processors: &[Processor], shift: u32) -> bool {
+    shift < u32::BITS
+        && processors.iter().enumerate().all(|(index, cpu)| {
+            processors[..index].iter().all(|other| {
+                (cpu.location.package == other.location.package)
+                    == (cpu.apic_id >> shift == other.apic_id >> shift)
+            })
+        })
+}
+
 /// Reconstruct flattened package/core/thread coordinates from full APIC IDs
 /// and the BSP's CPUID topology shifts, when firmware coordinates collide.
 pub fn place_by_apic_id(

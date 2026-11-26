@@ -17,6 +17,7 @@ use uefi::{
     proto::media::file::{Directory, File as _, FileAttribute, FileInfo, FileMode, RegularFile},
 };
 mod smbios;
+pub(crate) use smbios::capture as capture_identity;
 mod wifi;
 use stela_drivers::net::wifi::intel::platform::VARIABLE_DESCRIPTORS;
 
@@ -162,8 +163,10 @@ fn open_manifest(root: &mut Directory) -> Result<Option<(Layout, RegularFile)>> 
 /// Absence alone is optional. Any unreadable/malformed present manifest or
 /// missing/corrupt resource is a boot refusal. Images belong to the same
 /// selected firmware directory and volume as their manifest.
-pub fn read(root: &mut Directory) -> Result<Resources> {
-    let smbios = smbios::capture();
+pub fn read(
+    root: &mut Directory,
+    smbios: stela_boot_core::host_resources::smbios::Capture,
+) -> Result<Resources> {
     let mut wifi =
         [stela_boot_core::host_resources::wifi::Capture::default(); VARIABLE_DESCRIPTORS.len()];
     for (slot, descriptor) in wifi.iter_mut().zip(&VARIABLE_DESCRIPTORS) {

@@ -414,11 +414,11 @@ fn choose_swap(command: &mut Request) -> Result<()> {
     let policy = Swap::default();
     let requested = command.volume_swap_bytes.unwrap_or(policy.bytes);
     let prepare =
-        cliclack::select("Memory and swap · Does the target PC have 4 GiB of RAM or less?")
+        cliclack::select("USB swap · The target PC needs at least 8 GiB of installed RAM")
             .item(
                 false,
                 "Skip USB swap",
-                "For PCs with more than 4 GiB of RAM or unknown RAM",
+                "Leave more USB space for other files",
             )
             .item(
                 true,

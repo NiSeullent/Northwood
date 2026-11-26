@@ -234,10 +234,13 @@ fn qemu_host_inventory_does_not_synthesize_a_native_worker_grant() {
     };
     assert_eq!(run.host_cores, 2);
     assert_eq!(run.host_threads, 1);
+    assert_eq!(machine::smp(&run), "cpus=2,sockets=1,cores=2,threads=1");
     assert!(run.append.is_none());
     let parsed = crate::Cli::try_parse_from(prefix.into_iter().chain([
+        "--host-sockets",
+        "2",
         "--host-cores",
-        "8",
+        "16",
         "--host-threads",
         "2",
     ]))
@@ -245,16 +248,15 @@ fn qemu_host_inventory_does_not_synthesize_a_native_worker_grant() {
     let crate::Task::Boot(Command::Run(run)) = parsed.task else {
         panic!("boot run")
     };
-    assert_eq!((run.host_cores, run.host_threads), (8, 2));
+    assert_eq!(machine::smp(&run), "cpus=64,sockets=2,cores=16,threads=2");
     assert!(run.append.is_none());
     assert!(
         crate::Cli::try_parse_from(prefix.into_iter().chain(["--host-threads", "0",])).is_err()
     );
-    for invalid in ["0", "65", "-1", "two"] {
-        assert!(
-            crate::Cli::try_parse_from(prefix.into_iter().chain(["--host-cores", invalid]))
-                .is_err()
-        );
+    for flag in ["--host-cores", "--host-sockets"] {
+        for invalid in ["0", "65", "-1", "two"] {
+            assert!(crate::Cli::try_parse_from(prefix.into_iter().chain([flag, invalid])).is_err());
+        }
     }
 }
 

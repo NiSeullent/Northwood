@@ -597,6 +597,14 @@ impl System {
         self.preboot.is_some() && self.recovery.is_none() && !self.upgrade
     }
 
+    /// The AGX model never completes rendering work. Hide it when StelaGPU
+    /// supplies Metal or when an installed system or recoveryOS can start
+    /// Metal clients. Recovery can then use its software compositor. Without
+    /// Metal, restore and staged update ramdisks retain the model's startup.
+    pub fn hides_agx(&self, metal_device: bool) -> bool {
+        metal_device || (self.preboot.is_some() && !self.upgrade)
+    }
+
     /// Select the exact number of host processors the loader reserves.
     /// A disk-derived count is rechecked against the live source before SIPI.
     pub fn assigned_native_cores(

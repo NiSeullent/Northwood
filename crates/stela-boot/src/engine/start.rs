@@ -859,19 +859,31 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         ..
     } = storage;
     let mut bare = host_owner.host();
-    #[cfg_attr(not(feature = "nvk"), allow(unused_mut))]
     let mut assigned = assign(boot, &roster, topology_source.as_ref(), &full_profile);
     #[cfg(feature = "nvk")]
     let gpu_gates = assigned
         .as_mut()
-        .map(|assigned| {
-            let gates = gpu::gate::place(&mut assigned.tree);
-            if !gates.is_empty() {
-                hidden_devices.extend(stela_loader::devices::hide_agx(&mut assigned.tree));
-            }
-            gates
-        })
+        .map(|assigned| gpu::gate::place(&mut assigned.tree))
         .unwrap_or_default();
+    #[cfg(feature = "nvk")]
+    let metal_device = !gpu_gates.is_empty();
+    #[cfg(not(feature = "nvk"))]
+    let metal_device = false;
+    if options.hides_agx(metal_device)
+        && let Some(assigned) = &mut assigned
+    {
+        hidden_devices.extend(stela_loader::devices::hide_agx(&mut assigned.tree));
+        if !metal_device {
+            let mode = if options.recovery.is_some() {
+                "recoveryOS"
+            } else if options.single_user {
+                "single-user macOS"
+            } else {
+                "macOS"
+            };
+            output::arguments(format_args!("GPU none: hiding the AGX model for {mode}\n"));
+        }
+    }
     // SAFETY: all raw guest input copies have ended, AP executors are waiting
     // for their guest contexts, and no guest/device DMA producer has entered.
     // The same loader bytes are for every subsequent native CPU and synchronous device writer.

@@ -162,12 +162,14 @@ pub struct Run {
     /// model: QEMU's AMD models lack the required AMD routing-control MSRs.
     #[arg(long)]
     cpu: Option<String>,
-    /// Firmware-visible x86 cores, one thread each. This supplies the host
-    /// inventory; the mount independently selects/checks native workers.
+    /// Firmware-visible processor packages.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
+    host_sockets: u16,
+    /// Firmware-visible x86 cores per socket. The mount independently selects
+    /// native workers from this topology.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
     host_cores: u16,
-    /// Firmware-visible SMT threads per core. Native execution independently
-    /// selects one checked thread per physical core.
+    /// Firmware-visible SMT threads per core.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     host_threads: u16,
     /// Guest machine memory for QEMU; defaults to 1G, 8G for system mode

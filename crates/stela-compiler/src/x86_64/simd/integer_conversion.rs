@@ -4,7 +4,7 @@ use super::numerical::{
     ArithmeticOpcode, Condition, INPUT_MINIMUM_EXPONENT, MXCSR_INEXACT, Rounding, branch,
     clear_scalar, commit_inexact, emit_opcode, environment_round, exponent_range,
     prepare_vector_input_range, read_numerical_vector, reject_other_status, resolve,
-    restore_environment, test_control, vector_exponent_range,
+    restore_environment, test_control, vector_exponent_range, vector_normal_or_zero_range,
 };
 use super::{Host, commit, packed, read_vector, vector_offset};
 use crate::TargetCpu;
@@ -644,7 +644,13 @@ pub(in crate::x86_64) fn from_integer(
 
 fn guard_float_input(code: &mut Code, operand: &IntegerConversion) -> usize {
     let shape = operand.integer.shape();
-    if shape == Shape::Scalar {
+    if operand.format == Format::Half {
+        // AVX512-FP16 converts either sign of zero exactly. Keep mixed zero
+        // lanes inline and let the helper handle subnormals and specials.
+        prepare_vector_input_range(code, Format::Half);
+        vector_normal_or_zero_range(code, Format::Half, shape, RESULT_VECTOR, TEMPORARY_VECTOR);
+        branch(code, Condition::NotZero)
+    } else if shape == Shape::Scalar {
         exponent_range(code, operand.format, RESULT_VECTOR, INPUT_MINIMUM_EXPONENT);
         branch(code, Condition::AboveOrEqual)
     } else {
@@ -1024,6 +1030,74 @@ pub(in crate::x86_64) fn javascript(
     asm.alu_imm8(Alu::Xor, Size::Dword, Rcx, INEXACT as i8);
     asm.shift_imm(ShiftOp::Shl, Size::Dword, Rcx, shift);
     flag_word::store(&mut asm, Rcx);
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux")
+))]
+#[test]
+fn native_half_conversion_guard_admits_zero_and_checks_only_active_lanes() {
+    use crate::{GuestState, x86_64::native::run};
+
+    let source = 4;
+    for (shape, lanes) in [
+        (Shape::Scalar, 1),
+        (Shape::Vector64, 4),
+        (Shape::Vector128, 8),
+    ] {
+        let operand = IntegerConversion {
+            integer: IntegerOperand::Simd {
+                register: 3,
+                format: IntegerFormat {
+                    width: IntegerWidth::Bits16,
+                    signed: true,
+                },
+                shape,
+            },
+            float: source,
+            format: Format::Half,
+            frac_bits: 0,
+        };
+        // The guard uses SSE2, so an AMD host can verify this part of the
+        // AVX512-FP16 conversion path even without the FP16 conversion itself.
+        let mut code = Code::new();
+        read_numerical_vector(&mut code, shape, source, RESULT_VECTOR);
+        let failure = guard_float_input(&mut code, &operand);
+        code.asm().mov_imm32(Rax, 1);
+        code.asm().ret();
+        let rejected = code.len();
+        resolve(&mut code, failure, rejected);
+        code.asm().mov_imm32(Rax, 0);
+
+        for (lane, input, expected) in [
+            (0, 0, 1),
+            (0, 0x8000, 1),
+            (0, 0x0001, 0),
+            (0, 0x8001, 0),
+            (0, 0x7c00, 0),
+            (0, 0x7e01, 0),
+            (7, 0x7c00, u64::from(lanes < 8)),
+        ] {
+            let mut input_lanes = [0x0400u16, 0x8000, 0, 0x3c00, 0x4a1f, 0, 0x06b6, 0];
+            input_lanes[lane] = input;
+            let mut state = GuestState::default();
+            for (slot, lanes) in state.v[usize::from(source)]
+                .iter_mut()
+                .zip(input_lanes.chunks_exact(4))
+            {
+                *slot = lanes.iter().enumerate().fold(0, |limb, (index, &value)| {
+                    limb | u64::from(value) << (16 * index)
+                });
+            }
+            assert_eq!(
+                run(&code, &mut state),
+                expected,
+                "{shape:?} {input_lanes:x?}"
+            );
+        }
+    }
 }
 
 #[cfg(all(

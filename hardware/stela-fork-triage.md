@@ -46,12 +46,14 @@ The counts describe the accessible snapshot. [Stela forks](https://github.com/ty
   report an i915 probe failure, a WindowServer watchdog, and a translated
   worker page fault respectively. These configurations need fresh
   Northwood boot logs. [Stambha #8](https://github.com/garvitsurana271/stambha/issues/8) · [Stambha #7](https://github.com/garvitsurana271/stambha/issues/7) · [Stambha #6](https://github.com/garvitsurana271/stambha/issues/6)
-- The AMD/RADV and Intel graphics efforts in Stambha and Stela-Mods
-  depend on different pinned Linux and Mesa sources, build glue, and
-  hardware qualification. Those drivers remain open compatibility work.
-  [Stambha graphics PRs](https://github.com/garvitsurana271/stambha/pulls) · [Stela-Mods graphics branches](https://github.com/reece-builds/Stela-Mods/branches)
 - The published 32-core/64-thread Xeon x2APIC hang in Memtest86+ comes from
   a separate program. It documents a useful comparison topology. Northwood
   verification on a physical Xeon still needs the specific model and
   firmware, the saved boot log, and boots with SMT enabled and disabled.
   [Memtest86+ #605](https://github.com/memtest86plus/memtest86plus/issues/605)
+
+## Graphics support by generation
+
+The [legacy GPU compatibility matrix](legacy-gpus.md) lists the requirements
+for AMD GCN 2, NVIDIA Kepler and Intel Ivy Bridge and records the coverage of
+the available drivers.

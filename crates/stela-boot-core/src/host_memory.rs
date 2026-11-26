@@ -4,8 +4,8 @@
 //!
 //! The standard profile gives the heap its measured
 //! desktop floor ([`HEAP_FLOOR`]) and the guest at least [`GUEST_FLOOR`]; a
-//! PC of about 7 GiB free and up boots with it. The compact one is for
-//! smaller PCs, a 4 GB one above all: the guest gets at least
+//! supported PC with about 7 GiB free and up normally uses it. Compact
+//! handles tighter usable memory maps: the guest gets at least
 //! [`GUEST_COMPACT_FLOOR`], the heap at least [`HEAP_COMPACT_FLOOR`] beside
 //! its block records, and what is left is split evenly between them. A
 //! compact boot runs slower: its code window and shadow pools are small, it
@@ -104,6 +104,9 @@ pub const HEAP_COMPACT_FLOOR: u64 = 1024 * MIB;
 /// halves, which a 26A434 restore's userland filled 20 to 80 times a beat
 /// and ran with.
 const POOL_COMPACT_RUNNER_FLOOR: u64 = 16 * MIB;
+/// Northwood's minimum installed host memory. Usable RAM may be lower
+/// because the firmware, devices and the loader reserve a portion of it.
+pub const MIN_INSTALLED: u64 = 8 * GIB;
 /// The least usable host RAM at which a low-memory reservation is attempted.
 pub const MIN_PHYSICAL: u64 = 2 * GIB;
 /// The paged profile's provisional engine heap floor beside the code-window

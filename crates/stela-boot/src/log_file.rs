@@ -94,16 +94,9 @@ pub(crate) fn save_loader_log() -> Option<VolumeLog> {
     if !VOLUME_LOG_ENABLED.load(Ordering::Relaxed) {
         return None;
     }
-    let Some(device) = shared::<LoadedImage>(boot::image_handle()).and_then(|image| image.device())
-    else {
-        return None;
-    };
-    let Some(path) = shared::<DevicePath>(device) else {
-        return None;
-    };
-    let Some(boot_disk) = partition_path(&path) else {
-        return None;
-    };
+    let device = shared::<LoadedImage>(boot::image_handle()).and_then(|image| image.device())?;
+    let path = shared::<DevicePath>(device)?;
+    let boot_disk = partition_path(&path)?;
     let Ok(handles) = boot::find_handles::<SimpleFileSystem>() else {
         return None;
     };

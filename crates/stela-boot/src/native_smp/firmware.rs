@@ -382,8 +382,7 @@ extern "efiapi" fn observe_ap(argument: *mut c_void) {
 
 /// Find the SMT and package boundary shifts in the BSP's CPUID topology.
 /// Prefer leaf 1FH, whose final level also separates dies and tiles.
-fn apic_id_shifts() -> Option<(u32, u32)> {
-    let maximum = __cpuid(0).eax;
+fn apic_id_shifts(maximum: u32) -> Option<(u32, u32)> {
     for leaf in [0x1f, 0xb] {
         if leaf > maximum {
             continue;
@@ -501,20 +500,28 @@ pub(crate) fn inventory() -> Result<Inventory, Error> {
     {
         return Err(Error::ProcessorInventory);
     }
+    let vendor = __cpuid(0);
+    let shifts = apic_id_shifts(vendor.eax);
+    // Intel's topology leaves describe the package boundary even when the
+    // firmware calls cores from two sockets one package with global core IDs.
+    let intel = (vendor.ebx, vendor.edx, vendor.ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+    let mismatched_packages = intel
+        && shifts.is_some_and(|(_, shift)| !topology::packages_match_apic_ids(&processors, shift));
     let logical = match topology::select(&processors) {
-        Err(topology::Refusal::DuplicateThreadLocation) => {
-            let (thread, package) = apic_id_shifts()
-                .ok_or(Error::Topology(topology::Refusal::DuplicateThreadLocation))?;
+        Ok(logical) if !mismatched_packages => logical,
+        Ok(_) | Err(topology::Refusal::DuplicateThreadLocation) => {
+            let (thread, package) =
+                shifts.ok_or(Error::Topology(topology::Refusal::DuplicateThreadLocation))?;
             topology::place_by_apic_id(&mut processors, thread, package)
                 .map_err(Error::Topology)?;
             let logical = topology::select(&processors).map_err(Error::Topology)?;
             crate::output::arguments(format_args!(
-                "HOST PROCESSORS firmware coordinates collide; reconstructed from APIC IDs \
+                "HOST PROCESSORS firmware coordinates conflict; reconstructed from APIC IDs \
                  (SMT shift={thread}, package shift={package})\n"
             ));
             logical
         }
-        result => result.map_err(Error::Topology)?,
+        Err(error) => return Err(Error::Topology(error)),
     };
     if mp.who_am_i().map_err(|_| Error::WrongBootstrapProcessor)?
         != processors[logical[0]].processor_number as usize

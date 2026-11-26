@@ -31,11 +31,13 @@ and Apple7 GPU families.
 
 ## Requirements
 
-- An x86-64-v2 CPU (about 2011 or newer), UEFI with Secure Boot off, 4 GB of
-  RAM. 8 GB or more is recommended: with less than about 7 GB free, Stela
-  boots in a compact profile that gives macOS 2 GB or a little more and runs
-  slower.
-- An NVIDIA GTX 16 or RTX 20 series GPU or newer.
+- An x86-64-v2 CPU (about 2011 or newer), UEFI with Secure Boot off, and at
+  least 8 GiB of installed RAM. Northwood checks installed memory before
+  connecting devices. If firmware reserves substantial memory, the guest
+  may use a smaller memory profile.
+- NVIDIA GTX 16 and RTX 20 series GPUs and newer are the supported Metal
+  targets. See the hardware notes for the AMD, NVIDIA and Intel generations
+  under investigation. [GPU compatibility](hardware/legacy-gpus.md)
 - A USB stick of 8 GB or more for a network installer, or 32 GB or more
   for a full installer.
 - An empty GPT partition of at least 60 GB.
