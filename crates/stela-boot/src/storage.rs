@@ -21,11 +21,14 @@ pub use options::split;
 use crate::{output, paging::Tables};
 use alloc::{sync::Arc, vec::Vec};
 use core::time::Duration;
+#[cfg(not(feature = "diagnostics"))]
+use stela_drivers::probe::probe;
+#[cfg(feature = "diagnostics")]
+use stela_drivers::probe::probe_with_minimum;
 use stela_drivers::{
     Clock, Handoff, PlatformCaptures,
     block::BlockDevice,
     bus::{dma::RegionAllocator, pci},
-    probe::probe,
 };
 use stela_runtime::pc::{
     acpi,
@@ -55,7 +58,9 @@ pub struct Prepared {
     open: Vec<Target>,
     check: Vec<Target>,
     #[cfg(feature = "diagnostics")]
-    usb_check: Option<(UsbCheck, minimum::Prepared)>,
+    minimum: minimum::Prepared,
+    #[cfg(feature = "diagnostics")]
+    usb_check: Option<UsbCheck>,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -140,9 +145,9 @@ pub fn prepare(
     handoff.firmware = firmware;
     #[cfg(feature = "diagnostics")]
     let usb_check = if usb_media_check {
-        Some((UsbCheck::Media, minimum::Prepared::capture()?))
+        Some(UsbCheck::Media)
     } else if usb_reset_check {
-        Some((UsbCheck::Reset, minimum::Prepared::capture()?))
+        Some(UsbCheck::Reset)
     } else {
         None
     };
@@ -151,6 +156,8 @@ pub fn prepare(
         captures,
         open,
         check,
+        #[cfg(feature = "diagnostics")]
+        minimum: minimum::Prepared::capture()?,
         #[cfg(feature = "diagnostics")]
         usb_check,
     }))
@@ -355,9 +362,7 @@ impl Prepared {
     /// Map ECAM and the controllers' registers uncached.
     pub fn map(&mut self, tables: &mut Tables) -> Result<()> {
         #[cfg(feature = "diagnostics")]
-        if let Some((_, clock)) = &mut self.usb_check {
-            clock.map(tables)?;
-        }
+        self.minimum.map(tables)?;
         self.handoff
             .mapped
             .iter()
@@ -370,11 +375,12 @@ impl Prepared {
         // SAFETY: one CPU after ExitBootServices; `dma` was reserved for this.
         let mut dma = unsafe { RegionAllocator::new(self.handoff.dma.clone()) };
         #[cfg(feature = "diagnostics")]
-        let mut devices = if let Some((check, clock)) = self.usb_check {
-            // SAFETY: these explicit USB fixtures own their clocks and
-            // controllers, under the standalone root before any device I/O.
-            let minimum =
-                unsafe { clock.attach(root) }.unwrap_or_else(|error| output::fatal(error));
+        // SAFETY: the standalone BSP and its activated root retain the
+        // original HPET and controller handoff before device I/O begins.
+        let minimum =
+            unsafe { self.minimum.attach(root) }.unwrap_or_else(|error| output::fatal(error));
+        #[cfg(feature = "diagnostics")]
+        let mut devices = if let Some(check) = self.usb_check {
             let result = match check {
                 // SAFETY: exact post-EBS fixture ownership and retained timer.
                 UsbCheck::Media => unsafe {
@@ -387,8 +393,9 @@ impl Prepared {
             };
             result.unwrap_or_else(|error| output::fatal(error))
         } else {
-            // SAFETY: this handoff describes the running machine and its tables.
-            unsafe { probe(&self.handoff, self.captures, &mut dma) }
+            // SAFETY: the original standalone mappings and DMA reservation
+            // remain active, and the HPET provider retains its hardware.
+            unsafe { probe_with_minimum(&self.handoff, self.captures, &mut dma, minimum) }
         };
         #[cfg(not(feature = "diagnostics"))]
         // SAFETY: this handoff describes the running machine and its tables.

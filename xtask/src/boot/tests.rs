@@ -13,6 +13,7 @@ fn usb_hpet_handoff_needs_standalone_usb_diagnostics_before_work() {
         Ok::<_, clap::Error>(run)
     };
     assert!(!parse(vec![]).unwrap().hpet_enabled());
+    assert!(parse(vec!["--storage-check"]).unwrap().hpet_enabled());
     assert!(parse(vec!["--hpet"]).is_err());
     let usb_line = "--usb-reset-check --usb-own-hpet --storage-check TEST:02020202-0202-0202-0202-020202020202";
     let usb = parse(vec!["--append", usb_line]).unwrap();

@@ -930,7 +930,7 @@ impl Run {
     }
 
     fn hpet_enabled(&self) -> bool {
-        self.audio_check.is_some() || self.usb_hpet_handoff()
+        self.storage_check || self.audio_check.is_some() || self.usb_hpet_handoff()
     }
 
     /// Install mode and the storage check run no guest.
