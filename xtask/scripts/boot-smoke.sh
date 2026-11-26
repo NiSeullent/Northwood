@@ -53,4 +53,4 @@ PY
 
 boot_case control 1 1 standard
 boot_case intel-smt 32 2 standard --no-la57
-boot_case compact 1 1 compact --memory 4G
+boot_case compact 4 1 compact --memory 4G

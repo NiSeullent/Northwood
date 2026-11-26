@@ -8,8 +8,10 @@ issue API returns HTTP 410. The direct fork API returned 309 visible Stela
 forks and 26 Stambha forks. Northwood and Stela-Mods had issue tracking
 enabled in that enumeration. The accessible trackers contained 11 Stambha
 issues, eight Stela-Mods issues and zero Northwood issues, excluding pull
-requests. Published issue and pull-request pages supplement the archived
-tracker. The counts describe the accessible snapshot. [Stela forks](https://github.com/tylertms/Stela/forks) · [Stambha](https://github.com/garvitsurana271/stambha) · [Stela-Mods issues](https://github.com/reece-builds/Stela-Mods/issues) · [Northwood issues](https://github.com/NiSeullent/Northwood/issues)
+requests. The review also sampled the default branch heads of 16 direct
+Stela forks with push dates newer than the archived upstream head.
+Published issue and pull-request pages supplement the archived tracker.
+The counts describe the accessible snapshot. [Stela forks](https://github.com/tylertms/Stela/forks) · [Stambha](https://github.com/garvitsurana271/stambha) · [Stela-Mods issues](https://github.com/reece-builds/Stela-Mods/issues) · [Northwood issues](https://github.com/NiSeullent/Northwood/issues)
 
 ## Changes integrated
 
@@ -31,6 +33,10 @@ tracker. The counts describe the accessible snapshot. [Stela forks](https://gith
   history introduced after Northwood's branch point. The parser patch
   applies once the history, boot log persistence and protection for essential
   devices are available together. [Stela PR #35](https://github.com/tylertms/Stela/pull/35) · [Stambha 1b67b2c99](https://github.com/garvitsurana271/stambha/commit/1b67b2c99)
+- Root PCI bridges whose Bus Master bit is hard-wired need the donor's full
+  containment change and tests for both root and downstream bridges. The
+  donor verifies the bit and preserves the rules for DMA-capable endpoints.
+  [Stela #48](https://github.com/tylertms/Stela/issues/48) · [Stambha f2cbad820](https://github.com/garvitsurana271/stambha/commit/f2cbad820) · [Stambha 4f8d5b58c](https://github.com/garvitsurana271/stambha/commit/4f8d5b58c)
 - Separately reproduce the Stela-Mods RTX 5060 black screen, intermittent USB
   freezes and USB-dependent installed boot. The report reaches
   WindowServer and the Language Chooser, so loader progress by itself

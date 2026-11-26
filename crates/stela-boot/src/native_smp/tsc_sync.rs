@@ -146,9 +146,12 @@ impl Sync {
                 core::hint::spin_loop();
             }
             let now = ordered();
-            self.samples.record(side, now.wrapping_add(offset as u64));
+            let expired = now.wrapping_sub(started) >= self.round_ticks;
+            if !expired {
+                self.samples.record(side, now.wrapping_add(offset as u64));
+            }
             self.lock.store(false, Ordering::Release);
-            if now.wrapping_sub(started) >= self.round_ticks {
+            if expired {
                 return !self.aborted.load(Ordering::Acquire);
             }
         }

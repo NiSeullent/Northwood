@@ -130,6 +130,8 @@ Ported sources
 crates/stela-driver-net/src/realtek.rs and realtek/: Ethernet compatibility
     Stambha, Tyler Smith, commits 9fd57360e, 8553805c1, 1cad3804d and
     f446b7e1a; GPL-2.0-compatible source, see file headers.
+crates/stela-driver-net/src/alx/tests.rs: Link polling in Ethernet test fixtures
+    Stambha, Tyler Smith, commit ff0da9887.
 crates/stela-driver-net/src/e1000e/pch/cold/spt.rs: Intel I219 ULP exit
     Stambha, Tyler Smith, commit da395e895; see file headers.
 crates/stela-driver-storage/src/nvme/admin.rs: NVMe controller enable order

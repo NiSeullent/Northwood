@@ -809,11 +809,14 @@ impl stela_boot_core::usb_legacy::Dwords for XhciBar<'_> {
     fn read32(&mut self, offset: usize) -> u32 {
         let mut value = u32::MAX;
         // SAFETY: live boot protocol; EfiPciIoWidthUint32 (2) reads one
-        // dword of BAR 0 into the writable local. A refused read leaves
-        // all ones, which every reader takes as absent registers.
-        let _ =
+        // dword of BAR 0 into the writable local.
+        let result =
             unsafe { (self.0.mem_read)(self.0, 2, 0, offset as u64, 1, (&raw mut value).cast()) };
-        value
+        if result == Status::SUCCESS {
+            value
+        } else {
+            u32::MAX
+        }
     }
     // The firmware still drives the controller: nothing is written here.
     fn write32(&mut self, _: usize, _: u32) {}

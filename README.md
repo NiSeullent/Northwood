@@ -78,8 +78,9 @@ the complete IPSW for the supported Mac mini (M2) model.
 ```
 
 The kit contains the signed restore bundle, its machine identity, and the
-image verification data. Northwood stages firmware for detected supported
-NVIDIA GPUs. If the target PC has a different GPU, pass its chip name with
+image verification data. Prepare a separate kit for each machine identity.
+Northwood stages firmware for the supported NVIDIA GPUs it detects.
+If the target PC has a different GPU, pass its chip name with
 `--gpu CHIP` when preparing the kit. Copy the kit and the exact IPSW to the
 disconnected computer. Keep both on a separate disk from the destination USB.
 

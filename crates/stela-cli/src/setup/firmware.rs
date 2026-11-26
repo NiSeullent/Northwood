@@ -169,9 +169,11 @@ pub(super) fn cache_gpu(chips: &[String], cache: &Path) -> Result<()> {
         recipes::require_gsp(&mut inventory, chip)?;
     }
     let client = download_client()?;
+    let progress = crate::progress::Phase::spinner("Staging NVIDIA firmware for the offline kit");
     for artifact in Plan::select(&inventory)?.artifacts() {
         cached(Some(&client), cache, artifact)?;
     }
+    progress.finish();
     Ok(())
 }
 

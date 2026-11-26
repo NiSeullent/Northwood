@@ -5036,6 +5036,7 @@ fn offline_kit_creates_a_full_usb_with_no_online_callbacks() -> Result<()> {
     };
     let mut request = command(&f, &f.esp);
     request.offline_kit = Some(kit.output);
+    request.host_firmware_cache = Some(f._dir.path().join("firmware"));
     request.model = None;
     request.install_image = None;
     let report = setup(&air_gapped, request)?;
@@ -5078,6 +5079,7 @@ fn offline_kit_refuses_missing_signing_answers_and_damaged_hashes() -> Result<()
     let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
     let mut request = command(&f, Path::new("disk5"));
     request.offline_kit = Some(kit.output);
+    request.host_firmware_cache = Some(f._dir.path().join("firmware"));
     request.confirmed = true;
     let error = setup(&staged, request).unwrap_err();
     assert!(format!("{error:#}").contains("block hashes failed verification"));

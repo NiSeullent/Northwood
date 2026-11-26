@@ -95,7 +95,23 @@ AMD EPYC 9V74 Linux에서 `a562d9365`와 1.0.0b2 후보를 Rust 1.99.1의 같은
 | `MOVI` SIMD 즉시값 | 일반 | 828 | 648 | −21.7% |
 | `MOVI` SIMD 즉시값 | 시스템 | 871 | 691 | −20.7% |
 
-일반 프로필의 두 표본은 실제 x86-64에서 실행해 결과 체크섬이 일치하는지 확인했다. 32비트 비트필드의 중복 이동을 제거하고, 가능한 마스크와 반복 SIMD 상수에 짧은 명령을 쓴다. 시스템 프로필의 실행 시간과 전체 부팅 시간은 위의 실기 시나리오로 측정해야 한다. [비트필드 변경의 원본](https://github.com/garvitsurana271/stambha/commit/0aeffcd0194505269ac61a56cfefd45cfbe37b76) · [SIMD 상수 변경의 원본](https://github.com/garvitsurana271/stambha/commit/3d29a7999c4a828040e350f20b6add5dcd827137)
+일반 프로필의 두 표본을 실제 x86-64에서 160만 번씩 호출하고, 논리 CPU마다 기준과 후보의 실행 순서를 교대하며 7쌍을 측정했다. 시간은 Linux 스레드 CPU 시계로 수집한 호출당 중앙값이다. 변화율은 각 쌍의 변화율 중앙값이고, 모든 실행에서 결과 체크섬이 일치했다.
+
+| 표본 | 논리 CPU | 기준 (ns) | 후보 (ns) | 쌍별 변화율 |
+| --- | ---: | ---: | ---: | ---: |
+| 비트필드 | 2 | 18.11 | 12.49 | −31.3% |
+| 비트필드 | 3 | 17.61 | 12.00 | −33.0% |
+| SIMD 즉시값 | 2 | 13.90 | 12.74 | −11.1% |
+| SIMD 즉시값 | 3 | 13.95 | 12.41 | −10.5% |
+
+32비트 비트필드의 중복 이동을 제거하고, 가능한 마스크와 반복 SIMD 상수에 짧은 명령을 쓴다. 시스템 프로필의 실행 시간과 전체 부팅 시간은 위의 실기 시나리오로 측정해야 한다. [비트필드 변경의 원본](https://github.com/garvitsurana271/stambha/commit/0aeffcd0194505269ac61a56cfefd45cfbe37b76) · [SIMD 상수 변경의 원본](https://github.com/garvitsurana271/stambha/commit/3d29a7999c4a828040e350f20b6add5dcd827137)
+
+아래 첫 줄은 비트필드, 두 번째 줄은 SIMD 즉시값 표본이다. 줄마다 32비트 워드를 리틀 엔디언 바이트로 변환해 네 번 반복한다. `stela_compiler::compile`에는 게스트 시작 주소 `0x400000`과 `TargetCpu::Baseline`을 사용하고, `BlockProfile::ORDINARY`와 `BlockProfile::new(Features::SYSTEM_MODE)`를 차례로 선택한다. 일반 프로필 실행은 기본 `GuestState`의 `x1`을 `0xfedcba9876543210`으로 설정하고 1,000회 워밍업했다.
+
+```text
+531f0028 13012029 d340182a d340302b b3483c2c b37c1c2d b3689c2e b340fc2f
+4f00e400 4f07e7e1 4f03c7e2 4f024743 6f05e424 6f04e405 4f07d7c6 4f07d7e7
+```
 
 ## 실기 측정표
 
