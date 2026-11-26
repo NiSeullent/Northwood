@@ -29,7 +29,8 @@ pub(crate) unsafe fn validate(
     requested: Option<usize>,
 ) -> Result<Option<&'static firmware::Capture>> {
     let cores = handoff.native_resources.cores as usize;
-    if cores == 0 || cores > topology::MAX_CORES {
+    let runners = handoff.native_resources.runners as usize;
+    if runners == 0 || runners > cores || cores > topology::MAX_CORES {
         return Err(refuse!("native processor count is outside capacity"));
     }
     let resources = &handoff.native_resources;
@@ -101,14 +102,11 @@ pub(crate) unsafe fn validate(
             }
         }
     }
-    let last = resources::partition(
-        cores,
-        cores,
-        cores - 1,
-        handoff.code.bytes,
-        handoff.pool.bytes,
-    )?;
-    resources::code_part_bytes(last.code_bytes, resources.code_parts)?;
+    for slot in [runners - 1, cores - 1] {
+        let part =
+            resources::partition(cores, runners, slot, handoff.code.bytes, handoff.pool.bytes)?;
+        resources::code_part_bytes(part.code_bytes, resources.code_parts)?;
+    }
     if (cores > 1 || resources.sipi != 0)
         && (!(crate::tables::PAGE..1 << 20).contains(&resources.sipi)
             || !resources.sipi.is_multiple_of(crate::tables::PAGE))
@@ -129,7 +127,7 @@ pub(crate) unsafe fn validate(
     );
     let assignable = (capture.logical_count as usize).min(topology::MAX_CORES);
     crate::output::arguments(format_args!(
-        "NATIVE INVENTORY firmware_processors={} enabled={} physical_cores={} logical={} assignable={} retired={} requested={cores}\n",
+        "NATIVE INVENTORY firmware_processors={} enabled={} physical_cores={} logical={} assignable={} retired={} requested={cores} runners={runners}\n",
         capture.processor_count,
         capture.enabled_count,
         topology::physical_cores(&capture.processors),

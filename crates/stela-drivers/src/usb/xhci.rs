@@ -274,7 +274,9 @@ const ABORT_US: u64 = 5_000_000;
 const RING_STOP_US: u64 = 2_000_000;
 const CONTROL_US: u64 = 5_000_000;
 const PORT_RESET_US: u64 = 500_000;
-const RESET_RECOVERY_US: u64 = 10_000;
+// Linux hub_port_reset waits 50 ms for reset recovery, in addition to the
+// USB 2 reset itself; SET_ADDRESS has its own recovery interval.
+const RESET_RECOVERY_US: u64 = 50_000;
 /// A newly powered port's settle time before its first sample.
 const PORT_POWER_US: u64 = 20_000;
 /// Linux `hub_port_debounce`: a connection counts once it stays the same
@@ -284,7 +286,7 @@ const DEBOUNCE_STABLE_US: u64 = 100_000;
 const DEBOUNCE_TIMEOUT_US: u64 = 2_000_000;
 /// Linux `PORT_INIT_TRIES`: resets and enumerations a port gets.
 const PORT_INIT_TRIES: usize = 4;
-const ADDRESS_RECOVERY_US: u64 = 2_000;
+const ADDRESS_RECOVERY_US: u64 = 10_000;
 
 const HUB_DESCRIPTOR: u8 = 0x29;
 const HUB_CLASS: u8 = 9;

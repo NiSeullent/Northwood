@@ -36,7 +36,7 @@ use stela_boot_core::aperture::{self, Controls, Flush, Processors};
 use stela_drivers::bus::{
     irq::{self, Platform as _, posted_msi::NotificationDomain},
     mmio::owned::{
-        AddressSpace, Authority, CacheAttribute, InstalledMapping, MapFailure, MapRequest,
+        AddressSpace, Authority, CacheAttribute, InstalledMapping, MapFailure, MapRequest, Mapping,
         MappingPlatform, PhysicalSpan, Protection, Resource, ResourceBacking, ResourceId,
         ResourceKind,
     },
@@ -715,8 +715,11 @@ impl Source {
 
     /// Translate an observed BAR range without reserving or mapping it.
     fn bar_address(&self, segment: u16, address: u64, bytes: u64) -> Option<u64> {
-        let windows = self
-            .platform
+        aperture::bar_physical(self.memory_windows(), u32::from(segment), address, bytes)
+    }
+
+    fn memory_windows(&self) -> impl Iterator<Item = aperture::BusWindow> {
+        self.platform
             .wire()
             .roots()
             .iter()
@@ -726,8 +729,51 @@ impl Source {
                 minimum: root.minimum,
                 maximum: root.maximum,
                 translation: root.translation,
-            });
-        aperture::bar_physical(windows, u32::from(segment), address, bytes)
+            })
+    }
+
+    /// Map a small register BAR (such as EHCI's 1 KiB BAR). Retain an
+    /// exclusive mapping of its page and give the driver only the BAR bytes.
+    /// Keep the page out of physical-address lookup, which lends whole pages.
+    ///
+    /// # Safety
+    /// The caller owns the function that decodes the BAR.
+    pub(crate) unsafe fn map_subpage_bar(
+        &self,
+        segment: u16,
+        address: u64,
+        bytes: u64,
+    ) -> Result<Mapping, Error> {
+        let (physical, offset) =
+            aperture::subpage_bar(self.memory_windows(), u32::from(segment), address, bytes)
+                .ok_or(Error::OutsideResource)?;
+        let span = PhysicalSpan::new(physical, PAGE)?;
+        if !self
+            .platform
+            .wire()
+            .excludes_memory(span.start(), span.end())
+        {
+            return Err(Error::OutsideResource);
+        }
+        let mut reservations = self
+            .reservations
+            .try_borrow_mut()
+            .map_err(|_| Error::Busy)?;
+        reservations.try_reserve(1).map_err(|_| Error::Exhausted)?;
+        let (resource, mut assignment) = self.reservation(span, ResourceKind::Registers)?;
+        let result = self.authority.map(
+            resource,
+            offset,
+            bytes as usize,
+            CacheAttribute::Uncached,
+            Protection::ReadWrite,
+        );
+        if result.is_ok() || assignment.close().is_err() {
+            reservations.push(assignment);
+        } else {
+            let _ = assignment.into_original();
+        }
+        result
     }
 }
 

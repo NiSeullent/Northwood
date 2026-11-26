@@ -4,6 +4,7 @@
 //! DSP0134 §5.2 authorize reading their published tables. Never use this after
 //! root replacement/EBS, or for undescribed/reserved/MMIO/protected memory.
 use crate::handoff_records::Region;
+use alloc::vec::Vec;
 use stela_crypto::Sha256;
 use stela_crypto::digest::Digest;
 use stela_drivers::firmware::smbios::{self, Error, Format, MAX_ENTRY_BYTES};
@@ -69,9 +70,13 @@ pub fn failure(stage: Stage, reason: Error, address: u64, bytes: usize) -> Failu
         bytes: bytes as u64,
     }
 }
-pub fn select(
-    entries: impl Iterator<Item = (Format, u64)>,
-) -> Result<Option<(Format, u64)>, Error> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Selection {
+    primary: (Format, u64),
+    legacy: Option<u64>,
+}
+
+pub fn select(entries: impl Iterator<Item = (Format, u64)>) -> Result<Option<Selection>, Error> {
     let mut old = None;
     let mut modern = None;
     for (format, address) in entries {
@@ -84,8 +89,16 @@ pub fn select(
         }
     }
     Ok(modern
-        .map(|a| (Format::Smbios3, a))
-        .or_else(|| old.map(|a| (Format::Smbios2, a))))
+        .map(|address| Selection {
+            primary: (Format::Smbios3, address),
+            legacy: old,
+        })
+        .or_else(|| {
+            old.map(|address| Selection {
+                primary: (Format::Smbios2, address),
+                legacy: None,
+            })
+        }))
 }
 #[derive(Clone, Copy)]
 pub struct Span {
@@ -150,12 +163,12 @@ pub fn grant(
     Ok(())
 }
 pub fn capture_with(
-    selected: Result<Option<(Format, u64)>, Error>,
+    selected: Result<Option<Selection>, Error>,
     mut read: impl FnMut(u64, &mut [u8], Stage) -> Result<(), Failure>,
     allocate: impl FnOnce(usize) -> Result<&'static mut [u8], Failure>,
 ) -> Capture {
     let mut capture = Capture::empty();
-    let (format, address) = match selected {
+    let Selection { primary, legacy } = match selected {
         Ok(Some(selected)) => selected,
         Ok(None) => {
             capture.state = State::Unavailable;
@@ -166,31 +179,29 @@ pub fn capture_with(
             return capture;
         }
     };
+    let (mut format, mut address) = primary;
+    let mut source = read_source(format, address, &mut read);
+    // Some firmware publishes a modern entry whose table is in unreadable
+    // legacy memory. A separately published 2.x entry can supply the data
+    // under the same memory-map and format checks. Never scan low memory.
+    if let Err(Failure {
+        stage: Stage::Table,
+        reason: Error::UnreadableRange,
+        ..
+    }) = &source
+        && let Some(legacy) = legacy
+        && let Ok(alternate) = read_source(Format::Smbios2, legacy, &mut read)
+    {
+        format = Format::Smbios2;
+        address = legacy;
+        source = Ok(alternate);
+    }
     capture.format = Some(format);
     capture.source_address = address;
-    let result = (|| {
-        let mut prefix = [0; 8];
-        read(address, &mut prefix, Stage::EntryPrefix)?;
-        let length = smbios::entry_length(&prefix, format)
-            .map_err(|error| failure(Stage::Entry, error, address, 8))?;
-        let mut raw = [0; MAX_ENTRY_BYTES];
-        read(address, &mut raw[..length], Stage::Entry)?;
-        if raw[..8] != prefix {
-            return Err(failure(Stage::Entry, Error::ChangedEntry, address, length));
-        }
-        let entry = smbios::entry(&raw[..length], format).map_err(|error| {
-            failure(
-                Stage::Entry,
-                error,
-                address,
-                match error {
-                    Error::TableBound { bytes } => bytes,
-                    _ => length,
-                },
-            )
-        })?;
-        let output = allocate(length + entry.table_bytes)?;
-        if output.len() != length + entry.table_bytes {
+    let result = source.and_then(|(entry, bytes)| {
+        // Reserve permanent handoff memory only for a complete, valid source.
+        let output = allocate(bytes.len())?;
+        if output.len() != bytes.len() {
             return Err(failure(
                 Stage::Table,
                 Error::AllocationFailed,
@@ -198,16 +209,8 @@ pub fn capture_with(
                 entry.table_bytes,
             ));
         }
-        output[..length].copy_from_slice(&raw[..length]);
-        read(entry.table_address, &mut output[length..], Stage::Table)?;
-        smbios::identity(entry, &output[length..]).map_err(|error| {
-            failure(
-                Stage::Validate,
-                error,
-                entry.table_address,
-                entry.table_bytes,
-            )
-        })?;
+        output.copy_from_slice(&bytes);
+        let length = entry.entry_bytes;
         capture.sha256 = Sha256::digest(&*output).into();
         capture.entry_sha256 = Sha256::digest(&output[..length]).into();
         capture.table_sha256 = Sha256::digest(&output[length..]).into();
@@ -216,12 +219,57 @@ pub fn capture_with(
             bytes: output.len() as u64,
         };
         Ok(())
-    })();
+    });
     capture.state = match result {
         Ok(()) => State::Present,
         Err(error) => State::Failed(error),
     };
     capture
+}
+
+fn read_source(
+    format: Format,
+    address: u64,
+    read: &mut impl FnMut(u64, &mut [u8], Stage) -> Result<(), Failure>,
+) -> Result<(smbios::Entry, Vec<u8>), Failure> {
+    let mut prefix = [0; 8];
+    read(address, &mut prefix, Stage::EntryPrefix)?;
+    let length = smbios::entry_length(&prefix, format)
+        .map_err(|error| failure(Stage::Entry, error, address, prefix.len()))?;
+    let mut raw = [0; MAX_ENTRY_BYTES];
+    read(address, &mut raw[..length], Stage::Entry)?;
+    if raw[..8] != prefix {
+        return Err(failure(Stage::Entry, Error::ChangedEntry, address, length));
+    }
+    let entry = smbios::entry(&raw[..length], format).map_err(|error| {
+        let reported_bytes = match error {
+            Error::TableBound { bytes } => bytes,
+            _ => length,
+        };
+        failure(Stage::Entry, error, address, reported_bytes)
+    })?;
+    let mut bytes = Vec::new();
+    let total = length + entry.table_bytes;
+    bytes.try_reserve_exact(total).map_err(|_| {
+        failure(
+            Stage::Table,
+            Error::AllocationFailed,
+            entry.table_address,
+            entry.table_bytes,
+        )
+    })?;
+    bytes.extend_from_slice(&raw[..length]);
+    bytes.resize(total, 0);
+    read(entry.table_address, &mut bytes[length..], Stage::Table)?;
+    smbios::identity(entry, &bytes[length..]).map_err(|error| {
+        failure(
+            Stage::Validate,
+            error,
+            entry.table_address,
+            entry.table_bytes,
+        )
+    })?;
+    Ok((entry, bytes))
 }
 pub fn record(
     phase: &str,
@@ -281,6 +329,19 @@ mod tests {
             kind: MemoryType::RUNTIME_SERVICES_DATA,
             attributes: 0,
         }
+    }
+    fn legacy_entry(table: &[u8]) -> [u8; 31] {
+        let mut entry = [0; 31];
+        entry[..4].copy_from_slice(b"_SM_");
+        entry[5..8].copy_from_slice(&[31, 2, 8]);
+        entry[8..10].copy_from_slice(&(table.len() as u16).to_le_bytes());
+        entry[16..21].copy_from_slice(b"_DMI_");
+        entry[22..24].copy_from_slice(&(table.len() as u16).to_le_bytes());
+        entry[24..28].copy_from_slice(&0x4000u32.to_le_bytes());
+        entry[28..30].copy_from_slice(&2u16.to_le_bytes());
+        entry[21] = 0u8.wrapping_sub(entry[16..].iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        entry[4] = 0u8.wrapping_sub(entry.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        entry
     }
     #[test]
     fn read_grants_require_full_unambiguous_readable_canonical_data_ram() {
@@ -345,11 +406,14 @@ mod tests {
         );
     }
     #[test]
-    fn published_selection_and_unavailable_facts_never_guess_or_fallback() {
+    fn published_selection_prefers_modern_and_rejects_ambiguity() {
         assert_eq!(select([].into_iter()), Ok(None));
         assert_eq!(
             select([(Format::Smbios2, 1), (Format::Smbios3, 2)].into_iter()),
-            Ok(Some((Format::Smbios3, 2)))
+            Ok(Some(Selection {
+                primary: (Format::Smbios3, 2),
+                legacy: Some(1),
+            }))
         );
         assert_eq!(
             select([(Format::Smbios3, 1), (Format::Smbios3, 2)].into_iter()),
@@ -366,7 +430,7 @@ mod tests {
         assert_eq!(json["product_name"]["state"], "not-observed");
         assert_eq!(json["product_version"]["state"], "not-observed");
         let c = capture_with(
-            Ok(Some((Format::Smbios3, 1))),
+            select([(Format::Smbios3, 1)].into_iter()),
             |address, _, stage| {
                 Err(Failure {
                     status: Some(0x8000_0000_0000_0007),
@@ -391,7 +455,7 @@ mod tests {
         let mut calls = 0;
         let mut allocations = 0;
         let c = capture_with(
-            Ok(Some((Format::Smbios3, 0x1000))),
+            select([(Format::Smbios3, 0x1000), (Format::Smbios2, 0x3000)].into_iter()),
             |address, output, _| {
                 calls += 1;
                 let source = if address == 0x1000 {
@@ -432,6 +496,61 @@ mod tests {
         assert_eq!(json["system_vendor"]["state"], "value");
     }
     #[test]
+    fn unreadable_ami_table_recovers_only_with_an_independent_valid_entry() {
+        let (mut modern, table) = fixtures();
+        let reported_address = 0x000e_d9b0u64;
+        let reported_bytes = 5530u32;
+        modern[12..16].copy_from_slice(&reported_bytes.to_le_bytes());
+        modern[16..24].copy_from_slice(&reported_address.to_le_bytes());
+        modern[5] = 0;
+        modern[5] = 0u8.wrapping_sub(modern.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        let legacy = legacy_entry(&table);
+        let primary_failure = failure(
+            Stage::Table,
+            Error::UnreadableRange,
+            reported_address,
+            reported_bytes as usize,
+        );
+        for alternate_readable in [true, false] {
+            let mut allocations = 0;
+            let mut spans = [span(0x1000, 1), span(0x3000, 1), span(0x4000, 1)];
+            if !alternate_readable {
+                spans[2].kind = MemoryType::RESERVED;
+            }
+            let captured = capture_with(
+                select([(Format::Smbios3, 0x1000), (Format::Smbios2, 0x3000)].into_iter()),
+                |address, output, stage| {
+                    grant(spans.into_iter(), address, output.len(), 47)
+                        .map_err(|reason| failure(stage, reason, address, output.len()))?;
+                    let source = match address {
+                        0x1000 => modern.as_slice(),
+                        0x3000 => legacy.as_slice(),
+                        0x4000 if alternate_readable => table.as_slice(),
+                        _ => panic!("unpublished source"),
+                    };
+                    output.copy_from_slice(&source[..output.len()]);
+                    Ok(())
+                },
+                |bytes| {
+                    allocations += 1;
+                    assert_eq!(bytes, legacy.len() + table.len());
+                    Ok(Box::leak(vec![0; bytes].into_boxed_slice()))
+                },
+            );
+            if alternate_readable {
+                assert_eq!(captured.state, State::Present);
+                assert_eq!(captured.format, Some(Format::Smbios2));
+                assert_eq!(captured.source_address, 0x3000);
+                assert_eq!(allocations, 1);
+            } else {
+                assert_eq!(captured.state, State::Failed(primary_failure));
+                assert_eq!(captured.format, Some(Format::Smbios3));
+                assert_eq!(captured.source_address, 0x1000);
+                assert_eq!(allocations, 0);
+            }
+        }
+    }
+    #[test]
     fn changed_malformed_or_oversized_sources_do_not_publish_or_retry() {
         for changed in 0..5 {
             let (mut entry, mut table) = fixtures();
@@ -448,7 +567,7 @@ mod tests {
             }
             let mut calls = 0;
             let c = capture_with(
-                Ok(Some((Format::Smbios3, 0x1000))),
+                select([(Format::Smbios3, 0x1000)].into_iter()),
                 |address, output, stage| {
                     calls += 1;
                     let raw = if address == 0x1000 { &entry } else { &table };
@@ -464,10 +583,7 @@ mod tests {
                     }
                     Ok(())
                 },
-                |bytes| {
-                    assert!(changed >= 2);
-                    Ok(Box::leak(vec![0; bytes].into_boxed_slice()))
-                },
+                |_| panic!("invalid source must not reserve handoff memory"),
             );
             assert!(matches!(c.state, State::Failed(_)));
             assert_eq!(c.region.bytes, 0);

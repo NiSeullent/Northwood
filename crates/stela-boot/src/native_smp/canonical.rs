@@ -44,9 +44,9 @@ pub(crate) unsafe fn reserve(
     unsafe { reserve_with_limit(handoff, ranges, None) }
 }
 
-/// Production assignment adds a conservative ceiling from installed
-/// workers. Authored single-BSP diagnostics keep `reserve` without inventing
-/// AP executors or treating copied firmware observations as owned workers.
+/// Production assignment caps native code features at the installed guest
+/// workers' common capabilities. Single-BSP diagnostics use `reserve` with
+/// their own installed worker.
 ///
 /// # Safety
 /// `reserve`'s complete reservation contract applies. `capture` is the validated
@@ -59,15 +59,18 @@ pub(crate) unsafe fn reserve_for_workers(
 ) -> Result<Arc<RegisteredSystemRam>> {
     let reserved = handoff.native_resources.cores as usize;
     // The started executors, fewer than reserved when an AP failed to start.
-    let cores = executors.started();
+    let started = executors.started();
+    let runners = handoff.native_resources.runners as usize;
     let count = capture.processor_count as usize;
-    if cores > reserved
+    if started > reserved
+        || runners == 0
+        || runners > reserved
         || reserved > capture.core_count as usize
         || reserved > super::topology::MAX_CORES
         || count != capture.processors.len()
     {
         return Err(refuse!(
-            "canonical target has an invalid assigned physical roster"
+            "canonical target has an invalid assigned host roster"
         ));
     }
     let selected = |slot: usize| {
@@ -90,15 +93,14 @@ pub(crate) unsafe fn reserve_for_workers(
     );
     bsp.qualify_native(five_level)
         .map_err(|refusal| refusal.refusal("canonical target BSP floor refused"))?;
-    let mut observations = Vec::with_capacity(cores);
+    let mut observations = Vec::with_capacity(runners.min(started));
     observations.push(&bsp);
-    for slot in 1..cores {
+    for (index, actual) in executors.processors().iter().enumerate() {
+        let slot = index + 1;
+        if actual.slot() != slot {
+            return Err(refuse!("canonical target assigned AP is absent"));
+        }
         let expected = selected(slot)?;
-        let actual = executors
-            .processors()
-            .iter()
-            .find(|processor| processor.slot() == slot)
-            .ok_or(refuse!("canonical target assigned AP is absent"))?;
         let observed = actual.observation();
         if actual.apic_id() != expected.apic_id || !observed.matches(expected) {
             return Err(refuse!("canonical target AP differs from assigned worker"));
@@ -106,7 +108,11 @@ pub(crate) unsafe fn reserve_for_workers(
         observed
             .qualify_native(five_level)
             .map_err(|refusal| refusal.refusal("canonical target AP floor refused"))?;
-        observations.push(observed);
+        // Host-only executors run Rust jobs and never run generated guest
+        // code. Their instruction sets do not constrain the guest target.
+        if slot < runners {
+            observations.push(observed);
+        }
     }
     let limit = super::topology::common_native_target(&observations)
         .map_err(|_| refuse!("canonical target assigned observations refused"))?;
@@ -274,14 +280,16 @@ pub(crate) unsafe fn prepare_with_locks<'host, D: Devices>(
     } = preparation;
     let reserved = handoff.native_resources.cores as usize;
     let started = executors.started();
+    let runners = (handoff.native_resources.runners as usize).min(started);
     let cores = profile.processors.len().max(1);
-    if cores == 0 || cores > started || started > reserved || reserved > capture.core_count as usize
-    {
+    if cores > runners || started > reserved || reserved > capture.core_count as usize {
         return Err(refuse!(
-            "canonical active PE roster exceeds the retained physical workers"
+            "canonical active PE roster exceeds the retained guest workers"
         ));
     }
-    bindings::validate(cores, started, boot_processor, assignments)?;
+    // Only guest runners have the full shadow pool and contribute to the
+    // shared native code target. Spare APs cannot own a guest frame.
+    bindings::validate(cores, runners, boot_processor, assignments)?;
     for binding in assignments.iter().filter(|binding| binding.worker.0 != 0) {
         let slot = binding.worker.0;
         let selected = capture.processors[capture.selected[slot] as usize];

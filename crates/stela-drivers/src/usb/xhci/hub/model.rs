@@ -338,6 +338,8 @@ pub(in super::super) struct Hardware {
     pub silent_configuration: Option<u8>,
     pub failed_configuration: Option<u8>,
     pub root_status: Option<u32>,
+    pub root_resets: usize,
+    pub root_disabled_resets: usize,
     pub notification_override: Option<u32>,
     pending_interrupts: BTreeMap<(u8, u8), (u64, u64, usize)>,
     pub mmio_reads: usize,
@@ -376,6 +378,8 @@ impl Hardware {
             silent_configuration: None,
             failed_configuration: None,
             root_status: None,
+            root_resets: 0,
+            root_disabled_resets: 0,
             notification_override: None,
             pending_interrupts: BTreeMap::new(),
             mmio_reads: 0,
@@ -1016,18 +1020,23 @@ impl Registers for RegistersModel {
         }
         if at == 0x440 {
             let actual_speed = state.nodes[&0].speed;
+            let reset = value & PR != 0;
+            if reset {
+                state.root_resets += 1;
+            }
+            let enabled = state.root_resets > state.root_disabled_resets;
             if let Some(status) = state.root_status.as_mut() {
                 *status &= !(value & PORT_CHANGES);
-                if value & PR != 0 {
+                if reset {
                     // The device handshake determines speed when reset enables
                     // the port; its pre-reset speed field may be undefined.
-                    *status = *status & !(PR | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
-                        | PED
+                    *status = *status & !(PR | PED | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
+                        | if enabled { PED } else { 0 }
                         | PRC
                         | u32::from(actual_speed) << PORT_SPEED_SHIFT;
                 }
             }
-            if value & PR != 0 {
+            if reset {
                 state.event(1 << 24, SUCCESS, reset::PORT_STATUS_CHANGE, 0, 0, 0);
             }
         }

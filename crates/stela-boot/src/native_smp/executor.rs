@@ -426,6 +426,7 @@ pub(crate) unsafe fn start(
     _fp_qualification: bool,
 ) -> Result<Executors, StartupFailure> {
     let cores = handoff.native_resources.cores as usize;
+    let runners = handoff.native_resources.runners as usize;
     if cores == 0 || cores > capture.core_count as usize || handoff.tsc_hz == 0 {
         return Err(StartupFailure::Resources);
     }
@@ -500,7 +501,7 @@ pub(crate) unsafe fn start(
         }
         let attempt = (|| -> Result<(), StartupFailure> {
             let part =
-                resources::partition(cores, cores, slot, handoff.code.bytes, handoff.pool.bytes)
+                resources::partition(cores, runners, slot, handoff.code.bytes, handoff.pool.bytes)
                     .map_err(|_| StartupFailure::Resources)?;
             let processor = capture.processors[capture.selected[slot] as usize];
             let destination =

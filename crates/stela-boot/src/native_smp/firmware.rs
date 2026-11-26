@@ -21,7 +21,8 @@ use core::{
     time::Duration,
 };
 use uefi::{
-    boot::{self, AllocateType, MemoryType, ScopedProtocol},
+    Handle,
+    boot::{self, AllocateType, MemoryType},
     proto::pi::mp::{CPU_V2_EXTENDED_TOPOLOGY, MpServices},
 };
 
@@ -412,7 +413,7 @@ fn apic_id_shifts(maximum: u32) -> Option<(u32, u32)> {
 }
 
 pub(crate) struct Inventory {
-    mp: ScopedProtocol<MpServices>,
+    handle: Handle,
     processors: Vec<Processor>,
     logical: Vec<usize>,
     pub(crate) enabled: usize,
@@ -529,55 +530,59 @@ pub(crate) fn inventory() -> Result<Inventory, Error> {
         return Err(Error::WrongBootstrapProcessor);
     }
     Ok(Inventory {
-        mp,
+        handle,
         processors,
         logical,
         enabled: count.enabled,
     })
 }
 
-/// Capture controls only on processors reserved for guest work. The entire
-/// inventory remains available to stop and park firmware APs after EBS.
-pub(crate) fn capture(inventory: Inventory, requested: usize) -> Result<Region, Error> {
+/// Capture the selected guest runners and spare native workers. If an AP
+/// cannot be observed during an ordinary boot, keep the verified prefix and
+/// retain the complete inventory for the post-EBS firmware handoff.
+pub(crate) fn capture(
+    inventory: Inventory,
+    requested: usize,
+    exact: bool,
+) -> Result<(Region, usize), Error> {
     let Inventory {
-        mp,
+        handle,
         processors,
         logical,
         enabled,
     } = inventory;
+    let mp =
+        boot::open_protocol_exclusive::<MpServices>(handle).map_err(|_| Error::NoMpServices)?;
     topology::assignment_count(Some(requested), logical.len()).map_err(|_| Error::CoreCount)?;
     let selected = &logical[..requested];
     let mut snapshots = Vec::with_capacity(selected.len());
     for (slot, &index) in selected.iter().enumerate() {
-        let snapshot = if slot == 0 {
+        let processor = processors[index];
+        let observed = if slot == 0 {
             // SAFETY: UEFI executes the loader at CPL0 on the recorded BSP.
-            unsafe { observe() }?
+            unsafe { observe() }
         } else {
-            let mut callback = Callback {
-                observation: UnsafeCell::new(None),
-                complete: AtomicBool::new(false),
-            };
-            mp.startup_this_ap(
-                processors[index].processor_number as usize,
-                observe_ap,
-                (&raw mut callback).cast(),
-                None,
-                Some(Duration::from_millis(500)),
-            )
-            .map_err(|_| Error::SnapshotTimeout)?;
-            if !callback.complete.load(Ordering::Acquire) {
-                return Err(Error::SnapshotCallback);
-            }
-            callback
-                .observation
-                .into_inner()
-                .ok_or(Error::SnapshotCallback)??
+            observe_one(&mp, processor.processor_number as usize)
         };
-        if !snapshot.matches(processors[index]) {
-            return Err(Error::ProcessorIdentity);
+        let observed = observed.and_then(|snapshot| {
+            snapshot
+                .matches(processor)
+                .then_some(snapshot)
+                .ok_or(Error::ProcessorIdentity)
+        });
+        match observed {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) if slot != 0 && !exact => {
+                crate::output::arguments(format_args!(
+                    "NATIVE FIRMWARE SOURCE refused slot={slot} apic={:#x} firmware_cpu={} error={error:?}; keeping {slot} workers\n",
+                    processor.apic_id, processor.processor_number,
+                ));
+                break;
+            }
+            Err(error) => return Err(error),
         }
-        snapshots.push(snapshot);
     }
+    let selected = &selected[..snapshots.len()];
     let pages = record_pages(processors.len()).ok_or(Error::Memory)?;
     let memory = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
         .map_err(|_| Error::Memory)?;
@@ -599,10 +604,35 @@ pub(crate) fn capture(inventory: Inventory, requested: usize) -> Result<Region, 
             capture.snapshots[slot] = snapshots[slot];
         }
     }
-    Ok(Region {
-        physical: memory.as_ptr() as u64,
-        bytes: (pages * PAGE as usize) as u64,
-    })
+    Ok((
+        Region {
+            physical: memory.as_ptr() as u64,
+            bytes: (pages * PAGE as usize) as u64,
+        },
+        selected.len(),
+    ))
+}
+
+fn observe_one(mp: &MpServices, processor_number: usize) -> Result<Snapshot, Error> {
+    let mut callback = Callback {
+        observation: UnsafeCell::new(None),
+        complete: AtomicBool::new(false),
+    };
+    mp.startup_this_ap(
+        processor_number,
+        observe_ap,
+        (&raw mut callback).cast(),
+        None,
+        Some(Duration::from_millis(500)),
+    )
+    .map_err(|_| Error::SnapshotTimeout)?;
+    if !callback.complete.load(Ordering::Acquire) {
+        return Err(Error::SnapshotCallback);
+    }
+    callback
+        .observation
+        .into_inner()
+        .ok_or(Error::SnapshotCallback)?
 }
 
 /// Whole pages holding a record of `processors` inventory entries.

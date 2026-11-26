@@ -298,9 +298,9 @@ fn with(f: impl FnOnce(&mut State)) {
 }
 
 /// The time-stamp counter's rate, for the times steps show.
-pub fn set_clock(tsc_hz: u64) {
+pub fn set_clock(tsc_hz: u64, boot_epoch: u64) {
     with(|state| state.tsc_hz = tsc_hz);
-    output::set_clock(tsc_hz);
+    output::set_clock(tsc_hz, boot_epoch);
 }
 
 /// Start a step; one still running ends first, as done.
@@ -309,8 +309,8 @@ pub fn begin(title: &str) {
         if state.running.is_some() {
             state.finish(Mark::Ok, "");
         }
-        // Seconds since the PC started, which the serial port's lines lack.
-        let millis = state.millis(0);
+        // Elapsed boot time, also visible on the serial console.
+        let millis = output::boot_elapsed_millis();
         output::arguments(format_args!(
             "STEP {title} t={}.{:03}\n",
             millis / 1000,

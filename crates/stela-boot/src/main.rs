@@ -202,6 +202,7 @@ static HOST_FIRMWARE_INTERFACE: [u8; 21] = stela_loader::host_firmware::MOUNT_CA
 
 #[uefi::entry]
 fn main() -> Status {
+    let boot_epoch = output::now();
     // Before any Rust state exists: the system engine runs from this copy.
     let snapshot = system::take_snapshot();
     // Referenced, so the linker keeps the marker setup reads.
@@ -236,7 +237,7 @@ fn main() -> Status {
     unsafe {
         native_memory::initialize(heap.as_ptr() as usize, heap.as_ptr() as u64, heap_bytes, 0)
     };
-    status::set_clock(firmware::tsc_hz());
+    status::set_clock(firmware::tsc_hz(), boot_epoch);
     firmware::start_ticker();
     let log = log_file::open();
     let (smbios, installed_ram) = host_firmware::capture_identity();

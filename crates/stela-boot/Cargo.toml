@@ -29,7 +29,7 @@ test = false
 
 [features]
 default = []
-diagnostics = ["stela-drivers/irq-diagnostics"]
+diagnostics = ["stela-drivers/irq-diagnostics", "stela-engine/test-support"]
 native-profile = ["stela-soc/native-profile", "stela-engine/native-profile"]
 # StelaGPU kext objects and plugin CDHashes, from `cargo xtask guest`.
 guest-stelagpu = []

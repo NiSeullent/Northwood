@@ -305,8 +305,8 @@ pub struct System {
     /// Cable the native USB keyboard and pointer to the last USB-C
     /// controller and feed it the host's virtio-input devices (`--input`).
     pub input: bool,
-    /// Explicit native executors and guest PEs (`--native-cores N`), one per
-    /// logical processor; SMT siblings count after every physical core.
+    /// Explicit native executor limit (`--native-cores N`), one per logical
+    /// processor. The source board also limits how many can run guest PEs.
     pub native_cores: Option<usize>,
     /// The source PE count (`--guest-pes N`) recorded by setup for disk
     /// boots whose verified DeviceTree is loaded after firmware exit.
@@ -589,6 +589,30 @@ fn flag(set: &mut bool, duplicate: Error) -> Result<(), Error> {
     Ok(())
 }
 
+/// Firmware executors and the prefix given resources to run guest PEs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeAssignment {
+    pub cores: usize,
+    pub runners: usize,
+}
+
+impl NativeAssignment {
+    fn for_runners(cores: usize) -> Self {
+        Self {
+            cores,
+            runners: cores,
+        }
+    }
+
+    /// Apply the smaller pool when firmware left no SIPI page or RAM limited it.
+    pub fn limit(self, cores: usize) -> Self {
+        Self {
+            cores: self.cores.min(cores),
+            runners: self.runners.min(cores),
+        }
+    }
+}
+
 impl System {
     /// This boot starts the macOS the Preboot disk holds, which needs a GPU;
     /// its recoveryOS and a staged update's installer show on the firmware's
@@ -605,20 +629,20 @@ impl System {
         metal_device || (self.preboot.is_some() && !self.upgrade)
     }
 
-    /// Select the exact number of host processors the loader reserves.
-    /// A disk-derived count is rechecked against the live source before SIPI.
-    pub fn assigned_native_cores(
+    /// Reserve native workers separately from the source board's PE roster.
+    /// Disk-derived PE counts are rechecked against the live source at boot.
+    pub fn native_assignment(
         &self,
         available: usize,
         verified_bundle_pes: Option<usize>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<NativeAssignment> {
         use crate::topology::{assignment_count, guest_assignment_count};
         use stela_contracts::refuse;
         if self.native_bootstrap_check || self.native_shared_check {
             let count = self.native_cores.ok_or(refuse!(
                 "native bootstrap check needs an explicit processor count"
             ))?;
-            return assignment_count(Some(count), available);
+            return assignment_count(Some(count), available).map(NativeAssignment::for_runners);
         }
         if !self.parallel && !self.native_rounds {
             if self.native_cores.is_some_and(|count| count != 1) {
@@ -626,31 +650,37 @@ impl System {
                     "serialized guest execution claims exactly one native core"
                 ));
             }
-            return assignment_count(Some(1), available);
+            return assignment_count(Some(1), available).map(NativeAssignment::for_runners);
         }
         let source_pes = if let Some(verified) = verified_bundle_pes {
             verified
         } else if self.preboot.is_some() {
-            self.native_cores.or(self.guest_pes).ok_or(refuse!(
+            self.guest_pes.or(self.native_cores).ok_or(refuse!(
                 "Preboot CPU count is unavailable before reservation; run stela setup repair or specify --guest-pes N"
             ))?
         } else {
             1
         };
-        guest_assignment_count(self.native_cores, available, source_pes)
+        if self.native_rounds || (verified_bundle_pes.is_none() && self.preboot.is_none()) {
+            return guest_assignment_count(self.native_cores, available, source_pes)
+                .map(NativeAssignment::for_runners);
+        }
+        let cores = assignment_count(self.native_cores, available)?;
+        let runners = guest_assignment_count(None, cores, source_pes)?;
+        Ok(NativeAssignment { cores, runners })
     }
 
-    /// Join the reservation to the verified live topology before starting APs.
+    /// Check the guest runner count against the verified live topology.
     pub fn validate_native_cores(
         &self,
         available: usize,
-        reserved: usize,
+        runners: usize,
         source_pes: usize,
     ) -> crate::Result<()> {
         use stela_contracts::refuse;
         if self.preboot.is_some()
             && (self.parallel || self.native_rounds)
-            && self.native_cores.is_none()
+            && (self.guest_pes.is_some() || self.native_cores.is_none())
             && self.guest_pes != Some(source_pes)
         {
             return Err(refuse!(
@@ -659,7 +689,7 @@ impl System {
         }
         // Fewer cores than assigned run when firmware leaves no AP startup
         // page or an AP fails to start.
-        if reserved == 0 || reserved > self.assigned_native_cores(available, Some(source_pes))? {
+        if runners == 0 || runners > self.native_assignment(available, Some(source_pes))?.runners {
             return Err(refuse!(
                 "verified live source and reserved native core count disagree; check --guest-pes and --native-cores"
             ));

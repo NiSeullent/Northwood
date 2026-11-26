@@ -22,6 +22,18 @@ pub use features::{
 };
 pub use measurement::{Calibration, WindowEvidence, calibrate_hpet};
 pub use sequence::CounterSequence;
+
+/// Elapsed milliseconds since this boot entered its EFI application. Firmware
+/// can leave the TSC running through a warm reset. A sample below the epoch
+/// (for example, from a processor with a small residual skew) reads as zero.
+pub fn boot_elapsed_millis(epoch: u64, now: u64, hz: u64) -> u64 {
+    if hz == 0 {
+        return 0;
+    }
+    let millis = u128::from(now.saturating_sub(epoch)) * 1000 / u128::from(hz);
+    millis.min(u128::from(u64::MAX)) as u64
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     MalformedCapture,

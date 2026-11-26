@@ -35,6 +35,8 @@
 //! region alone. Writes reach its blocks directly, never the volume's
 //! directory or FAT: [`file_runs`] gives the block-aligned runs of its
 //! clusters, wherever they lie, that hold the bytes its layout needs.
+//! The layout above is Northwood's writable version 1 format. [`read`] also
+//! recognizes Stambha's version 2 headers and extracts their boot records.
 use super::fat32;
 use alloc::{collections::VecDeque, format, vec, vec::Vec};
 use core::{
@@ -46,10 +48,14 @@ use stela_crypto::digest::Digest;
 use stela_drivers::block::{BlockDevice, BlockError, Finished, Request};
 use stela_soc_data::nor::CAPACITY;
 
+mod v2;
+
 /// Where the region starts in the machine-state partition.
 pub const OFFSET: u64 = CAPACITY as u64 + stela_formats::machine_state::SEP_BYTES;
 /// The region: the header and the ring.
 pub const LOG_BYTES: u64 = 4 << 20;
+/// The largest standalone Stambha log region the reader accepts.
+pub const MAX_FILE_BYTES: u64 = 64 << 20;
 /// The smallest machine-state partition that holds the log.
 pub const PARTITION_BYTES: u64 = OFFSET + LOG_BYTES;
 pub const HEADER_BYTES: u64 = 4096;
@@ -73,6 +79,8 @@ pub enum HeaderError {
     Version(u32),
     /// Reserved header bytes are not zero.
     Reserved,
+    /// More boot records than fit in the version 2 header.
+    Records(u32),
     Checksum,
     /// The header's ring is not the one this region holds.
     RingSize {
@@ -94,6 +102,9 @@ impl fmt::Display for HeaderError {
                 write!(f, "the log header is version {version}, not {VERSION}")
             }
             Self::Reserved => f.write_str("the log header's reserved bytes are not zero"),
+            Self::Records(count) => {
+                write!(f, "the log header names {count} boot records, more than 16")
+            }
             Self::Checksum => f.write_str("the log header's checksum does not match"),
             Self::RingSize { recorded, region } => write!(
                 f,
@@ -772,17 +783,48 @@ pub struct Log {
     pub ring_bytes: u64,
     /// The valid stream, oldest byte first.
     pub stream: Vec<u8>,
+    /// Boot excerpts saved separately from the ring in version 2 logs.
+    pub starts: Vec<BootStart>,
+}
+
+/// First and last lines saved for a boot, with the marker's stream position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootStart {
+    pub boot: u64,
+    pub start: u64,
+    pub first: Vec<u8>,
+    pub last: Vec<u8>,
 }
 
 impl Log {
     /// The stream bytes the ring has overwritten.
     pub fn overwritten(&self) -> u64 {
-        self.head.saturating_sub(self.ring_bytes)
+        self.head.saturating_sub(self.stream.len() as u64)
     }
 }
 
-/// The log a whole region holds, its stream in order. A blank or invalid
-/// header is refused by name.
+/// Whether a header page has a boot log signature, including Stambha's
+/// backup header after an incomplete write.
+pub fn has_magic(page: &[u8]) -> bool {
+    page.starts_with(MAGIC)
+        || page
+            .get(v2::COPY_AT..)
+            .is_some_and(|copy| copy.starts_with(MAGIC))
+}
+
+/// The boot number at the start of a marker, with or without a boot note.
+pub fn marker(line: &[u8]) -> Option<u64> {
+    let rest = line.strip_prefix(b"=== STELA BOOT ")?;
+    let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    let suffix = rest[digits..].strip_prefix(b" ===")?;
+    if !matches!(suffix.first(), None | Some(b' ' | b'\n' | b'\r')) {
+        return None;
+    }
+    core::str::from_utf8(&rest[..digits]).ok()?.parse().ok()
+}
+
+/// Read a Northwood version 1 or Stambha version 2 boot log. A version 2
+/// backup header is used if the primary could not be read.
 pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     let bytes = region.len() as u64;
     if bytes <= HEADER_BYTES {
@@ -790,7 +832,28 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     }
     let (header, ring) = region.split_at(HEADER_BYTES as usize);
     let ring_bytes = bytes - HEADER_BYTES;
-    let Header { head, boots, .. } = Header::decode(header, ring_bytes)?;
+    match Header::decode(header, ring_bytes) {
+        // Older Northwood loaders use the first 4 MiB of a larger USB file.
+        Err(HeaderError::RingSize {
+            recorded: RING_BYTES,
+            ..
+        }) if bytes > LOG_BYTES => read(&region[..LOG_BYTES as usize]),
+        Ok(header) => Ok(Log {
+            boots: header.boots,
+            head: header.head,
+            ring_bytes,
+            stream: read_stream(header.head, ring),
+            starts: Vec::new(),
+        }),
+        Err(HeaderError::Version(v2::VERSION)) => v2::read(header, ring)
+            .or_else(|error| v2::read(&header[v2::COPY_AT..], ring).or(Err(error))),
+        Err(error @ HeaderError::Version(_)) => Err(error),
+        Err(error) => v2::read(&header[v2::COPY_AT..], ring).or(Err(error)),
+    }
+}
+
+fn read_stream(head: u64, ring: &[u8]) -> Vec<u8> {
+    let ring_bytes = ring.len() as u64;
     let start = head.saturating_sub(ring_bytes);
     let len = (head - start) as usize;
     let at = (start % ring_bytes) as usize;
@@ -798,12 +861,7 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     let mut stream = Vec::with_capacity(len);
     stream.extend_from_slice(&ring[at..at + first]);
     stream.extend_from_slice(&ring[..len - first]);
-    Ok(Log {
-        boots,
-        head,
-        ring_bytes,
-        stream,
-    })
+    stream
 }
 
 #[cfg(test)]

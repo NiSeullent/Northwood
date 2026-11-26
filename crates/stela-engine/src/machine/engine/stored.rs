@@ -177,8 +177,8 @@ impl Offer {
     }
     /// Off-path preparation from canonical immutable input. No native template
     /// or copied site can be supplied; this owner emits the block itself.
-    #[cfg(test)]
-    pub(crate) fn compile(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn compile(
         key: Digest,
         page: u64,
         pc: u64,

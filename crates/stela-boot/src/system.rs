@@ -718,18 +718,19 @@ pub(crate) fn boot(
 fn translation_store(
     mut files: BundleFiles,
     mut storage: Option<stela_drivers::Handoff>,
-    cores: usize,
+    assignment: stela_boot_core::options::NativeAssignment,
     pending: u64,
-) -> (BundleFiles, Option<stela_drivers::Handoff>) {
+) -> (BundleFiles, Option<stela_drivers::Handoff>, bool) {
     use crate::engine::translations::PackRead;
     crate::status::begin("Opening the translation cache");
     // Without a memory map the pack gets nothing; the parts' sizing
     // reports the map's absence.
     let free = memory_map(None).map_or(0, |map| map.ledger.separate_usable.saturating_sub(pending));
-    let budget = stela_boot_core::host_memory::pack_budget(free, cores, cores);
+    let budget =
+        stela_boot_core::host_memory::pack_budget(free, assignment.cores, assignment.runners);
     let Some(store) = crate::engine::translations::read(budget) else {
         crate::status::done("none on this USB");
-        return (files, storage);
+        return (files, storage, false);
     };
     let mb = |bytes: u64| bytes / 1_000_000;
     let stays = "new translations stay in memory this boot";
@@ -757,16 +758,18 @@ fn translation_store(
             crate::status::warn(&format!("{stays}: `stela setup repair` prepares the file"))
         }
     }
-    if files.len() < MAX_FILES {
-        files.push((
-            String::from(crate::engine::translations::FILE),
-            store.region,
-        ));
-        if store.writable && storage.is_none() {
-            storage = storage::discover().ok();
-        }
+    if files.len() >= MAX_FILES {
+        return (files, storage, false);
     }
-    (files, storage)
+    files.push((
+        String::from(crate::engine::translations::FILE),
+        store.region,
+    ));
+    if store.writable && storage.is_none() {
+        storage = storage::discover().ok();
+    }
+    let writable = store.writable && storage.is_some();
+    (files, storage, writable)
 }
 
 fn load(
@@ -790,16 +793,31 @@ fn load(
     let system = System::parse(text).map_err(stela_boot_core::options::Error::message)?;
     let processors = crate::native_smp::firmware::inventory()
         .map_err(crate::native_smp::firmware::Error::message)?;
-    let cores = system.assigned_native_cores(processors.logical_count(), bundle_pes)?;
-    let (cores, sipi) = memory::prepare_sipi(cores, processors.enabled > 1);
-    let native_processors = crate::native_smp::firmware::capture(processors, cores)
-        .map_err(crate::native_smp::firmware::Error::message)?;
-    // The translation cache takes only what the parts and the guest leave,
-    // so it is read last before they are reserved: only the engine image's
-    // copy comes between.
+    let assignment = system.native_assignment(processors.logical_count(), bundle_pes)?;
+    let exact = system.native_bootstrap_check || system.native_shared_check;
+    let (cores, sipi) = memory::prepare_sipi(assignment.cores, processors.enabled > 1);
+    if exact && cores != assignment.cores {
+        return Err(refuse!(
+            "native processor diagnostic lacks a SIPI startup page"
+        ));
+    }
+    // Limit the cache to the memory left after the planned workers and guest.
+    let mut assignment = assignment.limit(cores);
     let image_bytes = crate::native_image::ResidentImage::allocation_bytes(snapshot.bytes);
-    let (bundle, storage) = translation_store(bundle, storage, cores, image_bytes);
+    let (bundle, storage, writable_store) =
+        translation_store(bundle, storage, assignment, image_bytes);
     output::boot_stage("translation-store-ready");
+    if !writable_store && system.native_cores.is_none() && assignment.cores > assignment.runners {
+        output::arguments(format_args!(
+            "NATIVE WORKERS plan host={} runners={} spare=0 reason=no-writable-translation-store\n",
+            assignment.cores, assignment.runners,
+        ));
+        assignment = assignment.limit(assignment.runners);
+    }
+    let (native_processors, observed) =
+        crate::native_smp::firmware::capture(processors, assignment.cores, exact)
+            .map_err(crate::native_smp::firmware::Error::message)?;
+    let assignment = assignment.limit(observed);
     let pack = bundle
         .iter()
         .find(|(name, _)| name == crate::engine::translations::FILE)
@@ -820,12 +838,18 @@ fn load(
         before_release.total, before_release.live,
     ));
     let mut memory = memory::reserve(
-        (cores, sipi),
+        assignment,
+        sipi,
         &image.ram,
         staged + pack,
         released,
         before_reclaim,
     )?;
+    if exact && memory.native_resources.cores as usize != assignment.cores {
+        return Err(refuse!(
+            "native processor diagnostic could not reserve every requested worker"
+        ));
+    }
     let tsc_hz = crate::firmware::tsc_hz();
     if !crate::cpu::INVARIANT_TSC.present() {
         output::arguments(format_args!(
@@ -1068,6 +1092,7 @@ fn load(
             low_dma,
             northwood_config,
             bundle_layout,
+            boot_epoch: output::boot_epoch(),
         });
     }
     // SAFETY: boot services ended; the completed root maps this code and

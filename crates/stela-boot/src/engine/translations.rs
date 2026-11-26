@@ -15,21 +15,25 @@
 //! When every PE runs on its own host core (the default), their machines
 //! share the store ([`Shared`]), split by page key into parts behind locks
 //! of their own, and it keeps the blocks any of them compiled for the others
-//! to install ([`share`]). A PE that compiles at EL0 proves a few waiting
-//! blocks now and then, so that a stop has fewer left to prove.
+//! to install ([`share`]). Idle host CPUs without guest PEs prove batches
+//! independently. With no spare CPU a PE at EL0 proves a few waiting blocks.
 use super::bundle::Bytes;
-use crate::{firmware, handoff::Region, output, paging::PAGE};
+use super::host;
+use crate::{
+    apic::Apic, firmware, handoff::Region, native_smp::executor::Executors, output, paging::PAGE,
+};
 use alloc::{boxed::Box, format, string::String, vec};
 use core::{
     cell::UnsafeCell,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use stela_boot_core::host_memory::PACK_FLOOR;
 use stela_drivers::block::BlockDevice;
 use stela_engine::machine::Offer;
 use stela_engine::machine::Translations;
 use stela_engine::machine::engine::StoreEvent;
+use stela_engine::machine::engine::publication::WorkerBinding;
 use stela_engine::translations;
 use stela_engine::translations::Digest;
 use stela_engine::translations::Record;
@@ -411,7 +415,11 @@ struct Boot {
 /// The parts a boot's store is split into by page key, each behind a lock
 /// of its own, so that PEs looking up, sharing and offering blocks of
 /// different pages do not wait for each other.
-const PARTS: usize = 16;
+const PARTS: usize = stela_boot_core::topology::MAX_CORES;
+const BASE_PARTS: usize = 16;
+const _: () = assert!(PARTS.is_power_of_two() && PARTS <= u64::BITS as usize);
+/// Retain the existing shard width for small hosts and read-only boots.
+static SHARDS: AtomicUsize = AtomicUsize::new(BASE_PARTS);
 
 /// A spin lock that counts how often it was found held and how long its
 /// waiters spun.
@@ -471,7 +479,15 @@ static STORES: [Lock<Option<Store<'static>>>; PARTS] = [const { Lock::new(None) 
 
 /// The part of the store that holds the page whose bytes hash to `key`.
 fn part(key: &Digest) -> &'static Lock<Option<Store<'static>>> {
-    &STORES[usize::from(key.0[2]) % PARTS]
+    &STORES[part_index(key)]
+}
+
+fn part_index(key: &Digest) -> usize {
+    usize::from(key.0[2]) & (SHARDS.load(Ordering::Relaxed) - 1)
+}
+
+fn stores() -> &'static [Lock<Option<Store<'static>>>] {
+    &STORES[..SHARDS.load(Ordering::Relaxed)]
 }
 
 /// Keep the store's capabilities off the locks' cache lines so a PE can
@@ -525,11 +541,10 @@ static COSTS: Costs = Costs {
     batch_ticks: AtomicU64::new(0),
 };
 
-/// Proof during the boot: one PE at a time proves a batch of this many
-/// blocks, at EL0, and the next batch waits until the time since this one
-/// began is [`PROOF_SPACING`] times its own. The prover then takes at most
-/// a fraction of one core, and no PE holds a kernel lock while it proves.
+/// How many blocks a shard accumulates before waking its proof worker.
 const PROOF_BATCH_BLOCKS: usize = 32;
+/// With no spare AP, space batches so that EL0 proof uses only a fraction
+/// of a guest PE and never runs while it holds an XNU kernel lock.
 const PROOF_SPACING: u64 = 4;
 /// Counter ticks after a look that found nothing to prove before the next:
 /// about a millisecond at the clocks Stela runs on.
@@ -537,8 +552,232 @@ const IDLE_LOOK_TICKS: u64 = 1 << 22;
 static PROVING: AtomicBool = AtomicBool::new(false);
 static NEXT_PROOF: AtomicU64 = AtomicU64::new(0);
 static PROOF_PART: AtomicUsize = AtomicUsize::new(0);
+static PROOF_WORKERS: [ProofWorker; PARTS] = [const { ProofWorker::new() }; PARTS];
+static PROOF_WORKER_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// The most a stop spends proving what the boot left: the rest is not kept.
 const STOP_PROOF_MILLIS: u64 = 3000;
+
+/// One idle AP owns proof of its assigned shards. The bitmap coalesces
+/// their offers without copying guest state, queuing unbounded jobs or
+/// taking a lock on the sender's path to the AP.
+#[repr(align(64))]
+struct ProofWorker {
+    apic: AtomicU32,
+    pending: AtomicU64,
+    active: AtomicBool,
+    batches: AtomicU64,
+}
+
+impl ProofWorker {
+    const fn new() -> Self {
+        Self {
+            apic: AtomicU32::new(0),
+            pending: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+            batches: AtomicU64::new(0),
+        }
+    }
+
+    fn schedule(&self, shard: usize) {
+        if self.pending.fetch_or(1 << shard, Ordering::Release) == 0 {
+            host::ring(self.apic.load(Ordering::Relaxed));
+        }
+    }
+
+    fn run(&self) {
+        loop {
+            crate::native_mmio::shootdown::service();
+            let mut pending = self.pending.swap(0, Ordering::Acquire);
+            while pending != 0 {
+                let shard = pending.trailing_zeros() as usize;
+                pending &= pending - 1;
+                self.active.store(true, Ordering::SeqCst);
+                // Paired with write's capability close and active scan.
+                // A producer may leave a signal after closing, but it must
+                // not start proof with the stores already taken by write.
+                let writable = AVAILABLE.capabilities.load(Ordering::SeqCst) & WRITE_PACK != 0;
+                if writable && !crate::ALLOCATOR.low() {
+                    let lock = &STORES[shard];
+                    let took = prove_batch(lock, true);
+                    if took {
+                        self.batches.fetch_add(1, Ordering::Relaxed);
+                        if lock.with(|store| {
+                            store
+                                .as_ref()
+                                .is_some_and(|store| store.proof_ready(PROOF_BATCH_BLOCKS))
+                        }) {
+                            self.pending.fetch_or(1 << shard, Ordering::Release);
+                        }
+                    }
+                }
+                self.active.store(false, Ordering::SeqCst);
+            }
+            if self.pending.load(Ordering::Acquire) == 0 {
+                // SAFETY: this AP enters with interrupts masked. A directed
+                // interrupt signaled before the wait is pending and wakes it;
+                // the pinned AP IDT and shootdown state remain installed.
+                unsafe { crate::native_idle::wait(|| None) };
+            }
+        }
+    }
+}
+
+/// Reserve only workers that have no guest PE binding. A read-only or absent
+/// pack has no durable proof to do, so its extra APs remain in their mailbox.
+pub(super) fn start_proof_workers(
+    executors: &Executors,
+    bindings: &[WorkerBinding],
+    sender: &Apic,
+    tsc_hz: u64,
+) -> usize {
+    if !available(WRITE_PACK) {
+        return 0;
+    }
+    let mut count = 0;
+    for processor in executors.processors() {
+        if bindings
+            .iter()
+            .any(|binding| binding.worker.0 == processor.slot())
+        {
+            continue;
+        }
+        let worker = &PROOF_WORKERS[count];
+        let apic = u32::try_from(processor.apic_id()).expect("validated APIC ID");
+        worker.apic.store(apic, Ordering::Relaxed);
+        match processor.spawn(Box::new(move |_| worker.run()), sender, tsc_hz) {
+            Ok(()) => count += 1,
+            Err(error) => output::arguments(format_args!(
+                "TRANSLATIONS APIC {apic:#x} proof worker unavailable: {error}\n"
+            )),
+        }
+    }
+    PROOF_WORKER_COUNT.store(count, Ordering::Release);
+    count
+}
+
+/// Feed one owned relocation-proof batch to each eligible AP, using an
+/// authored AArch64 source page and the actual offer/wake/fold path. The
+/// diagnostic terminates here without a guest or a disk write.
+#[cfg(feature = "diagnostics")]
+pub(super) fn check_proof_workers(executors: &Executors, sender: &Apic, tsc_hz: u64) {
+    use alloc::sync::Arc;
+    use stela_compiler::{
+        TargetCpu,
+        x86_64::{MemoryChecks, NativeSystem},
+    };
+    use stela_engine::machine::engine::{Description, Preparation, publication::WorkerId};
+
+    let logical = executors.started();
+    if logical == 1 {
+        output::arguments(format_args!(
+            "CHECK native-translation-proof SKIP reason=no-remote-processor\n"
+        ));
+        return;
+    }
+    let guest_reserved = if logical == PARTS { 8 } else { 1 };
+    let bindings: alloc::vec::Vec<_> = (0..guest_reserved)
+        .map(|pe| WorkerBinding {
+            pe,
+            worker: WorkerId(pe),
+        })
+        .collect();
+    SHARDS.store(PARTS, Ordering::Relaxed);
+    for lock in stores() {
+        drop(lock.with(Option::take));
+    }
+    install_parts(translations::translator_id(), None, 0);
+    AVAILABLE.capabilities.store(WRITE_PACK, Ordering::SeqCst);
+    let workers = start_proof_workers(executors, &bindings, sender, tsc_hz);
+    if workers != logical - guest_reserved {
+        output::fatal("translation proof diagnostic could not start every unassigned AP");
+    }
+
+    let mut keys = [None; PARTS];
+    let mut source = vec![0; translations::PAGE_BYTES];
+    let block = [0x00, 0x04, 0x00, 0x91, 0xc0, 0x03, 0x5f, 0xd6]; // add x0, x0, #1; ret
+    for bytes in source
+        .chunks_exact_mut(block.len())
+        .take(PROOF_BATCH_BLOCKS)
+    {
+        bytes.copy_from_slice(&block);
+    }
+    let mut found = 0;
+    let salt_range = source.len() - 8..;
+    for salt in 0..4096u64 {
+        source[salt_range.clone()].copy_from_slice(&salt.to_le_bytes());
+        let key = Digest::of(&source);
+        let shard = part_index(&key);
+        if shard < workers && keys[shard].replace(key).is_none() {
+            found += 1;
+            if found == workers {
+                break;
+            }
+        }
+    }
+    let preparation = Arc::new(
+        Preparation::from_description(&Description {
+            chip: stela_contracts::chip::Chip::AppleM1,
+            target: TargetCpu::Baseline,
+            fp: true,
+            checks: MemoryChecks::DEFAULT,
+            scalable: None,
+            system: NativeSystem::NONE,
+            withheld: 0,
+        })
+        .unwrap_or_else(|error| output::fatal(error)),
+    );
+    let mut shared = Shared;
+    let started = output::now();
+    for (shard, key) in keys[..workers].iter().enumerate() {
+        let key =
+            key.unwrap_or_else(|| output::fatal("translation proof diagnostic page key absent"));
+        let page = (shard + 1) as u64 * translations::PAGE_BYTES as u64;
+        for index in 0..PROOF_BATCH_BLOCKS {
+            let pc = page + (index * block.len()) as u64;
+            let offer = Offer::compile(
+                key,
+                page,
+                pc,
+                preparation.context(page),
+                block.to_vec(),
+                Arc::clone(&preparation),
+            )
+            .unwrap_or_else(|| output::fatal("translation proof diagnostic block refused"));
+            shared.offer(offer);
+        }
+    }
+    while PROOF_WORKERS[..workers]
+        .iter()
+        .any(|worker| worker.batches.load(Ordering::Relaxed) == 0)
+    {
+        if output::now().wrapping_sub(started) >= tsc_hz * 30 {
+            output::fatal("translation proof diagnostic worker deadline");
+        }
+        crate::native_mmio::shootdown::service();
+        core::hint::spin_loop();
+    }
+    finish_proofs();
+    let (proven, unkept) = stores()
+        .iter()
+        .map(|lock| {
+            lock.with(|store| {
+                store.as_ref().map_or((0, 0), |store| {
+                    (store.counters.proven, store.counters.unkept)
+                })
+            })
+        })
+        .fold((0, 0), |(proven, unkept), (add, lost)| {
+            (proven + add, unkept + lost)
+        });
+    if proven != (workers * PROOF_BATCH_BLOCKS) as u64 || unkept != 0 {
+        output::fatal("translation proof diagnostic entries missing");
+    }
+    output::arguments(format_args!(
+        "CHECK native-translation-proof PASS logical={logical} guest_reserved={guest_reserved} \
+         workers={workers} completed={workers} proven={proven} ms={}\n",
+        output::millis_since(started)
+    ));
+}
 
 /// What the store keeps beyond its pack, for an engine heap of `heap` bytes:
 /// blocks waiting for proof, entries proven during the boot, decoded
@@ -560,11 +799,12 @@ fn bounds(heap: usize) -> (pack::Bounds, usize) {
 fn install_parts(translator: Digest, pack: Option<Pack<'static>>, shared: usize) {
     let (bounds, kept_pages) = bounds(crate::ALLOCATOR.usage().total);
     AVAILABLE.kept_pages.store(kept_pages, Ordering::Release);
-    for lock in &STORES {
+    let stores = stores();
+    for lock in stores {
         let evicted = lock.with(|store| {
             let store = store.get_or_insert_with(|| Store::over(translator, pack));
-            store.share(shared / PARTS);
-            store.set_bounds(bounds.share(PARTS))
+            store.share(shared / stores.len());
+            store.set_bounds(bounds.share(stores.len()))
         });
         drop(evicted);
     }
@@ -575,7 +815,8 @@ pub struct Shared;
 
 impl Shared {
     fn publish_shared(offer: Offer) {
-        let bound = AVAILABLE.shared_bound.load(Ordering::Acquire) / PARTS;
+        let parts = SHARDS.load(Ordering::Relaxed);
+        let bound = AVAILABLE.shared_bound.load(Ordering::Acquire) / parts;
         let lock = part(&offer.key());
         let Some(mut staged) = StagedOffer::new(offer, bound) else {
             return;
@@ -585,18 +826,57 @@ impl Shared {
     }
 
     fn publish_writable(offer: Offer) {
-        let bound = AVAILABLE.shared_bound.load(Ordering::Acquire) / PARTS;
+        let parts = SHARDS.load(Ordering::Relaxed);
+        let bound = AVAILABLE.shared_bound.load(Ordering::Acquire) / parts;
         let mut staged = StagedOffer::for_writable(&offer, bound);
-        let retired = part(&offer.key()).with(|store| {
-            let store = store.as_mut()?;
+        let workers = PROOF_WORKER_COUNT.load(Ordering::Acquire);
+        let shard = part_index(&offer.key());
+        let (retired, ready) = STORES[shard].with(|store| {
+            let Some(store) = store.as_mut() else {
+                return (None, false);
+            };
             store.keep_pending(&offer);
-            store.accept_shared(staged.as_mut()?)
+            (
+                staged
+                    .as_mut()
+                    .and_then(|staged| store.accept_shared(staged)),
+                workers != 0 && store.proof_ready(PROOF_BATCH_BLOCKS),
+            )
         });
         drop(retired);
-        if offer.quiet() {
+        if ready {
+            PROOF_WORKERS[shard % workers].schedule(shard);
+        } else if workers == 0 && offer.quiet() {
             prove_some();
         }
     }
+}
+
+/// A proof only uses its owned input and immutable preparation. Holding the
+/// shard lock for take and fold only leaves guest fetches free to use it.
+fn prove_batch(lock: &Lock<Option<Store<'static>>>, on_worker: bool) -> bool {
+    let started = output::now();
+    let Some(batch) = lock.with(|store| store.as_mut()?.take_batch(PROOF_BATCH_BLOCKS)) else {
+        return false;
+    };
+    let proven = if on_worker {
+        // SAFETY: the AP is outside guest execution, holds no shard/driver
+        // lock and has interrupts disabled. Its shootdown and doorbell do
+        // not access the compiler. The previous interrupt mask is restored.
+        unsafe { crate::native_mmio::shootdown::job(|| batch.prove()) }
+    } else {
+        batch.prove()
+    };
+    lock.with(|store| {
+        if let Some(store) = store {
+            store.fold(proven);
+        }
+    });
+    COSTS.batches.fetch_add(1, Ordering::Relaxed);
+    COSTS
+        .batch_ticks
+        .fetch_add(output::now().wrapping_sub(started), Ordering::Relaxed);
+    true
 }
 
 /// Prove one batch of the blocks waiting for proof outside the store's
@@ -607,31 +887,18 @@ fn prove_some() {
         return;
     }
     // A stop clears the capability before it waits for `PROVING`.
-    let mut proved = false;
-    if available(WRITE_PACK) && !crate::ALLOCATOR.low() {
-        for _ in 0..PARTS {
-            let lock = &STORES[PROOF_PART.fetch_add(1, Ordering::Relaxed) % PARTS];
-            let Some(batch) = lock.with(|store| store.as_mut()?.take_batch(PROOF_BATCH_BLOCKS))
-            else {
-                continue;
-            };
-            let proven = batch.prove();
-            lock.with(|store| {
-                if let Some(store) = store {
-                    store.fold(proven);
-                }
-            });
-            proved = true;
-            break;
-        }
-    }
+    let stores = stores();
+    let proved = AVAILABLE.capabilities.load(Ordering::SeqCst) & WRITE_PACK != 0
+        && !crate::ALLOCATOR.low()
+        && (0..stores.len()).any(|_| {
+            let lock = &stores[PROOF_PART.fetch_add(1, Ordering::Relaxed) & (stores.len() - 1)];
+            prove_batch(lock, false)
+        });
     let spent = output::now().wrapping_sub(now);
     // Only batches proven count: a look that found every part empty or
     // full is not one, and the next look waits a while, so that EL0
     // compiles do not each look through every part.
     let wait = if proved {
-        COSTS.batches.fetch_add(1, Ordering::Relaxed);
-        COSTS.batch_ticks.fetch_add(spent, Ordering::Relaxed);
         spent.saturating_mul(PROOF_SPACING)
     } else {
         IDLE_LOOK_TICKS
@@ -779,7 +1046,7 @@ pub fn share(bound: usize) {
 
 /// Make the store of the handoff file `contents` the engine's: the GPT
 /// partition to open for writing it, when it can be written.
-pub fn install(contents: &'static [u8]) -> Option<Guid> {
+pub fn install(contents: &'static [u8], logical: usize) -> Option<Guid> {
     if contents.len() < PLACEMENT_BYTES || contents[..8] != PLACEMENT_MAGIC {
         return None;
     }
@@ -814,10 +1081,16 @@ pub fn install(contents: &'static [u8]) -> Option<Guid> {
         }
     };
     BOOT.with(|boot| {
-        for lock in &STORES {
+        for lock in stores() {
             let old = lock.with(Option::take);
             drop(old);
         }
+        let partitions = if flags & WRITABLE != 0 {
+            logical.clamp(BASE_PARTS, PARTS).next_power_of_two()
+        } else {
+            BASE_PARTS
+        };
+        SHARDS.store(partitions, Ordering::Relaxed);
         install_parts(translator, pack, 0);
         *boot = Some(Boot {
             translator,
@@ -907,21 +1180,49 @@ fn report(counters: &pack::Counters) {
         counters.shared_in_flight,
     ));
     let (mut acquired, mut contended, mut spun) = (0, 0, 0);
-    for lock in &STORES {
+    for lock in stores() {
         acquired += load(&lock.acquired);
         contended += load(&lock.contended);
         spun += load(&lock.spun);
     }
+    let workers = &PROOF_WORKERS[..PROOF_WORKER_COUNT.load(Ordering::Acquire)];
+    let busy = workers
+        .iter()
+        .filter(|worker| load(&worker.batches) != 0)
+        .count();
+    let offloaded = workers
+        .iter()
+        .map(|worker| load(&worker.batches))
+        .sum::<u64>();
     output::arguments(format_args!(
         "TRANSLATIONS early proven={} unprovable={} unkept={} batches={} batch_ms={} \
+         proof_workers={} working={busy} offloaded={offloaded} \
          locks acquired={acquired} contended={contended} spin_ms={}\n",
         counters.proven,
         counters.unprovable,
         counters.unkept,
         load(&costs.batches),
         millis(load(&costs.batch_ticks)),
+        workers.len(),
         millis(spun),
     ));
+}
+
+fn finish_proofs() {
+    AVAILABLE
+        .capabilities
+        .fetch_and(!WRITE_PACK, Ordering::SeqCst);
+    // Each owner folds its batch before the stores can be taken. A late
+    // producer can leave a signal, but cannot start another proof.
+    while PROVING.load(Ordering::SeqCst) {
+        core::hint::spin_loop();
+    }
+    for worker in &PROOF_WORKERS[..PROOF_WORKER_COUNT.load(Ordering::Acquire)] {
+        while worker.active.load(Ordering::SeqCst) {
+            crate::native_mmio::shootdown::service();
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// At a quiescent point (the guest restarts or powers off): prove the
@@ -934,11 +1235,8 @@ pub fn write() {
     }) else {
         return;
     };
-    // A batch being proven is folded back before the parts are taken.
-    while PROVING.load(Ordering::SeqCst) {
-        core::hint::spin_loop();
-    }
-    let mut parts = STORES.iter().filter_map(|lock| lock.with(Option::take));
+    finish_proofs();
+    let mut parts = stores().iter().filter_map(|lock| lock.with(Option::take));
     let Some(mut store) = parts.next() else {
         return;
     };
