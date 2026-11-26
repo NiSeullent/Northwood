@@ -54,6 +54,10 @@ if expected_exit == 35:
 
 if report["scenario"] != {"passed": True}:
     sys.exit(f"{run.name}: the authored kernel did not reach its verified idle state")
+if "FIRMWARE watchdog disabled" not in lines or not any(
+    line.startswith("FIRMWARE boot services ended at try ") for line in lines
+):
+    sys.exit(f"{run.name}: firmware handoff diagnostics are missing")
 
 inventories = [
     dict(field.split("=", 1) for field in line.split()[2:])
@@ -63,6 +67,11 @@ inventories = [
 expected = {"physical_cores": str(cores_total), "logical": str(cores_total * threads)}
 if len(inventories) != 1 or any(inventories[0].get(key) != count for key, count in expected.items()):
     sys.exit(f"{run.name}: expected CPU inventory {expected}, got {inventories}")
+other_threads = cores_total * threads - 1
+if other_threads and (
+    f"NATIVE PARKED BEFORE FIRMWARE {other_threads} of {other_threads}; wait_for_sipi=0" not in lines
+):
+    sys.exit(f"{run.name}: not all {other_threads} other threads parked before firmware access")
 if not any(line.startswith("HOST MEMORY ") and "profile=standard" in line.split() for line in lines):
     sys.exit(f"{run.name}: expected the standard memory profile")
 print(f"{run.name}: verified boot with {sockets} socket(s), {cores_total} cores and {cores_total * threads} threads")
