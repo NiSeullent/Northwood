@@ -149,9 +149,7 @@ pub fn matches<C: ConfigSpace>(function: &Function<C>) -> bool {
 /// Candidate selection from copied identity DATA; owned attachment still
 /// revalidates configuration and platform requirements.
 pub fn matches_identity(function: &crate::bus::pci::Identity) -> bool {
-    function.vendor == 0x10ec
-        && revision::pci_candidate(function.device)
-        && function.class == [2, 0, 0]
+    function.class == [2, 0, 0] && revision::pci_device(function.vendor, function.device).is_some()
 }
 trait Registers {
     fn read8(&self, offset: usize) -> u8;
@@ -259,11 +257,11 @@ impl Realtek {
         minimum: alloc::rc::Rc<dyn crate::bus::pci::power::Timer>,
     ) -> Result<Self, Error> {
         let clock = crate::timing::Timing::checked(handoff.clock, minimum)?;
-        if !matches(function) {
-            return Err(
-                BlockError::Unsupported("not a supported Realtek PCI Ethernet candidate").into(),
-            );
-        }
+        let family = revision::pci_device(function.vendor, function.device)
+            .filter(|_| function.class == [2, 0, 0])
+            .ok_or(BlockError::Unsupported(
+                "not a supported Realtek PCI Ethernet candidate",
+            ))?;
         let pcie_link_control = prepare_pcie_link(function, |function| {
             // SAFETY: caller grants exclusive PCI segment access and valid ECAM.
             unsafe { pci::disable_aspm_link(function, handoff) }
@@ -280,7 +278,7 @@ impl Realtek {
         let revision = detect_revision(&device, txconfig, |bytes| {
             map_registers(handoff, bar, 0, bytes).map(|_| ())
         })?;
-        admit_revision(function.device, pcie_link_control, revision)?;
+        admit_revision(family, pcie_link_control, revision)?;
         if !revision.nbase() && device.read8(PHY_STATUS) & 0x80 != 0 {
             return Err(BlockError::Unsupported("Realtek TBI/fiber mode").into());
         }
@@ -392,15 +390,13 @@ impl RuntimeLink {
             // genphy_update_link's polled BMCR/BMSR sequence preserves a
             // latch-low drop while up, and retries a low sample while down.
             // A 10 ms cache keeps PHY polling out of the per-packet fast path.
+            // A register that reads all ones is taken as read, as Linux
+            // does: a BMCR of all ones has its restart bit set, so the link
+            // reads down until a later poll. Only a PHY access that does not
+            // complete, or a function whose registers read all ones, ends
+            // link polling, as phylib's PHY_ERROR state does.
             (|| {
-                let read = |reg| {
-                    let value = hw.phy_read(reg)?;
-                    if value == u16::MAX {
-                        Err(BlockError::Device { status: 65535 })
-                    } else {
-                        Ok(value)
-                    }
-                };
+                let read = |reg| hw.phy_read(reg);
                 if read(PHY_CONTROL)? & BMCR_RESTART_AUTONEGOTIATION != 0 {
                     return Ok(0);
                 }

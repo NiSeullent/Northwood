@@ -261,6 +261,7 @@ fn command(f: &Fixture, usb: &Path) -> Request {
         // Most of these tests exercise a USB that holds the whole image, as
         // setups made before every install streamed it do.
         install_image: Some(InstallImage::Full),
+        offline_kit: None,
         download_dir: None,
         efi: Some(f.efi.clone()),
         model: Some(restore::payload::SYNTHETIC_MODEL.into()),
@@ -5007,4 +5008,125 @@ fn a_new_setup_puts_macos_on_a_usb_of_32_gb_or_more() {
     // A stick sold as 32 GB.
     assert_eq!(default_install_image(31_000_000_000), InstallImage::Full);
     assert_eq!(default_install_image(64 * GIB), InstallImage::Full);
+}
+
+#[test]
+fn offline_kit_creates_a_full_usb_with_no_online_callbacks() -> Result<()> {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    let kit = offline::Prepare {
+        ipsw: f.ipsw.clone(),
+        output: f._dir.path().join("offline"),
+        model: restore::payload::SYNTHETIC_MODEL.into(),
+        ecid: Some(Ecid::parse("1a2b")?),
+        gpu: Vec::new(),
+    };
+    kit.run(&Environment {
+        prepare_restore: &staged_prepare_restore,
+        ..environment(&f.host)
+    })?;
+    let fail_signing = |_: prepare::RamdiskOptions<'_>| bail!("unexpected online signing");
+    let fail_inventory = |_: &Path, _: &str| bail!("unexpected online payload inventory");
+    let air_gapped = Environment {
+        prepare_restore: &fail_signing,
+        prepare_update: &fail_signing,
+        inventory: &fail_inventory,
+        remote_inventory: &fail_inventory,
+        ..environment(&f.host)
+    };
+    let mut request = command(&f, &f.esp);
+    request.offline_kit = Some(kit.output);
+    request.model = None;
+    request.install_image = None;
+    let report = setup(&air_gapped, request)?;
+    assert!(report.contains(create::OFFLINE_NOTE), "{report}");
+    let record = record(&f);
+    assert_eq!(record.installs[0].ecid, kit.ecid);
+    let medium = record.active_medium().expect("full restore media");
+    assert!(!medium.remote, "{medium:?}");
+    assert!(medium.problems().is_empty(), "{medium:?}");
+    Ok(())
+}
+
+#[test]
+fn offline_kit_refuses_missing_signing_answers_and_damaged_hashes() -> Result<()> {
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    let kit = offline::Prepare {
+        ipsw: f.ipsw.clone(),
+        output: f._dir.path().join("offline"),
+        model: restore::payload::SYNTHETIC_MODEL.into(),
+        ecid: None,
+        gpu: Vec::new(),
+    };
+    let error = kit.run(&environment(&f.host)).unwrap_err();
+    assert!(
+        error.to_string().contains("every signing answer"),
+        "{error:#}"
+    );
+    assert!(!kit.output.exists());
+
+    let staged = Environment {
+        prepare_restore: &staged_prepare_restore,
+        ..environment(&f.host)
+    };
+    kit.run(&staged)?;
+    fs::write(
+        kit.output.join(stela_formats::payload::BLOCK_HASHES_FILE),
+        b"damaged",
+    )?;
+    let before = (snapshot(&f.esp), snapshot(&stela_volume(&f)));
+    let mut request = command(&f, Path::new("disk5"));
+    request.offline_kit = Some(kit.output);
+    request.confirmed = true;
+    let error = setup(&staged, request).unwrap_err();
+    assert!(format!("{error:#}").contains("block hashes failed verification"));
+    assert_eq!((snapshot(&f.esp), snapshot(&stela_volume(&f))), before);
+    Ok(())
+}
+
+#[test]
+fn offline_kit_setup_arguments_select_distinct_creation_paths() {
+    use clap::Parser as _;
+    let parse = |args: &[&str]| {
+        crate::Cli::try_parse_from(["stela", "setup"].into_iter().chain(args.iter().copied())).map(
+            |cli| match cli.command {
+                crate::Command::Setup(setup) => setup.request(),
+                _ => panic!("not a setup"),
+            },
+        )
+    };
+    assert_eq!(
+        parse(&["--installer", "offline"]).unwrap().install_image,
+        Some(InstallImage::Full)
+    );
+    assert_eq!(
+        parse(&["--installer", "online"]).unwrap().install_image,
+        Some(InstallImage::Network)
+    );
+    assert!(matches!(
+        parse(&["prepare-offline", "--ipsw", "macos.ipsw", "--output", "kit"])
+            .unwrap()
+            .action,
+        Action::PrepareOffline(_)
+    ));
+    assert!(parse(&["--offline-kit", "kit", "--ipsw", "macos.ipsw"]).is_err());
+    assert!(parse(&["--offline-kit", "kit", "--usb", "disk5"]).is_err());
+    let request = parse(&[
+        "--offline-kit",
+        "kit",
+        "--usb",
+        "disk5",
+        "--ipsw",
+        "macos.ipsw",
+        "--host-firmware-cache",
+        "firmware",
+    ])
+    .unwrap();
+    assert_eq!(request.offline_kit.as_deref(), Some(Path::new("kit")));
+    assert_eq!(
+        request.host_firmware_cache.as_deref(),
+        Some(Path::new("firmware"))
+    );
+    assert!(!request.fetch);
 }

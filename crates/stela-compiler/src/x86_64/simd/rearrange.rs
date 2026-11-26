@@ -85,14 +85,70 @@ pub(in crate::x86_64) fn emit_reverse_dword_run(
     last
 }
 
+/// Load the 16 `bytes` into `xmm` without a constant pool (clobbers RCX and
+/// XMM7). Zero, and a run of ones at either end of every word, dword or
+/// qword lane, come from PXOR or PCMPEQD and one shift. A constant with
+/// repeated dwords or qwords needs one immediate and one broadcast.
 pub(super) fn constant(code: &mut Code, xmm: u8, bytes: [u8; 16]) {
+    let [low, high] =
+        core::array::from_fn(|i| u64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap()));
+    if low == high {
+        let dword = low as u32;
+        if low == 0 {
+            packed(code, Host::Xor, xmm, xmm);
+        } else if let Some((shift, amount)) = ones_run(low) {
+            packed(code, Host::EqualDword, xmm, xmm);
+            if let Some(shift) = shift {
+                shift.emit(code, xmm, amount);
+            }
+        } else if low >> 32 == u64::from(dword) {
+            let mut asm = code.asm();
+            asm.mov_imm32(Rcx, dword);
+            asm.movd_to_xmm(xmm, Rcx);
+            packed_imm(code, Host::ShuffleDword, xmm, xmm, 0);
+        } else {
+            code.asm().mov_imm64(Rcx, low);
+            packed(code, Host::MoveGprQword, xmm, 1);
+            packed(code, Host::UnpackLowQword, xmm, xmm);
+        }
+        return;
+    }
     // MOVQ from a GPR followed by PUNPCKLQDQ avoids constant-pool relocations.
-    for (register, limb) in [(xmm, &bytes[..8]), (7, &bytes[8..])] {
-        let limb = u64::from_le_bytes(limb.try_into().expect("an eight-byte limb"));
+    for (register, limb) in [(xmm, low), (7, high)] {
         code.asm().mov_imm64(Rcx, limb);
         packed(code, Host::MoveGprQword, register, 1);
     }
     packed(code, Host::UnpackLowQword, xmm, 7);
+}
+
+/// The shift that produces a word, dword or qword run from all ones.
+/// The inner `None` indicates an all-ones pattern that needs no shift.
+fn ones_run(limb: u64) -> Option<(Option<ShiftOpcode>, u8)> {
+    if limb == 0 {
+        return None;
+    }
+    for (bits, right, left) in [
+        (16, ShiftOpcode::RightWord, ShiftOpcode::LeftWord),
+        (32, ShiftOpcode::RightDword, ShiftOpcode::LeftDword),
+        (64, ShiftOpcode::RightQword, ShiftOpcode::LeftQword),
+    ] {
+        if limb.rotate_left(bits) != limb {
+            continue;
+        }
+        let full = u64::MAX >> (64 - bits);
+        let value = limb & full;
+        let shift = (bits - value.count_ones()) as u8;
+        if value == full {
+            return Some((None, 0));
+        }
+        if value == full >> shift {
+            return Some((Some(right), shift));
+        }
+        if value == (full << shift) & full {
+            return Some((Some(left), shift));
+        }
+    }
+    None
 }
 
 /// Load `value` repeated in each `lane`-byte lane of `xmm` (clobbers RCX and XMM7).

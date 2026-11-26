@@ -361,11 +361,15 @@ impl<R: CapabilityRead> Capabilities<R> {
                 }
             }
             0x09 => {
-                let bytes = self.read.read(offset + 2, 1)? as u16 & 0xff;
-                if bytes < 3 {
-                    return Err(CapabilityError::Malformed { offset }.into());
+                // A vendor-specific body states its own length. One that
+                // states less than its three-byte header has no body to
+                // size: Intel's PCH xHCI carries such an entry (lspci:
+                // "Vendor Specific Information: Len=00"). Linux sizes no
+                // vendor body and walks on, so only the header is reserved.
+                match self.read.read(offset + 2, 1)? as u16 & 0xff {
+                    0..3 => Ok((2, Layout::Header)),
+                    bytes => sized(bytes),
                 }
-                sized(bytes)
             }
             0x0d => sized(8), // Bridge subsystem vendor/device IDs
             0x10 => {

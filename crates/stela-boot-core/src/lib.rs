@@ -16,6 +16,7 @@ pub mod apic;
 pub mod assigned_topology;
 pub mod audio_check_samples;
 pub mod bluetooth_dsbr;
+pub mod boot_exit;
 pub mod boot_progress;
 pub mod bundle;
 pub mod chain_check;
@@ -29,6 +30,7 @@ pub mod doorbell;
 pub mod early_fault;
 pub mod entropy;
 pub mod exit_port;
+pub mod file_kind;
 pub mod firmware_state;
 pub mod firmware_time;
 #[cfg(feature = "metal-vulkan")]
@@ -78,6 +80,7 @@ pub mod staged_frame;
 pub mod storage;
 pub mod topology;
 pub mod tsc;
+pub mod usb_legacy;
 #[cfg(target_arch = "x86_64")]
 pub mod vtd;
 pub mod worker_bindings;

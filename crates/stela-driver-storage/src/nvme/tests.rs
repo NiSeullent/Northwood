@@ -337,12 +337,12 @@ fn synchronous_read_changes_the_caller_only_after_success() {
     let mut data = [0x11; 512];
     {
         let mut controller = disk.controller.borrow_mut();
-        next_page(&mut controller).bytes_mut()[..512].fill(0x42);
         controller.io.completions.write(8, 1u32 << 16 | 1);
         controller.io.completions.write(12, 1u32 << 16 | 1);
     }
     disk.read(0, &mut data).unwrap();
-    assert_eq!(data, [0x42; 512]);
+    // This fixture posts the completion without a data transfer.
+    assert_eq!(data, [READ_POISON; 512]);
     {
         let mut controller = disk.controller.borrow_mut();
         next_page(&mut controller).bytes_mut()[..512].fill(0x87);
@@ -358,7 +358,33 @@ fn synchronous_read_changes_the_caller_only_after_success() {
             status: STATUS_DO_NOT_RETRY | 2
         })
     );
-    assert_eq!(data, [0x42; 512]);
+    assert_eq!(data, [READ_POISON; 512]);
+}
+
+#[test]
+fn a_read_that_moves_no_data_does_not_echo_the_previous_write() {
+    let _clock = crate::test_clock::virtualize();
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let written: Vec<u8> = (0..3 * PAGE).map(|at| (at % 251) as u8).collect();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        controller.io.completions.write(8, 1u32 << 16 | 1);
+        controller.io.completions.write(12, 1u32 << 16 | 1);
+    }
+    disk.write(0, &written).unwrap();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        assert_eq!(
+            &next_page(&mut controller).bytes()[..PAGE],
+            &written[..PAGE]
+        );
+        controller.io.completions.write(16 + 8, 1u32 << 16 | 2);
+        controller.io.completions.write(16 + 12, 1u32 << 16 | 2);
+    }
+    let mut back = vec![0; written.len()];
+    disk.read(0, &mut back).unwrap();
+    assert!(back.iter().all(|&byte| byte == READ_POISON));
 }
 
 #[test]
@@ -906,6 +932,24 @@ fn reused_tag_requires_its_new_submission_to_be_fetched() {
         Some(Err(BlockError::Device { status: 0xffff }))
     );
     assert_eq!(disk.controller.borrow().io.head, 1);
+}
+
+#[test]
+fn an_out_of_range_deallocate_count_is_rejected_before_publication() {
+    let fixture = Fixture::new();
+    let mut controller = fixture.disk.controller.borrow_mut();
+    for count in [0, MAX_DEALLOCATE_RANGES + 1] {
+        let extents = vec![crate::block::Extent { lba: 1, blocks: 1 }; count];
+        assert_eq!(
+            controller.start(1, 512, Command::Discard { extents }),
+            Err(BlockError::Unsupported(
+                "an NVMe Deallocate holds 1 to 256 ranges"
+            ))
+        );
+    }
+    assert!(controller.fault.is_none());
+    assert!(controller.tags.iter().all(|tag| matches!(tag, Tag::Free)));
+    assert_eq!(controller.io.tail, 0);
 }
 
 #[test]

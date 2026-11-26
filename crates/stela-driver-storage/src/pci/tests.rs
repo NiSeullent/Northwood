@@ -195,11 +195,6 @@ fn owned_pio_activation_never_grants_dma_or_writes_adjacent_pci_status() {
             "PCIe truncated v2 body",
             vec![(0x34, 0xe0), (0xe0, 0x10), (0xe2, 2)],
         ),
-        ("vendor missing length", vec![(0x34, 0x40), (0x40, 9)]),
-        (
-            "vendor short header",
-            vec![(0x34, 0x40), (0x40, 9), (0x42, 2)],
-        ),
         ("vendor overflow", vec![(0x34, 0xfc), (0xfc, 9), (0xfe, 5)]),
         ("unknown extent", vec![(0x34, 0x40), (0x40, 0x7f)]),
         ("unsupported known extent", vec![(0x34, 0x40), (0x40, 7)]),
@@ -314,7 +309,8 @@ fn owned_pio_activation_never_grants_dma_or_writes_adjacent_pci_status() {
         );
     }
     // Exact endpoint bodies and vendor lengths may end at byte255. These
-    // are boundary profiles, not headers admitted by truncation.
+    // are boundary profiles, not headers admitted by truncation. A vendor
+    // length below the entry's own header reserves the header alone.
     for (start, id, extra) in [
         (0xec, 0x10, 0x01u8),
         (0xcc, 0x10, 0x02),
@@ -322,6 +318,8 @@ fn owned_pio_activation_never_grants_dma_or_writes_adjacent_pci_status() {
         (0xd4, 0x10, 0x92),
         (0xfc, 9, 3),
         (0x40, 9, 0xc0),
+        (0x40, 9, 0),
+        (0x40, 9, 2),
     ] {
         let mut boundary = valid.clone();
         boundary[0x34] = start as u8;

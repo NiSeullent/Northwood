@@ -239,3 +239,29 @@ fn alias_detected_layout_requires_full_bar_before_hardware_or_dma() {
         );
     }
 }
+
+#[test]
+fn other_vendors_realtek_boards_take_the_family_of_their_realtek_id() {
+    for (vendor, device, realtek) in [
+        (0x1186, 0x4300, 0x8167),
+        (0x1186, 0x4302, 0x8167),
+        (0x1259, 0xc107, 0x8167),
+        (0x16ec, 0x0116, 0x8167),
+        (0x10ff, 0x8168, 0x8168),
+    ] {
+        let mut function = alias_function(device, true);
+        function.vendor = vendor;
+        assert!(matches(&function));
+        assert_eq!(revision::pci_device(vendor, device), Some(realtek));
+        function.class = [2, 0x80, 0];
+        assert!(!matches(&function));
+    }
+    // A Realtek ID under another vendor, or another vendor's ID under
+    // Realtek's, is no candidate.
+    assert_eq!(revision::pci_device(0x1186, 0x8168), None);
+    assert_eq!(revision::pci_device(0x10ec, 0x4300), None);
+    assert_eq!(revision::pci_device(0x1737, 0x1032), None);
+    // The RTL8169SC boards admit what Realtek's 8167 does; NCube's what 8168 does.
+    assert!(admit_revision(0x8167, None, revision(4)).is_ok());
+    assert!(admit_revision(0x8168, Some(0x50), revision(4)).is_err());
+}

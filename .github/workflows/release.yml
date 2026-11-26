@@ -40,9 +40,9 @@ env:
 
     - An x86-64-v2 CPU (about 2011 or newer), UEFI with Secure Boot off, 4 GB of RAM (8 GB or more recommended; under about 7 GB free, macOS gets 2 GB and runs slower).
     - An NVIDIA GTX 16 or RTX 20 series GPU or newer.
-    - A USB stick of 8 GB or more.
+    - A USB stick of 8 GB or more for a network installer, or 32 GB or more for a full installer.
     - An empty GPT partition of at least 60 GB.
-    - Network access during the install, which downloads macOS.
+    - Network access for initial preparation. An offline kit lets a disconnected computer write the USB after preparation.
   INSTALL: |-
     Install:
 
@@ -54,20 +54,8 @@ env:
     You are responsible for following Apple's software license agreement and terms of use.
 
 jobs:
-  upstream-merge:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check the merge against Stela main
-        run: |
-          git fetch --no-tags https://github.com/tylertms/Stela.git refs/heads/main
-          printf 'Northwood %s\nStela %s\n' "$(git rev-parse HEAD)" "$(git rev-parse FETCH_HEAD)"
-          git merge-tree --write-tree HEAD FETCH_HEAD
+  checks:
+    uses: ./.github/workflows/ci.yml
 
   version:
     runs-on: ubuntu-24.04
@@ -135,13 +123,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Clang 21
+      - name: Install Clang 21 and QEMU
         run: |
           # The kext needs upstream Clang 21 or newer for arm64e.
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends clang-21 lld-21 llvm-21 libclang-21-dev
+          sudo apt-get install -y -q --no-install-recommends clang-21 lld-21 llvm-21 libclang-21-dev qemu-system-x86 ovmf
           echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
 
       - uses: actions/cache@v4
@@ -252,6 +240,21 @@ jobs:
           ls -l dist/northwood.efi
           printf 'northwood.efi: %s bytes\nsha256 %s\n' \
             "$(stat -c %s dist/northwood.efi)" "$(sha256sum dist/northwood.efi | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Boot the release EFI in QEMU
+        run: bash xtask/scripts/boot-smoke.sh dist/northwood.efi "$RUNNER_TEMP/northwood-boot-smoke"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: efi-boot-smoke
+          path: |
+            ${{ runner.temp }}/northwood-boot-smoke/*/run.json
+            ${{ runner.temp }}/northwood-boot-smoke/*/serial.txt
+            ${{ runner.temp }}/northwood-boot-smoke/*/stdout.txt
+            ${{ runner.temp }}/northwood-boot-smoke/*/stderr.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - uses: actions/upload-artifact@v4
         with:
@@ -412,7 +415,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/diag-'))
-    needs: [version, cli]
+    needs: [version, checks, cli]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -451,8 +454,17 @@ jobs:
               echo "Internal Intel CNVi Wi-Fi association, complete macOS installation and installed boot are still under development."
               echo
             elif [[ "${VERSION%%+*}" == *-beta.* ]]; then
-              echo "Experimental prerelease. Intel MacBook Pro model detection and Apple Broadcom USB Bluetooth initialization are included."
-              echo "Physical MacBook Pro USB installation and installed boot are unverified. T2 internal SSD installation, Touch Bar, Apple Wi-Fi, AirDrop and Radeon or Intel GPU acceleration remain under development."
+              echo "Experimental prerelease."
+              if [[ "$GITHUB_REF_NAME" == v1.0.0b2 ]]; then
+                echo
+                echo "- Boot now handles the firmware watchdog, legacy xHCI ownership and ExitBootServices retries."
+                echo "- Intel host startup honors the DMAR x2APIC opt-out, recovers duplicate firmware CPU coordinates and keeps secondary CPUs available to firmware."
+                echo "- USB setup supports an offline kit with previously prepared restore inputs. See the [USB setup instructions](https://github.com/NiSeullent/Northwood/blob/v1.0.0b2/README.md#install)."
+                echo "- Includes input, storage, Ethernet, Wi-Fi DMA and display fixes, focused JIT optimizations and the Nw mark."
+                echo "- Firmware and synthetic guest boot are tested at 1 core and at 32 cores with 64 threads in QEMU. Physical Xeon and full macOS installation still require hardware verification."
+                echo
+                echo "[Stela and Stambha issue triage](https://github.com/NiSeullent/Northwood/blob/v1.0.0b2/hardware/stela-fork-triage.md)"
+              fi
               echo
             fi
             printf '%s\n\n' "$ABOUT"

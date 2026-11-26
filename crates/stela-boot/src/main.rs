@@ -24,11 +24,13 @@ use uefi::{
 };
 #[cfg(feature = "diagnostics")]
 mod audio_check;
+mod boot_exit;
 mod choice;
 mod console;
 mod cpu;
 mod engine;
 mod entropy;
+mod file_kind;
 mod firmware;
 mod handoff;
 use stela_boot_core::heap;
@@ -60,6 +62,7 @@ mod storage;
 mod system;
 mod tables;
 mod ui;
+mod usb_legacy;
 #[global_allocator]
 pub(crate) static ALLOCATOR: heap::Heap = heap::Heap::new().reporting_failures(|report| {
     use core::fmt::Write;
@@ -226,6 +229,15 @@ fn main() -> Status {
         "STELA UEFI MOUNT version={}\n",
         env!("CARGO_PKG_VERSION")
     ));
+    // A boot menu or an offline payload check can outlast the 5-minute
+    // watchdog a UEFI boot manager arms before starting this image.
+    match uefi::boot::set_watchdog_timer(0, 0x10000, None) {
+        Ok(()) => output::arguments(format_args!("FIRMWARE watchdog disabled\n")),
+        Err(error) => output::arguments(format_args!(
+            "FIRMWARE watchdog could not be disabled: {:?}\n",
+            error.status()
+        )),
+    }
     let heap_bytes =
         initial_heap_bytes().unwrap_or_else(|error| output::early_fatal(error.as_str()));
     let heap = uefi::boot::allocate_pages(

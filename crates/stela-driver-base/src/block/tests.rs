@@ -540,6 +540,22 @@ fn a_submission_runs_its_writes_together_and_its_flush_after_them() {
 }
 
 #[test]
+fn a_discard_without_ranges_is_rejected_before_reaching_the_disk() {
+    let identity = RamDisk::new("d", 64, 512).identity;
+    assert_eq!(
+        Command::Discard {
+            extents: Vec::new()
+        }
+        .within(&identity, 8),
+        Err(BlockError::Unsupported("a discard of no ranges"))
+    );
+    assert_eq!(
+        Command::discard(4, 2).within(&identity, 8),
+        Ok(Command::discard(12, 2))
+    );
+}
+
+#[test]
 fn range_plans_keep_chunk_sizes_and_unmap_permissions() {
     let mut identity = cached(false, 1024);
     identity.features.discard = Some(DiscardLimits::single(2));

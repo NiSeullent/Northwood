@@ -311,6 +311,40 @@ fn large_hosts_select_every_physical_core_before_siblings_and_retire_the_rest() 
 }
 
 #[test]
+fn xeon_smt_is_recovered_from_sparse_apic_ids_when_firmware_locations_collide() {
+    let mut source = large_host(2, 16, 2);
+    for processor in &mut source {
+        processor.apic_id = u64::from(
+            processor.location.package * 0x100 + processor.location.core * 2 + processor.thread,
+        );
+        processor.location = Location::default();
+        processor.thread = 0;
+    }
+    assert_eq!(select(&source), Err(Refusal::DuplicateThreadLocation));
+    place_by_apic_id(&mut source, 1, 7).unwrap();
+    let order = select(&source).unwrap();
+    assert_eq!(physical_cores(&source), 32);
+    assert_eq!(assignment_count(None, order.len()), Ok(64));
+    assert_eq!(order[0], 31);
+    assert!(order[1..32].iter().all(|&index| source[index].thread == 0));
+    assert!(order[32..].contains(&30));
+    assert_eq!(source[32].apic_id, 0x100);
+    assert_eq!(source[32].location.package, 2);
+
+    source[63].apic_id = source[62].apic_id;
+    place_by_apic_id(&mut source, 1, 7).unwrap();
+    assert_eq!(select(&source), Err(Refusal::DuplicateApicId));
+    assert_eq!(
+        place_by_apic_id(&mut source, 8, 7),
+        Err(Refusal::InvalidTopology)
+    );
+    assert_eq!(
+        place_by_apic_id(&mut source, 1, 32),
+        Err(Refusal::InvalidTopology)
+    );
+}
+
+#[test]
 fn processor_inventory_has_no_fixed_logical_ceiling() {
     let source = large_host(4, 80, 2); // 640 logical processors
     assert_eq!(select(&source).map(|all| all.len()), Ok(640));

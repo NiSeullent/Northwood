@@ -119,8 +119,21 @@ pub(super) fn emit(code: &mut Code, operand: &Operand) {
         store(code, operand.destination);
         return;
     }
-    if operand.width == Width::W32 {
-        // Required even when both shifts are absent (the full-width MOV alias).
+    if from_bit_zero && operand.kind == Kind::Unsigned && field_width < 32 {
+        // A dword AND both extracts the low field and clears the upper half.
+        let mask = ((1u32 << field_width) - 1) as i32;
+        let mut asm = code.asm();
+        if let Ok(short) = i8::try_from(mask) {
+            asm.alu_imm8(Alu::And, Size::Dword, Rax, short);
+        } else {
+            asm.alu_accumulator_imm32(Alu::And, Size::Dword, mask);
+        }
+        shift(code, operand.width, ShiftOp::Shl, destination_shift);
+        store(code, operand.destination);
+        return;
+    }
+    if operand.width == Width::W32 && field_width == bits {
+        // A dword shift clears the upper half. The full-width copy has no shift.
         code.asm().mov(Size::Dword, Rax, Rax);
     }
     // Move the source field to the operand's MSB, then extract it. Arithmetic
@@ -145,17 +158,20 @@ pub(super) fn emit(code: &mut Code, operand: &Operand) {
     );
     shift(code, operand.width, ShiftOp::Shl, destination_shift);
 
-    if operand.kind == Kind::Insert {
-        let field_mask = (u64::MAX >> (64 - field_width)) << destination_shift;
+    if operand.kind == Kind::Insert && field_width != bits {
+        let keep_mask = !((u64::MAX >> (64 - field_width)) << destination_shift);
+        let immediate = keep_mask as i32;
         // Nothing has been written yet, so source and destination may alias.
         // RCX receives the old destination after the source is staged.
         right_operand(code, operand.destination, Width::X64, Shift::Lsl, 0);
         let mut asm = code.asm();
-        if operand.width == Width::X64 {
-            asm.mov_imm64(Rdx, !field_mask);
-            asm.alu(Alu::And, Size::Qword, Rcx, Rdx);
+        if operand.width == Width::W32 || keep_mask <= u64::from(u32::MAX) {
+            asm.alu_imm(Alu::And, Size::Dword, Rcx, immediate);
+        } else if keep_mask == i64::from(immediate) as u64 {
+            asm.alu_imm(Alu::And, Size::Qword, Rcx, immediate);
         } else {
-            asm.alu_imm32(Alu::And, Size::Dword, Rcx, !(field_mask as u32) as i32);
+            asm.mov_imm64(Rdx, keep_mask);
+            asm.alu(Alu::And, Size::Qword, Rcx, Rdx);
         }
         asm.alu(Alu::Or, Size::of(operand.width == Width::X64), Rax, Rcx);
     }
@@ -261,7 +277,7 @@ mod tests {
 
     #[test]
     fn full_width_extract_avoids_masked_x86_shifts_and_clears_w_upper_bits() {
-        for kind in [Kind::Signed, Kind::Unsigned] {
+        for kind in [Kind::Signed, Kind::Unsigned, Kind::Insert] {
             assert_eq!(
                 code(Width::X64, kind, 0, 63),
                 [0x48, 0x8b, 0x87, 8, 0, 0, 0, 0x48, 0x89, 0x87, 16, 0, 0, 0]
@@ -287,7 +303,12 @@ mod tests {
         let unsigned = code(Width::W32, Kind::Unsigned, 31, 0);
         assert_eq!(
             &unsigned[7..unsigned.len() - 7],
-            [0x89, 0xc0, 0xc1, 0xe0, 31, 0xc1, 0xe8, 31, 0xc1, 0xe0, 1]
+            [0x83, 0xe0, 1, 0xc1, 0xe0, 1]
+        );
+        let shifted_signed = code(Width::W32, Kind::Signed, 1, 8);
+        assert_eq!(
+            &shifted_signed[7..shifted_signed.len() - 7],
+            [0xc1, 0xe0, 23, 0xc1, 0xf8, 24]
         );
         let extraction = code(Width::X64, Kind::Unsigned, 8, 15);
         assert_eq!(
@@ -308,6 +329,8 @@ mod tests {
             (Width::W32, Kind::Signed, 0, 7, &[0x0f, 0xbe, 0xc0]),
             (Width::X64, Kind::Unsigned, 61, 60, &[0x48, 0xc1, 0xe0, 3]),
             (Width::W32, Kind::Signed, 27, 26, &[0xc1, 0xe0, 5]),
+            (Width::X64, Kind::Unsigned, 0, 6, &[0x83, 0xe0, 127]),
+            (Width::X64, Kind::Unsigned, 0, 12, &[0x25, 0xff, 0x1f, 0, 0]),
         ] {
             let emitted = code(width, kind, rotation, mask_end);
             assert_eq!(&emitted[7..emitted.len() - 7], expected);
@@ -316,12 +339,12 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
     #[test]
-    fn every_extract_field_matches_the_arm_definition() {
+    fn every_bitfield_matches_the_arm_definition() {
         use crate::x86_64::asm::vector_extensions::execution::Native;
         use crate::{GuestState, context::ExecutionContext};
         let mut random = 0x2545_f491_4f6c_dd1d_u64;
         for (width, bits) in [(Width::W32, 32u8), (Width::X64, 64)] {
-            for kind in [Kind::Signed, Kind::Unsigned] {
+            for kind in [Kind::Signed, Kind::Unsigned, Kind::Insert] {
                 for rotation in 0..bits {
                     for mask_end in 0..bits {
                         let mut function = code(width, kind, rotation, mask_end);
@@ -336,7 +359,7 @@ mod tests {
                             } else {
                                 random
                             };
-                            // UBFM/SBFM: the source field ends at bit mask_end;
+                            // The source field ends at bit mask_end;
                             // it moves right by rotation, or left by
                             // bits - rotation when it starts below rotation.
                             let (low, high, left) = if rotation <= mask_end {
@@ -345,23 +368,33 @@ mod tests {
                                 (0, mask_end, bits - rotation)
                             };
                             let field_bits = u32::from(high - low + 1);
-                            let field = source >> low & (u64::MAX >> (64 - field_bits));
+                            let mask = u64::MAX >> (64 - field_bits);
+                            let field = source >> low & mask;
                             let extended = if kind == Kind::Signed {
                                 ((field << (64 - field_bits)) as i64 >> (64 - field_bits)) as u64
                             } else {
                                 field
                             };
+                            let initial_destination = !random.rotate_left(13);
                             let mut expected = extended << left;
+                            if kind == Kind::Insert {
+                                expected |= initial_destination & !(mask << left);
+                            }
                             if bits == 32 {
                                 expected &= u64::from(u32::MAX);
                             }
-                            let mut state = GuestState::default();
+                            let mut state = GuestState {
+                                nzcv: 0x9000_0000,
+                                ..GuestState::default()
+                            };
                             state.x[1] = random;
+                            state.x[2] = initial_destination;
                             native.run(&mut state, &mut ExecutionContext::default());
                             assert_eq!(
                                 state.x[2], expected,
                                 "{width:?} {kind:?} {rotation} {mask_end} {source:#x}"
                             );
+                            assert_eq!(state.nzcv, 0x9000_0000);
                         }
                     }
                 }
@@ -371,21 +404,23 @@ mod tests {
 
     #[test]
     fn insert_masks_preserve_only_bits_outside_the_selected_destination_field() {
-        for (rotation, mask_end, keep_mask) in [
-            (8, 15, 0xffffffffffffff00u64),
-            (60, 7, 0xfffffffffffff00f),
-            (0, 63, 0),
-            (1, 0, 0x7fffffffffffffff),
+        for (rotation, mask_end, instruction) in [
+            (8, 15, &[0x48, 0x81, 0xe1, 0, 0xff, 0xff, 0xff][..]),
+            (60, 7, &[0x48, 0x81, 0xe1, 0x0f, 0xf0, 0xff, 0xff]),
+            (40, 39, &[0x81, 0xe1, 0xff, 0xff, 0xff, 0]),
+            (57, 56, &[0x83, 0xe1, 0x7f]),
+            (0, 6, &[0x48, 0x83, 0xe1, 0x80]),
+            (
+                1,
+                0,
+                &[0x48, 0xba, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+            ),
         ] {
             let emitted = code(Width::X64, Kind::Insert, rotation, mask_end);
-            let mask_offset = emitted
-                .windows(2)
-                .position(|bytes| bytes == [0x48, 0xba])
-                .unwrap()
-                + 2;
-            assert_eq!(
-                &emitted[mask_offset..mask_offset + 8],
-                keep_mask.to_le_bytes()
+            assert!(
+                emitted
+                    .windows(instruction.len())
+                    .any(|bytes| bytes == instruction)
             );
         }
         let emitted = code(Width::W32, Kind::Insert, 28, 7);

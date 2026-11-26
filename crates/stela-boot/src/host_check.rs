@@ -72,7 +72,6 @@ use stela_runtime::pc::{
     power::HostPower,
     storage::{StorageError, Target, verify_target},
 };
-use uefi::boot;
 
 mod inventory;
 mod summary;
@@ -377,11 +376,11 @@ fn prepare(
     }
     let registers = (machine.apic_base & apic::BASE_ADDRESS) as usize;
     tables.device(registers, registers + PAGE)?;
+    let final_map = crate::boot_exit::Buffer::allocate();
     machine.volume_log = crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; the heap,
     // stack and tables are LOADER_DATA, which Stela keeps.
-    let map = unsafe { boot::exit_boot_services(None) };
-    core::mem::forget(map);
+    let _ = unsafe { crate::boot_exit::exit(final_map) };
     Ok((machine, tables))
 }
 

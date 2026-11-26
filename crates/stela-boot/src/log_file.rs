@@ -252,10 +252,8 @@ fn loader_log_file(
     mode: FileMode,
 ) -> Option<RegularFile> {
     let path = CString16::try_from(path).ok()?;
-    let mut file = root
-        .open(&path, mode, FileAttribute::empty())
-        .ok()?
-        .into_regular_file()?;
+    let handle = root.open(&path, mode, FileAttribute::empty()).ok()?;
+    let mut file = crate::file_kind::regular(handle).ok()?;
     (file.get_boxed_info::<FileInfo>().ok()?.file_size() == VOLUME_LOG_BYTES as u64).then_some(file)
 }
 
@@ -402,9 +400,9 @@ fn firmware_esp_log(
             .map_err(|_| refuse!("the log's path is not UCS-2"))?;
         match root.open(&name, FileMode::ReadWrite, FileAttribute::empty()) {
             Ok(file) => {
-                let file = file
-                    .into_regular_file()
-                    .ok_or(refuse!("the USB log path is a directory"))?;
+                let file = crate::file_kind::regular(file).map_err(
+                    |answers| refuse!("the USB log path is not a regular file", %answers),
+                )?;
                 return Ok((path, file));
             }
             Err(error) if error.status() == Status::NOT_FOUND => {}

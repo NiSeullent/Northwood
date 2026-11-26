@@ -31,7 +31,8 @@ use sha2::{Digest, Sha384};
 /// The boot bundle file that holds the staged answers.
 pub const FILE: &str = "tss-answers.plist";
 const VERSION: u64 = 1;
-const MAX_FILE_BYTES: usize = 256 * 1024;
+/// Maximum serialized size of the staged answers.
+pub const MAX_FILE_BYTES: usize = 256 * 1024;
 
 /// The `Ap,VolumeUUID` restored names in its recoveryOS LocalPolicy request:
 /// the system recoveryOS UUID, a constant CFString (26A434 R 0x100253780), not

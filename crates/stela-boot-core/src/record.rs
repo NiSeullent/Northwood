@@ -11,11 +11,11 @@ pub struct Capture {
     pub version: u32,
     pub processor_count: u32,
     /// Logical processors with source observations, a prefix of `select`'s
-    /// order: the assignable roster, `min(logical_count, MAX_CORES)`.
+    /// order sized to this boot's native executor reservation.
     pub core_count: u32,
     pub enabled_count: u32,
-    /// Every enabled, healthy logical processor `select` returns. Those past
-    /// `core_count` get INIT at EBS with the other unassigned processors.
+    /// Every enabled, healthy logical processor `select` returns, including
+    /// those outside this boot's executor reservation.
     pub logical_count: u32,
     pub selected: [u32; topology::MAX_CORES],
     pub snapshots: [Snapshot; topology::MAX_CORES],

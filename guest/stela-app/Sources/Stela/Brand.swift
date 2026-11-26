@@ -6,7 +6,7 @@
     static let icon: NSImage = {
       let bundled = Bundle.main.url(forResource: "stela-icon", withExtension: "png")
       let development = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent().appendingPathComponent("../../../../assets/stela-icon.png")
+        .deletingLastPathComponent().appendingPathComponent("../../../../assets/northwood-nw.png")
         .standardizedFileURL
       return bundled.flatMap(NSImage.init(contentsOf:))
         ?? NSImage(contentsOf: development)

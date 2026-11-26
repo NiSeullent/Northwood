@@ -83,7 +83,7 @@ impl Ring {
             }
             fence(Ordering::Acquire);
             let length = (status & LENGTH) as usize;
-            let good = status & RX_ERRORS == 0
+            let good = status & RX_RES == 0
                 && status & (FIRST | LAST) == FIRST | LAST
                 && (18..=MAX_FRAME + 4).contains(&length);
             let frame = good.then(|| {
@@ -180,7 +180,7 @@ mod tests {
             LENGTH,
             FIRST | 18,
             LAST | 18,
-            FIRST | LAST | 18 | RX_ERRORS,
+            FIRST | LAST | 18 | RX_RES,
         ] {
             let index = rx.next;
             rx.descriptors.write(index * DESCRIPTOR, bad | end(index));
@@ -190,6 +190,13 @@ mod tests {
                 OWN | end(index) | BUFFER as u32
             );
         }
+        // Linux checks the error summary before considering the reason bits.
+        let index = rx.next;
+        rx.descriptors.write(
+            index * DESCRIPTOR,
+            FIRST | LAST | end(index) | 64 | (1 << 19),
+        );
+        assert_eq!(rx.receive().unwrap().len(), 60);
         // All bad descriptors are bounded to one pass; receive cannot spin forever.
         for index in 0..DESCRIPTORS {
             rx.descriptors.write(index * DESCRIPTOR, end(index));

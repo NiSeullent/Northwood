@@ -126,6 +126,52 @@ RustCrypto/hashes sha1/src/compress/x86.rs at commit
 82c36a428f8d6f05f3bfccdedb243e9d1f85359d (MIT OR Apache-2.0, MIT used).
 
 Ported sources
+
+crates/stela-driver-net/src/realtek.rs and realtek/: Ethernet compatibility
+    Stambha, Tyler Smith, commits 9fd57360e, 8553805c1, 1cad3804d and
+    f446b7e1a; GPL-2.0-compatible source, see file headers.
+crates/stela-driver-net/src/e1000e/pch/cold/spt.rs: Intel I219 ULP exit
+    Stambha, Tyler Smith, commit da395e895; see file headers.
+crates/stela-driver-storage/src/nvme/admin.rs: NVMe controller enable order
+    Stambha, Tyler Smith, commit f5f8121a2; GPL-2.0-only.
+crates/stela-soc/src/dcp/modes.rs: dense panel guest scaling
+    Stambha, G-Nug85, pull request 13, commit dcea0f075d; GPL-2.0-or-later.
+crates/stela-drivers/src/input/ps2.rs and crates/stela-boot/src/engine/input.rs:
+    Input event draining and polling from Stambha, Federico Bricca,
+    pull requests 11 (d972a17a9) and 20 (5f5c7607c); see file headers.
+crates/stela-runtime/src/translation_store.rs: Synchronous block write pacing
+    inspired by Stambha, Federico Bricca, pull request 21 (83096986c).
+crates/stela-driver-base/src/bus/pci/inventory.rs and bus/pci/capability.rs:
+    PCI function and vendor capability discovery from Stambha, Tyler Smith, commits
+    d2fa5d25b and 80ff754de.
+crates/stela-driver-storage/src/nvme/io.rs and crates/stela-driver-base/src/block.rs:
+    NVMe read and discard integrity from Stambha, Garvit Surana, commits
+    4a56ad302 and 7f67ae7f9.
+crates/stela-boot/src/engine/bluetooth.rs and crates/stela-boot/src/engine/network.rs:
+    Bluetooth address-space teardown from Stambha, Tyler Smith, commit 747e1e784.
+crates/stela-boot-core/src/boot_exit.rs: final UEFI memory map and exit retry
+    Stambha, Tyler Smith, 4266969c72b01e474e73bebb83114d9ba1fdcc2f;
+    GPL-2.0-or-later, crates/stela-boot-core/src/boot_exit.rs.
+crates/stela-boot/src/boot_exit.rs: UEFI boot services exit
+    Stambha, Tyler Smith, 4266969c72b01e474e73bebb83114d9ba1fdcc2f;
+    GPL-2.0-or-later, crates/stela-boot/src/boot_exit.rs.
+crates/stela-boot-core/src/file_kind.rs: firmware file type resolution
+    Stambha, Tyler Smith, 28d1adaf0533b428c8d884b381e4ee12d263b684;
+    GPL-2.0-or-later, crates/stela-boot-core/src/file_kind.rs.
+crates/stela-boot/src/file_kind.rs: UEFI FileInfo probing
+    Stambha, Tyler Smith, 28d1adaf0533b428c8d884b381e4ee12d263b684;
+    GPL-2.0-or-later, crates/stela-boot/src/file_kind.rs.
+crates/stela-boot-core/src/usb_legacy.rs: xHCI firmware ownership protocol
+    Stambha, Tyler Smith, 6de44a1a474d62d6604c35df37fd3df52a880b47;
+    GPL-2.0-or-later, crates/stela-boot-core/src/usb_legacy.rs.
+crates/stela-boot/src/usb_legacy.rs: xHCI handoff at firmware exit
+    Stambha, Tyler Smith, 6de44a1a474d62d6604c35df37fd3df52a880b47;
+    GPL-2.0-or-later, crates/stela-boot/src/usb_legacy.rs.
+crates/stela-boot/src/native_memory.rs: driver DMA pool below 4 GiB
+    Stambha, Tyler Smith, 951e92cf00f2e41ee0002b34dc362690e5c93b23;
+    GPL-2.0-or-later, crates/stela-boot/src/native_memory.rs.
+crates/stela-driver-net/src/wifi/allocation.rs: 32-bit passthrough DMA
+    Stambha, Tyler Smith, e090587df; GPL-2.0-or-later.
 --------------
 
 The drivers and Linux support code below are ports or adaptations of the named
@@ -1301,3 +1347,15 @@ crates/stela-linux/src/compat/kernel/: Linux kernel services for the unchanged
     lib/list_sort.c, lib/seq_buf.c, lib/sort.c, lib/usercopy.c,
     lib/vsprintf.c, mm/interval_tree.c, mm/memory.c, mm/mmap.c, mm/slab.h,
     mm/slub.c, mm/util.c, mm/vmalloc.c
+crates/stela-boot-core/src/apic.rs and crates/stela-boot/src/system.rs: DMAR
+  x2APIC opt-out
+    Stambha, Tyler Smith, 8740e9748ce0c9e8cfc1bd813f437cceeaaef6f1;
+    GPL-2.0-or-later, crates/stela-boot-core/src/apic.rs and
+    crates/stela-boot/src/system.rs
+crates/stela-boot-core/src/topology.rs and crates/stela-boot/src/native_smp/:
+  APIC topology recovery and AP parking before firmware device takeover
+    Stambha, Tyler Smith, 3aaf4292b434c28a04dca0ba7da18601b93b326d and
+    8746557de45bf39e3f3f6a3ca5fb93dd6479d500; GPL-2.0-or-later,
+    crates/stela-boot-core/src/topology.rs,
+    crates/stela-boot/src/native_smp/firmware.rs, and
+    crates/stela-boot/src/native_smp/executor/park.rs

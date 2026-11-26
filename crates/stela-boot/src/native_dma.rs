@@ -16,6 +16,12 @@ pub(crate) struct FirmwareUnits {
     complete: bool,
 }
 
+impl FirmwareUnits {
+    pub(crate) fn dmar_flags(&self) -> u8 {
+        self.units.dmar_flags
+    }
+}
+
 /// The complete original IOMMU inventory observed inactive at firmware exit.
 pub(crate) struct InactiveFirmwareUnits(Option<Units>);
 

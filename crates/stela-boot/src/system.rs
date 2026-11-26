@@ -27,7 +27,7 @@ use stela_runtime::pc::gpt::Guid;
 use uefi::{
     boot::{self, AllocateType, MemoryType},
     fs::FileSystem,
-    mem::memory_map::{MemoryMap, MemoryMapOwned},
+    mem::memory_map::{MemoryMap, MemoryMapRef},
     proto::loaded_image::LoadedImage,
 };
 
@@ -49,12 +49,12 @@ pub(crate) struct EbsOwnership {
 
 /// Keeps the final memory map and its receipt together on the loader side.
 pub(crate) struct SuccessfulExit {
-    map: core::mem::ManuallyDrop<MemoryMapOwned>,
+    map: MemoryMapRef<'static>,
     ownership: Option<EbsOwnership>,
 }
 
 impl SuccessfulExit {
-    pub(crate) fn map(&self) -> &MemoryMapOwned {
+    pub(crate) fn map(&self) -> &MemoryMapRef<'static> {
         &self.map
     }
 
@@ -788,9 +788,12 @@ fn load(
     } = inputs;
     let text = core::str::from_utf8(&options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let system = System::parse(text).map_err(stela_boot_core::options::Error::message)?;
-    let (native_processors, available_cores) = crate::native_smp::firmware::capture_inventory()
+    let processors = crate::native_smp::firmware::inventory()
         .map_err(crate::native_smp::firmware::Error::message)?;
-    let cores = system.assigned_native_cores(available_cores, bundle_pes)?;
+    let cores = system.assigned_native_cores(processors.logical_count(), bundle_pes)?;
+    let (cores, sipi) = memory::prepare_sipi(cores, processors.enabled > 1);
+    let native_processors = crate::native_smp::firmware::capture(processors, cores)
+        .map_err(crate::native_smp::firmware::Error::message)?;
     // The translation cache takes only what the parts and the guest leave,
     // so it is read last before they are reserved: only the engine image's
     // copy comes between.
@@ -804,7 +807,6 @@ fn load(
     output::arguments(format_args!("HOST STAGED pack={pack:#x}\n"));
     crate::status::begin("Setting up Stela's memory");
     let image = memory::prepare_image(&snapshot)?;
-    let (cores, sipi) = memory::prepare_sipi(cores);
     let before_reclaim = memory_map(None)?.ledger.separate_usable;
     let snapshot_bytes = snapshot.bytes;
     let before_release = crate::ALLOCATOR.usage();
@@ -873,6 +875,7 @@ fn load(
     let memory::EngineMemory {
         profile: memory_profile,
         heap,
+        low_dma,
         native_resources,
         native_task_allocations,
         stack,
@@ -916,18 +919,27 @@ fn load(
         && memory_profile == stela_boot_core::host_memory::Profile::Paged)
         .then(firmware::esp::boot_esp)
         .flatten();
+    let usb_legacy = crate::usb_legacy::find();
+    let final_map = crate::boot_exit::Buffer::allocate();
+    crate::status::progress("Waiting for firmware boot services to exit");
     let volume_log = crate::output::leave_boot_services().filter(|_| storage.present);
     let mut bundle_layout = staging.commit();
     // SAFETY: no protocol or pool allocation outlives this call; every page
     // Stela keeps is LOADER_DATA or LOADER_CODE.
-    let map = unsafe { boot::exit_boot_services(None) };
+    let map = unsafe { crate::boot_exit::exit(final_map) };
     output::boot_stage("exit-boot-services");
     let mut exit = SuccessfulExit {
-        map: core::mem::ManuallyDrop::new(map),
+        map,
         ownership: Some(EbsOwnership { _private: () }),
     };
+    crate::status::progress("Taking ownership of firmware USB controllers");
+    // SAFETY: the firmware's identity map is still active, IRQs are masked
+    // and no native driver has started.
+    unsafe { usb_legacy.take(tsc_hz) };
+    crate::status::progress("Checking firmware DMA remapping");
     // SAFETY: the firmware's identity map is still loaded, the APs idle in
     // firmware code, and no Stela driver or memory reuse has started.
+    let dmar_flags = remapping.dmar_flags();
     let inactive_firmware_units =
         unsafe { crate::native_dma::release_firmware_units(remapping, tsc_hz) };
     let native_mmio_capture = match native_mmio {
@@ -944,19 +956,25 @@ fn load(
     // guest RAM, including workers that will later receive their owned SIPI.
     // The BSP alone sends ICR commands, with firmware IRQ handlers excluded.
     unsafe { asm!("cli", options(nomem, nostack)) };
-    // x2APIC whenever CPUID offers it, from here on: the firmware no longer
-    // runs on this processor, and every later APIC handle is made from the
-    // base returned here (the handoff's) or read afresh. The APs take the
-    // same mode as they enter Stela (`native_smp::executor`).
+    // A firmware SMI handler can still access the xAPIC MMIO page after EBS.
+    // Honor its DMAR opt-out if all enabled IDs fit the physical destination field.
+    let keep_xapic = crate::apic::honours_x2apic_opt_out(
+        dmar_flags,
+        capture
+            .processors
+            .iter()
+            .filter(|processor| processor.flags & stela_boot_core::topology::ENABLED != 0)
+            .map(|processor| processor.apic_id),
+    );
     // SAFETY: CPL0, interrupts masked, no APIC handle of this processor made.
-    let apic_base = unsafe { crate::apic::prefer_x2apic() };
+    let apic_base = unsafe { crate::apic::choose_mode(keep_xapic) };
     let sender = crate::apic::Apic::new(apic_base, apic_base & crate::apic::BASE_ADDRESS);
     output::arguments(format_args!(
         "HOST APIC {}\n",
-        if sender.is_x2apic() {
-            "x2APIC"
-        } else {
-            "xAPIC (no x2APIC offered)"
+        match (sender.is_x2apic(), keep_xapic) {
+            (true, _) => "x2APIC",
+            (false, true) => "xAPIC (firmware DMAR opt-out)",
+            (false, false) => "xAPIC (x2APIC unavailable)",
         }
     ));
     // SAFETY: interrupts are masked, the BSP alone sends ICR commands, and `capture` lists the
@@ -1047,6 +1065,7 @@ fn load(
             native_mmio_capture,
             inactive_firmware_units,
             amd_tables,
+            low_dma,
             northwood_config,
             bundle_layout,
         });

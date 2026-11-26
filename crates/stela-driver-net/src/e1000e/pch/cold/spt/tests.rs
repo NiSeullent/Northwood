@@ -197,7 +197,7 @@ fn exact_initial_i219_cohort_uses_integrated_nvm_and_forced_ulp_exit() {
 }
 #[test]
 fn foreign_required_flush_and_live_config_failures_refuse_without_foreign_dma() {
-    for failure in 0..4 {
+    for failure in 0..3 {
         let (state, released, io, timer) = fixture_spt();
         {
             let mut m = state.borrow_mut();
@@ -212,24 +212,32 @@ fn foreign_required_flush_and_live_config_failures_refuse_without_foreign_dma() 
                 2 => {
                     m.fail_at = Some(5);
                 }
-                3 => {
-                    m.power_stuck = true;
-                }
                 _ => unreachable!(),
             }
         }
         assert!(start_spt(0x156f, io, timer).is_err());
         let m = state.borrow();
-        if failure < 3 {
-            assert!(
-                !m.operations
-                    .iter()
-                    .any(|o| o[0] == 1 && matches!(o[1], super::super::CTRL | 0x3818))
-            );
-        }
+        assert!(
+            !m.operations
+                .iter()
+                .any(|o| o[0] == 1 && matches!(o[1], super::super::CTRL | 0x3818))
+        );
         assert_eq!(released.load(Ordering::SeqCst), 0);
     }
 }
+#[test]
+fn ulp_exit_clears_settings_even_without_the_power_cycle_status() {
+    let (state, _, io, timer) = fixture_spt();
+    state.borrow_mut().power_stuck = true;
+    let controller = start_spt(0x156f, io, timer).unwrap();
+    let model = state.borrow();
+    assert_eq!(model.phy[&(1, 779, 16)] & ULP_CLEAR, 0);
+    assert_eq!(model.mac[&CTRL_EXT] & FORCE_SMBUS, 0);
+    assert_eq!(model.mac[&FEXTNVM7] & DISABLE_SMB_PERST, 0);
+    drop(model);
+    drop(controller);
+}
+
 #[test]
 fn ulp_mode_switch_recovers_only_the_specific_mdi_transition_and_verifies_state() {
     let (state, released, io, timer) = fixture_spt();

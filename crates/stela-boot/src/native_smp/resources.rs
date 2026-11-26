@@ -14,7 +14,7 @@ pub(crate) struct Resources {
     pub cores: u32,
     /// Active parts of each exact owner's fixed native code ring.
     pub code_parts: u32,
-    /// Owned LOADER_CODE page below 1 MiB, absent for the serial path.
+    /// Owned LOADER_CODE page below 1 MiB for AP parking and worker startup.
     pub sipi: u64,
     /// Fixed physical stack ranges; virtual guards are not mapped.
     pub stacks: Region,

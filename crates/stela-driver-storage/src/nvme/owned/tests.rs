@@ -770,6 +770,14 @@ unsafe impl Registers for Regs {
                 | u32::from(m.fatal) << 1
                 | if m.stopped { 8 } else { 0 });
         }
+        if offset == CAPABILITIES
+            && m.stopped
+            && m.registers
+                .get(&CONFIGURATION)
+                .is_some_and(|&value| value != 0)
+        {
+            m.record("configured_capabilities");
+        }
         if offset == CONFIGURATION && m.stuck_enable {
             return Ok(m.registers.get(&offset).copied().unwrap_or(0) | ENABLE);
         }
@@ -789,6 +797,8 @@ unsafe impl Registers for Regs {
                     m.stopped = false;
                     m.queues[0] = (m.register64(0x28), m.register64(0x30));
                     m.record("enable");
+                } else if value != 0 && !m.enabled {
+                    m.record("configure");
                 } else {
                     m.record("stop");
                     if !m.stuck_ready {
@@ -1316,6 +1326,25 @@ fn nvm_limits_cap_deallocate_and_write_zeroes_like_nvme_init_non_mdts_limits() {
     assert_eq!(features.discard, None);
     assert_eq!(features.write_zeroes.unwrap().blocks, transfer);
     assert!(attached.failures.is_empty());
+}
+
+#[test]
+fn attach_configures_the_controller_before_reading_its_enable_capabilities() {
+    let f = Fixture::new();
+    let attached = f.attach().unwrap();
+    {
+        let model = f.model.lock().unwrap();
+        let at = |event| {
+            model
+                .events
+                .iter()
+                .position(|entry| *entry == event)
+                .unwrap()
+        };
+        assert!(at("configure") < at("configured_capabilities"));
+        assert!(at("configured_capabilities") < at("enable"));
+    }
+    drop(attached);
 }
 
 #[test]

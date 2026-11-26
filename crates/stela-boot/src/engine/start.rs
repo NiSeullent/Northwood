@@ -198,6 +198,11 @@ fn start(handoff: u64) -> Started {
             "HOST AMD-Vi table memory unavailable: {error:?}\n"
         ));
     }
+    // SAFETY: loader-reserved pages in the shared physmap, outside guest
+    // RAM, and no native driver has been started.
+    if let Err(error) = unsafe { crate::native_memory::initialize_low_dma(handoff.low_dma) } {
+        output::arguments(format_args!("HOST LOW DMA memory unavailable: {error:?}\n"));
+    }
     // SAFETY: loader-reserved immutable pages, kept in every shared-window
     // physmap; metadata and Arc are created in this active engine allocator.
     let host_firmware = unsafe { crate::host_firmware::after_ebs(&handoff.host_firmware) }
@@ -319,6 +324,13 @@ fn open_host(
         apic_hz,
         tsc_base: native_tsc_base,
     } = install_host(handoff, options, &ram);
+    if let Some(capture) = native_processors {
+        crate::status::begin("Parking the other host processors");
+        // SAFETY: the relocated BSP host is installed with IF clear. The
+        // loader stopped its firmware APs; no device takeover has run yet.
+        unsafe { crate::native_smp::executor::park::before_firmware(handoff, capture) };
+        crate::status::done("");
+    }
     let Platform {
         acpi: host_acpi,
         mmio: native_mmio,

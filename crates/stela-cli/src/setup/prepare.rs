@@ -23,7 +23,8 @@ pub(super) struct Prepared {
     pub(super) personalized: bool,
     pub(super) generation: bundle::Generation,
     pub(super) processors: usize,
-    pub(super) directory: tempfile::TempDir,
+    path: PathBuf,
+    _temporary: Option<tempfile::TempDir>,
     pub(super) bytes: u64,
 }
 
@@ -31,7 +32,26 @@ pub(super) type PreparedSetup = (String, String, Vec<Prepared>);
 
 impl Prepared {
     pub(super) fn path(&self) -> PathBuf {
-        self.directory.path().join(BUNDLE_LEAF)
+        self.path.clone()
+    }
+
+    pub(super) fn existing(
+        path: &Path,
+        build: String,
+        ecid: Ecid,
+        generation: bundle::Generation,
+    ) -> Result<Self> {
+        Ok(Self {
+            build,
+            ecid: Some(ecid),
+            kind: Kind::Restore,
+            personalized: true,
+            generation,
+            processors: bundle::processors(path)?,
+            path: path.to_owned(),
+            _temporary: None,
+            bytes: bundle::bytes(path)?,
+        })
     }
 }
 
@@ -146,7 +166,8 @@ pub(super) fn prepare_kind(
             personalized,
             generation,
             processors: bundle::processors(&output)?,
-            directory,
+            path: output,
+            _temporary: Some(directory),
             bytes,
         });
     }

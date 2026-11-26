@@ -78,6 +78,20 @@ fn write_range(
     block: u64,
     buffer: &mut Vec<u8>,
 ) -> Result<(), WriteError> {
+    let device_limit = device.identity().features.max_transfer as u64;
+    let transfer = if device_limit == 0 {
+        TRANSFER_BYTES as u64
+    } else {
+        device_limit.min(TRANSFER_BYTES as u64)
+    };
+    let transfer = transfer / block * block;
+    if transfer == 0 {
+        return Err(WriteError::Device(
+            stela_drivers::block::BlockError::Protocol(
+                "device transfer limit is below its logical block size",
+            ),
+        ));
+    }
     let file: u64 = extents.iter().map(|extent| extent.bytes).sum();
     let mut at = range.start - range.start % block;
     let end = range
@@ -92,8 +106,7 @@ fn write_range(
                 at = extent_start;
                 continue;
             }
-            let take =
-                (extent_end.next_multiple_of(block).min(end) - at).min(TRANSFER_BYTES as u64);
+            let take = (extent_end.next_multiple_of(block).min(end) - at).min(transfer);
             buffer.clear();
             buffer.resize(take as usize, 0);
             layout.read_at(at, buffer);
@@ -208,6 +221,46 @@ fn entry(pack: &[u8], index: usize) -> (u64, u64) {
 mod tests {
     use super::*;
     use stela_engine::translations::pack::{self, Pack, Piece};
+
+    #[test]
+    fn a_pack_write_respects_the_devices_transfer_limit() {
+        use stela_drivers::block::{BlockDevice, BlockError, Identity, RamDisk};
+        use stela_formats::payload::pieces::Extent;
+
+        struct Limited(RamDisk);
+        impl BlockDevice for Limited {
+            fn identity(&self) -> &Identity {
+                &self.0.identity
+            }
+
+            fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+                self.0.read(lba, buffer)
+            }
+
+            fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+                if data.len() > self.identity().features.max_transfer {
+                    return Err(BlockError::Protocol("write exceeds device transfer limit"));
+                }
+                self.0.write(lba, data)
+            }
+        }
+
+        let translator = Digest::of(b"translator");
+        let records = vec![(Digest::of(b"record"), Piece::New(vec![5; 4096]))];
+        let layout = Layout::new(&translator, records);
+        let mut disk = Limited(RamDisk::new("limited pack", 128, 512));
+        disk.0.identity.features.max_transfer = 1500;
+        let extents = [Extent {
+            offset: 512,
+            bytes: 8192,
+        }];
+        write_in_place(&mut disk, &extents, &layout).unwrap();
+        assert_eq!(
+            &disk.0.bytes[512..][..layout.bytes() as usize],
+            layout.to_vec()
+        );
+    }
+
     #[test]
     fn a_pack_is_written_over_its_files_extents_and_never_past_them() {
         use stela_drivers::block::RamDisk;

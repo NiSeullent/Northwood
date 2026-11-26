@@ -28,6 +28,7 @@ pub(super) struct EngineImage {
 pub(super) struct EngineMemory {
     pub profile: stela_boot_core::host_memory::Profile,
     pub heap: Region,
+    pub low_dma: Region,
     pub native_resources: NativeResources,
     pub native_task_allocations: crate::native_smp::resources::TaskAllocations,
     pub stack: Region,
@@ -100,20 +101,20 @@ pub(super) fn prepare_image(snapshot: &Snapshot) -> Result<EngineImage> {
     })
 }
 
-/// Reserve the other cores' page below 1 MiB. If none is free, use the BSP.
-pub(super) fn prepare_sipi(cores: usize) -> (usize, u64) {
-    match cores {
-        1 => (1, 0),
-        _ => match sipi_page() {
-            Some(page) => (cores, page),
-            None => {
-                crate::status::info(&format!(
-                    "the firmware left no free memory below 1 MiB to start the other cores from, \
-                     so macOS runs on one of this PC's {cores}"
-                ));
-                (1, 0)
-            }
-        },
+/// Reserve the other CPUs' startup page below 1 MiB. Even a serial guest
+/// uses this page to park firmware APs where they can service SMIs.
+pub(super) fn prepare_sipi(cores: usize, has_aps: bool) -> (usize, u64) {
+    if !has_aps {
+        return (1, 0);
+    }
+    match sipi_page() {
+        Some(page) => (cores, page),
+        None => {
+            crate::status::info(
+                "The firmware left no free startup page below 1 MiB. Only the boot processor will run.",
+            );
+            (1, 0)
+        }
     }
 }
 
@@ -126,7 +127,23 @@ pub(super) fn reserve(
     before_reclaim: u64,
 ) -> Result<EngineMemory> {
     use stela_boot_core::host_memory::{self, Profile, gigabytes};
-    let map = memory_map(Some("budget"))?.ledger;
+    let map = memory_map(None)?.ledger;
+    let mut low_dma = Region::default();
+    if let Ok(baseline) = host_memory::sizes(map.usable, cores, cores) {
+        low_dma = crate::native_memory::reserve_low_dma(|bytes| {
+            // The reservation may split a 2 MiB-aligned usable range.
+            let free = map.usable.saturating_sub(bytes + 2 * LARGE);
+            host_memory::sizes(free, cores, cores).is_ok_and(|sizes| {
+                sizes.profile == baseline.profile && sizes.cores == baseline.cores
+            }) && (before_reclaim > map.usable || free >= before_reclaim)
+        });
+    }
+    let map = if low_dma.bytes != 0 {
+        memory_map(None)?.ledger
+    } else {
+        map
+    };
+    map.report("budget");
     let free = map.usable;
     output::arguments(format_args!(
         "HOST MEMORY free={}M before_reclaim={}M cores={cores} staged={staged:#x} loader_released={released:#x} \
@@ -285,6 +302,7 @@ pub(super) fn reserve(
     Ok(EngineMemory {
         profile: sizes.profile,
         heap,
+        low_dma,
         native_resources,
         native_task_allocations,
         stack,

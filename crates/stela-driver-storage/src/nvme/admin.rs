@@ -25,9 +25,12 @@ impl Controller {
         self.registers.write32(INTERRUPT_MASK_SET, u32::MAX)
     }
 
-    /// Linux `nvme_enable_ctrl`: set CC.EN, returning how long CSTS.RDY may
-    /// take, CAP.TO or a longer CRTO.CRWMT. CRIME stays clear, as in Linux.
+    /// Configure the stopped controller before reading CAP, which can
+    /// change after CC is written. Return the CAP.TO or longer CRTO.CRWMT
+    /// timeout for CSTS.RDY, as Linux's `nvme_enable_ctrl` does.
     pub(super) fn enable(&mut self) -> Result<u64, BlockError> {
+        self.registers
+            .write32(CONFIGURATION, self.configuration & !ENABLE)?;
         let capabilities = self.registers.read64(CAPABILITIES)?;
         let mut timeout = capabilities >> 24 & 0xff;
         if capabilities & CAPABILITY_READY_WITH_MEDIA != 0 {

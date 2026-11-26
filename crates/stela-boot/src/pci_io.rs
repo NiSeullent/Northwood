@@ -800,3 +800,67 @@ impl core::fmt::Display for CaptureFailure {
         }
     }
 }
+
+/// xHCI register reads through the firmware's protocol, which reaches the
+/// BAR whatever the firmware's page tables map.
+struct XhciBar<'a>(&'a mut PciIo);
+
+impl stela_boot_core::usb_legacy::Dwords for XhciBar<'_> {
+    fn read32(&mut self, offset: usize) -> u32 {
+        let mut value = u32::MAX;
+        // SAFETY: live boot protocol; EfiPciIoWidthUint32 (2) reads one
+        // dword of BAR 0 into the writable local. A refused read leaves
+        // all ones, which every reader takes as absent registers.
+        let _ =
+            unsafe { (self.0.mem_read)(self.0, 2, 0, offset as u64, 1, (&raw mut value).cast()) };
+        value
+    }
+    // The firmware still drives the controller: nothing is written here.
+    fn write32(&mut self, _: usize, _: u32) {}
+}
+
+/// Each xHCI controller the firmware decodes, with the physical address of
+/// its USB Legacy Support capability, for
+/// [`stela_boot_core::usb_legacy::take`] once the firmware has exited. A
+/// controller without the capability, or one whose registers the firmware
+/// does not place in memory, is left out.
+pub(crate) fn xhci_legacy_capabilities() -> Vec<(Address, u64)> {
+    const XHCI_CLASS: [u8; 3] = [0x30, 0x03, 0x0c];
+    const COMMAND_MEMORY: u8 = 1 << 1;
+    let mut found = Vec::new();
+    let Ok(handles) = boot::find_handles::<PciIo>() else {
+        return found;
+    };
+    for handle in handles {
+        let Ok(mut io) = get_protocol::<PciIo>(handle) else {
+            continue;
+        };
+        let (Ok(address), Ok(header)) = (io.address(), io.read_header()) else {
+            continue;
+        };
+        if header[0x09..0x0c] != XHCI_CLASS || header[0x04] & COMMAND_MEMORY == 0 {
+            continue;
+        }
+        // A memory resource (type 0) the processor reaches without
+        // translation: the address read after the exit is then the one the
+        // firmware's own driver used.
+        let Some(window) = io.bar_regions(0).ok().and_then(|regions| {
+            regions
+                .into_iter()
+                .find(|region| region.resource_type == 0 && region.translation == 0)
+                .map(|region| region.host)
+        }) else {
+            continue;
+        };
+        let Ok(bytes) = usize::try_from(window.end.saturating_sub(window.start)) else {
+            continue;
+        };
+        if window.start == 0 || !window.start.is_multiple_of(4) {
+            continue;
+        }
+        if let Some(at) = stela_boot_core::usb_legacy::find(&mut XhciBar(&mut io), bytes) {
+            found.push((address, window.start + at as u64));
+        }
+    }
+    found
+}

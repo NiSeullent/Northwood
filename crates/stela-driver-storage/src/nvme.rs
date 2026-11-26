@@ -240,6 +240,9 @@ const IO_ENTRIES: u16 = 64;
 const DEPTH: usize = IO_ENTRIES as usize - 1;
 /// The most data one command moves.
 const BOUNCE_BYTES: usize = 128 * 1024;
+/// A read starts with fresh data so a false completion cannot return the
+/// previous contents of a recycled DMA page.
+const READ_POISON: u8 = 0xa5;
 /// The I/O bounce pages of one controller: as much memory as eight commands
 /// of [`BOUNCE_BYTES`] take, which many more small commands share.
 const POOL_PAGES: usize = 256;

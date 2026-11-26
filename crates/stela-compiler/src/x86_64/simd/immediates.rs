@@ -19,15 +19,15 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, target: TargetCpu) {
         }
         return;
     };
-    if value == 0 {
+    if bytes == 16 {
+        let limb = value.to_le_bytes();
+        rearrange::constant(code, 0, core::array::from_fn(|i| limb[i % limb.len()]));
+    } else if value == 0 {
         packed(code, Host::Xor, 0, 0);
     } else {
         // The expanded low 64 bits.
         code.asm().mov_imm64(crate::x86_64::asm::Gpr::Rcx, value);
         packed(code, Host::MoveGprQword, 0, 1);
-        if bytes == 16 {
-            packed(code, Host::UnpackLowQword, 0, 0);
-        }
     }
     match operation {
         ConstantOperation::Move => {}

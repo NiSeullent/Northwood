@@ -5,6 +5,88 @@
 //! moves the AP's counter, and the counter base an AP corrected in software
 //! counts from.
 
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+/// The sampling processors in a synchronization round.
+#[derive(Clone, Copy)]
+pub enum Side {
+    Bsp,
+    Ap,
+}
+
+impl Side {
+    fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// Shared counter samples and the largest backwards warp seen by each side.
+pub struct Samples {
+    previous: AtomicU64,
+    previous_side: AtomicU8,
+    crossed: AtomicU8,
+    warps: [AtomicU64; 2],
+}
+
+impl Default for Samples {
+    fn default() -> Self {
+        Self {
+            previous: AtomicU64::new(0),
+            previous_side: AtomicU8::new(0),
+            crossed: AtomicU8::new(0),
+            warps: [AtomicU64::new(0), AtomicU64::new(0)],
+        }
+    }
+}
+
+impl Samples {
+    /// Give the peer the next sample, so a processor cannot immediately
+    /// reacquire the sampling lock until its peer misses the entire round.
+    pub fn next_is(&self, side: Side) -> bool {
+        self.previous_side.load(Ordering::Relaxed) != side.bit()
+    }
+
+    /// Forget the previous round before either processor starts sampling.
+    pub fn reset(&self) {
+        self.previous_side.store(0, Ordering::Relaxed);
+        self.crossed.store(0, Ordering::Relaxed);
+        for warp in &self.warps {
+            warp.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a counter read. Callers serialize their reads and submissions
+    /// with the same lock, so each sample sees the last read in real order.
+    pub fn record(&self, side: Side, now: u64) {
+        let bit = side.bit();
+        let previous_side = self.previous_side.load(Ordering::Relaxed);
+        let previous = self.previous.load(Ordering::Relaxed);
+        self.previous_side.store(bit, Ordering::Relaxed);
+        self.previous.store(now, Ordering::Relaxed);
+        if previous_side != 0 && previous_side != bit {
+            let crossed = self.crossed.load(Ordering::Relaxed);
+            self.crossed.store(crossed | bit, Ordering::Relaxed);
+            // Signed subtraction also covers a counter or correction crossing zero.
+            let forward = now.wrapping_sub(previous) as i64;
+            if forward < 0 {
+                self.warps[side as usize].fetch_max(forward.unsigned_abs(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The AP and BSP warps, once each has read after the other. A quiet
+    /// round in which one processor only sampled after its peer stopped
+    /// provides no proof of agreement.
+    pub fn interleaved_warps(&self) -> Option<(u64, u64)> {
+        (self.crossed.load(Ordering::Relaxed) == 0b11).then(|| {
+            (
+                self.warps[Side::Ap as usize].load(Ordering::Relaxed),
+                self.warps[Side::Bsp as usize].load(Ordering::Relaxed),
+            )
+        })
+    }
+}
+
 /// Linux's `loop_timeout`: 2 ms when a CPU of the AP's package already
 /// synchronized, whose counters the package's own clock already keeps
 /// together, else 20 ms for a new package or module.
@@ -39,6 +121,32 @@ pub fn corrected_base(tsc_base: u64, offset: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delayed_ap_does_not_make_a_quiet_round_agree() {
+        let samples = Samples::default();
+        samples.record(Side::Bsp, 100);
+        samples.record(Side::Bsp, 200);
+        samples.record(Side::Ap, 4_592_093_650);
+        samples.record(Side::Ap, 4_592_093_750);
+        assert_eq!(samples.interleaved_warps(), None);
+
+        samples.reset();
+        samples.record(Side::Bsp, 100);
+        samples.record(Side::Ap, 4_592_093_650);
+        samples.record(Side::Bsp, 300);
+        let (ap, bsp) = samples.interleaved_warps().unwrap();
+        assert_eq!(correction(ap, bsp), -4_592_093_350);
+    }
+
+    #[test]
+    fn an_interleaved_round_can_agree_across_a_counter_wrap() {
+        let samples = Samples::default();
+        samples.record(Side::Ap, u64::MAX);
+        samples.record(Side::Bsp, 0);
+        samples.record(Side::Ap, 1);
+        assert_eq!(samples.interleaved_warps(), Some((0, 0)));
+    }
 
     #[test]
     fn a_core_of_a_synchronized_package_reads_for_2_ms() {

@@ -14,7 +14,7 @@ fn every_implemented_phy_branch_executes_analogue_sequence_and_restarts_copper_a
         hw.configure_phy(Some(&script), version == 5).unwrap();
         let s = model.state.borrow();
         assert_eq!(s.page, 0, "version{version}");
-        assert_eq!(s.phy[&(0, 4)], 0x1e1);
+        assert_eq!(s.phy[&(0, 4)], 0x0de1);
         assert_eq!(s.phy[&(0, 9)] & 0xfb00, 0x0200);
         assert_eq!(s.phy[&(0, 0)], 0x1200);
         let expected = match version {

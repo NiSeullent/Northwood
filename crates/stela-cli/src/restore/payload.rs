@@ -377,7 +377,7 @@ pub(crate) fn file_sha256(path: &Path) -> Result<(u64, String)> {
 }
 
 /// [`file_sha256`], telling `read` each piece's length as it is hashed.
-fn file_sha256_with(path: &Path, read: impl Fn(u64)) -> Result<(u64, String)> {
+pub(crate) fn file_sha256_with(path: &Path, read: impl Fn(u64)) -> Result<(u64, String)> {
     let mut file = File::open(path)?;
     let mut hash = Sha256::new();
     let mut buffer = vec![0u8; BUFFER];

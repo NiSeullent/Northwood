@@ -21,12 +21,12 @@ use core::{
     time::Duration,
 };
 use uefi::{
-    boot::{self, AllocateType, MemoryType},
+    boot::{self, AllocateType, MemoryType, ScopedProtocol},
     proto::pi::mp::{CPU_V2_EXTENDED_TOPOLOGY, MpServices},
 };
 
 const MAGIC: u64 = 0x5354_4c53_4d50_3031;
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const MAX_VARIABLE_MTRRS: usize = 16;
 const CR4_OSXSAVE: u64 = 1 << 18;
 
@@ -380,17 +380,53 @@ extern "efiapi" fn observe_ap(argument: *mut c_void) {
     }
 }
 
-/// Observe the complete processor inventory without assigning its workers.
-/// The count is every logical processor that can run a PE.
-pub(crate) fn capture_inventory() -> Result<(Region, usize), Error> {
-    let region = capture(1)?;
-    // SAFETY: capture just allocated and initialized this exact UEFI
-    // allocation; before EBS its physical address is directly accessible.
-    let logical = unsafe { Capture::from_raw(region.physical as *const u8, 0).logical_count };
-    Ok((region, logical as usize))
+/// Find the SMT and package boundary shifts in the BSP's CPUID topology.
+/// Prefer leaf 1FH, whose final level also separates dies and tiles.
+fn apic_id_shifts() -> Option<(u32, u32)> {
+    let maximum = __cpuid(0).eax;
+    for leaf in [0x1f, 0xb] {
+        if leaf > maximum {
+            continue;
+        }
+        let mut thread = None;
+        let mut package = None;
+        for subleaf in 0..8 {
+            let level = __cpuid_count(leaf, subleaf);
+            let kind = level.ecx >> 8 & 0xff;
+            if kind == 0 || level.ebx & 0xffff == 0 {
+                break;
+            }
+            let shift = level.eax & 0x1f;
+            if kind == 1 {
+                thread = Some(shift);
+            } else {
+                package = Some(shift);
+            }
+        }
+        if let (Some(thread), Some(package)) = (thread, package)
+            && thread <= package
+        {
+            return Some((thread, package));
+        }
+    }
+    None
 }
 
-pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
+pub(crate) struct Inventory {
+    mp: ScopedProtocol<MpServices>,
+    processors: Vec<Processor>,
+    logical: Vec<usize>,
+    pub(crate) enabled: usize,
+}
+
+impl Inventory {
+    pub(crate) fn logical_count(&self) -> usize {
+        self.logical.len()
+    }
+}
+
+/// Discover the complete firmware roster without running callbacks on APs.
+pub(crate) fn inventory() -> Result<Inventory, Error> {
     let handle = boot::get_handle_for_protocol::<MpServices>().map_err(|_| Error::NoMpServices)?;
     let mp =
         boot::open_protocol_exclusive::<MpServices>(handle).map_err(|_| Error::NoMpServices)?;
@@ -457,18 +493,53 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
             thread,
         });
     }
-    let logical = topology::select(&processors).map_err(Error::Topology)?;
-    let assignable =
-        topology::assignment_count(None, logical.len()).map_err(|_| Error::CoreCount)?;
-    if requested == 0 || requested > assignable {
-        return Err(Error::CoreCount);
+    if count.enabled
+        != processors
+            .iter()
+            .filter(|processor| processor.flags & topology::ENABLED != 0)
+            .count()
+    {
+        return Err(Error::ProcessorInventory);
     }
-    let selected = &logical[..assignable];
+    let logical = match topology::select(&processors) {
+        Err(topology::Refusal::DuplicateThreadLocation) => {
+            let (thread, package) = apic_id_shifts()
+                .ok_or(Error::Topology(topology::Refusal::DuplicateThreadLocation))?;
+            topology::place_by_apic_id(&mut processors, thread, package)
+                .map_err(Error::Topology)?;
+            let logical = topology::select(&processors).map_err(Error::Topology)?;
+            crate::output::arguments(format_args!(
+                "HOST PROCESSORS firmware coordinates collide; reconstructed from APIC IDs \
+                 (SMT shift={thread}, package shift={package})\n"
+            ));
+            logical
+        }
+        result => result.map_err(Error::Topology)?,
+    };
     if mp.who_am_i().map_err(|_| Error::WrongBootstrapProcessor)?
-        != processors[selected[0]].processor_number as usize
+        != processors[logical[0]].processor_number as usize
     {
         return Err(Error::WrongBootstrapProcessor);
     }
+    Ok(Inventory {
+        mp,
+        processors,
+        logical,
+        enabled: count.enabled,
+    })
+}
+
+/// Capture controls only on processors reserved for guest work. The entire
+/// inventory remains available to stop and park firmware APs after EBS.
+pub(crate) fn capture(inventory: Inventory, requested: usize) -> Result<Region, Error> {
+    let Inventory {
+        mp,
+        processors,
+        logical,
+        enabled,
+    } = inventory;
+    topology::assignment_count(Some(requested), logical.len()).map_err(|_| Error::CoreCount)?;
+    let selected = &logical[..requested];
     let mut snapshots = Vec::with_capacity(selected.len());
     for (slot, &index) in selected.iter().enumerate() {
         let snapshot = if slot == 0 {
@@ -512,7 +583,7 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
         capture.magic = MAGIC;
         capture.version = VERSION;
         capture.processor_count = processors.len() as u32;
-        capture.enabled_count = count.enabled as u32;
+        capture.enabled_count = enabled as u32;
         capture.core_count = selected.len() as u32;
         capture.logical_count = logical.len() as u32;
         capture.processors.copy_from_slice(&processors);
@@ -554,14 +625,15 @@ pub(crate) unsafe fn captured(region: Region) -> Result<&'static Capture, Error>
     let logical = capture.logical_count as usize;
     if capture.magic != MAGIC
         || capture.version != VERSION
-        || capture.core_count == 0
-        || topology::assignment_count(None, logical) != Ok(capture.core_count as usize)
+        || topology::assignment_count(Some(capture.core_count as usize), logical).is_err()
     {
         return Err(Error::ProcessorInventory);
     }
     let processors = &capture.processors;
     let all = topology::select(processors).map_err(Error::Topology)?;
-    let selected = &all[..all.len().min(topology::MAX_CORES)];
+    let selected = all
+        .get(..capture.core_count as usize)
+        .ok_or(Error::ProcessorInventory)?;
     if all.len() != logical
         || capture.enabled_count as usize
             != processors

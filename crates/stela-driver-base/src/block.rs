@@ -533,6 +533,9 @@ impl Command {
                 }
             }
             Self::Flush => Self::Flush,
+            Self::Discard { extents } if extents.is_empty() => {
+                return Err(BlockError::Unsupported("a discard of no ranges"));
+            }
             Self::Discard { mut extents } => {
                 for extent in &mut extents {
                     let Extent { lba, blocks } = *extent;

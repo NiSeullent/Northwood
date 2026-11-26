@@ -82,7 +82,7 @@ impl InputDevice {
             }
             Self::Ps2(controller) => {
                 let mut controller = controller.borrow_mut();
-                match controller.poll() {
+                match controller.poll_host() {
                     Ok(polled) => {
                         inputs.extend(polled);
                         Ok(())
