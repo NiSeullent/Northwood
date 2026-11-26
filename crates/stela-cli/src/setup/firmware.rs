@@ -150,6 +150,33 @@ fn cached(client: Option<&Client>, directory: &Path, artifact: &Artifact) -> Res
     read_cached(&path, artifact)
 }
 
+fn download_client() -> Result<Client> {
+    Ok(Client::builder()
+        .user_agent(concat!("stela/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(120))
+        .redirect(Policy::none())
+        .build()?)
+}
+
+/// Fetch the pinned NVIDIA firmware and corresponding licenses for a kit.
+pub(super) fn cache_gpu(chips: &[String], cache: &Path) -> Result<()> {
+    if chips.is_empty() {
+        return Ok(());
+    }
+    let mut inventory = Inventory::default();
+    for chip in chips {
+        recipes::require_gsp(&mut inventory, chip)?;
+    }
+    let client = download_client()?;
+    let progress = crate::progress::Phase::spinner("Staging NVIDIA firmware for the offline kit");
+    for artifact in Plan::select(&inventory)?.artifacts() {
+        cached(Some(&client), cache, artifact)?;
+    }
+    progress.finish();
+    Ok(())
+}
+
 /// The chips of this computer's NVIDIA GPUs, whose firmware setup adds to
 /// the USB, and a note for each NVIDIA GPU Stela cannot run.
 pub(super) fn host_chips(host: &dyn super::host::Host) -> Result<(Vec<&'static str>, Vec<String>)> {
@@ -169,6 +196,20 @@ pub(super) fn host_chips(host: &dyn super::host::Host) -> Result<(Vec<&'static s
     Ok((chips, notes))
 }
 
+pub(super) fn usb_chips(
+    host: &dyn super::host::Host,
+    staged: &[String],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let (chips, notes) = host_chips(host)?;
+    let mut chips: Vec<_> = chips.into_iter().map(str::to_owned).collect();
+    for chip in staged {
+        if !chips.contains(chip) {
+            chips.push(chip.clone());
+        }
+    }
+    Ok((chips, notes))
+}
+
 /// Why a USB made on this computer has no GPU firmware, and how to add it:
 /// `fix` is the command, with CHIP for the chip the PC's boot screen names.
 pub(super) fn missing(fix: &str) -> String {
@@ -180,36 +221,69 @@ pub(super) fn missing(fix: &str) -> String {
     )
 }
 
-/// Add what a Wi-Fi network needs to the firmware on the USB's EFI partition
-/// `esp`, whose boot program is `mount_image`: the regulatory database, and
-/// the files of this computer's Wi-Fi adapters whose PCI IDs name them.
+/// Add Wi-Fi firmware when an existing setup changes its network.
 pub(super) fn provision_wifi_in(
     host: &dyn super::host::Host,
     esp: &Path,
     layout: Layout,
     mount_image: &[u8],
 ) -> Result<()> {
-    // A boot program that reads no firmware from the USB has no Wi-Fi driver
-    // either.
-    if !host_firmware::supports_mount(mount_image) {
+    provision_usb_in(host, esp, layout, mount_image, &[], true, None)
+}
+
+/// Add the host GPU firmware, and Wi-Fi firmware when setup configures a network.
+pub(super) fn provision_usb_in(
+    host: &dyn super::host::Host,
+    esp: &Path,
+    layout: Layout,
+    mount_image: &[u8],
+    chips: &[String],
+    wifi: bool,
+    offline_cache: Option<&Path>,
+) -> Result<()> {
+    let wifi = wifi && host_firmware::supports_mount(mount_image);
+    if !wifi && chips.is_empty() {
         return Ok(());
     }
-    let (destination, installed) = publication_paths(esp, layout, mount_image)?;
-    provision_from(
-        ProvisionOptions {
-            requirements: None,
-            gpu: None,
-            wifi: Some(&host.network_adapters()?),
-            profile: None,
-            offline: false,
-            destination: &destination,
-            cache: &super::cache_dir().join("firmware"),
-            dry_run: false,
-            mount_image,
-        },
-        &installed,
-    )
-    .context("the Wi-Fi network is set, but the USB did not get the Wi-Fi firmware")?;
+    let cache = super::cache_dir().join("firmware");
+    let (destination, mut installed) = publication_paths(esp, layout, mount_image)?;
+    let options = || ProvisionOptions {
+        requirements: None,
+        gpu: None,
+        wifi: None,
+        profile: None,
+        offline: offline_cache.is_some(),
+        destination: &destination,
+        cache: offline_cache.unwrap_or(&cache),
+        dry_run: false,
+        mount_image,
+    };
+    for chip in chips {
+        provision_from(
+            ProvisionOptions {
+                gpu: Some(chip),
+                ..options()
+            },
+            &installed,
+        )
+        .with_context(|| {
+            format!(
+                "adding {chip}'s GPU firmware, which macOS needs; add it with {}",
+                super::fix(esp, &format!("host-firmware fetch --gpu {chip}"))
+            )
+        })?;
+        installed.clone_from(&destination);
+    }
+    if wifi {
+        provision_from(
+            ProvisionOptions {
+                wifi: Some(&host.network_adapters()?),
+                ..options()
+            },
+            &installed,
+        )
+        .context("the USB did not get the selected Wi-Fi firmware")?;
+    }
     Ok(())
 }
 
@@ -634,16 +708,7 @@ fn publish_plan(
         report.push_str("Dry run: no downloads or writes.\n");
         return Ok(report);
     }
-    let client = (!offline)
-        .then(|| {
-            Client::builder()
-                .user_agent(concat!("stela/", env!("CARGO_PKG_VERSION")))
-                .connect_timeout(Duration::from_secs(30))
-                .timeout(Duration::from_secs(120))
-                .redirect(Policy::none())
-                .build()
-        })
-        .transpose()?;
+    let client = (!offline).then(download_client).transpose()?;
     let package = plan.package(|artifact| {
         cached(client.as_ref(), cache, artifact)
             .map_err(|e| host_firmware::Error(format!("firmware provisioning: {e:#}")))

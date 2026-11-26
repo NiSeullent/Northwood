@@ -9,7 +9,7 @@
 //! device that gave no input for a few seconds is polled every
 //! [`IDLE_MILLIS`], so its first input waits that long, or for a busy
 //! host-drivers lock up to [`STARVED_MILLIS`] more. A device whose polls
-//! cost more than a [`COST_SHARE`]th of that is polled as much less often,
+//! cost more than its polling budget is polled as much less often,
 //! but at most [`SLOW_MILLIS`] apart when idle and [`ACTIVE_MILLIS`] when
 //! active, which bound its first input's wait. A posted
 //! GPU call is pumped between devices (`gpu::pump_posted`).
@@ -71,11 +71,16 @@ const STARVED_MILLIS: u64 = 32;
 /// How long a device is polled at every service turn after it last gave
 /// input, so a pointer's motion keeps its full rate.
 const ACTIVE_SECONDS: u64 = 5;
-/// A device's polls may take at most one part in this of the boot PE: a
+/// A device's polls normally take at most one part in this of the boot PE: a
 /// poll costing more is spaced this many times its cost apart. A port read
 /// that costs a microsecond on hardware can wait milliseconds for a
 /// hypervisor's device-model lock; the boot PE's time is the guest's.
 const COST_SHARE: u64 = 32;
+/// A 400 kHz I2C-HID precision touchpad takes ~1.25 ms on the wire to read one
+/// multitouch frame: spacing active polls by [`COST_SHARE`] (32) clamped it to
+/// [`ACTIVE_MILLIS`] (32 ms, ~30 Hz). A larger budget lets the active
+/// I2C-HID device keep up with high-refresh displays.
+const ACTIVE_I2C_COST_SHARE: u64 = 5;
 /// The longest an idle device waits for its next poll however costly its
 /// polls are, which its first input can wait.
 const SLOW_MILLIS: u64 = 250;
@@ -191,7 +196,12 @@ impl HostInput {
             let active =
                 now.wrapping_sub(reported.active) < super::host::COUNTER_HZ * ACTIVE_SECONDS;
             let interval = if active {
-                (reported.cost * COST_SHARE).min(millis * ACTIVE_MILLIS)
+                let share = if matches!(device, InputDevice::I2cHid(_)) {
+                    ACTIVE_I2C_COST_SHARE
+                } else {
+                    COST_SHARE
+                };
+                (reported.cost * share).min(millis * ACTIVE_MILLIS)
             } else {
                 (reported.cost * COST_SHARE).clamp(millis * IDLE_MILLIS, millis * SLOW_MILLIS)
             };

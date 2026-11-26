@@ -142,6 +142,7 @@ pub(super) fn finish(arguments: &Run, outcome: Outcome, print: bool) -> Result<E
         "usb_serial": arguments.usb_image.as_ref().map(|_| &arguments.usb_serial),
         "usb_writable": arguments.usb_writable,
         "no_la57": arguments.no_la57,
+        "qemu_host_sockets": arguments.host_sockets,
         "qemu_host_cores": arguments.host_cores,
         "qemu_host_threads": arguments.host_threads,
         "qemu_accelerator": qemu_accelerator(arguments.icount, arguments.kvm),

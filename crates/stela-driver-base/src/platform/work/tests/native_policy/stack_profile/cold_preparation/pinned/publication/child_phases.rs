@@ -222,7 +222,9 @@ fn dormant_job_waits_for_actual_activation_then_terminal_joins_on_real_successor
         clock: clock.clone(),
         thread: std::thread::current(),
     });
-    let domain = service::Domain::new(clock, idle).unwrap();
+    // This fixture's service returns after binding. A periodic tick could
+    // otherwise wake its closed continuation while the child is dispatched.
+    let domain = service::Domain::tickless(clock, idle).unwrap();
     r.attach_service_domain(domain.clone()).unwrap();
     *f.domain.lock().unwrap() = Some(domain.clone());
     // SAFETY: exact retained fixture/code on its real reserved service stack.

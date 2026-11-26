@@ -246,7 +246,11 @@ fn promoted_device_site_uses_only_current_canonical_ram_admission() {
     let generation = ram.generation().unwrap();
 
     // strb w0, [x1], #1; ret. Learn the actual promotion through its fault.
-    let mut machine = board(&[0x3800_1420, 0xd65f_03c0], Registers::default(), Vec::new());
+    let mut machine = board(
+        &[0x3800_1420, 0xd65f_03c0],
+        Registers::default(),
+        Vec::new(),
+    );
     machine.cpu.state.x[0] = VALUE;
     machine.cpu.state.x[1] = DEVICE;
     let (_, offset) =
@@ -321,7 +325,10 @@ fn promoted_device_site_uses_only_current_canonical_ram_admission() {
     machine.cpu.pc = BASE;
     machine.cpu.state.x[1] = RAM;
     machine.host.exits.push(exit(BASE, ExitKind::System));
-    machine.host.exits.push(exit(BASE + 4, ExitKind::Fallthrough));
+    machine
+        .host
+        .exits
+        .push(exit(BASE + 4, ExitKind::Fallthrough));
     machine.step().unwrap();
     assert!(machine.host.exits.is_empty());
     assert_eq!(machine.cpu.pc, BASE + 4);

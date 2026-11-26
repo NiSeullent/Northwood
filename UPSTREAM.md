@@ -2,19 +2,23 @@
 
 # Following Stela upstream
 
-The existing `origin` remote points to `tylertms/Stela`, and `lite` points to `NiSeullent/Northwood`. Use `origin/main` as the upstream mirror. Use `lite` for Northwood branches and tags. [Stela](https://github.com/tylertms/Stela) · [Northwood](https://github.com/NiSeullent/Northwood)
+A fresh Northwood clone uses `origin` for `NiSeullent/Northwood`. Fetch a reviewed Stela source separately when comparing changes. [Stela](https://github.com/tylertms/Stela) · [Northwood](https://github.com/NiSeullent/Northwood)
 
 ## Inspecting an update
 
 ```sh
-git fetch --no-tags origin main
-git rev-list --left-right --count HEAD...origin/main
-git merge-tree --write-tree HEAD origin/main
+git fetch --no-tags https://github.com/garvitsurana271/Stela.git refs/heads/main
+upstream="$(git rev-parse FETCH_HEAD)"
+git merge-base HEAD "$upstream" &&
+  git rev-list --left-right --count "HEAD...$upstream" &&
+  git merge-tree --write-tree HEAD "$upstream"
 ```
 
-`merge-tree` works on committed trees and leaves the current checkout and branch refs untouched. The scheduled and manual **build and release** workflow also reports the two revisions and runs this check. A successful check covers Git's merge, with compilation and boot validation handled separately.
+`merge-tree` works on committed trees and leaves the current checkout and branch refs untouched. The manual **Stela upstream merge check** workflow reports the two revisions, checks that they share a Git ancestor and tests the merge. Compilation and boot validation run in **build and release**.
 
-If Stela has new commits, create a dedicated integration branch or worktree from the committed Northwood branch. Merge `origin/main` into that integration branch and resolve conflicts with the table below and the current roadmap in view. Preserve the upstream file-specific licenses and both projects' source notices. Review submodule pins before updating them, and keep `third_party/patches/` aligned with the pins selected for the build.
+The archived `tylertms/Stela` main branch no longer shares Northwood's Git history. To review changes from a surviving public fork, enter its repository and branch in **Stela upstream merge check** after checking the source provenance. The original shared baseline was `502dbdd53d3d4d09b9b8bbf0a05cc98c1f9bc36b`.
+
+If the reviewed branch has changes to integrate, create a dedicated integration branch or worktree from the committed Northwood branch. Merge the captured `$upstream` revision into that integration branch and resolve conflicts with the table below and the current roadmap in view. Preserve the upstream file-specific licenses and both projects' source notices. Review submodule pins before updating them, and keep `third_party/patches/` aligned with the pins selected for the build.
 
 Run the x86-64 host checks, build the deployable EFI, then test Standard and Compact in QEMU with the usual fixtures. Re-run the low-memory and hardware tests relevant to the changed paths. Integrate the branch once those checks pass. For a fix that also benefits Stela, prepare a focused upstream patch with its tests and source provenance.
 

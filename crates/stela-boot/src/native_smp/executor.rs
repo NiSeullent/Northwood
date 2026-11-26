@@ -19,6 +19,7 @@ use core::{
 use stela_contracts::refuse;
 
 mod mailbox;
+pub(crate) mod park;
 
 const STARTING: u8 = 0;
 const READY: u8 = 1;
@@ -33,6 +34,7 @@ const ENTERED: u8 = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartupFailure {
     Resources,
+    ParkingPageHeld,
     Bootstrap(Refusal),
     FaultRecord {
         slot: usize,
@@ -236,6 +238,9 @@ unsafe extern "sysv64" fn enter(argument: u64) -> ! {
             }
             base
         } else {
+            if observed.apic_base & apic::X2APIC_MODE != 0 {
+                return Err(refuse!("AP retained x2APIC while the BSP uses xAPIC"));
+            }
             observed.apic_base
         };
         let loader_root = config.window_root;
@@ -480,6 +485,12 @@ pub(crate) unsafe fn start(
             .join_bsp(bsp)
             .ok_or(StartupFailure::Resources)?,
     );
+    if cores > 1 && park::page_held() {
+        return Ok(Executors {
+            processors,
+            failure: Some(StartupFailure::ParkingPageHeld),
+        });
+    }
     // An AP that does not start ends the startup of the ones after it, and
     // the guest runs on the cores before it (`Executors::failure`).
     let mut failed: Vec<(usize, StartupFailure)> = Vec::new();
@@ -515,8 +526,7 @@ pub(crate) unsafe fn start(
                 tsc_hz: handoff.tsc_hz,
                 // As the firmware left it, in the BSP's APIC mode, which
                 // the AP takes at entry.
-                apic_base: capture.snapshots[slot].apic_base
-                    | handoff.apic_base & apic::X2APIC_MODE,
+                apic_base: handoff.apic_base,
                 placement: handoff.placement,
                 bounce: Some((
                     layout::bounce() + slot as u64 * 2 * PAGE,
@@ -707,17 +717,23 @@ fn serve(
         match argument.status.load(Ordering::Acquire) {
             SYNCING if !started[index].synced => {
                 let begun = apic::rdtsc();
-                argument.tsc.source();
+                let completed = argument.tsc.source();
                 started[index].synced = true;
                 // The APs waiting meanwhile lose none of their second.
                 let spent = apic::rdtsc().wrapping_sub(begun);
                 for other in started.iter_mut() {
                     other.since = other.since.wrapping_add(spent);
                 }
+                if !completed {
+                    crate::output::arguments(format_args!(
+                        "NATIVE TSC slot={slot} timed out waiting for the AP\n"
+                    ));
+                    continue;
+                }
                 let outcome = argument.tsc.outcome();
                 crate::output::arguments(format_args!(
-                    "NATIVE TSC slot={slot} adjusted={} offset={} rounds={}\n",
-                    outcome.adjusted, outcome.offset, outcome.rounds,
+                    "NATIVE TSC slot={slot} adjusted={} offset={} rounds={} apart={}\n",
+                    outcome.adjusted, outcome.offset, outcome.rounds, outcome.apart,
                 ));
                 static OFFSET_REPORTED: core::sync::atomic::AtomicBool =
                     core::sync::atomic::AtomicBool::new(false);

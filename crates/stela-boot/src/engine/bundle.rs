@@ -92,10 +92,11 @@ fn source_contents(region: &Region) -> &[u8] {
 
 fn open(root: &mut Directory, path: &str) -> Result<RegularFile> {
     let path = CString16::try_from(path).map_err(|_| refuse!("bundle path is not UCS-2"))?;
-    root.open(&path, FileMode::Read, FileAttribute::empty())
-        .map_err(|_| refuse!("cannot open a bundle file"))?
-        .into_regular_file()
-        .ok_or(refuse!("a bundle path is a directory"))
+    let handle = root
+        .open(&path, FileMode::Read, FileAttribute::empty())
+        .map_err(|_| refuse!("cannot open a bundle file"))?;
+    crate::file_kind::regular(handle)
+        .map_err(|answers| refuse!("a bundle path is not a regular file", %answers))
 }
 
 fn size(file: &mut RegularFile) -> Result<u64> {

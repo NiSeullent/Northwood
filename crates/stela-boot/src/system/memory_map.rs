@@ -83,7 +83,7 @@ pub(super) fn summarize(map: &impl MemoryMap, stage: Option<&str>) -> Map {
         totals.entries += 1;
         totals.bytes += bytes;
         totals.aligned += aligned;
-        if is_ram(entry.ty) {
+        if is_ram(entry.ty) && entry.ty.0 < MemoryType::PERSISTENT_MEMORY.0 {
             installed += bytes;
         }
         if !matches!(

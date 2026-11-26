@@ -115,14 +115,16 @@ fn nbase_polled_carrier_preserves_latch_low_an_restart_and_cache_expiry() {
         }
         time.delay(NBASE_LINK_POLL_US).unwrap();
         assert_eq!(link.update(&hw), Ok(false)); // AN not complete.
-        model.state.borrow_mut().phy_ocp.insert(0xa402, u16::MAX);
+        // A register that reads all ones is taken as read, as Linux's
+        // genphy_update_link takes it, and polling goes on: a BMCR of all
+        // ones has its restart bit set and reads the link down.
+        model.state.borrow_mut().phy_ocp.insert(0xa400, u16::MAX);
         time.delay(NBASE_LINK_POLL_US).unwrap();
-        assert_eq!(link.update(&hw), Err(BlockError::Device { status: 65535 }));
-        let writes = model.state.borrow().writes.len();
+        assert_eq!(link.update(&hw), Ok(false));
+        model.state.borrow_mut().phy_ocp.insert(0xa400, 0x1000);
         model.state.borrow_mut().phy_ocp.insert(0xa402, 0x792d);
         time.delay(NBASE_LINK_POLL_US).unwrap();
-        assert_eq!(link.update(&hw), Err(BlockError::Device { status: 65535 }));
-        assert_eq!(model.state.borrow().writes.len(), writes);
+        assert_eq!(link.update(&hw), Ok(true));
         let mut model = Model::nbase(&time);
         model.fail_phy_ocp_at = 1;
         let mut link = RuntimeLink::default();

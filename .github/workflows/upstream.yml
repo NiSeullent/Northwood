@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: Stela upstream merge check
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Public GitHub repository in owner/name form
+        type: string
+        default: tylertms/Stela
+      branch:
+        description: Branch to compare with Northwood
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  upstream-merge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the merge against the selected Stela branch
+        env:
+          UPSTREAM_REPOSITORY: ${{ inputs.repository }}
+          UPSTREAM_BRANCH: ${{ inputs.branch }}
+        run: |
+          [[ "$UPSTREAM_REPOSITORY" =~ ^[a-zA-Z0-9-]+/[a-zA-Z0-9._-]+$ ]]
+          git check-ref-format "refs/heads/$UPSTREAM_BRANCH"
+          git fetch --no-tags "https://github.com/$UPSTREAM_REPOSITORY.git" "refs/heads/$UPSTREAM_BRANCH"
+          printf 'Northwood %s\nStela %s\n' "$(git rev-parse HEAD)" "$(git rev-parse FETCH_HEAD)"
+          status=0
+          git merge-base HEAD FETCH_HEAD || status=$?
+          if [[ "$status" == 1 ]]; then
+            echo '::error::Northwood and this Stela branch share no Git ancestor. Review upstream provenance before integrating changes.'
+          fi
+          if [[ "$status" != 0 ]]; then
+            exit "$status"
+          fi
+          git merge-tree --write-tree HEAD FETCH_HEAD

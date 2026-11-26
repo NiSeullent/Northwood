@@ -5,6 +5,7 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -17,16 +18,24 @@ jobs:
   x86:
     if: github.event.deleted != true
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
+      HOST_PACKAGES: >-
+        -p stela-boot-core -p stela-drivers -p northwood -p northwood-config
+        -p stela-cli -p stela-compiler -p stela-engine -p stela-runtime -p stela-soc
+        -p stela-driver-core -p stela-driver-base -p stela-driver-net -p stela-driver-storage
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: Check formatting
-        run: cargo fmt -p stela-boot-core -p stela-drivers -p northwood -p northwood-config -- --check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path crates/stela-boot/Cargo.toml -- --check
       - name: Lint host code and tests
-        run: cargo clippy --locked -p stela-boot-core -p stela-drivers -p northwood -p northwood-config --all-targets
+        run: cargo clippy --locked --features northwood/installer --all-targets $HOST_PACKAGES
       - name: Run host tests
-        run: cargo test --locked -p stela-boot-core -p stela-drivers -p northwood -p northwood-config
+        run: cargo test --locked --features northwood/installer $HOST_PACKAGES
+      - name: Test the QEMU boot harness
+        run: cargo test --locked -p xtask 'boot::'

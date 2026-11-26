@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="assets/stela-icon.png" alt="" width="96"><br>
+  <img src="assets/northwood-nw.png" alt="" width="96"><br>
   Northwood
 </h1>
 
@@ -31,14 +31,18 @@ and Apple7 GPU families.
 
 ## Requirements
 
-- An x86-64-v2 CPU (about 2011 or newer), UEFI with Secure Boot off, 4 GB of
-  RAM. 8 GB or more is recommended: with less than about 7 GB free, Stela
-  boots in a compact profile that gives macOS 2 GB or a little more and runs
-  slower.
-- An NVIDIA GTX 16 or RTX 20 series GPU or newer.
-- A USB stick of 8 GB or more.
+- An x86-64-v2 CPU (about 2011 or newer), UEFI with Secure Boot off, and at
+  least 8 GiB of installed RAM. Northwood checks installed memory before
+  connecting devices. If firmware reserves substantial memory, the guest
+  may use a smaller memory profile.
+- NVIDIA GTX 16 and RTX 20 series GPUs and newer are the supported Metal
+  targets. See the hardware notes for the AMD, NVIDIA and Intel generations
+  under investigation. [GPU compatibility](hardware/legacy-gpus.md)
+- A USB stick of 8 GB or more for a network installer, or 32 GB or more
+  for a full installer.
 - An empty GPT partition of at least 60 GB.
-- Network access during the install, which downloads macOS.
+- Network access to prepare the restore image and Apple's signing answers.
+  A network installer also downloads macOS during installation.
 
 Stela currently models the Mac mini (M2) and runs macOS 27.
 
@@ -58,6 +62,42 @@ Northwood loader, a fresh setup writes `EFI/northwood/nwconfig.plist` and
 keeps its data under `northwood/`. Setup labels a newly formatted data
 partition `NORTHWOOD`. Updates and repairs preserve the recorded layout,
 including `EFI/stela` and `stela/` on existing Stela media.
+
+### Create an offline USB
+
+Use `--installer offline` to put the complete macOS restore image on the
+USB, or `--installer online` to download macOS during installation. The
+wizard chooses a full installer for USB sticks of 32 GB or more. A full
+installer can install without internet when it contains all of Apple's
+signing answers.
+
+To create the USB on a disconnected PC, use the same Northwood release
+on both computers and first prepare a kit on a connected computer. Use
+the complete IPSW for the supported Mac mini (M2) model.
+
+```sh
+./northwood setup prepare-offline --ipsw macOS.ipsw --output northwood-kit
+```
+
+The kit contains the signed restore bundle, its machine identity, and the
+image verification data. Prepare a separate kit for each machine identity.
+Northwood stages firmware for the supported NVIDIA GPUs it detects.
+If the target PC has a different GPU, pass its chip name with
+`--gpu CHIP` when preparing the kit. Copy the kit and the exact IPSW to the
+disconnected computer. Keep both on a separate disk from the destination USB.
+
+```sh
+sudo ./northwood setup --usb /dev/sdX --ipsw macOS.ipsw --offline-kit northwood-kit
+```
+
+Replace `/dev/sdX` with the removable USB's whole-disk path. The command
+asks before erasing it. Without an interactive terminal, pass
+`--confirm-disk` with the USB's exact model or displayed size. On Windows,
+use `northwood.exe` and the appropriate `PhysicalDriveN` device name.
+If Wi-Fi or other target firmware must be supplied from a separate pinned
+cache, pass `--host-firmware-cache DIRECTORY`.
+If writing is interrupted after formatting, rerun with the same kit and
+IPSW and pass the USB's mounted EFI or data volume as `--usb` to resume.
 
 ## Build
 

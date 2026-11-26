@@ -176,8 +176,16 @@ pub(super) fn detect(txconfig: u32) -> Option<Revision> {
 const PCI_ALIASES: &[u16] = &[
     0x2502, 0x2600, 0x8129, 0x8162, 0x8167, 0x3000, 0x5000, 0x0e10,
 ];
-pub(super) fn pci_candidate(device: u16) -> bool {
-    matches!(device, 0x8161 | 0x8168 | 0x8169 | 0x8125 | 0x8126) || PCI_ALIASES.contains(&device)
+/// The Realtek ID whose family rules apply to this PCI function. The
+/// rebadged boards are listed in Linux's r8169 table without subsystem IDs.
+pub(super) fn pci_device(vendor: u16, device: u16) -> Option<u16> {
+    match (vendor, device) {
+        (0x10ec, 0x8161 | 0x8168 | 0x8169 | 0x8125 | 0x8126) => Some(device),
+        (0x10ec, alias) if PCI_ALIASES.contains(&alias) => Some(alias),
+        (0x1186, 0x4300 | 0x4302) | (0x1259, 0xc107) | (0x16ec, 0x0116) => Some(0x8167),
+        (0x10ff, 0x8168) => Some(0x8168),
+        _ => None,
+    }
 }
 
 pub(super) fn pci_family(device: u16, revision: Revision) -> bool {

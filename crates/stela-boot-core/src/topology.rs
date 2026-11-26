@@ -626,6 +626,48 @@ pub enum Refusal {
     InvalidAssignment,
 }
 
+/// Firmware package numbers are arbitrary. Compare their grouping with the
+/// package bits in the APIC IDs, without requiring the labels to match.
+pub fn packages_match_apic_ids(processors: &[Processor], shift: u32) -> bool {
+    shift < u32::BITS
+        && processors.iter().enumerate().all(|(index, cpu)| {
+            processors[..index].iter().all(|other| {
+                (cpu.location.package == other.location.package)
+                    == (cpu.apic_id >> shift == other.apic_id >> shift)
+            })
+        })
+}
+
+/// Reconstruct flattened package/core/thread coordinates from full APIC IDs
+/// and the BSP's CPUID topology shifts, when firmware coordinates collide.
+pub fn place_by_apic_id(
+    processors: &mut [Processor],
+    thread_shift: u32,
+    package_shift: u32,
+) -> Result<(), Refusal> {
+    if thread_shift > package_shift
+        || package_shift >= u32::BITS
+        || processors
+            .iter()
+            .any(|cpu| cpu.apic_id >= u64::from(u32::MAX))
+    {
+        return Err(Refusal::InvalidTopology);
+    }
+    let thread_mask = (1u32 << thread_shift) - 1;
+    let core_mask = (1u32 << (package_shift - thread_shift)) - 1;
+    for processor in processors {
+        let id = processor.apic_id as u32;
+        processor.location = Location {
+            package: id >> package_shift,
+            core: (id >> thread_shift) & core_mask,
+            ..Location::default()
+        };
+        processor.thread = id & thread_mask;
+        processor.topology_version = 1;
+    }
+    Ok(())
+}
+
 fn bootstrap_index(processors: &[Processor]) -> Result<usize, Refusal> {
     let mut bsp = None;
     for (index, processor) in processors.iter().enumerate() {

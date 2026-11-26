@@ -82,6 +82,31 @@ fn single_user_needs_a_preboot_selection() {
 }
 
 #[test]
+fn macos_and_recovery_hide_agx_and_restore_ramdisks_keep_it_without_metal() {
+    use stela_loader::boot_selection::{
+        PAIRED_RECOVERY_OPTION, SYSTEM_RECOVERY_OPTION, UPGRADE_OPTION,
+    };
+
+    for flag in [
+        "",
+        SINGLE_USER,
+        PAIRED_RECOVERY_OPTION,
+        SYSTEM_RECOVERY_OPTION,
+    ] {
+        let system = round_trip(&format!("--system --preboot {DISK} {flag}"));
+        assert!(system.hides_agx(false), "{flag}");
+        assert!(system.hides_agx(true), "{flag}");
+    }
+    for ramdisk in [
+        round_trip("--system"),
+        round_trip(&format!("--system --preboot {DISK} {UPGRADE_OPTION}")),
+    ] {
+        assert!(!ramdisk.hides_agx(false), "{ramdisk}");
+        assert!(ramdisk.hides_agx(true), "{ramdisk}");
+    }
+}
+
+#[test]
 fn scanout_mirror_round_trips() {
     assert!(!round_trip("--system").scanout_mirror);
     assert!(round_trip(&format!("--system {SCANOUT_MIRROR}")).scanout_mirror);

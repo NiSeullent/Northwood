@@ -542,6 +542,23 @@ impl Advertised {
     /// [`Self::at`] for a monitor whose image is `size_mm` millimetres,
     /// when its own EDID said.
     pub fn sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Result<Self> {
+        let size_mm = size_mm.map(|(width_mm, height_mm)| {
+            // SkyLight may default a dense 1080p panel to a 960-point desktop.
+            // Publish narrow panels at no more than 140 PPI to fit Setup.
+            let minimum_width_mm = (u64::from(mode.width) * 254).div_ceil(1400);
+            if mode.width >= 2560
+                || width_mm == 0
+                || height_mm == 0
+                || u64::from(width_mm) >= minimum_width_mm
+            {
+                return (width_mm, height_mm);
+            }
+            let height = (u64::from(height_mm) * minimum_width_mm).div_ceil(u64::from(width_mm));
+            (
+                minimum_width_mm as u32,
+                height.min(u64::from(u32::MAX)) as u32,
+            )
+        });
         let edid = edid_sized(mode, refresh, size_mm)?;
         let dtd: [u8; 18] = edid[54..72].try_into().expect("18 bytes");
         Ok(Self {
@@ -926,6 +943,16 @@ mod tests {
             (qhd, Some((650, 369)), 1),
             (qhd, None, 1),
             (FULL_HD, None, 1),
+            (FULL_HD, Some((309, 174)), 1),
+            (
+                Mode {
+                    width: 2560,
+                    height: 1600,
+                    format: PixelFormat::Bgra8888,
+                },
+                Some((286, 179)),
+                2,
+            ),
             (uhd, None, 2),
         ] {
             let a = Advertised::sized(mode, 60_000, size).unwrap();

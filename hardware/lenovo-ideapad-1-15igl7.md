@@ -5,6 +5,9 @@ Celeron N4120 unit with 4 GB of RAM running
 macOS 15.8.1 natively through OpenCore, whose kext list and device
 properties name the parts below.
 
+Northwood 1.0.0b2 requires 8 GiB of installed RAM. The 4 GB configurations and
+boot results on this page are historical observations from earlier builds.
+
 | Part | PCI / bus identity | Stela driver | Status |
 | --- | --- | --- | --- |
 | CPU: Celeron N4120, Gemini Lake Refresh, 4 cores, no AVX | — | translator (x86-64-v2) | A 4 GiB QEMU fixture with AVX, BMI, and LA57 disabled reaches XNU. The N4120 itself still needs a boot run. |

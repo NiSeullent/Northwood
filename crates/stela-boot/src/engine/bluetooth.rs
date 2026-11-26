@@ -52,6 +52,20 @@ pub struct HostBluetooth {
     unknown: Vec<u16>,
 }
 
+/// The controller is dropped in the loader's root. An install runs without
+/// host input and drops the controller it found right after the device
+/// start; a USB controller's drop closes its endpoints through the xHCI,
+/// whose registers only that root maps.
+impl Drop for HostBluetooth {
+    fn drop(&mut self) {
+        let controller = core::mem::replace(
+            &mut self.controller,
+            Controller::Modeled { installed: false },
+        );
+        super::network::in_loader_root(self.root, || drop(controller));
+    }
+}
+
 impl HostBluetooth {
     /// The first controller `usb` and `pcie` hold that initialized, or the
     /// model without one.

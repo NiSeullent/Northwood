@@ -423,7 +423,11 @@ impl<R: Registers, T: Timer> Hardware<'_, R, T> {
                         },
                 )?;
             }
-            self.phy_write(4, 0x01e1)?; // IEEE selector, 10/100 half/full, no pause.
+            // IEEE selector, 10/100 half/full, and symmetric and asymmetric
+            // pause, as r8169 advertises (`phy_support_asym_pause`): the MAC
+            // runs flow control from the negotiated result in hardware, with
+            // the FIFO pause thresholds its start set.
+            self.phy_write(4, 0x0de1)?;
             self.phy_modify(9, (3 << 8) | (3 << 11) | (7 << 13), 1 << 9)?; // 1000 full, auto master.
             self.phy_write(PHY_CONTROL, (1 << 12) | (1 << 9))?; // restart autonegotiation.
             Ok(warning)

@@ -4,7 +4,7 @@
 //! granted by this pure parser; boot must copy readable pre-EBS data.
 use super::{Image, Provenance, Provider, Requirement, Resource, Target};
 use crate::bytes::{le16, le32};
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 use stela_crypto::{Sha256, digest::Digest};
 
 pub const MAX_ENTRY_BYTES: usize = 255;
@@ -90,6 +90,8 @@ pub struct SystemIdentity<'a> {
     /// The first type-2 baseboard's manufacturer, the structure Linux's
     /// `dmi_decode` saves as DMI_BOARD_VENDOR. Not observed without one.
     pub board_vendor: Observation<'a>,
+    /// Installed volatile memory in the system arrays, when all sizes are known.
+    pub installed_memory_bytes: Option<u64>,
 }
 impl Default for SystemIdentity<'_> {
     fn default() -> Self {
@@ -98,6 +100,7 @@ impl Default for SystemIdentity<'_> {
             product_name: Observation::NotObserved,
             product_version: Observation::NotObserved,
             board_vendor: Observation::NotObserved,
+            installed_memory_bytes: None,
         }
     }
 }
@@ -221,6 +224,31 @@ fn field<'a>(index: u8, strings: &'a [u8]) -> Result<Observation<'a>, Error> {
     }
     Err(Error::InvalidStringIndex)
 }
+/// DMTF DSP0134: type 17 Size is in MiB unless the high bit indicates KiB.
+/// For nonvolatile devices, the separate Volatile Size field gives the RAM.
+fn memory_device_bytes(bytes: &[u8]) -> Option<u64> {
+    if bytes.get(18) == Some(&0x1f) {
+        return Some(0); // Logical memory is carved out of physical modules.
+    }
+    if let Some(detail) = bytes.get(19..21)
+        && u16::from_le_bytes(detail.try_into().ok()?) & (1 << 12) != 0
+    {
+        let volatile = u64::from_le_bytes(bytes.get(60..68)?.try_into().ok()?);
+        return (volatile != u64::MAX).then_some(volatile);
+    }
+    let size = u16::from_le_bytes(bytes.get(12..14)?.try_into().ok()?);
+    match size {
+        0 => Some(0), // Empty slot.
+        0x8000 | 0xffff => None,
+        0x7fff => {
+            let extended = u32::from_le_bytes(bytes.get(28..32)?.try_into().ok()?);
+            (extended != 0 && extended < (1 << 31)).then_some(u64::from(extended) << 20)
+        }
+        1..=0x7ffe => Some(u64::from(size) << 20),
+        _ => Some(u64::from(size & 0x7fff) << 10),
+    }
+}
+
 /// Walk the complete declared table. Every string-set has a bounded double NUL;
 /// only a zero string index establishes verified field absence.
 pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error> {
@@ -231,6 +259,8 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
     let mut count = 0usize;
     let mut found = None;
     let mut board = None;
+    let mut system_arrays = Vec::new();
+    let mut memory_devices = Vec::new();
     let mut ended = false;
     let mut handles = [0u8; 8192];
     while at < table.len() {
@@ -280,6 +310,7 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
                 product_name: field(table[at + 5], strings)?,
                 product_version: field(table[at + 6], strings)?,
                 board_vendor: Observation::NotObserved,
+                installed_memory_bytes: None,
             });
         }
         if head[0] == 2 && board.is_none() {
@@ -289,6 +320,15 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
             } else {
                 Observation::NotObserved
             });
+        }
+        if head[0] == 16 && length > 5 && table[at + 5] == 3 {
+            system_arrays.push(handle as u16);
+        }
+        if head[0] == 17 && length >= 6 {
+            memory_devices.push((
+                le16(table, at + 4),
+                memory_device_bytes(&table[at..at + length]),
+            ));
         }
         at = next;
         if head[0] == 127 {
@@ -305,9 +345,16 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
     if !ended {
         return Err(Error::MissingEnd);
     }
+    system_arrays.sort_unstable();
+    let installed_memory_bytes = memory_devices
+        .into_iter()
+        .filter(|(array, _)| system_arrays.binary_search(array).is_ok())
+        .try_fold(0u64, |sum, (_, bytes)| sum.checked_add(bytes?))
+        .filter(|&bytes| bytes != 0);
     found
         .map(|identity| SystemIdentity {
             board_vendor: board.unwrap_or(Observation::NotObserved),
+            installed_memory_bytes,
             ..identity
         })
         .ok_or(Error::MissingType1)
@@ -471,6 +518,7 @@ mod tests {
                     product_name: Observation::Absent,
                     product_version: Observation::Absent,
                     board_vendor: Observation::NotObserved,
+                    installed_memory_bytes: None,
                 }
             );
             assert_eq!(
@@ -479,6 +527,58 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn installed_memory_counts_populated_slots_across_size_encodings() {
+        let (raw, mut table) = fixture(Format::Smbios3);
+        let end_marker = table.split_off(table.len() - 6);
+        table.extend_from_slice(&[16, 6, 9, 0, 0, 3, 0, 0]); // System memory.
+        table.extend_from_slice(&[16, 6, 10, 0, 0, 4, 0, 0]); // Video memory.
+        let mut video = [0; 16];
+        video[..6].copy_from_slice(&[17, 14, 11, 0, 10, 0]);
+        video[12..14].copy_from_slice(&8192u16.to_le_bytes());
+        table.extend_from_slice(&video);
+        for (index, (size, extended)) in [(4096u16, 0u32), (0x7fff, 4096), (0, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut device = [0; 34];
+            device[..6].copy_from_slice(&[17, 32, 2 + index as u8, 0, 9, 0]);
+            device[12..14].copy_from_slice(&size.to_le_bytes());
+            device[28..32].copy_from_slice(&extended.to_le_bytes());
+            table.extend_from_slice(&device);
+        }
+        table.extend_from_slice(&end_marker);
+        let mut entry = entry(&raw, Format::Smbios3).unwrap();
+        entry.table_bytes = table.len();
+        assert_eq!(
+            identity(entry, &table).unwrap().installed_memory_bytes,
+            Some(8 << 30)
+        );
+        let last_size = table.len() - 6 - 34 + 12;
+        table[last_size..last_size + 2].copy_from_slice(&0x8040u16.to_le_bytes());
+        assert_eq!(
+            identity(entry, &table).unwrap().installed_memory_bytes,
+            Some((8 << 30) + (64 << 10))
+        );
+        table[last_size..last_size + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+        assert_eq!(
+            identity(entry, &table).unwrap().installed_memory_bytes,
+            None
+        );
+    }
+
+    #[test]
+    fn persistent_devices_contribute_only_their_volatile_portion() {
+        let mut device = [0; 68];
+        device[12..14].copy_from_slice(&0xffffu16.to_le_bytes());
+        device[19..21].copy_from_slice(&(1u16 << 12).to_le_bytes());
+        device[60..68].copy_from_slice(&(4u64 << 30).to_le_bytes());
+        assert_eq!(memory_device_bytes(&device), Some(4 << 30));
+        assert_eq!(memory_device_bytes(&device[..60]), None);
+        device[18] = 0x1f;
+        assert_eq!(memory_device_bytes(&device), Some(0));
+    }
+
     #[test]
     fn the_first_baseboard_names_the_board_vendor() {
         let (raw, table) = fixture(Format::Smbios3);

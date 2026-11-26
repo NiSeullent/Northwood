@@ -67,6 +67,7 @@ mod machines;
 mod medium;
 mod northwood_config;
 mod nwconfig_publish;
+mod offline;
 mod prepare;
 mod record;
 mod state;
@@ -277,17 +278,19 @@ fn restore_choice_name(kind: Kind, layout: Layout) -> &'static str {
 
 /// Where an install reads the macOS restore image: on the USB when it is
 /// large enough ([`default_install_image`]), else streamed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum InstallImage {
     /// The whole IPSW on the USB: with the signing answers setup fetched,
     /// the install needs no network. Records written before the name
     /// changed say `offline`.
     #[serde(alias = "offline")]
+    #[value(name = "offline", alias = "full")]
     Full,
     /// The IPSW on Apple's servers, streamed during the install. Records
     /// written before the name changed say `online`.
     #[serde(alias = "online")]
+    #[value(name = "online", alias = "network")]
     Network,
 }
 
@@ -328,6 +331,7 @@ enum Action {
     /// Create a setup, or add an install to one with `--target`.
     #[default]
     Create,
+    PrepareOffline(offline::Prepare),
     Status,
     Repair,
     UpdateStela,
@@ -362,6 +366,7 @@ struct Request {
     ipsw: Option<PathBuf>,
     fetch: bool,
     install_image: Option<InstallImage>,
+    offline_kit: Option<PathBuf>,
     download_dir: Option<PathBuf>,
     efi: Option<PathBuf>,
     model: Option<String>,
@@ -666,16 +671,23 @@ fn revision_mismatch(environment: &Environment<'_>, record: &Record) -> Option<S
 impl Request {
     fn run(mut self) -> Result<()> {
         // A Windows relaunch opens its own window, which only the wizard wants.
-        let swap_image = matches!(
+        let local_command = matches!(
             self.action,
-            Action::InspectSwap(_)
+            Action::PrepareOffline(_)
+                | Action::InspectSwap(_)
                 | Action::CreateSwapImage(_)
                 | Action::PlanSwapImage(_)
                 | Action::ApplySwapImage(_)
                 | Action::PrepareSwapVolumeImage(_)
         );
-        let interactive = !swap_image && self.usb.as_os_str().is_empty();
-        let elevate = !swap_image && (cfg!(unix) || interactive);
+        if self.offline_kit.is_some() {
+            ensure!(
+                !self.usb.as_os_str().is_empty(),
+                "pass --usb to create from an offline kit"
+            );
+        }
+        let interactive = !local_command && self.usb.as_os_str().is_empty();
+        let elevate = !local_command && (cfg!(unix) || interactive);
         if elevate && !self.dry_run && elevation::relaunch()? {
             return Ok(());
         }
@@ -744,11 +756,18 @@ impl Request {
                 ),
                 _ => String::new(),
             };
+            let network = [
+                create::OFFLINE_NOTE,
+                stela_runtime::restore::tss::network_reason(true),
+                stela_runtime::restore::tss::network_reason(false),
+            ]
+            .into_iter()
+            .find(|message| report.contains(message))
+            .unwrap_or_default();
             cliclack::note(
                 "Next steps",
                 format!(
-                    "Boot the target PC from this USB and choose the macOS installation entry.\nThe install \
-                     needs the internet for Apple's signing server.{gpu}{profile}"
+                    "Boot the target PC from this USB and choose the macOS installation entry.\n{network}{gpu}{profile}"
                 ),
             )?;
             cliclack::outro("Your installer USB is ready")?;
@@ -766,6 +785,7 @@ impl Request {
         let action = std::mem::take(&mut self.action);
         match action {
             Action::Create => return self.create(environment),
+            Action::PrepareOffline(command) => return command.run(environment),
             Action::Status => return doctor::status(environment, &self.usb),
             Action::BootLog => return state::boot_log(environment, &self),
             Action::Uninstall => return uninstall(environment, &self.usb, self.dry_run),
@@ -879,6 +899,7 @@ impl Request {
                 )
             }
             Action::Create
+            | Action::PrepareOffline(_)
             | Action::Status
             | Action::BootLog
             | Action::Uninstall

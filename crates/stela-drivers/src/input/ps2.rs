@@ -1171,6 +1171,40 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
         Ok(self.drain_events())
     }
+    /// [`Self::poll`] for the host's input path: a touchpad's records for
+    /// observation (its raw frames, advanced-gesture and pass-through
+    /// records) are dropped, and its pass-through pointer's (a TrackPoint's)
+    /// input joins the controller's. Nothing else drains those queues, and
+    /// a touchpad engine holding a full queue stops the controller reading
+    /// either port: a ThinkPad T14 Gen 2's keyboard, touchpad and TrackPoint
+    /// all went silent at its touchpad's 32nd packet.
+    pub fn poll_host(&mut self) -> Result<Vec<Input>, Error> {
+        let (mut inputs, error) = match self.poll() {
+            Ok(inputs) => (inputs, None),
+            Err(error) => (self.drain_events(), Some(error)),
+        };
+        if self.synaptics.is_some() {
+            drop(self.drain_synaptics_frames());
+            drop(self.drain_synaptics_advanced());
+            drop(self.drain_synaptics_passthrough());
+            let child = self.drain_synaptics_child_inputs();
+            let horizontal = self.drain_synaptics_child_horizontal();
+            inputs.extend(child);
+            inputs.extend(horizontal.into_iter().map(Input::HWheel));
+        }
+        if self.elantech.is_some() {
+            drop(self.drain_elantech_frames());
+        }
+        match error {
+            None => Ok(inputs),
+            // The device reads what was decoded before the error from
+            // `drain_events`.
+            Some(error) => {
+                self.events = inputs;
+                Err(error)
+            }
+        }
+    }
     pub fn drain_events(&mut self) -> Vec<Input> {
         core::mem::take(&mut self.events)
     }

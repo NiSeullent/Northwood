@@ -99,8 +99,8 @@ fn hex(bytes: &[u8]) -> String {
 pub(super) fn open(root: &mut Directory, path: &str, mode: FileMode) -> Option<RegularFile> {
     let path = CString16::try_from(path).ok()?;
     root.open(&path, mode, FileAttribute::empty())
-        .ok()?
-        .into_regular_file()
+        .ok()
+        .and_then(|handle| crate::file_kind::regular(handle).ok())
 }
 
 /// Read `buffer.len()` bytes from the current file position.

@@ -22,7 +22,7 @@ app="$stage/Stela.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary_directory/Stela" "$app/Contents/MacOS/Stela"
 cp "$package/Packaging/Info.plist" "$app/Contents/Info.plist"
-cp "$repository/assets/stela-icon.png" "$app/Contents/Resources/stela-icon.png"
+cp "$repository/assets/northwood-nw.png" "$app/Contents/Resources/stela-icon.png"
 
 # Use the workspace package version rather than maintaining a second product version.
 version="$(awk '/^\[workspace.package\]/{section=1;next} section && /^\[/{exit} section && /^version = /{gsub(/"/, "", $3);print $3;exit}' "$repository/Cargo.toml")"
@@ -48,9 +48,9 @@ short_version="${short_version%%-*}"
 iconset="$stage/Stela.iconset"
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
-    sips -z "$size" "$size" "$repository/assets/stela-icon.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    sips -z "$size" "$size" "$repository/assets/northwood-nw.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
     doubled=$((size * 2))
-    sips -z "$doubled" "$doubled" "$repository/assets/stela-icon.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+    sips -z "$doubled" "$doubled" "$repository/assets/northwood-nw.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil --convert icns "$iconset" --output "$app/Contents/Resources/Stela.icns"
 plutil -lint "$app/Contents/Info.plist"

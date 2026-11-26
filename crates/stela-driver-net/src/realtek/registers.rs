@@ -114,7 +114,8 @@ pub(super) const OWN: u32 = 1 << 31;
 pub(super) const END: u32 = 1 << 30;
 pub(super) const FIRST: u32 = 1 << 29;
 pub(super) const LAST: u32 = 1 << 28;
-pub(super) const RX_ERRORS: u32 = 0xf << 19;
+/// Receive descriptor error summary. RWT, RUNT and CRC give its reason.
+pub(super) const RX_RES: u32 = 1 << 21;
 pub(super) const LENGTH: u32 = 0x3fff;
 
 // The source extended-XID register lies beyond the normal NBASE timer aperture.

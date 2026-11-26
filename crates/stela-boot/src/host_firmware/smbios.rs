@@ -52,7 +52,7 @@ fn read(address: u64, output: &mut [u8], stage: Stage) -> Result<(), Failure> {
     }
     Ok(())
 }
-pub(super) fn capture() -> Capture {
+pub(crate) fn capture() -> (Capture, Option<u64>) {
     let selected = uefi::system::with_config_table(|entries| {
         select(entries.iter().filter_map(|entry| {
             let format = if entry.guid == ConfigTableEntry::SMBIOS3_GUID {
@@ -79,20 +79,20 @@ pub(super) fn capture() -> Capture {
         // excluded from guest allocation by the existing LOADER_DATA pipeline.
         Ok(unsafe { core::slice::from_raw_parts_mut(page.as_ptr(), bytes) })
     });
-    record_board(&capture);
-    capture
+    let installed_memory = record_board(&capture);
+    (capture, installed_memory)
 }
 
 /// Records the system's vendor and product name, model names the user may
 /// show, for the guest's `StelaHost` (`crate::host_inventory`). The serial
 /// number, UUID and asset tag are never read.
-fn record_board(capture: &Capture) {
+fn record_board(capture: &Capture) -> Option<u64> {
     use stela_drivers::firmware::smbios::{Observation, entry, entry_length, identity};
     let (Some(format), true) = (
         capture.format,
         capture.state == stela_boot_core::host_resources::smbios::State::Present,
     ) else {
-        return;
+        return None;
     };
     // SAFETY: the capture's own immutable LOADER_DATA pages, identity mapped.
     let bytes = unsafe {
@@ -101,16 +101,10 @@ fn record_board(capture: &Capture) {
             capture.region.bytes as usize,
         )
     };
-    let Ok(length) = entry_length(bytes, format) else {
-        return;
-    };
-    let Some(Ok(parsed)) = bytes.get(..length).map(|raw| entry(raw, format)) else {
-        return;
-    };
-    let Ok(system) = identity(parsed, &bytes[length..]) else {
-        return;
-    };
+    let length = entry_length(bytes, format).ok()?;
+    let parsed = entry(bytes.get(..length)?, format).ok()?;
     let table = &bytes[length..];
+    let system = identity(parsed, table).ok()?;
     let observed = |value| match value {
         Observation::Value(value) => Some(value),
         _ => None,
@@ -138,4 +132,5 @@ fn record_board(capture: &Capture) {
             model.model
         ));
     }
+    system.installed_memory_bytes
 }

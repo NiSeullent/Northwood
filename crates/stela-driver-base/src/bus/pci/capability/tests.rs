@@ -184,16 +184,37 @@ fn an_all_ones_header_is_a_failed_read() {
     );
 }
 
+/// Intel's PCH xHCI lists a vendor-specific entry whose length byte is 0
+/// after a sized one. Only its header is reserved and the walk goes on to
+/// the entries after it, as Linux's does.
 #[test]
-fn a_short_vendor_length_is_malformed() {
-    let mut space = Space::new();
-    space.0[0x34] = 0x40;
-    space.standard(0x40, 0x09, 0);
-    space.0[0x42] = 2;
-    assert_eq!(
-        space.walk(),
-        [Err(CapabilityError::Malformed { offset: 0x40 })]
-    );
+fn a_vendor_entry_shorter_than_its_header_reserves_only_the_header() {
+    for length in [0, 1, 2] {
+        let mut space = Space::new();
+        space.0[0x34] = 0x70;
+        space.standard(0x70, 0x01, 0x80);
+        space.standard(0x80, 0x09, 0xb0);
+        space.0[0x82] = 0x14;
+        space.standard(0xb0, 0x09, 0xb4);
+        space.0[0xb2] = length;
+        space.standard(0xb4, 0x00, 0);
+        assert_eq!(
+            space.walk(),
+            [
+                Ok((0x70, 1, 8)),
+                Ok((0x80, 9, 0x14)),
+                Ok((0xb0, 9, 2)),
+                Ok((0xb4, 0, 2))
+            ]
+        );
+        let layouts: Vec<_> = capabilities(&space)
+            .map(|entry| entry.unwrap().layout)
+            .collect();
+        assert_eq!(
+            layouts,
+            [Layout::Sized, Layout::Sized, Layout::Header, Layout::Sized]
+        );
+    }
 }
 
 #[test]

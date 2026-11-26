@@ -12,6 +12,16 @@ struct ReadDestination<'a> {
     bytes: &'a mut [u8],
 }
 
+/// Encode the number of ranges in an NVMe Deallocate command.
+fn deallocate_count(extents: &[crate::block::Extent]) -> Result<u32, BlockError> {
+    match extents.len() {
+        count @ 1..=MAX_DEALLOCATE_RANGES => Ok(count as u32 - 1),
+        _ => Err(BlockError::Unsupported(
+            "an NVMe Deallocate holds 1 to 256 ranges",
+        )),
+    }
+}
+
 impl Controller {
     /// Before the CPU takes back memory a completion released: an owned
     /// controller's completion counts only while its registers answer
@@ -233,6 +243,10 @@ impl Controller {
         words[1] = namespace;
         match command {
             Command::Read { lba, bytes } => {
+                for index in 0..bytes.div_ceil(PAGE) {
+                    let part = (bytes - index * PAGE).min(PAGE);
+                    self.tag_page(tag, index).bytes_mut()[..part].fill(READ_POISON);
+                }
                 let pointers = self.data_pointers(tag, *bytes)?;
                 Ok(transfer_command(
                     IO_READ,
@@ -259,6 +273,7 @@ impl Controller {
                 Ok(words)
             }
             Command::Discard { extents } => {
+                words[10] = deallocate_count(extents)?;
                 let bounce = self.tag_page(tag, 0);
                 // Each range: context attributes, length, starting LBA.
                 for (index, extent) in extents.iter().enumerate() {
@@ -273,7 +288,6 @@ impl Controller {
                 words[0] = u32::from(IO_DATASET_MANAGEMENT);
                 words[6] = address as u32;
                 words[7] = (address >> 32) as u32;
-                words[10] = extents.len() as u32 - 1;
                 words[11] = ATTRIBUTE_DEALLOCATE;
                 Ok(words)
             }
@@ -318,6 +332,9 @@ impl Controller {
         command: Command,
         retries: u8,
     ) -> Result<u32, BlockError> {
+        if let Command::Discard { extents } = &command {
+            deallocate_count(extents)?;
+        }
         self.ready()?;
         let tag = self
             .tags

@@ -430,13 +430,28 @@ impl Framebuffer {
         self.write_row(self.base, y, pixels);
     }
 
+    /// Redraw part of a firmware row, for pointer movement in the picker.
+    pub(crate) fn show_span(&self, x: usize, y: usize, pixels: &[u8]) {
+        if y >= self.height || x >= self.width {
+            return;
+        }
+        let Some(_access) = self.use_screen() else {
+            return;
+        };
+        self.write_span(self.base, x, y, pixels);
+    }
+
     /// Row `y` of the frame at `base`. A blue-low mode takes the pixels as
     /// they are, in one copy whose wide stores combine; the screen use's
     /// closing SFENCE, opaque to the compiler, keeps them.
     fn write_row(&self, base: usize, y: usize, pixels: &[u8]) {
-        let line = (base + y * self.stride * BYTES_PER_PIXEL) as *mut u32;
+        self.write_span(base, 0, y, pixels);
+    }
+
+    fn write_span(&self, base: usize, x: usize, y: usize, pixels: &[u8]) {
+        let line = (base + (y * self.stride + x) * BYTES_PER_PIXEL) as *mut u32;
         let (pixels, _) = pixels.as_chunks::<BYTES_PER_PIXEL>();
-        let pixels = &pixels[..pixels.len().min(self.width)];
+        let pixels = &pixels[..pixels.len().min(self.width - x)];
         if let Encoding::Bgr = self.encoding {
             // SAFETY: at most `width` pixels of row `y < height`, inside one
             // of the mode's frames in video memory, which no Rust reference

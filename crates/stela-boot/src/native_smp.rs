@@ -109,7 +109,7 @@ pub(crate) unsafe fn validate(
         handoff.pool.bytes,
     )?;
     resources::code_part_bytes(last.code_bytes, resources.code_parts)?;
-    if cores > 1
+    if (cores > 1 || resources.sipi != 0)
         && (!(crate::tables::PAGE..1 << 20).contains(&resources.sipi)
             || !resources.sipi.is_multiple_of(crate::tables::PAGE))
     {
@@ -127,14 +127,15 @@ pub(crate) unsafe fn validate(
         handoff.placement,
         stela_engine::machine::mmu::placement::Placement::FiveLevel
     );
+    let assignable = (capture.logical_count as usize).min(topology::MAX_CORES);
     crate::output::arguments(format_args!(
         "NATIVE INVENTORY firmware_processors={} enabled={} physical_cores={} logical={} assignable={} retired={} requested={cores}\n",
         capture.processor_count,
         capture.enabled_count,
         topology::physical_cores(&capture.processors),
         capture.logical_count,
-        capture.core_count,
-        capture.logical_count - capture.core_count,
+        assignable,
+        capture.logical_count as usize - assignable,
     ));
     crate::host_inventory::number(
         "HostCores",

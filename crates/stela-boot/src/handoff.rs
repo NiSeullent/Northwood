@@ -100,6 +100,8 @@ pub struct Handoff {
     pub(crate) inactive_firmware_units: crate::native_dma::InactiveFirmwareUnits,
     /// Exclusive firmware RAM below 4 GiB for AMD-Vi device tables.
     pub(crate) amd_tables: Region,
+    /// Exclusive firmware RAM below 4 GiB for 32-bit device DMA.
+    pub(crate) low_dma: Region,
     /// The prepared data-volume slot the engine can extend through native I/O.
     pub(crate) volume_log: Option<crate::log_file::VolumeLog>,
     pub(crate) final_memory_map: crate::system::memory_map::Ledger,

@@ -337,7 +337,7 @@ fn cold_retry_success_and_firmware_phy_nvm_power_refusals_are_distinct() {
             drop(c);
             assert_eq!(released.load(Ordering::SeqCst), 1);
         }
-        for failure in 0..9 {
+        for failure in 0..8 {
             let (state, released, io, timer) = spt::tests::fixture_spt();
             {
                 let mut m = state.borrow_mut();
@@ -360,17 +360,16 @@ fn cold_retry_success_and_firmware_phy_nvm_power_refusals_are_distinct() {
                             super::super::super::FW_VALID | super::super::super::RESET_PERMITTED,
                         );
                     }
-                    4 => m.power_stuck = true,
-                    5 => {
+                    4 => {
                         m.smb_stuck = true;
                         m.phy.insert((1, 769, 23), 0x7f01);
                     }
-                    6 => m.ulp_stuck = true,
-                    7 => {
+                    5 => m.ulp_stuck = true,
+                    6 => {
                         m.mac.insert(0x3808, 512);
                         m.config.insert(0xe4, 0x100);
                     }
-                    8 => m.reset_stuck = true,
+                    7 => m.reset_stuck = true,
                     _ => unreachable!(),
                 }
             }
@@ -395,6 +394,20 @@ fn cold_retry_success_and_firmware_phy_nvm_power_refusals_are_distinct() {
     assert_eq!(state.borrow().mdic_attempts, 1);
     assert_eq!(released.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn both_cohorts_can_leave_ulp_without_a_power_cycle_completion_bit() {
+    for device in [0x550a, 0x57b3] {
+        let (state, released, io, timer) = spt::tests::fixture_spt();
+        // Withhold the status indication while the PHY remains accessible.
+        state.borrow_mut().power_stuck = true;
+        let controller = start_any(device, io, timer).unwrap();
+        assert!(!controller.is_poisoned());
+        drop(controller);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+}
+
 #[test]
 #[ignore = "oracle: STELA_E1000E_PCH_MTP_ORACLE, STELA_E1000E_PCH_PTP_ORACLE"]
 fn unchanged_mdic_protocol_retry_limit_delays_and_both_directions() {

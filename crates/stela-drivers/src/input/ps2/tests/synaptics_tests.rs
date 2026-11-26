@@ -1585,6 +1585,51 @@ fn child_ack_and_data_may_precede_the_later_parent_outer_ack() {
     }
 }
 #[test]
+fn the_host_poll_drops_raw_frames_so_the_keyboard_keeps_working_past_32_packets() {
+    let (mut c, h) = ready_synaptics(true);
+    let before = h.borrow().consumed;
+    let packet = new_packet(2000, 2000, 50, 5, 0);
+    for _ in 0..40 {
+        emit(&h, Port::Mouse, &packet);
+    }
+    emit(&h, Port::Keyboard, &[0x1c]);
+    let mut inputs = Vec::new();
+    for _ in 0..8 {
+        inputs.extend(c.poll_host().unwrap());
+    }
+    assert!(
+        inputs.contains(&Input::Key {
+            usage: 4,
+            pressed: true
+        }),
+        "{inputs:?}"
+    );
+    assert_eq!(h.borrow().consumed - before, 241);
+    assert!(c.drain_synaptics_frames().is_empty());
+}
+#[test]
+fn the_host_poll_delivers_the_pass_through_pointer() {
+    let (mut c, h) = child_target(false, false);
+    c.initialize().unwrap();
+    c.initialize_synaptics_mouse().unwrap();
+    c.poll_synaptics().unwrap();
+    for _ in 0..100 {
+        emit(&h, Port::Mouse, &wrapped([9, 1, 0, 0]));
+    }
+    let mut inputs = Vec::new();
+    for _ in 0..40 {
+        inputs.extend(c.poll_host().unwrap());
+    }
+    assert!(inputs.contains(&Input::MouseButtons(1)), "{inputs:?}");
+    assert!(
+        inputs
+            .iter()
+            .filter(|input| matches!(input, Input::Motion { .. }))
+            .count()
+            >= 99
+    );
+}
+#[test]
 fn child_backpressure_keeps_raw_packets() {
     let (mut c, h) = child_target(false, false);
     c.initialize().unwrap();

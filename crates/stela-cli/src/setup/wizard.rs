@@ -195,6 +195,7 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
         !choices.is_empty(),
         "no removable USB found. Connect a USB and run setup again."
     );
+    let requested_install_image = command.install_image;
     let mut images = None;
     let mut names = catalog::cached_names();
     let mut first = true;
@@ -258,7 +259,8 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
         // install needs no network; a smaller one gets the network
         // installer. A local IPSW named on the command line supplies the
         // boot files, and macOS too when it holds the whole image.
-        let mut install_image = super::default_install_image(usb.bytes);
+        let explicit = requested_install_image;
+        let mut install_image = explicit.unwrap_or_else(|| super::default_install_image(usb.bytes));
         let prefilled = first && command.ipsw.is_some();
         first = false;
         let (version, models) = if prefilled {
@@ -273,7 +275,9 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
             command.fetch = false;
             command.build = manifest.product_build.clone();
             preferred_build = Some(command.build.clone());
-            if !crate::restore::payload::holds_system_image(command.ipsw.as_deref().unwrap())? {
+            if explicit.is_none()
+                && !crate::restore::payload::holds_system_image(command.ipsw.as_deref().unwrap())?
+            {
                 install_image = InstallImage::Network;
             }
             command.install_image = Some(install_image);
@@ -318,8 +322,8 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
         // What the install needs the network for, and what is not known
         // about the installed system's first start.
         let full = install_image == InstallImage::Full;
-        for note in super::create::network_notes(!full, full) {
-            cliclack::log::info(note)?;
+        if !full {
+            cliclack::log::info(stela_runtime::restore::tss::network_reason(true))?;
         }
         choose_wifi(command)?;
         super::addresses::choose(command)?;
@@ -333,7 +337,7 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
                     |serial| format!("{} · serial {serial}", usb.description())
                 ),
                 match full {
-                    true => "Full · macOS goes on the USB, the install needs no network",
+                    true => "Full · macOS goes on the USB",
                     false => "Network · macOS downloads during installation",
                 },
                 command.build,
@@ -410,11 +414,11 @@ fn choose_swap(command: &mut Request) -> Result<()> {
     let policy = Swap::default();
     let requested = command.volume_swap_bytes.unwrap_or(policy.bytes);
     let prepare =
-        cliclack::select("Memory and swap · Does the target PC have 4 GiB of RAM or less?")
+        cliclack::select("USB swap · The target PC needs at least 8 GiB of installed RAM")
             .item(
                 false,
                 "Skip USB swap",
-                "For PCs with more than 4 GiB of RAM or unknown RAM",
+                "Leave more USB space for other files",
             )
             .item(
                 true,

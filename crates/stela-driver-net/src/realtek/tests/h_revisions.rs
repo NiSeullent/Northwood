@@ -45,6 +45,8 @@ fn h_phy_adc_bias_sentinel_rlen_and_masks_use_calibration_values() {
             assert_eq!(s.phy_ocp[&0xa430], 0xfffa);
             assert_eq!(s.phy_ocp[&0xa5d0], 0);
             assert_eq!(s.phy_ocp[&0xa400], 0x1200);
+            // Pause advertised, as Linux: flow control under bursts.
+            assert_eq!(s.phy_ocp[&0xa408], 0x0de1);
             assert_eq!(s.mac[&0xdd02], 0x807d);
             if bias.is_none() {
                 assert!(!s.writes.iter().any(|(r, v, _)| *r == PHY_OCP

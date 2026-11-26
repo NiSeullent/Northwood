@@ -195,8 +195,10 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
         self.identity = self.phy.identify()?;
         Ok(())
     }
+    /// Complete Intel's forced ULP exit even when the power-cycle status
+    /// never arrives. The subsequent MDIC accesses still verify PHY access.
     fn spt_ulp_exit(&mut self) -> Result<(), Error> {
-        let cycle_done = self.phy.transaction(|p| {
+        self.phy.transaction(|p| {
             let value = p.read_mac(super::FEXTNVM3)?;
             p.write_mac(
                 super::FEXTNVM3,
@@ -209,18 +211,13 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             p.wait_minimum(10)?;
             p.write_mac(super::CTRL, value & !LANPHYPC_OVERRIDE)?;
             p.read_mac(super::STATUS)?;
-            let mut done = false;
-            for _ in 0..=20 {
+            for _ in 0..20 {
                 p.wait_minimum(5_000)?;
                 if p.read_mac(CTRL_EXT)? & POWER_CYCLE_DONE != 0 {
-                    done = true;
                     break;
                 }
             }
             p.wait_minimum(30_000)?;
-            if !done {
-                return Ok(false);
-            }
             p.retry_enabled = false;
             // A mode-switch MDIC error is a source-defined transition, not an
             // access/removal fault. Only the exact CV_SMB_CTRL response may
@@ -254,11 +251,8 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             p.access(ULP_CONFIG, Some(value | ULP_START))?;
             let value = p.read_mac(FEXTNVM7)?;
             p.write_mac(FEXTNVM7, value & !DISABLE_SMB_PERST)?;
-            Ok(true)
+            Ok(())
         })?;
-        if !cycle_done {
-            return Err(Error::PowerCycleTimeout);
-        }
         Ok(())
     }
 }

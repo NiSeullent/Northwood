@@ -214,6 +214,7 @@ fn smbios_fields_pass_unchanged_to_the_mtp_board_quirk() {
         product_name: Smbios::Absent,
         product_version: Smbios::Value(b"ThinkPad P14s Gen 5\0"),
         board_vendor: Smbios::Value(b"LENOVO"),
+        installed_memory_bytes: None,
     };
     assert_eq!(
         host_identity(&system),

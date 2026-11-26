@@ -123,7 +123,12 @@ fn check(
         );
         return false;
     }
-    assert_eq!(exit, RETURN, "{word:08x} {inputs:x?} {fpcr:#x} {target:?}");
+    // Some numerical forms terminate their block. Their native success
+    // exits to the following instruction instead of running its RET here.
+    assert!(
+        exit == RETURN || exit == PC.0 + 4,
+        "{word:08x} {inputs:x?} {fpcr:#x} {target:?}: {exit:#x}"
+    );
     let mut exceptions = 0;
     let mut results = [0u64; 2];
     for (lane, &input) in inputs.iter().enumerate().take(lanes) {

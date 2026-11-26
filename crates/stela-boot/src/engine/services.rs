@@ -139,10 +139,11 @@ impl<'a> Services<'a> {
         self
     }
 
-    /// The RAM device DMA may reach untranslated: the drivers' heap and the
-    /// guest's memory.
+    /// RAM device DMA may reach untranslated, including the small driver
+    /// pool that can satisfy 32-bit DMA addresses.
     fn dma_regions(&self) -> Vec<core::ops::Range<u64>> {
         let mut regions = alloc::vec![self.heap.clone()];
+        regions.extend(native_memory::low_dma_range());
         regions.extend_from_slice(&self.guest_ram);
         regions
     }
@@ -424,7 +425,7 @@ unsafe impl NativeServices for Services<'_> {
     }
 
     fn pages(&self) -> &'static dyn PageSource {
-        &native_memory::SOURCE
+        &native_memory::DRIVER_PAGES
     }
 
     fn interrupts(

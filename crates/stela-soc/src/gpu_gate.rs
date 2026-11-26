@@ -547,7 +547,12 @@ mod tests {
         );
 
         assert!(store(&mut gate, 0, IMPORT, page + 1).is_err());
-        service.0.lock().unwrap().retired.extend([DESCRIPTOR, WRITABLE]);
+        service
+            .0
+            .lock()
+            .unwrap()
+            .retired
+            .extend([DESCRIPTOR, WRITABLE]);
         for token in [WRITABLE, DESCRIPTOR, 0] {
             store(&mut gate, 0, RETIRE, 1).unwrap();
             serve(&mut gate, 0);

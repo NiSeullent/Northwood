@@ -2,7 +2,7 @@
 //! a Vec/Arc in the loader heap, this fixed wire representation survives engine
 //! relocation. Only immutable bytes in reserved LOADER_DATA pages cross it.
 use crate::Result;
-use crate::{firmware, handoff::Region, layout, output, paging::PAGE};
+use crate::{file_kind, firmware, handoff::Region, layout, output, paging::PAGE};
 use alloc::{format, string::ToString, sync::Arc};
 pub use stela_boot_core::host_resources::Resources;
 use stela_boot_core::host_resources::report;
@@ -17,6 +17,7 @@ use uefi::{
     proto::media::file::{Directory, File as _, FileAttribute, FileInfo, FileMode, RegularFile},
 };
 mod smbios;
+pub(crate) use smbios::capture as capture_identity;
 mod wifi;
 use stela_drivers::net::wifi::intel::platform::VARIABLE_DESCRIPTORS;
 
@@ -58,11 +59,11 @@ pub unsafe fn after_ebs(resources: &Resources) -> Result<Option<Arc<Catalog>>> {
 /// a second case alias is refused even on firmware with a case-sensitive driver.
 fn open(root: &mut Directory, relative: &str) -> Result<Option<RegularFile>> {
     let path = CString16::try_from("\\").map_err(|_| refuse!("invalid firmware root"))?;
-    let mut directory = root
+    let handle = root
         .open(&path, FileMode::Read, FileAttribute::empty())
-        .map_err(|_| refuse!("cannot open host firmware root"))?
-        .into_directory()
-        .ok_or(refuse!("host firmware root is not a directory"))?;
+        .map_err(|error| refuse!("cannot open host firmware root", status = ?error.status()))?;
+    let mut directory = file_kind::directory(handle)
+        .map_err(|answers| refuse!("host firmware root is not a directory", %answers))?;
     let mut parts = relative.split('/').peekable();
     while let Some(part) = parts.next() {
         let mut found = None;
@@ -99,14 +100,12 @@ fn open(root: &mut Directory, relative: &str) -> Result<Option<RegularFile>> {
             .open(&name, FileMode::Read, FileAttribute::empty())
             .map_err(|_| refuse!("cannot open present host firmware path"))?;
         if parts.peek().is_none() {
-            return handle
-                .into_regular_file()
+            return file_kind::regular(handle)
                 .map(Some)
-                .ok_or(refuse!("host firmware file is a directory"));
+                .map_err(|answers| refuse!("host firmware path is not a regular file", %answers));
         }
-        directory = handle
-            .into_directory()
-            .ok_or(refuse!("host firmware parent is not a directory"))?;
+        directory = file_kind::directory(handle)
+            .map_err(|answers| refuse!("host firmware parent is not a directory", %answers))?;
     }
     Err(refuse!("empty host firmware path"))
 }
@@ -164,8 +163,10 @@ fn open_manifest(root: &mut Directory) -> Result<Option<(Layout, RegularFile)>> 
 /// Absence alone is optional. Any unreadable/malformed present manifest or
 /// missing/corrupt resource is a boot refusal. Images belong to the same
 /// selected firmware directory and volume as their manifest.
-pub fn read(root: &mut Directory) -> Result<Resources> {
-    let smbios = smbios::capture();
+pub fn read(
+    root: &mut Directory,
+    smbios: stela_boot_core::host_resources::smbios::Capture,
+) -> Result<Resources> {
     let mut wifi =
         [stela_boot_core::host_resources::wifi::Capture::default(); VARIABLE_DESCRIPTORS.len()];
     for (slot, descriptor) in wifi.iter_mut().zip(&VARIABLE_DESCRIPTORS) {

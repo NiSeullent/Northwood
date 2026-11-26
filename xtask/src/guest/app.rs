@@ -393,7 +393,7 @@ fn job() -> Result<Vec<u8>> {
 /// The sources `guest/stela-app/build.sh` reads, relative to the root.
 const SOURCES: [&str; 7] = [
     "Cargo.toml",
-    "assets/stela-icon.png",
+    "assets/northwood-nw.png",
     "guest/stela-app/Package.swift",
     "guest/stela-app/build.sh",
     "guest/stela-app/Packaging",

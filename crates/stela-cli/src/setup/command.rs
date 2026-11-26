@@ -2,7 +2,9 @@
 //! flags, and each action on an existing setup is a subcommand with only
 //! the options it takes, so the parser refuses every other combination.
 //! Each form becomes one [`Request`] for the action it names.
-use super::{Action, NextBoot, Request, builds, ecid::Ecid, firmware, swap, wifi};
+use super::{
+    Action, InstallImage, NextBoot, Request, builds, ecid::Ecid, firmware, offline, swap, wifi,
+};
 use clap::{Args, Subcommand, builder::TypedValueParser};
 use std::path::PathBuf;
 use stela_boot_core::options::Uuid;
@@ -33,6 +35,8 @@ impl Setup {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Prepare signed macOS boot files and restore metadata for offline USB creation.
+    PrepareOffline(offline::Prepare),
     /// Report everything about the setup and check it, changing nothing;
     /// fails when something needs fixing.
     Status(Usb),
@@ -68,6 +72,10 @@ enum Command {
 impl Command {
     fn request(self) -> Request {
         match self {
+            Self::PrepareOffline(command) => Request {
+                action: Action::PrepareOffline(command),
+                ..Request::default()
+            },
             Self::Status(usb) => usb.request(Action::Status),
             Self::Repair(command) => command.request(),
             Self::Update(command) => command.request(),
@@ -303,6 +311,19 @@ struct Create {
     usb: PathBuf,
     #[command(flatten)]
     image: Image,
+    /// Store macOS on the USB (offline) or download it when installing (online).
+    #[arg(long, value_enum)]
+    installer: Option<InstallImage>,
+    /// Create the USB without internet using a kit from setup prepare-offline.
+    #[arg(
+        long,
+        requires_all = ["usb", "ipsw"],
+        conflicts_with_all = ["installer", "model", "ecid", "new_ecid", "target"]
+    )]
+    offline_kit: Option<PathBuf>,
+    /// Read pinned device firmware from this local cache when creating from a kit.
+    #[arg(long, requires = "offline_kit")]
+    host_firmware_cache: Option<PathBuf>,
     #[command(flatten)]
     wifi: Wifi,
     /// Give this USB4 device a PCIe tunnel on PCs without an IOMMU that
@@ -395,6 +416,9 @@ impl Create {
             usb: self.usb,
             efi: self.efi,
             model: self.model,
+            install_image: self.installer,
+            offline_kit: self.offline_kit,
+            host_firmware_cache: self.host_firmware_cache,
             dry_run: self.dry_run,
             target: self.target,
             nor: self.nor,
