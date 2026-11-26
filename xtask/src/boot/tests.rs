@@ -261,6 +261,48 @@ fn qemu_host_inventory_does_not_synthesize_a_native_worker_grant() {
 }
 
 #[test]
+fn qemu_memory_defaults_support_all_boot_modes() {
+    use clap::Parser;
+    let parsed = crate::Cli::try_parse_from([
+        "xtask",
+        "boot",
+        "run",
+        "--output",
+        "/tmp/synthetic-payload",
+        "--payload",
+        "stage",
+    ])
+    .unwrap();
+    let crate::Task::Boot(Command::Run(run)) = parsed.task else {
+        panic!("boot run")
+    };
+    let firmware = Firmware {
+        code: "code.fd".into(),
+        variables: "vars.fd".into(),
+    };
+    for (system, bundle, expected) in [
+        (false, false, "8G"),
+        (true, false, "8G"),
+        (true, true, "12G"),
+    ] {
+        let command = machine::command(
+            &run,
+            machine::MachineOptions {
+                qemu: Path::new("qemu"),
+                firmware: &firmware,
+                variables: &firmware.variables,
+                format: "raw",
+                system,
+                bundle,
+            },
+        );
+        let mut arguments = command.get_args();
+        assert!(arguments.any(|argument| argument == "-m"));
+        assert_eq!(arguments.next().unwrap(), expected);
+    }
+}
+
+#[test]
 fn attached_storage_and_directory_volume_have_explicit_cli_contracts() {
     use clap::Parser;
     let cli = crate::Cli::try_parse_from([

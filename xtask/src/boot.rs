@@ -172,8 +172,7 @@ pub struct Run {
     /// Firmware-visible SMT threads per core.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     host_threads: u16,
-    /// Guest machine memory for QEMU; defaults to 1G, 8G for system mode
-    /// and 12G with a boot bundle.
+    /// Machine memory for QEMU. Defaults to 8G, or 12G with a boot bundle.
     #[arg(long)]
     memory: Option<String>,
     /// A kernel boot bundle directory (`stela-dev boot prepare` output) to start

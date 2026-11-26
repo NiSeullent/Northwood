@@ -93,14 +93,10 @@ pub(super) fn command(arguments: &Run, options: MachineOptions<'_>) -> Process {
         usb || system,
     );
     let keyboard = if usb { "on" } else { "off" };
-    let memory = arguments.memory.clone().unwrap_or_else(|| {
-        match (bundle, system) {
-            (true, _) => "12G",
-            (false, true) => "8G",
-            (false, false) => "1G",
-        }
-        .into()
-    });
+    let memory = arguments
+        .memory
+        .as_deref()
+        .unwrap_or(if bundle { "12G" } else { "8G" });
     command
         .arg("-machine")
         .arg(qemu_machine(keyboard, arguments.hpet_enabled()))
@@ -119,7 +115,7 @@ pub(super) fn command(arguments: &Run, options: MachineOptions<'_>) -> Process {
                 .into_iter()
                 .flatten(),
         )
-        .args(["-m", &memory, "-nodefaults", "-no-reboot"])
+        .args(["-m", memory, "-nodefaults", "-no-reboot"])
         // Every change to a mapped page of guest RAM flushes the guest's
         // whole mapping, which under nested virtualization discards the
         // outer hypervisor's shadow tables: fault it all in before it runs.
