@@ -447,6 +447,10 @@ pub(crate) unsafe fn start(
         .map_err(|_| StartupFailure::Resources)?;
     let memory_types = super::memory_types::Image::from_snapshot(&memory_source)
         .map_err(StartupFailure::Bootstrap)?;
+    let five_level = matches!(
+        handoff.placement,
+        stela_engine::machine::mmu::placement::Placement::FiveLevel
+    );
     if memory_types.amd.is_some() {
         for range in ram {
             memory_types
@@ -500,6 +504,17 @@ pub(crate) unsafe fn start(
             break;
         }
         let attempt = (|| -> Result<(), StartupFailure> {
+            let snapshot = &capture.snapshots[slot];
+            if slot >= runners {
+                snapshot.qualify_native(five_level).map_err(|refusal| {
+                    StartupFailure::Bootstrap(
+                        refusal.refusal("spare CPU lacks the native executor floor"),
+                    )
+                })?;
+                memory_types
+                    .compatible(snapshot)
+                    .map_err(StartupFailure::Bootstrap)?;
+            }
             let part =
                 resources::partition(cores, runners, slot, handoff.code.bytes, handoff.pool.bytes)
                     .map_err(|_| StartupFailure::Resources)?;
@@ -583,15 +598,12 @@ pub(crate) unsafe fn start(
                     layout::physical(physical) as *mut u8,
                     physical,
                     bootstrap::Entry {
-                        processor_signature: capture.snapshots[slot]
+                        processor_signature: snapshot
                             .get(1, 0)
                             .ok_or(StartupFailure::Resources)?
                             .eax,
                         root: handoff.root,
-                        five_level: matches!(
-                            handoff.placement,
-                            stela_engine::machine::mmu::placement::Placement::FiveLevel
-                        ),
+                        five_level,
                         pat: effective_pat,
                         memory_types: &memory_types,
                         stack_top: layout::stack()

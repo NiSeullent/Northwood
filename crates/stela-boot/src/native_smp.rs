@@ -165,6 +165,11 @@ pub(crate) unsafe fn validate(
             snapshot.cr4,
             snapshot.efer,
         ));
+        // An incompatible spare may be skipped. Its executor checks the same
+        // floor and memory types before sending its owned startup IPI.
+        if slot >= runners {
+            continue;
+        }
         snapshot.qualify_native(five_level).map_err(|refusal| {
             refusal.refusal("a selected processor lacks the native executor floor")
         })?;

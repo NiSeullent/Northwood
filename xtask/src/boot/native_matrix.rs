@@ -74,6 +74,7 @@ struct TranslationProof {
     eligible_workers: u64,
     completed_workers: u64,
     proven_blocks: u64,
+    elapsed_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -474,6 +475,7 @@ fn translation_proof(serial: &str, active_workers: u64) -> Result<Option<Transla
         eligible_workers,
         completed_workers,
         proven_blocks,
+        elapsed_ms: number(pass, "ms")?,
     }))
 }
 
@@ -556,12 +558,13 @@ mod tests {
             workers: 64,
         };
         let log = format!(
-            "{}CHECK native-translation-proof PASS logical=64 guest_reserved=8 workers=56 completed=56 proven=1792\n",
+            "{}CHECK native-translation-proof PASS logical=64 guest_reserved=8 workers=56 completed=56 proven=1792 ms=340\n",
             log(case)
         );
         let proof = verify(case, &log).unwrap().translation_proof.unwrap();
         assert_eq!(proof.completed_workers, 56);
         assert_eq!(proof.proven_blocks, 1792);
+        assert_eq!(proof.elapsed_ms, 340);
         assert!(verify(case, &log.replace("completed=56", "completed=55")).is_err());
     }
 
